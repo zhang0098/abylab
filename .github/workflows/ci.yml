@@ -21,7 +21,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         run: |
@@ -65,7 +65,7 @@ jobs:
             target: aarch64-apple-darwin
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         run: |
@@ -98,7 +98,7 @@ jobs:
           bin="target/${{ matrix.target }}/release/abylab"
           "$bin" --version || "$bin" --help
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: abylab-${{ matrix.target }}
           path: ${{ steps.package.outputs.artifact }}
