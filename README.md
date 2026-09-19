@@ -13,7 +13,9 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
 ```
 
-程序会装到 `~/.local/bin/abylab`.
+程序会装到 `~/.local/bin/abylab`, 并把这个目录写进你的 shell 启动文件(带注释
+标记, 想撤销就删那一行); `--no-path` 只打印命令不落盘, `--path-file` 指定写到
+哪个文件, `--bin-dir` 换安装目录, `--help` 看全部选项.
 
 你可以直接让你的ai帮你安装.
 

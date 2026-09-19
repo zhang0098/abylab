@@ -11,6 +11,9 @@
 # Options:
 #   -v, --version <tag>   release to install (default: latest, e.g. v0.1.0)
 #       --bin-dir <dir>   where to put the binary (default: ~/.local/bin)
+#       --path-file <f>   startup file to put that directory on PATH in
+#                         (default: the one your shell actually reads)
+#       --no-path         never touch a startup file; only print the line
 #       --force           reinstall even when this version is already present
 #       --no-verify       skip SHA-256 verification (not recommended)
 #       --dry-run         print the plan, download nothing
@@ -25,6 +28,9 @@ REPO="${ABYLAB_REPO:-zhang0098/abylab}"
 BIN_NAME="abylab"
 VERSION="${ABYLAB_VERSION:-latest}"
 BIN_DIR="${ABYLAB_BIN_DIR:-${HOME:?HOME is not set}/.local/bin}"
+MODIFY_PATH=1
+PATH_FILE=''
+PATH_WROTE=0
 FORCE=0
 VERIFY=1
 DRY_RUN=0
@@ -66,10 +72,16 @@ verifies its SHA-256 sum and installs that one file.
 Options:
   -v, --version <tag>   release to install (default: latest, e.g. v0.1.0)
       --bin-dir <dir>   where to put the binary (default: ~/.local/bin)
+      --path-file <f>   startup file to put that directory on PATH in
+                        (default: the one your shell actually reads)
+      --no-path         never touch a startup file; only print the line
       --force           reinstall even when this version is already present
       --no-verify       skip SHA-256 verification (not recommended)
       --dry-run         print the plan, download nothing
   -h, --help            this text
+
+Unless --no-path is given, that directory is also added to your shell startup
+file, marked with a comment so the line is easy to find and remove.
 
 Environment: ABYLAB_VERSION, ABYLAB_BIN_DIR, ABYLAB_REPO
 EOF
@@ -88,6 +100,15 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || die "--bin-dir needs a path"
             BIN_DIR="$2"
             shift 2
+            ;;
+        --path-file)
+            [ $# -ge 2 ] || die "--path-file needs a path"
+            PATH_FILE="$2"
+            shift 2
+            ;;
+        --no-path)
+            MODIFY_PATH=0
+            shift
             ;;
         --force)
             FORCE=1
@@ -257,6 +278,120 @@ install_binary() {
     install -m 0755 "$src" "$dst" || die "could not write $dst"
 }
 
+# ----------------------------------------------------------------- PATH ----
+
+# Startup file(s) that put a directory on PATH for the shells this user will
+# run abylab from, one absolute path per line. The first entry is created when
+# missing; the rest are only touched when they already exist.
+rc_files() {
+    if [ -n "$PATH_FILE" ]; then
+        printf '%s\n' "$PATH_FILE"
+        return 0
+    fi
+    case "${SHELL##*/}" in
+        zsh)
+            printf '%s\n' "$HOME/.zshrc"
+            ;;
+        bash)
+            printf '%s\n' "$HOME/.bashrc"
+            # Login shells read .bash_profile instead. Only touch an existing
+            # one: creating it would shadow ~/.profile.
+            if [ -f "$HOME/.bash_profile" ]; then
+                printf '%s\n' "$HOME/.bash_profile"
+            fi
+            ;;
+        fish)
+            printf '%s\n' "$HOME/.config/fish/config.fish"
+            ;;
+        *)
+            printf '%s\n' "$HOME/.profile"
+            ;;
+    esac
+}
+
+# fish spells this differently. The login shell decides, except when
+# --path-file points at a fish config.
+fish_syntax() { # file
+    case "${SHELL##*/}" in
+        fish) return 0 ;;
+    esac
+    case "$1" in
+        *.fish) return 0 ;;
+    esac
+    return 1
+}
+
+path_line() { # dir file
+    if fish_syntax "$2"; then
+        printf 'fish_add_path "%s"' "$1"
+    else
+        # shellcheck disable=SC2016  # $PATH is literal: it is written to the file
+        printf 'export PATH="%s:$PATH"' "$1"
+    fi
+}
+
+# Append the PATH line to one startup file unless the directory is mentioned
+# there already — re-running the installer, or a hand-written line, must not
+# stack duplicates. Sets PATH_WROTE when it actually adds something.
+add_path_to() { # file dir
+    local file="$1" dir="$2" parent
+    if [ -f "$file" ] && grep -qF -- "$dir" "$file" 2>/dev/null; then
+        note "PATH     $dir already in $file"
+        return 0
+    fi
+    parent="${file%/*}"
+    [ "$parent" = "$file" ] || mkdir -p "$parent" 2>/dev/null || true
+    if ! printf '\n# added by the abylab installer\n%s\n' "$(path_line "$dir" "$file")" >>"$file" 2>/dev/null; then
+        warn "could not write $file — add this line yourself:
+       $(path_line "$dir" "$file")"
+        return 1
+    fi
+    note "PATH     $dir added to $file"
+    PATH_WROTE=1
+}
+
+# Put BIN_DIR on PATH for future shells. Never fatal: a failed edit only
+# downgrades to printing the line.
+ensure_path() { # dir
+    local file
+    if [ "$(id -u)" = 0 ]; then
+        warn "running as root — leaving shell startup files alone; add $1 to PATH yourself"
+        return 0
+    fi
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        add_path_to "$file" "$1" || true
+    done <<EOF
+$(rc_files)
+EOF
+    if [ "$PATH_WROTE" = 1 ]; then
+        printf 'Restart your shell to pick up the new PATH.\n'
+    fi
+    return 0
+}
+
+# Report (and unless --no-path, arrange) how BIN_DIR reaches PATH. $1 is the
+# dry-run flag, so nothing is written during a dry run.
+wire_path() { # dry_run
+    case ":${PATH}:" in
+        *":$BIN_DIR:"*)
+            note "PATH     $BIN_DIR is already on \$PATH"
+            return 0
+            ;;
+    esac
+    if [ "$MODIFY_PATH" = 0 ]; then
+        printf '\n%s%s is not on your PATH.%s Add it:\n' "$BOLD" "$BIN_DIR" "$OFF"
+        # shellcheck disable=SC2016  # $PATH is literal: the user pastes this line
+        printf '\n    export PATH="%s:$PATH"\n' "$BIN_DIR"
+        return 0
+    fi
+    if [ "$1" = 1 ]; then
+        note "PATH     would add $BIN_DIR to $(rc_files | tr '\n' ' ')"
+        return 0
+    fi
+    ensure_path "$BIN_DIR"
+}
+
 # ---------------------------------------------------------------- main -----
 
 main() {
@@ -278,6 +413,7 @@ main() {
         current=$("$BIN_DIR/$BIN_NAME" --version 2>/dev/null || true)
         if [ "${current##* }" = "${tag#v}" ]; then
             note "already up to date — use --force to reinstall"
+            wire_path "$DRY_RUN"
             return 0
         fi
     fi
@@ -285,6 +421,7 @@ main() {
     if [ "$DRY_RUN" = 1 ]; then
         note "would download $base/$asset"
         [ "$VERIFY" = 1 ] && note "would verify it against $base/SHA256SUMS"
+        wire_path 1
         note "dry run — nothing downloaded"
         return 0
     fi
@@ -325,15 +462,7 @@ main() {
     installed=$("$BIN_DIR/$BIN_NAME" --version 2>/dev/null || printf '%s' "$BIN_NAME")
     printf '%sinstalled%s %s\n' "$GREEN" "$OFF" "$installed"
 
-    case ":${PATH}:" in
-        *":$BIN_DIR:"*) ;;
-        *)
-            printf '\n%s%s is not on your PATH yet.%s Add it (bash/zsh):\n' \
-                "$BOLD" "$BIN_DIR" "$OFF"
-            # shellcheck disable=SC2016  # $PATH is literal: the user pastes this line
-            printf '\n    export PATH="%s:$PATH"\n' "$BIN_DIR"
-            ;;
-    esac
+    wire_path 0
 
     # abylab never reads the environment for credentials: the key is typed into
     # the app (/login) and lands in $ABYLAB_HOME/.credentials.yaml.

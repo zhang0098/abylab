@@ -32,7 +32,9 @@ abylab
 Prebuilt binaries cover Linux (x86_64, aarch64) and macOS (Intel, Apple
 Silicon). The script installs `~/.local/bin/abylab` and checks the download
 against the release's `SHA256SUMS`; `--bin-dir` moves it, `--version <tag>`
-pins a release, `--help` lists the rest. To build from source instead:
+pins a release, `--help` lists the rest. It also puts that directory on PATH
+in your shell startup file (marked with a comment; `--no-path` only prints the
+line, `--path-file` picks the file). To build from source instead:
 `cargo build --release`.
 
 Then store your key (from <https://platform.deepseek.com/> → API keys) by
