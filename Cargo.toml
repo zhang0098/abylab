@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/abylab-tui", "crates/abylab-backend", "crates/abycore"]
+# Root manifest is virtual (no [package]); bare `cargo run` resolves via
+# default-members below. `cargo install` must target a member crate, e.g.
+#   cargo install --path crates/abylab-tui
+default-members = ["crates/abylab-tui"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+abycore = { path = "crates/abycore" }
+
+[profile.release]
+lto = true
+strip = true

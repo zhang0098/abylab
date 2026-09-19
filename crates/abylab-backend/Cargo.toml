@@ -1,0 +1,12 @@
+[package]
+name = "abylab-backend"
+version = "0.1.0"
+edition = "2024"
+description = "abycore-driven agent backend for the abylab TUI"
+license.workspace = true
+
+[dependencies]
+abycore = { path = "../abycore" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "fs", "time", "sync"] }
+futures-util = "0.3.34"
+serde_json = "1"

@@ -1,0 +1,45 @@
+[package]
+name = "abycore"
+version = "0.1.0"
+edition = "2024"
+description = "An embeddable Rust agent SDK for DeepSeek Messages"
+license.workspace = true
+readme = "README.md"
+publish = false
+include = ["Cargo.toml", "Cargo.lock", "src/**", "README.md", "README.en.md", "examples/**", "tests/**"]
+
+[features]
+default = ["web-search"]
+web-search = []
+
+[dependencies]
+async-stream = "0.3.6"
+cap-std = "4.0.3"
+futures-util = "0.3.34"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+httpdate = "1.0.3"
+ignore = "0.4"
+rand = "0.9.5"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.20"
+tempfile = "3"
+tokio = { version = "1.53.1", features = ["time", "sync", "macros", "rt", "process", "io-util", "fs"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", features = ["process", "fs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+libc = "0.2"
+seccompiler = "0.5.0"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "signal", "test-util"] }
+
+[[example]]
+name = "web_search"
+required-features = ["web-search"]
