@@ -25,10 +25,16 @@ GC pauses.
 ## Quick start
 
 ```sh
-cargo build --release
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
 export DEEPSEEK_API_KEY=sk-…
-./target/release/abylab
+abylab
 ```
+
+Prebuilt binaries cover Linux (x86_64, aarch64) and macOS (Intel, Apple
+Silicon). The script installs `~/.local/bin/abylab` and checks the download
+against the release's `SHA256SUMS`; `--bin-dir` moves it, `--version <tag>`
+pins a release, `--help` lists the rest. To build from source instead:
+`cargo build --release`.
 
 Options:
 

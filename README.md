@@ -8,12 +8,16 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 
 ## 快速开始
 
-1. 下载安装
+1. 安装（Linux x86_64/aarch64、macOS Intel/Apple Silicon 都有预编译包）：
 
 ```sh
-cargo build --release
-./target/release/abylab
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
 ```
+
+装到 `~/.local/bin/abylab`，下载后会核对 release 里的 `SHA256SUMS`；换目录用
+`--bin-dir`，`--version <tag>` 装指定版本，`--help` 看全部选项。想从源码构建
+就是 `cargo build --release`。
+
 2. 去 Deepseek官网 获取一个API Key, 点击这里 [https://platform.deepseek.com/](https://platform.deepseek.com/)
 
 3. 在你的终端中输入: `abylab` ; 然后在程序中用`/login`命令输入你的API Key: 

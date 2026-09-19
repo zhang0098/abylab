@@ -1,0 +1,146 @@
+name: Release
+
+# Tag pushes are the only way a release is published. The `check` job keeps a
+# tag on an untested commit from shipping a broken build.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to (re)build a release for, e.g. v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # On a tag push this is the tag; on workflow_dispatch the operator supplies
+  # an existing one. Asset names are `abylab-<tag>-<target>.tar.gz`, which is
+  # exactly what install.sh looks for.
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Same gate as ci.yml: never publish a tag that does not build, lint or test.
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked
+
+      - name: cargo test
+        run: cargo test --workspace --all-features --locked
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p abylab-tui
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="abylab-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/abylab" "dist/$name/"
+          cp LICENSE README.md README.en.md install.sh "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/abylab"
+          "$bin" --version || "$bin" --help
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+
+  publish:
+    name: publish ${{ inputs.tag || github.ref_name }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # `--` keeps names starting with a dash safe; the glob (rather than
+          # ./*.tar.gz) keeps the sums file usable with `sha256sum -c`.
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Re-running a tag (or a manual dispatch) refreshes the assets
+          # instead of failing on an existing release.
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" --clobber dist/*
+          gh release view "$TAG" --json url --jq .url
