@@ -322,7 +322,7 @@ fn keys_markdown_renders_within_the_terminal_width() {
                 let lines = crate::markdown::render(&md, &theme, width);
                 assert!(!lines.is_empty());
                 for line in lines {
-                    let w = line.width() as usize;
+                    let w = line.width();
                     assert!(
                         w <= width,
                         "rendered keys line is {w} wide at {width} ({zh}, mac={mac}): {line:?}"
@@ -352,7 +352,7 @@ fn keys_markdown_uses_the_platform_spellings_and_groups_everything() {
         KeyGroup::Mouse,
     ] {
         assert!(
-            linux.contains(&group.title(false)),
+            linux.contains(group.title(false)),
             "group {:?} missing:\n{linux}",
             group
         );

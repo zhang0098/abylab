@@ -269,7 +269,7 @@ impl ContextEstimate {
     /// See [`ViewEstimate::tokens`]: calibrated when available.
     pub fn tokens(&self) -> u64 {
         self.calibrated_tokens()
-            .map_or_else(|| self.estimated_tokens(), |calibrated| calibrated)
+            .unwrap_or_else(|| self.estimated_tokens())
     }
 
     /// See [`ViewEstimate::bytes_per_token`].

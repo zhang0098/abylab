@@ -315,10 +315,10 @@ impl DeepSeekWebSearch {
             }
         }
         let ok: Vec<_> = results.into_iter().flatten().collect();
-        if ok.is_empty() {
-            if let Some(error) = first_failure {
-                return Err(error);
-            }
+        if ok.is_empty()
+            && let Some(error) = first_failure
+        {
+            return Err(error);
         }
         Ok(merge_results(&ok, self.max_results))
     }

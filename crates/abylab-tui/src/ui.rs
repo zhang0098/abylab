@@ -246,11 +246,9 @@ fn stats_dock_spans(app: &App, width: usize) -> Vec<Span<'static>> {
             "ttft".into(),
             format!(
                 "TTFT avg {}",
-                if s.ttft_count > 0 {
-                    crate::app::fmt_duration(s.ttft_total_millis / s.ttft_count)
-                } else {
-                    "—".into()
-                }
+                s.ttft_total_millis
+                    .checked_div(s.ttft_count)
+                    .map_or_else(|| "—".to_string(), crate::app::fmt_duration)
             ),
         ),
     ];
