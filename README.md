@@ -3,20 +3,19 @@
 # abylab
 
 abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文件，
-没有依赖目录，更没有后台进程。整个程序就是一个文件, 大约 11 MB，
-启动也是毫秒级的, 简洁明了. 程序开源免费.
+没有任何依赖，整个程序就是一个文件, 大约 11 MB，启动飞速,程序开源免费.
 
 ## 快速开始
 
-1. 安装（Linux x86_64/aarch64、macOS Intel/Apple Silicon 都有预编译包）：
+1. 安装（支持 Linux、macOS ）, 在你的终端中运行：
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
 ```
 
-装到 `~/.local/bin/abylab`，下载后会核对 release 里的 `SHA256SUMS`；换目录用
-`--bin-dir`，`--version <tag>` 装指定版本，`--help` 看全部选项。想从源码构建
-就是 `cargo build --release`。
+程序会装到 `~/.local/bin/abylab`.
+
+你可以直接让你的ai帮你安装.
 
 2. 去 Deepseek官网 获取一个API Key, 点击这里 [https://platform.deepseek.com/](https://platform.deepseek.com/)
 
