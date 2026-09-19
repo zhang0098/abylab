@@ -136,6 +136,9 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job never checks out the repo, so gh has no git remote to
+          # infer the target from; GH_REPO supplies it instead.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # Re-running a tag (or a manual dispatch) refreshes the assets
