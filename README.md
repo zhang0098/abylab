@@ -2,82 +2,55 @@
 
 # abylab
 
-终端里的 abycore agent harness —— 一块 ratatui 画布，驱动 abycore DeepSeek
-SDK。所有东西都跑在一个进程里：没有单独的服务进程，没有 ACP，没有插件，
-也没有演示模式。
-
-```
-crates/abycore           agent SDK（workspace 成员）：Agent、会话快照、工具
-crates/abylab-backend    abycore Agent 驱动：Cmd ⇄ Agent::run，hooks → 权限询问
-crates/abylab-tui        画布：输入卡片、markdown、调色板、@文件、图片缩略图
-```
-
-## 极简、单文件、快
-
-abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文件，不用 Node
-也不用 Python，没有依赖目录，更没有后台进程。x86_64 Linux 上 release 构建
-（默认开 LTO + strip）大约 11 MB，压成发布包约 4.9 MB；冷启动也是毫秒级的
-（本机实测 `abylab --version` 约 2 ms）。流式渲染、工具执行、会话落盘全在
-同一个进程里完成，没有 IPC 往返，也没有 GC 停顿。
+abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文件，
+没有依赖目录，更没有后台进程。整个程序就是一个文件, 大约 11 MB，
+启动也是毫秒级的, 简洁明了. 程序开源免费.
 
 ## 快速开始
 
+1. 下载安装
+
 ```sh
 cargo build --release
-export DEEPSEEK_API_KEY=sk-…
 ./target/release/abylab
 ```
+2. 去 Deepseek官网 获取一个API Key, 点击这里 [https://platform.deepseek.com/](https://platform.deepseek.com/)
 
-常用参数：
-
+3. 在你的终端中输入: `abylab` ; 然后在程序中用`/login`命令输入你的API Key: 
 ```
--w, --workspace <dir>     agent 工作区（默认：当前目录）
-    --session-root <dir>  会话 JSONL 根目录（默认：$ABYLAB_HOME/sessions）
-    --session-id <id>     恢复/继续一个持久会话 id
-    --model <id>          模型 id（默认：$ABY_MODEL，其次持久化设置，
-                          最后 deepseek-flash）
-    --base-url <url>      为 agent 设置 DEEPSEEK_BASE_URL
-    --api-key <key>       为 agent 设置 DEEPSEEK_API_KEY
-    --theme <dark|light>  外观模式（默认：持久化设置，其次 dark）
+/login sk-*****
 ```
 
-细调参数没有命令行开关，用环境变量就行：`ABY_MAX_REQUESTS`、
-`ABY_MAX_TOOL_CALLS`、`ABY_AUTO_CONTINUE`、`ABY_TURN_TIMEOUT`、
-`ABY_TOOL_TIMEOUT`、`ABY_CONTEXT_WINDOW`（启用压缩）、`ABY_COMPACT_AT`、
-`ABY_KEEP_RECENT`、`ABY_PRUNE_TOOL_OUTPUT`，另外还有 `ABYLAB_HOME` 和
-`ABY_MODEL`。
+4. 任意输入你的命令就开始工作了.
 
-偏好设置存在 `$ABYLAB_HOME/settings.json`：界面语言（默认中文）、模型、推理
-强度、权限预设、外观（明暗模式 + 主题包）。命令行参数只在当次运行里盖过它们。
 
-## 回合预算
+## 命令列表
 
-abycore 每个轮段都会硬性执行请求/工具上限（对话请求、重试和 `web_search`
-辅助请求共用同一份额度）。abylab 把这些数字当兜底，而不是正常的收尾方式：
+`/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
+`/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
+`/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
+`/session` · `/lang [zh|en]` · `/quit`
 
-- `ABY_MAX_REQUESTS` / `ABY_MAX_TOOL_CALLS` 默认都是 **1000**。填 `0` 就完全
-  不限：回合会一直跑，直到模型自己收尾、你按 esc、回合时限到了，或者撞上
-  上下文上限。
-- 如果某个轮段是撞上限停的，或者是瞬时故障（断连、限流、服务端错误）停的，
-  abylab 会把还没执行的工具调用结算成错误结果——模型不会以为写入已经落盘
-  ——然后打一条 `info` 通知；提供商带了 `Retry-After` 就先等一等，再在同一个
-  回合里续跑，最多 `ABY_AUTO_CONTINUE` 次（默认 3）。
-- 只有这点续跑额度也用光了，回合才会以错误收场，而会话依然能恢复：再发一条
-  消息就接着跑。
-- 卡住的循环只会被劝，不会被杀：同一个工具调用、同样的参数连着出现 3、5、8
-  次之后，宿主会给模型排队一条简短提醒。调用本身不会被拦也不会被拖慢，
-  `todo_write` 不算；新提示词或换一个调用都会重新计数。这道守卫在
-  `abycore::AgentHooks::tool_reminder`，由 abylab 通过 hooks 装上。
+`/theme` 用来挑调色板包：内置的 DeepSeek 默认主题，外加九个主题（ayu ·
+catppuccin · ember · everforest · iceberg · kanagawa · one · solarized ·
+tomorrow）。`ctrl+t` 在当前包里切换深色/
+浅色。
 
-预算是 abylab 自己的兜底，不是 DeepSeek 的限制——用量照常计费。时限也一样：
-预算都兜住之后，真正卡时间的是 `ABY_TURN_TIMEOUT`（回合仍可恢复，发条消息
-就能继续），单个工具调用则由 `ABY_TOOL_TIMEOUT` 约束。
+## 按键
 
-`incomplete` 表示模型撞到了单次请求的输出上限。驱动会把这个上限报出来，并
-暂停自动目标轮次，等你下一步操作。你发的新消息会并进未完成回合的下一次请求，
-所以修正能立刻到达模型。被截断的响应在会话记录里还看得到，但不会进可执行
-历史；被截断响应里的工具调用永远不会执行。想要更短的回答就直接说：新会话用
-SDK 的输出上限（256,000 token），恢复的会话沿用当初存下的上限。
+enter 发送/排队 · ctrl+x 立即发送 · esc 中断 / 双击清空草稿 ·
+ctrl+c 清空/退出 · ↑ 历史 · `/` 命令 · `@` 文件提及 ·
+ctrl+z / ctrl+shift+z 撤销/重做 · ctrl+p 模型 · ctrl+t 主题
+
+`/permission` 在 `read-only`、`workspace-write`、`danger-full-access`（默认）
+之间切换实时会话。切换保留对话历史，并作用于后续的文件工具与 Bash 进程；
+Shift+Tab 循环切换预设。
+
+鼠标：滚轮滚动 · 点击工具卡片展开 · 拖动选择，松开复制
+（原生工具 → tmux → OSC52）· `@` 打开文件浏览器。
+
+
+# 下面是技术性的说明,可以不看
 
 ## 工作区指令
 
@@ -136,17 +109,6 @@ SDK 的输出上限（256,000 token），恢复的会话沿用当初存下的上
 比 harness 更严的地方，以及实际真正卡人的限制：abycore 每个轮段 10 分钟运行
 时限，和 4 MiB 的序列化输入上限。字节估算不保证是上界。
 
-## 命令
-
-`/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
-`/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
-`/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
-`/session` · `/lang [zh|en]` · `/quit`
-
-`/theme` 用来挑调色板包：内置的 DeepSeek 默认主题，外加九个画廊包（ayu ·
-catppuccin · ember · everforest · iceberg · kanagawa · one · solarized ·
-tomorrow）——全都编在二进制里，不需要外部文件。`ctrl+t` 在当前包里切换深色/
-浅色。
 
 ## 会话持久化
 
@@ -186,18 +148,6 @@ incomplete/错误退出）都会在对外公布结算状态之前存好。
 - 续跑是*你*说了算：模型用工具建的目标不会自己开跑，直到你执行
   `/goal resume`。SDK 从不自己开回合，开回合的是这里的驱动。
 
-## 按键
-
-enter 发送/排队 · ctrl+x 立即发送 · esc 中断 / 双击清空草稿 ·
-ctrl+c 清空/退出 · ↑ 历史 · `/` 命令 · `@` 文件提及 ·
-ctrl+z / ctrl+shift+z 撤销/重做 · ctrl+p 模型 · ctrl+t 主题
-
-`/permission` 在 `read-only`、`workspace-write`、`danger-full-access`（默认）
-之间切换实时会话。切换保留对话历史，并作用于后续的文件工具与 Bash 进程；
-Shift+Tab 循环切换预设。
-
-鼠标：滚轮滚动 · 点击工具卡片展开 · 拖动选择，松开复制
-（原生工具 → tmux → OSC52）· `@` 打开文件浏览器。
 
 ## 许可证
 
