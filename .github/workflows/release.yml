@@ -37,6 +37,20 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
+      - name: Tag matches the crate version
+        run: |
+          set -euo pipefail
+          # install.sh compares `abylab --version` with the tag to decide
+          # whether an upgrade is needed, so a tag that disagrees with the
+          # version compiled into the binary would reinstall the same build on
+          # every run. Catch that here instead of shipping it.
+          crate=$(grep -m1 '^version = ' crates/abylab-tui/Cargo.toml | cut -d'"' -f2)
+          if [ "${TAG#v}" != "$crate" ]; then
+            echo "::error::tag $TAG does not match crates/abylab-tui version $crate"
+            exit 1
+          fi
+          echo "tag $TAG matches abylab-tui $crate"
+
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal \
