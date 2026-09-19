@@ -335,7 +335,10 @@ main() {
             ;;
     esac
 
-    printf '\nNext: export DEEPSEEK_API_KEY=sk-… then run %s%s%s\n' "$BOLD" "$BIN_NAME" "$OFF"
+    # abylab never reads the environment for credentials: the key is typed into
+    # the app (/login) and lands in $ABYLAB_HOME/.credentials.yaml.
+    printf '\nNext: run %s%s%s, then enter %s/login sk-…%s to store your DeepSeek API key\n' \
+        "$BOLD" "$BIN_NAME" "$OFF" "$BOLD" "$OFF"
 }
 
 main

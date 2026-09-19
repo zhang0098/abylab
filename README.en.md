@@ -26,7 +26,6 @@ GC pauses.
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
-export DEEPSEEK_API_KEY=sk-…
 abylab
 ```
 
@@ -35,6 +34,18 @@ Silicon). The script installs `~/.local/bin/abylab` and checks the download
 against the release's `SHA256SUMS`; `--bin-dir` moves it, `--version <tag>`
 pins a release, `--help` lists the rest. To build from source instead:
 `cargo build --release`.
+
+Then store your key (from <https://platform.deepseek.com/> → API keys) by
+typing this into the composer — it takes effect without a restart:
+
+```
+/login sk-xxxxxxxx
+```
+
+It is written to `~/.abylab/.credentials.yaml` (0600, owner-only). Credentials
+never come from the environment: abylab does not read `DEEPSEEK_API_KEY` or any
+other variable, and `--api-key <key>` is only a one-run override that is never
+persisted.
 
 Options:
 
@@ -45,7 +56,8 @@ Options:
     --model <id>          model id (default: $ABY_MODEL, else the persisted
                           model, else deepseek-flash)
     --base-url <url>      sets DEEPSEEK_BASE_URL for the agent
-    --api-key <key>       sets DEEPSEEK_API_KEY for the agent
+    --api-key <key>       override the agent API key for this run
+                          (/login persists one instead)
     --theme <dark|light>  appearance mode (default: persisted, else dark)
 ```
 
