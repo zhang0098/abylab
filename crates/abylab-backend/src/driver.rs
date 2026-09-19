@@ -572,28 +572,20 @@ async fn drive(
             }
         }
     }
-    let mut agent = local.as_ref().and_then(|local| match &resumed {
-        Some(snapshot) => resume_agent(
+    let mut agent = local.as_ref().and_then(|local| {
+        let ctx = AgentContext {
             local,
-            &api_key,
-            cfg.base_url.as_deref(),
-            snapshot,
-            store.as_ref(),
-            &active_session,
-            subagents.as_ref(),
-            &host,
-        ),
-        None => fresh_agent(
-            local,
-            &api_key,
-            cfg.base_url.as_deref(),
-            &model,
-            effort,
-            store.as_ref(),
-            &active_session,
-            subagents.as_ref(),
-            &host,
-        ),
+            api_key: &api_key,
+            base_url: cfg.base_url.as_deref(),
+            store: store.as_ref(),
+            session_id: &active_session,
+            subagents: subagents.as_ref(),
+            host: &host,
+        };
+        match &resumed {
+            Some(snapshot) => resume_agent(&ctx, snapshot),
+            None => fresh_agent(&ctx, &model, effort),
+        }
     });
     // Bind the session up front — fresh or resumed — so the composer's meta
     // row (mode/permission chips · model) renders from the first frame
@@ -818,15 +810,17 @@ async fn drive(
                 }
                 agent = local.as_ref().and_then(|local| {
                     fresh_agent(
-                        local,
-                        &api_key,
-                        cfg.base_url.as_deref(),
+                        &AgentContext {
+                            local,
+                            api_key: &api_key,
+                            base_url: cfg.base_url.as_deref(),
+                            store: store.as_ref(),
+                            session_id: &active_session,
+                            subagents: subagents.as_ref(),
+                            host: &host,
+                        },
                         &model,
                         effort,
-                        store.as_ref(),
-                        &active_session,
-                        subagents.as_ref(),
-                        &host,
                     )
                 });
                 if agent.is_some() {
@@ -848,15 +842,17 @@ async fn drive(
                 active_session = id.clone();
                 agent = local.as_ref().and_then(|local| {
                     fresh_agent(
-                        local,
-                        &api_key,
-                        cfg.base_url.as_deref(),
+                        &AgentContext {
+                            local,
+                            api_key: &api_key,
+                            base_url: cfg.base_url.as_deref(),
+                            store: store.as_ref(),
+                            session_id: &id,
+                            subagents: subagents.as_ref(),
+                            host: &host,
+                        },
                         &model,
                         effort,
-                        store.as_ref(),
-                        &id,
-                        subagents.as_ref(),
-                        &host,
                     )
                 });
                 if agent.is_some() {
@@ -877,14 +873,16 @@ async fn drive(
                 match (next, local.as_ref()) {
                     (Some(snapshot), Some(local)) => {
                         agent = resume_agent(
-                            local,
-                            &api_key,
-                            cfg.base_url.as_deref(),
+                            &AgentContext {
+                                local,
+                                api_key: &api_key,
+                                base_url: cfg.base_url.as_deref(),
+                                store: store.as_ref(),
+                                session_id: &id,
+                                subagents: subagents.as_ref(),
+                                host: &host,
+                            },
                             &snapshot,
-                            store.as_ref(),
-                            &id,
-                            subagents.as_ref(),
-                            &host,
                         );
                         active_session = id.clone();
                         if agent.is_some() {
@@ -1019,15 +1017,17 @@ async fn drive(
                     // an empty client config): this `/login` brings the
                     // session alive instead of demanding a restart.
                     agent = fresh_agent(
-                        local,
-                        &api_key,
-                        cfg.base_url.as_deref(),
+                        &AgentContext {
+                            local,
+                            api_key: &api_key,
+                            base_url: cfg.base_url.as_deref(),
+                            store: store.as_ref(),
+                            session_id: &active_session,
+                            subagents: subagents.as_ref(),
+                            host: &host,
+                        },
                         &model,
                         effort,
-                        store.as_ref(),
-                        &active_session,
-                        subagents.as_ref(),
-                        &host,
                     );
                     if agent.is_some() {
                         ctl(CtlEvent::SessionBound {
@@ -1260,18 +1260,34 @@ fn spawn_subagent_forwarder(
     });
 }
 
+/// Everything a session agent needs besides its model choice: the local tool
+/// bundle, credentials, persistence target and host policy. Bundled so
+/// [`fresh_agent`] and [`resume_agent`] stay in lockstep.
+struct AgentContext<'a> {
+    local: &'a LocalTools,
+    api_key: &'a str,
+    base_url: Option<&'a str>,
+    store: Option<&'a abycore::SessionStore>,
+    session_id: &'a str,
+    subagents: Option<&'a Arc<abycore::Subagents>>,
+    host: &'a HostPolicy,
+}
+
 /// Build a fresh agent and register the local tool bundle atomically.
 fn fresh_agent(
-    local: &LocalTools,
-    api_key: &str,
-    base_url: Option<&str>,
+    ctx: &AgentContext<'_>,
     model: &str,
     effort: ReasoningEffort,
-    store: Option<&abycore::SessionStore>,
-    session_id: &str,
-    subagents: Option<&Arc<abycore::Subagents>>,
-    host: &HostPolicy,
 ) -> Option<SessionAgent> {
+    let AgentContext {
+        local,
+        api_key,
+        base_url,
+        store,
+        session_id,
+        subagents,
+        host,
+    } = *ctx;
     let mut config = ClientConfig::new(api_key);
     if let Some(url) = base_url {
         config.base_url = url.to_string();
@@ -1329,15 +1345,18 @@ fn fresh_agent(
 
 /// Restore an agent from a persisted snapshot and register the tool bundle.
 fn resume_agent(
-    local: &LocalTools,
-    api_key: &str,
-    base_url: Option<&str>,
+    ctx: &AgentContext<'_>,
     snapshot: &abycore::SessionSnapshot,
-    store: Option<&abycore::SessionStore>,
-    session_id: &str,
-    subagents: Option<&Arc<abycore::Subagents>>,
-    host: &HostPolicy,
 ) -> Option<SessionAgent> {
+    let AgentContext {
+        local,
+        api_key,
+        base_url,
+        store,
+        session_id,
+        subagents,
+        host,
+    } = *ctx;
     let mut config = ClientConfig::new(api_key);
     if let Some(url) = base_url {
         config.base_url = url.to_string();
@@ -2673,7 +2692,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("abylab-list-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&workspace).expect("workspace directory");
-        let store = abycore::SessionStore::at(&workspace.join("store"), &workspace).expect("store");
+        let store = abycore::SessionStore::at(workspace.join("store"), &workspace).expect("store");
         let snapshot = abycore::SessionSnapshot::new("sys", ModelOptions::default());
         let mut writer = store.create("resume-list-test", &snapshot).expect("writer");
         store

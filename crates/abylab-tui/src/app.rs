@@ -2219,12 +2219,10 @@ impl App {
         // modal above (overlays and forms keep their own key handling; a
         // vim Insert-mode Esc cancels the ask/picker instead of toggling
         // vim, and normal-mode letters never land in a hidden composer).
-        if self.vim.is_active() {
-            if self.vim.handle_key(&key, &mut self.input) {
-                self.reconcile_attachments();
-                self.refresh_file_menu();
-                return;
-            }
+        if self.vim.is_active() && self.vim.handle_key(&key, &mut self.input) {
+            self.reconcile_attachments();
+            self.refresh_file_menu();
+            return;
         }
 
         // The @file browser owns its navigation keys while open; everything
@@ -5669,7 +5667,6 @@ mod mode_tests {
         ));
     }
 
-    #[test]
     #[test]
     fn no_key_onboarding_guides_the_platform_and_login() {
         let (mut app, _ctl, _rx) = test_app();

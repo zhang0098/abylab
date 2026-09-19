@@ -71,7 +71,7 @@ fn normal_motions() {
 }
 
 #[test]
-fn dd_kills_the_line_and_gg_G_jump() {
+fn dd_kills_the_line_and_gg_g_jump() {
     let mut v = VimState::default();
     v.set(true);
     v.mode = VimMode::Normal;
