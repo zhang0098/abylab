@@ -110,7 +110,7 @@ jobs:
           name="abylab-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/abylab" "dist/$name/"
-          cp LICENSE README.md README.en.md TECH.md install.sh "dist/$name/"
+          cp LICENSE README.md README.en.md TECH.md TECH.en.md install.sh "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 

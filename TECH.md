@@ -1,4 +1,4 @@
-[README](README.md) · **技术说明**
+**中文** · [English](TECH.en.md)
 
 # abylab 技术说明
 
