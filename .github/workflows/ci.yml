@@ -26,11 +26,12 @@ jobs:
       # The site serves its own copy of the installer, so
       # `curl https://abylab.ai/install.sh | bash` never has to reach GitHub,
       # while the packaged tarball ships the repo's file. Same script in two
-      # places; this is what keeps them from drifting.
+      # places; this is what keeps them from drifting. The syntax check also
+      # covers the Pages staging both deploy workflows call.
       - name: install.sh and site/install.sh are in sync
         run: |
           set -euo pipefail
-          bash -n install.sh
+          bash -n install.sh scripts/stage-site.sh
           if ! diff -u install.sh site/install.sh; then
             echo "::error::site/install.sh is stale — fix with: cp install.sh site/install.sh"
             exit 1

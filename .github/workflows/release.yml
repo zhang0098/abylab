@@ -222,31 +222,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # A Pages deployment is a full snapshot of the uploaded directory, so
-          # the site has to travel with the tarballs: staging gets a copy of
-          # site/ (`_headers` and `_redirects` included) plus downloads/.
-          mkdir -p staging downloads-src
-          cp -R site/. staging/
-          gh release download "$TAG" --pattern '*.tar.gz' -D downloads-src
-
-          mkdir -p staging/downloads/latest
-          printf '%s\n' "$TAG" > staging/downloads/latest/VERSION
-          for src in downloads-src/*.tar.gz; do
-            name=${src##*/}
-            # abylab-v0.1.2-x86_64-unknown-linux-gnu.tar.gz becomes
-            # abylab-latest-x86_64-unknown-linux-gnu.tar.gz — the stable name
-            # install.sh asks the mirror for.
-            stable=${name/abylab-${TAG}-/abylab-latest-}
-            cp "$src" "staging/downloads/latest/$stable"
-          done
-          cd staging/downloads/latest
-          # Sums for the names as mirrored (the release's own SHA256SUMS lists
-          # the versioned ones), so `sha256sum -c` works against this directory.
-          sha256sum -- *.tar.gz > SHA256SUMS
-          cat SHA256SUMS
-
+        # Shared with site.yml: a Pages deployment is a full snapshot, so both
+        # deployers have to stage the same shape of directory or they delete
+        # each other's half of the live site.
+        run: scripts/stage-site.sh staging "$TAG"
       - name: Deploy site + downloads to Cloudflare Pages
         if: steps.latest.outputs.is_latest == 'true'
         uses: cloudflare/wrangler-action@v3
