@@ -79,6 +79,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.plan_chip = None;
     app.prompt_jump_btn = None;
     app.expand_btn = None;
+    // …and the well's own hit targets: a frame that draws no composer (a
+    // child view, or a terminal too small for one) must not leave the last
+    // frame's well, chip rects or thumbnails behind for the mouse to hit.
+    app.composer_area = Rect::default();
+    app.att_chips.clear();
+    app.att_thumbs.clear();
     f.render_widget(
         Block::default().style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,

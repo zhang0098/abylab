@@ -150,8 +150,9 @@ lands in the transcript — same chrome as `/help` and `/keys`.
 
 ## Keys
 
-enter send/queue · ctrl+enter send-now · esc interrupt / 2×clear draft ·
-ctrl+c clear/quit · ↑ history · `/` commands · `@` file mention ·
+enter send/queue · ctrl+enter send-now · esc interrupt (clears the draft when idle) ·
+ctrl+c clear/quit · ↑ history (empty draft, or from the draft's first row) ·
+`/` commands · `@` file mention ·
 ctrl+z / ctrl+shift+z undo / redo · ctrl+p model · ctrl+t theme
 
 `/permission` switches the live abycore session between `read-only`,

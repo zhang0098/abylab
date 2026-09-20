@@ -57,8 +57,8 @@ iceberg · kanagawa · solarized · tomorrow）。
 
 ## 按键
 
-enter 发送/排队 · ctrl+enter 立即发送 · esc 中断 / 双击清空草稿 ·
-ctrl+c 清空/退出 · ↑ 历史 · `/` 命令 · `@` 文件提及 ·
+enter 发送/排队 · ctrl+enter 立即发送 · esc 中断（空闲时清空草稿）·
+ctrl+c 清空/退出 · ↑ 历史（空草稿时召回，草稿首行也能拉起）· `/` 命令 · `@` 文件提及 ·
 ctrl+z / ctrl+shift+z 撤销/重做 · ctrl+p 模型 · ctrl+t 主题
 
 `/permission` 在 `read-only`、`workspace-write`、`danger-full-access`（默认）

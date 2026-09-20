@@ -5549,6 +5549,45 @@ mod mode_tests {
         );
     }
 
+    /// A child view replaces the composer, so a frame without a well must
+    /// clear the mouse seam: a click where the parent's well used to be can
+    /// neither move the main draft's caret nor arm a drag.
+    #[test]
+    fn a_child_view_frame_clears_the_well_hit_target() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.input.set("parent draft".into());
+        let _ = crate::ui::dump_frame(&mut app, 100, 24);
+        let well = app.composer_area;
+        assert!(
+            well.height > 0,
+            "the parent frame records the well: {well:?}"
+        );
+
+        app.apply_ui(crate::events::UiEvent::SubagentStarted {
+            parent: "dsh-test".into(),
+            child: "child-1".into(),
+            label: None,
+        });
+        // The switcher's ↓ only opens on an empty draft, so take the view the
+        // way it lands it and keep the parent draft in place.
+        app.active_subagent = Some("child-1".into());
+        assert_eq!(app.active_subagent.as_deref(), Some("child-1"));
+
+        let _ = crate::ui::dump_frame(&mut app, 100, 24);
+        assert_eq!(app.composer_area, Rect::default(), "the well is gone");
+
+        let caret = app.input.cursor_char();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: well.x + 4,
+            row: well.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.input_selecting, "no composer drag in a child view");
+        assert!(app.input_sel.is_none());
+        assert_eq!(app.input.cursor_char(), caret, "the draft caret stays put");
+    }
+
     #[test]
     fn down_from_a_child_view_preselects_the_next_agent() {
         let (mut app, ctl, _rx) = test_app();
