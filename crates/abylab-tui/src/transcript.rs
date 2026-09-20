@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::events::UiEvent;
+use crate::locale::Locale;
 use crate::theme::Theme;
 
 /// Collapsed tool preview height; click toggles full expansion. Mouse wheel
@@ -85,12 +86,15 @@ pub enum CellKind {
     MarkdownNotice {
         text: String,
     },
-    /// The startup splash: an ASCII wordmark plus the project URL, painted
-    /// once at the top of a fresh run. `art` rows keep their own spacing, so
-    /// they are painted verbatim (never re-wrapped).
+    /// The startup splash: an ASCII wordmark, the project URL and the launch
+    /// facts, painted once at the top of a fresh run. `art` rows keep their
+    /// own spacing, so they are painted verbatim (never re-wrapped); every
+    /// fact is a `(label, value)` pair, so the label keeps the caption tone
+    /// and the value stays the readable one.
     Banner {
         art: Vec<String>,
         url: String,
+        facts: Vec<(String, String)>,
     },
 }
 
@@ -189,6 +193,10 @@ pub struct Transcript {
     /// the ground truth of what actually answered.
     pub last_model: Option<String>,
     pub expand_all: bool,
+    /// Interface language for this timeline's own chrome: the notice wording,
+    /// the tool-card footer, the reasoning heading. Payload text stays
+    /// authored by its owner; `App` keeps this in sync with `/lang`.
+    locale: Locale,
 }
 
 impl Transcript {
@@ -212,7 +220,14 @@ impl Transcript {
             last_finish: None,
             last_model: None,
             expand_all: false,
+            locale: Locale::default(),
         }
+    }
+
+    /// Follow the interface language (`/lang`). The root timeline and each
+    /// subagent's are told separately — they are separate `Transcript`s.
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale = locale;
     }
 
     pub fn set_root_session(&mut self, session: String) {
@@ -288,10 +303,11 @@ impl Transcript {
             .push(Cell::new(CellKind::MarkdownNotice { text }));
     }
 
-    /// Push the startup splash: preformatted `art` rows plus the URL that
-    /// follows the mark (`App::push_banner`).
-    pub fn push_banner(&mut self, art: Vec<String>, url: String) {
-        self.cells.push(Cell::new(CellKind::Banner { art, url }));
+    /// Push the startup splash: preformatted `art` rows, the URL that follows
+    /// the mark, and the launch facts under it (`App::push_banner`).
+    pub fn push_banner(&mut self, art: Vec<String>, url: String, facts: Vec<(String, String)>) {
+        self.cells
+            .push(Cell::new(CellKind::Banner { art, url, facts }));
     }
 
     /// Mark one client-owned queued prompt group as delivered.
@@ -467,7 +483,10 @@ impl Transcript {
                         } else {
                             NoticeLevel::Warn
                         };
-                        self.push_notice(level, format!("turn ended: {kind}"));
+                        self.push_notice(
+                            level,
+                            format!("{} · {kind}", self.locale.tr("turn ended", "回合结束")),
+                        );
                     }
                 }
             }
@@ -682,7 +701,10 @@ impl Transcript {
                 self.push_user(text, false);
             }
             UiEvent::SessionTitle { title, .. } => {
-                self.push_notice(NoticeLevel::Info, format!("session · {title}"));
+                self.push_notice(
+                    NoticeLevel::Info,
+                    format!("{} · {title}", self.locale.tr("session", "会话")),
+                );
             }
             UiEvent::Plan { summary, .. } => {
                 if let Some(idx) = self.plan_cell {
@@ -703,22 +725,39 @@ impl Transcript {
             }
             UiEvent::SubagentStarted { child, .. } => {
                 self.agent_seq += 1;
-                let label = format!("subagent {}", self.agent_seq);
+                let label = format!(
+                    "{} {}",
+                    self.locale.tr("subagent", "子代理"),
+                    self.agent_seq
+                );
                 self.agents.insert(child, label.clone());
-                self.push_notice(NoticeLevel::Info, format!("⛭ {label} started"));
+                self.push_notice(
+                    NoticeLevel::Info,
+                    format!("⛭ {label} {}", self.locale.tr("started", "已启动")),
+                );
             }
             UiEvent::SubagentFinished { child } => {
                 let label = self
                     .agents
                     .get(&child)
                     .cloned()
-                    .unwrap_or_else(|| "subagent".into());
-                self.push_notice(NoticeLevel::Info, format!("⛭ {label} finished"));
+                    .unwrap_or_else(|| self.locale.tr("subagent", "子代理").to_string());
+                self.push_notice(
+                    NoticeLevel::Info,
+                    format!("⛭ {label} {}", self.locale.tr("finished", "已结束")),
+                );
             }
             UiEvent::PlanMode { active, .. } => {
                 self.push_notice(
                     NoticeLevel::Info,
-                    format!("⌁ plan mode {}", if active { "on" } else { "off" }),
+                    format!(
+                        "⌁ {} {}",
+                        self.locale.tr("plan mode", "计划模式"),
+                        self.locale.tr(
+                            if active { "on" } else { "off" },
+                            if active { "开" } else { "关" }
+                        )
+                    ),
                 );
             }
             // Permission facts (`file policy` · `approval policy` ·
@@ -733,7 +772,10 @@ impl Transcript {
                 let why = reason.map(|r| format!(" · {r}")).unwrap_or_default();
                 self.push_notice(
                     NoticeLevel::Warn,
-                    format!("⚖ approval requested · {tool}{why}"),
+                    format!(
+                        "⚖ {} · {tool}{why}",
+                        self.locale.tr("approval requested", "请求审批")
+                    ),
                 );
             }
             UiEvent::ApprovalDecided { outcome, .. } => {
@@ -742,7 +784,10 @@ impl Transcript {
                 } else {
                     NoticeLevel::Info
                 };
-                self.push_notice(level, format!("⚖ approval · {outcome}"));
+                self.push_notice(
+                    level,
+                    format!("⚖ {} · {outcome}", self.locale.tr("approval", "审批")),
+                );
             }
         }
     }
@@ -919,7 +964,7 @@ impl Transcript {
                             &mut out,
                             &mut owners,
                             Line::from(Span::styled(
-                                format!("✻ {agent}thought{dur} · {n} line{}", plural(n)),
+                                reasoning_heading(self.locale, &agent, &dur, n),
                                 head_style,
                             )),
                             None,
@@ -1113,10 +1158,17 @@ impl Transcript {
                                 Line::from(vec![
                                     Span::styled("│ ".to_string(), Style::default().fg(bar_color)),
                                     Span::styled(
-                                        format!(
-                                            "last {}/{} lines · click to expand",
-                                            TOOL_VIEWPORT, total
-                                        ),
+                                        if self.locale == Locale::Zh {
+                                            format!(
+                                                "最后 {}/{} 行 · 点击展开",
+                                                TOOL_VIEWPORT, total
+                                            )
+                                        } else {
+                                            format!(
+                                                "last {}/{} lines · click to expand",
+                                                TOOL_VIEWPORT, total
+                                            )
+                                        },
                                         Style::default().fg(theme.caption),
                                     ),
                                 ]),
@@ -1150,7 +1202,8 @@ impl Transcript {
                     if summary.is_empty() {
                         continue;
                     }
-                    for l in wrap(&format!("plan · {summary}"), width.saturating_sub(2)) {
+                    let plan = self.locale.tr("plan", "计划");
+                    for l in wrap(&format!("{plan} · {summary}"), width.saturating_sub(2)) {
                         emit(
                             &mut out,
                             &mut owners,
@@ -1189,18 +1242,23 @@ impl Transcript {
                         emit(&mut out, &mut owners, l, None);
                     }
                 }
-                CellKind::Banner { art, url } => {
+                CellKind::Banner { art, url, facts } => {
                     emit(&mut out, &mut owners, Line::default(), None);
-                    // The mark and the URL share one centered column so the
-                    // splash reads as a block; rows wider than the pane (a
-                    // tiny terminal) fall back to the left margin.
+                    // The mark, the URL and the launch facts share one
+                    // centered column so the splash reads as a block; rows
+                    // wider than the pane (a tiny terminal) fall back to the
+                    // left margin.
+                    let fact_line =
+                        |(label, value): &(String, String)| format!("{label} · {value}");
                     let widest = art
                         .iter()
                         .map(|row| row.width())
                         .chain(std::iter::once(url.width()))
+                        .chain(facts.iter().map(|fact| fact_line(fact).width()))
                         .max()
                         .unwrap_or(0);
                     let pad = " ".repeat(width.saturating_sub(widest) / 2);
+                    let pad_w = pad.width();
                     for row in art {
                         emit(
                             &mut out,
@@ -1217,7 +1275,7 @@ impl Transcript {
                         &mut out,
                         &mut owners,
                         Line::from(vec![
-                            Span::raw(pad),
+                            Span::raw(pad.clone()),
                             Span::styled(
                                 url.clone(),
                                 Style::default()
@@ -1227,6 +1285,30 @@ impl Transcript {
                         ]),
                         None,
                     );
+                    if facts.is_empty() {
+                        continue;
+                    }
+                    emit(&mut out, &mut owners, Line::default(), None);
+                    for (label, value) in facts {
+                        // The label is the fixed part; the value (a path, a
+                        // model id) takes whatever the pane has left and gets
+                        // the ellipsis.
+                        let prefix = format!("{label} · ");
+                        let budget = width.saturating_sub(pad_w + prefix.width());
+                        emit(
+                            &mut out,
+                            &mut owners,
+                            Line::from(vec![
+                                Span::raw(pad.clone()),
+                                Span::styled(prefix, Style::default().fg(theme.caption)),
+                                Span::styled(
+                                    clamp_str(value, budget),
+                                    Style::default().fg(theme.fg_secondary),
+                                ),
+                            ]),
+                            None,
+                        );
+                    }
                 }
             }
         }
@@ -1264,6 +1346,15 @@ fn plural(n: usize) -> &'static str {
         ""
     } else {
         "s"
+    }
+}
+
+/// The reasoning divider, in the interface language: `✻ thought · 12 lines`
+/// in English, `✻ 思考 · 12 行` in Chinese (no plural to agree with).
+fn reasoning_heading(locale: Locale, agent: &str, dur: &str, lines: usize) -> String {
+    match locale {
+        Locale::En => format!("✻ {agent}thought{dur} · {lines} line{}", plural(lines)),
+        Locale::Zh => format!("✻ {agent}思考{dur} · {lines} 行"),
     }
 }
 
@@ -1531,6 +1622,106 @@ mod tests {
 
     fn t(session: &str) -> Transcript {
         Transcript::new(session.to_string())
+    }
+
+    /// Timeline chrome follows the interface language: the notices, the plan
+    /// divider, the reasoning heading and the tool-card footer all speak the
+    /// locale `App` sets, while payload text (a session title) stays as it
+    /// arrived.
+    #[test]
+    fn timeline_chrome_follows_the_interface_language() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::Zh);
+        tr.apply(UiEvent::SessionTitle {
+            session: "s".into(),
+            title: "fix the tests".into(),
+        });
+        tr.apply(UiEvent::SubagentStarted {
+            parent: "s".into(),
+            child: "c1".into(),
+            label: None,
+        });
+        tr.apply(UiEvent::PlanMode {
+            session: "s".into(),
+            active: true,
+        });
+        tr.apply(UiEvent::Plan {
+            session: "s".into(),
+            summary: "locate fn main".into(),
+            todos: Vec::new(),
+            active: None,
+            active_extra: 0,
+            completed: 1,
+            total: 1,
+        });
+        tr.apply(UiEvent::TurnEnd {
+            session: "s".into(),
+            kind: "error".into(),
+        });
+        tr.apply(UiEvent::ToolCall {
+            session: "s".into(),
+            call_id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{\"command\":\"ls\"}".into(),
+        });
+        tr.apply(UiEvent::ToolResult {
+            session: "s".into(),
+            call_id: "c1".into(),
+            is_error: false,
+            text: "l1\nl2\nl3\nl4\nl5\nl6".into(),
+            error: None,
+        });
+        tr.apply(UiEvent::TextDelta {
+            session: "s".into(),
+            text: "".into(),
+        });
+
+        let notices: Vec<String> = tr
+            .cells
+            .iter()
+            .filter_map(|c| match &c.kind {
+                CellKind::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.contains(&"会话 · fix the tests".to_string()),
+            "zh session notice, payload title untouched: {notices:?}"
+        );
+        assert!(
+            notices.contains(&"⛭ 子代理 1 已启动".to_string()),
+            "{notices:?}"
+        );
+        assert!(
+            notices.contains(&"⌁ 计划模式 开".to_string()),
+            "{notices:?}"
+        );
+        assert!(
+            notices.contains(&"回合结束 · error".to_string()),
+            "{notices:?}"
+        );
+
+        let theme = Theme::dark();
+        let rendered: String = tr
+            .lines(&theme, 40, ' ')
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(rendered.contains("计划 · locate fn main"), "{rendered}");
+        assert!(rendered.contains("最后 4/6 行 · 点击展开"), "{rendered}");
+
+        // The same timeline in English keeps the words it had before.
+        tr.set_locale(Locale::En);
+        let rendered: String = tr
+            .lines(&theme, 40, ' ')
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(rendered.contains("plan · locate fn main"), "{rendered}");
+        assert!(
+            rendered.contains("last 4/6 lines · click to expand"),
+            "{rendered}"
+        );
     }
 
     /// The `↥` jump walks this index: every user prompt with its bubble rows
@@ -1899,7 +2090,10 @@ mod tests {
 
     #[test]
     fn acp_load_replay_paints_user_title_and_plan() {
+        // Pinned English: this test is about the replay painting, and the
+        // chrome it reads (the session notice) follows the locale.
         let mut tr = t("s");
+        tr.set_locale(Locale::En);
         tr.apply(UiEvent::UserMessage {
             session: "s".into(),
             text: "hello from load".into(),
@@ -2017,6 +2211,7 @@ mod tests {
     fn tool_preview_shows_a_fixed_tail_and_expand_all_opens_it() {
         let text = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8";
         let mut tr = t("s");
+        tr.set_locale(Locale::En);
         tr.apply(UiEvent::ToolCall {
             session: "s".into(),
             call_id: "c1".into(),
@@ -2120,6 +2315,7 @@ mod tests {
                 "█▀█ █▄█  █  █▄▄ █▀█ █▄█".into(),
             ],
             "https://abylab.ai".into(),
+            Vec::new(),
         );
         let row = |layout: &TranscriptLayout, i: usize| -> String {
             layout.lines[i]
@@ -2158,6 +2354,56 @@ mod tests {
         // instead of losing its head to padding.
         let narrow = tr.layout(&theme, 20, ' ', false);
         assert_eq!(row(&narrow, 1), "▄▀█ █▄▄ █▄█ █   ▄▀█ █▄▄");
+    }
+
+    #[test]
+    fn banner_facts_ride_under_the_url_in_the_caption_tone() {
+        let theme = Theme::dark();
+        let mut tr = t("s");
+        let facts = vec![
+            ("version".to_string(), "0.1.4".to_string()),
+            ("cwd".to_string(), "/home/kk/project/abylab".to_string()),
+            ("permission".to_string(), "workspace-write".to_string()),
+            ("model".to_string(), "deepseek-flash".to_string()),
+        ];
+        tr.push_banner(
+            vec![
+                "▄▀█ █▄▄ █▄█ █   ▄▀█ █▄▄".into(),
+                "█▀█ █▄█  █  █▄▄ █▀█ █▄█".into(),
+            ],
+            "https://abylab.ai".into(),
+            facts.clone(),
+        );
+        let row = |layout: &TranscriptLayout, i: usize| -> String {
+            layout.lines[i]
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        let lead = |s: &str| s.len() - s.trim_start().len();
+
+        // 60 cols: mark rows, a blank, the URL, a blank, then one row per fact.
+        let layout = tr.layout(&theme, 60, ' ', false);
+        let start = 6;
+        assert!(row(&layout, 3).trim().is_empty());
+        assert!(row(&layout, 5).trim().is_empty(), "facts open a block");
+        let column = lead(&row(&layout, 4));
+        for (i, (label, value)) in facts.iter().enumerate() {
+            let line = row(&layout, start + i);
+            assert_eq!(line.trim_start(), format!("{label} · {value}"));
+            assert_eq!(lead(&line), column, "facts share the URL's column");
+        }
+        // The label keeps the caption tone; the value is the readable one.
+        let spans = &layout.lines[start].spans;
+        assert_eq!(spans[1].style.fg, Some(theme.caption));
+        assert_eq!(spans[2].style.fg, Some(theme.fg_secondary));
+
+        // A pane too narrow for the row ellipsizes the value, never the label.
+        let narrow = tr.layout(&theme, 24, ' ', false);
+        let long = row(&narrow, start + 1);
+        assert_eq!(long, "cwd · /home/kk/project/…");
+        assert!(long.width() <= 24);
     }
 
     #[test]

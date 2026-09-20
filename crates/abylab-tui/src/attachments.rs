@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use crate::locale::Locale;
+
 pub const MAX_STAGED: usize = 8;
 
 /// Composer preview thumbnails get kitty image ids far above the
@@ -44,16 +46,22 @@ pub struct Staged {
 }
 
 impl Staged {
-    /// Append one image and mint its draft token; `Err` when full.
+    /// Append one image and mint its draft token; `Err` when full. The one
+    /// message this can produce is chrome, so it follows the interface
+    /// language (`Locale` comes from the caller, like `file_ref`'s hints).
     pub fn add(
         &mut self,
+        locale: Locale,
         name: String,
         path: String,
         media_type: String,
         data: Vec<u8>,
     ) -> Result<&Attachment, &'static str> {
         if self.items.len() >= MAX_STAGED {
-            return Err("attachment tray is full — send or remove an [image] chip first");
+            return Err(locale.tr(
+                "attachment tray is full — send or remove an [image] chip first",
+                "附件区已满 —— 先发送或删除一个 [image] 图片",
+            ));
         }
         self.seq += 1;
         self.items.push(Attachment {
@@ -116,6 +124,7 @@ mod tests {
         let mut s = Staged::default();
         for i in 0..n {
             s.add(
+                Locale::En,
                 format!("img-{i}.png"),
                 "clipboard".into(),
                 "image/png".into(),
@@ -130,7 +139,13 @@ mod tests {
     fn add_mints_stable_unique_tokens_and_caps() {
         let mut s = staged_with(MAX_STAGED);
         assert!(s
-            .add("x".into(), "p".into(), "image/png".into(), vec![])
+            .add(
+                Locale::En,
+                "x".into(),
+                "p".into(),
+                "image/png".into(),
+                vec![]
+            )
             .is_err());
         let tokens: Vec<&str> = s.iter().map(|a| a.token.as_str()).collect();
         assert_eq!(tokens[0], "[image 1]");
@@ -159,6 +174,7 @@ mod tests {
     fn png_sniffing_reads_the_magic() {
         let mut s = Staged::default();
         s.add(
+            Locale::En,
             "a.png".into(),
             "p".into(),
             "image/png".into(),
@@ -166,6 +182,7 @@ mod tests {
         )
         .unwrap();
         s.add(
+            Locale::En,
             "b.jpg".into(),
             "p".into(),
             "image/jpeg".into(),

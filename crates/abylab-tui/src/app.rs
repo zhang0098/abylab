@@ -54,6 +54,9 @@ const LOGO_ART: [&str; 2] = ["▄▀█ █▄▄ █▄█ █   ▄▀█ █�
 /// Project URL under the startup wordmark.
 const SITE_URL: &str = "https://abylab.ai";
 
+/// Build version the startup splash reports (`-V` prints the same number).
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Some terminal layers incorrectly wrap Kitty/CSI-u key reports in
 /// bracketed-paste markers. Crossterm then exposes the key bytes as a paste,
 /// so recover them only when the *entire* payload is made of CSI-u keys.
@@ -306,6 +309,25 @@ pub fn permission_label(id: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// One-line meaning of a stock permission preset in the interface language.
+/// Only the three stock ids carry a translation; a custom preset the host
+/// reports falls back to the English table (and then to nothing), so the
+/// picker never invents a meaning the host didn't list.
+pub fn permission_desc(locale: Locale, id: &str) -> Option<&'static str> {
+    if locale == Locale::Zh {
+        match id {
+            "read-only" => return Some("只读 —— 不写文件"),
+            "workspace-write" => return Some("只写工作区 · 更大的动作会先征求同意"),
+            "danger-full-access" => return Some("完全文件访问 · 关闭审批 —— 仅限信任目录"),
+            _ => {}
+        }
+    }
+    PERMISSION_PRESETS
+        .iter()
+        .find(|(preset, _)| *preset == id)
+        .map(|(_, desc)| *desc)
 }
 
 /// Map a file extension to the attachment media type the host accepts.
@@ -688,6 +710,11 @@ pub struct App {
     pub(crate) expand_btn: Option<ratatui::layout::Rect>,
     /// The pointer rests on the `⛶` glyph: brighten it.
     pub(crate) hover_expand_btn: bool,
+    /// Screen rect of the meta row's `↓ N` scroll chip, recorded by the frame
+    /// that draws it. `None` while the transcript follows the tail (no chip).
+    pub(crate) scroll_btn: Option<ratatui::layout::Rect>,
+    /// The pointer rests on the `↓ N` chip: brighten it.
+    pub(crate) hover_scroll_btn: bool,
     /// The `⛶` click pins the well to the amplified height (issue #92) until
     /// the next click; the auto layout returns.
     pub(crate) composer_expanded: bool,
@@ -855,22 +882,33 @@ fn session_picker_row(id: &str, title: Option<&str>, updated_at: Option<&str>) -
     }
 }
 
-fn unique_session_list_match(sessions: &[SessionListItem], prefix: &str) -> Result<String, String> {
+fn unique_session_list_match(
+    locale: Locale,
+    sessions: &[SessionListItem],
+    prefix: &str,
+) -> Result<String, String> {
     let matches: Vec<&SessionListItem> = sessions
         .iter()
         .filter(|s| s.id.starts_with(prefix))
         .collect();
+    let list_hint = locale.tr("/resume lists them", "/resume 可以看到它们");
     match matches.as_slice() {
         [one] => Ok(one.id.clone()),
-        [] => Err(format!(
-            "no session matches “{prefix}” — /resume lists them"
-        )),
+        [] => Err(if locale == Locale::Zh {
+            format!("没有会话匹配 “{prefix}” —— {list_hint}")
+        } else {
+            format!("no session matches “{prefix}” — {list_hint}")
+        }),
         many => match many.iter().find(|s| s.id == prefix) {
             Some(one) => Ok(one.id.clone()),
-            None => Err(format!(
-                "“{prefix}” is ambiguous ({} matches) — /resume lists them",
-                many.len()
-            )),
+            None => Err(if locale == Locale::Zh {
+                format!("“{prefix}” 有歧义（{} 个匹配）—— {list_hint}", many.len())
+            } else {
+                format!(
+                    "“{prefix}” is ambiguous ({} matches) — {list_hint}",
+                    many.len()
+                )
+            }),
         },
     }
 }
@@ -1013,7 +1051,11 @@ impl App {
             palettes,
             active_palette_id,
             theme_preview: None,
-            transcript: Transcript::new(session_id.clone()),
+            transcript: {
+                let mut transcript = Transcript::new(session_id.clone());
+                transcript.set_locale(locale);
+                transcript
+            },
             subagents: Vec::new(),
             active_subagent: None,
             input: ComposerEditor::new(),
@@ -1059,6 +1101,8 @@ impl App {
             hover_prompt_jump_btn: false,
             expand_btn: None,
             hover_expand_btn: false,
+            scroll_btn: None,
+            hover_scroll_btn: false,
             composer_expanded: false,
             prompt_jump_cell: None,
             prompt_flash: None,
@@ -1178,15 +1222,48 @@ impl App {
             .push_markdown(format!("- **{label}** · {hint}"));
     }
 
-    /// The startup splash: the ASCII wordmark plus the project URL, painted
-    /// once per run at the top of the timeline (see `main`). `/new` keeps the
-    /// timeline to the usage hint — the mark belongs to the launch, not to
-    /// every session the client opens.
+    /// The startup splash: the ASCII wordmark, the project URL and the launch
+    /// facts — build version, working directory, permission preset and model —
+    /// painted once per run at the top of the timeline (see `main`). `/new`
+    /// keeps the timeline to the usage hint: the mark (and the facts it
+    /// reports) belongs to the launch, not to every session the client opens.
     pub fn push_banner(&mut self) {
+        let facts = vec![
+            (
+                self.locale.tr("version", "版本").to_string(),
+                VERSION.to_string(),
+            ),
+            (
+                self.locale.tr("cwd", "工作目录").to_string(),
+                self.cfg.workspace.clone(),
+            ),
+            (
+                self.locale.tr("permission", "权限").to_string(),
+                self.current_permission().to_string(),
+            ),
+            (
+                self.locale.tr("model", "模型").to_string(),
+                self.model_fact(),
+            ),
+        ];
         self.transcript.push_banner(
             LOGO_ART.iter().map(|row| (*row).to_string()).collect(),
             SITE_URL.to_string(),
+            facts,
         );
+    }
+
+    /// The splash's model value: the model id, with the requested reasoning
+    /// effort riding along when the session has one.
+    fn model_fact(&self) -> String {
+        match self.modes.effort.as_deref().filter(|e| !e.is_empty()) {
+            Some(effort) => format!(
+                "{} · {} {effort}",
+                self.cfg.model,
+                self.locale.tr("effort", "推理强度")
+            ),
+            None => self.cfg.model.clone(),
+        }
     }
 
     fn activate_palette(&mut self, id: &str) {
@@ -1200,7 +1277,8 @@ impl App {
         self.sync_theme_from_active();
         self.save_settings();
         self.show_tip(format!(
-            "theme: {} {}",
+            "{}: {} {}",
+            self.locale.tr("theme", "主题"),
             self.active_palette_id,
             self.theme.mode.as_str()
         ));
@@ -1313,20 +1391,29 @@ impl App {
             "dark" => {
                 self.theme = self.theme.with_mode(crate::theme::Mode::Dark);
                 self.save_settings();
-                self.show_tip(format!("theme: {} dark", self.active_palette_id));
+                self.show_tip(format!(
+                    "{}: {} dark",
+                    self.locale.tr("theme", "主题"),
+                    self.active_palette_id
+                ));
             }
             "light" => {
                 self.theme = self.theme.with_mode(crate::theme::Mode::Light);
                 self.save_settings();
-                self.show_tip(format!("theme: {} light", self.active_palette_id));
+                self.show_tip(format!(
+                    "{}: {} light",
+                    self.locale.tr("theme", "主题"),
+                    self.active_palette_id
+                ));
             }
             id => {
                 if self.palettes.iter().any(|p| p.id == id) {
                     self.select_palette(id);
                 } else {
-                    self.show_tip(format!("unknown palette: {id}"));
+                    let unknown = self.locale.tr("unknown palette", "未知主题包");
+                    self.show_tip(format!("{unknown}: {id}"));
                     self.transcript
-                        .push_notice(NoticeLevel::Warn, format!("unknown palette `{id}`"));
+                        .push_notice(NoticeLevel::Warn, format!("{unknown} `{id}`"));
                 }
             }
         }
@@ -1456,28 +1543,37 @@ impl App {
                 .map(|effort| (effort.clone(), effort.clone(), String::new()))
                 .collect(),
             "effort" => vec![
-                plain("off", "disable extended reasoning"),
-                plain("high", "high reasoning effort"),
-                plain("max", "maximum reasoning effort"),
+                plain(
+                    "off",
+                    self.locale.tr("disable extended reasoning", "关闭扩展推理"),
+                ),
+                plain(
+                    "high",
+                    self.locale.tr("high reasoning effort", "高推理强度"),
+                ),
+                plain(
+                    "max",
+                    self.locale.tr("maximum reasoning effort", "最高推理强度"),
+                ),
             ],
             "permission" => PERMISSION_PRESETS
                 .iter()
-                .map(|(id, desc)| plain(id, desc))
+                .map(|(id, _)| plain(id, permission_desc(self.locale, id).unwrap_or_default()))
                 .collect(),
             "plan" => vec![
-                plain("on", "enable plan mode"),
-                plain("off", "disable plan mode"),
+                plain("on", self.locale.tr("enable plan mode", "打开计划模式")),
+                plain("off", self.locale.tr("disable plan mode", "关闭计划模式")),
             ],
             "theme" => {
                 let mut choices = vec![
-                    plain("dark", "dark appearance"),
-                    plain("light", "light appearance"),
+                    plain("dark", self.locale.tr("dark appearance", "深色外观")),
+                    plain("light", self.locale.tr("light appearance", "浅色外观")),
                 ];
                 choices.extend(self.palettes.iter().map(|palette| {
                     (
                         palette.id.clone(),
                         palette.label.clone(),
-                        "palette pack".to_string(),
+                        self.locale.tr("palette pack", "主题包").to_string(),
                     )
                 }));
                 choices
@@ -1549,7 +1645,13 @@ impl App {
                     if c != 0 {
                         self.transcript.push_notice(
                             NoticeLevel::Warn,
-                            format!("runtime exited with code {c} — next prompt restarts it"),
+                            format!(
+                                "{} ({c}) — {}",
+                                self.locale
+                                    .tr("runtime exited with code", "运行时退出，代码"),
+                                self.locale
+                                    .tr("the next prompt restarts it", "下一条消息会重新拉起")
+                            ),
                         );
                     }
                 }
@@ -1560,7 +1662,8 @@ impl App {
                     CtlEvent::Starting { .. } => {
                         self.state = RunState::Starting;
                         self.run_started = Some(Instant::now());
-                        self.state_note = "starting runtime".into();
+                        self.state_note =
+                            self.locale.tr("starting runtime", "正在启动运行时").into();
                     }
                     CtlEvent::Ready { server } => {
                         self.server_info = Some(server.clone());
@@ -1588,9 +1691,10 @@ impl App {
                             if deferred {
                                 self.transcript.mark_prompt_queued(&pending.cells);
                                 self.enqueue_prompt(pending.blocks, pending.cells);
-                                self.show_tip(
+                                self.show_tip(self.locale.tr(
                                     "agent deferred Send Now — queued after the active turn",
-                                );
+                                    "Agent 推迟了立即发送 —— 已排到本轮之后",
+                                ));
                             }
                         }
                     }
@@ -1601,7 +1705,7 @@ impl App {
                         self.transcript.push_notice(NoticeLevel::Error, err);
                     }
                     CtlEvent::CancelRequested => {
-                        self.state_note = "cancelling".into();
+                        self.state_note = self.locale.tr("cancelling", "正在取消").into();
                         self.transcript.cancel_open_work();
                     }
                     CtlEvent::Interrupted => {
@@ -1610,8 +1714,12 @@ impl App {
                         self.run_started = None;
                         self.state_note.clear();
                         self.transcript.cancel_open_work();
-                        self.transcript
-                            .push_notice(NoticeLevel::Warn, "interrupted — turn cancelled".into());
+                        self.transcript.push_notice(
+                            NoticeLevel::Warn,
+                            self.locale
+                                .tr("interrupted — turn cancelled", "已中断 —— 本轮已取消")
+                                .into(),
+                        );
                     }
                     CtlEvent::Skills { skills } => {
                         self.skills = skills;
@@ -1724,13 +1832,19 @@ impl App {
         } = &ui
         {
             if !self.subagents.iter().any(|view| view.id == *child) {
-                let fallback = format!("subagent {}", self.subagents.len() + 1);
+                let fallback = format!(
+                    "{} {}",
+                    self.locale.tr("subagent", "子代理"),
+                    self.subagents.len() + 1
+                );
+                let mut transcript = Transcript::new(child.clone());
+                transcript.set_locale(self.locale);
                 self.subagents.push(SubagentView {
                     id: child.clone(),
                     parent: parent.clone(),
                     label: label.clone().unwrap_or(fallback),
                     running: true,
-                    transcript: Transcript::new(child.clone()),
+                    transcript,
                 });
             }
             if parent == &self.session_id {
@@ -1932,6 +2046,15 @@ impl App {
                     self.needs_redraw = true;
                     return;
                 }
+                // The `↓ N` chip in the meta row is the way back down: one
+                // click drops the scroll and follows the tail again.
+                if self.scroll_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
+                    self.scroll_up = 0;
+                    self.needs_redraw = true;
+                    return;
+                }
                 // A click inside the composer well places the caret at the
                 // clicked char and arms a drag-selection; the chat highlight is
                 // dismissed first, like any click outside that pane.
@@ -2036,6 +2159,13 @@ impl App {
                     self.hover_expand_btn = expand_hover;
                     self.needs_redraw = true;
                 }
+                // …and for the meta row's `↓ N` scroll chip.
+                let scroll_hover =
+                    self.scroll_btn_hit(mouse.column, mouse.row) && !self.modal_open();
+                if scroll_hover != self.hover_scroll_btn {
+                    self.hover_scroll_btn = scroll_hover;
+                    self.needs_redraw = true;
+                }
             }
             _ => {}
         }
@@ -2077,7 +2207,11 @@ impl App {
         };
         self.input.delete_char_range(start, end);
         if let Some(att) = self.pending_images.remove(idx) {
-            self.show_tip(format!("removed {}", att.name));
+            self.show_tip(
+                self.locale
+                    .tr("removed {n}", "已移除 {n}")
+                    .replace("{n}", &att.name),
+            );
         }
         true
     }
@@ -2150,6 +2284,17 @@ impl App {
     /// this frame.
     fn expand_btn_hit(&self, col: u16, row: u16) -> bool {
         self.expand_btn.is_some_and(|r| {
+            col >= r.x
+                && col < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        })
+    }
+
+    /// Hit-test a screen cell against the meta row's `↓ N` scroll chip drawn
+    /// this frame (absent while the tail is already on screen).
+    fn scroll_btn_hit(&self, col: u16, row: u16) -> bool {
+        self.scroll_btn.is_some_and(|r| {
             col >= r.x
                 && col < r.x.saturating_add(r.width)
                 && row >= r.y
@@ -2301,18 +2446,22 @@ impl App {
 
     /// Toggle a tool between its collapsed viewport and full expansion.
     fn toggle_tool(&mut self, ci: usize) {
-        let label = {
+        let expanded = {
             let Some(cell) = self.displayed_transcript_mut().cells.get_mut(ci) else {
                 return;
             };
             cell.expanded = !cell.expanded;
-            if cell.expanded {
-                "expanded"
-            } else {
-                "collapsed"
-            }
+            cell.expanded
         };
-        self.show_tip(format!("{label} tool output · click toggles"));
+        let label = self.locale.tr(
+            if expanded { "expanded" } else { "collapsed" },
+            if expanded { "已展开" } else { "已折叠" },
+        );
+        self.show_tip(format!(
+            "{label} {}",
+            self.locale
+                .tr("tool output · click toggles", "工具输出 · 点击切换")
+        ));
         self.needs_redraw = true;
     }
 
@@ -2337,9 +2486,19 @@ impl App {
     fn copy_text(&mut self, text: &str) {
         let chars = text.chars().count();
         if crate::clipboard::copy(text) {
-            self.show_tip(format!("✓ copied {chars} chars — esc clears the highlight"));
+            self.show_tip(
+                self.locale
+                    .tr(
+                        "✓ copied {n} chars — esc clears the highlight",
+                        "✓ 已复制 {n} 个字符 —— esc 清除高亮",
+                    )
+                    .replace("{n}", &chars.to_string()),
+            );
         } else {
-            self.show_tip("copy failed — hold shift and drag for the terminal's native selection");
+            self.show_tip(self.locale.tr(
+                "copy failed — hold shift and drag for the terminal's native selection",
+                "复制失败 —— 按住 shift 拖动可用终端自带的选择",
+            ));
         }
     }
 
@@ -2638,6 +2797,10 @@ impl App {
             return;
         };
         self.locale = next;
+        self.transcript.set_locale(next);
+        for view in &mut self.subagents {
+            view.transcript.set_locale(next);
+        }
         self.save_settings();
         self.show_tip(match next {
             Locale::En => "Language switched to English",
@@ -3117,14 +3280,17 @@ impl App {
             Action::ClearScrollback => {
                 self.transcript.clear();
                 self.sel = None;
-                self.transcript
-                    .push_notice(NoticeLevel::Info, "scrollback cleared".into());
+                self.transcript.push_notice(
+                    NoticeLevel::Info,
+                    self.locale.tr("scrollback cleared", "滚动区已清空").into(),
+                );
             }
             Action::ToggleTheme => {
                 self.theme = self.theme.toggled();
                 self.save_settings();
                 self.show_tip(format!(
-                    "theme: {} {}",
+                    "{}: {} {}",
+                    self.locale.tr("theme", "主题"),
                     self.active_palette_id,
                     self.theme.mode.as_str()
                 ));
@@ -3132,9 +3298,15 @@ impl App {
             Action::ToggleExpandAll => {
                 self.transcript.expand_all = !self.transcript.expand_all;
                 self.show_tip(if self.transcript.expand_all {
-                    "expanded all thoughts and tool results"
+                    self.locale.tr(
+                        "expanded all thoughts and tool results",
+                        "已展开全部思考与工具结果",
+                    )
                 } else {
-                    "collapsed all thoughts and tool results"
+                    self.locale.tr(
+                        "collapsed all thoughts and tool results",
+                        "已折叠全部思考与工具结果",
+                    )
                 });
             }
             Action::SendNow => self.send_now(ctl),
@@ -3379,8 +3551,13 @@ impl App {
                             model: None,
                             effort: Some(effort.clone()),
                         });
-                        self.transcript
-                            .push_notice(NoticeLevel::Info, format!("reasoning effort → {effort}"));
+                        self.transcript.push_notice(
+                            NoticeLevel::Info,
+                            format!(
+                                "{} → {effort}",
+                                self.locale.tr("reasoning effort", "推理强度")
+                            ),
+                        );
                     }
                 }
             }
@@ -3627,7 +3804,11 @@ impl App {
         };
         self.prompt_queue[index].blocks = blocks;
         self.finish_queue_edit();
-        self.show_tip(format!("queued prompt #{} updated", index + 1));
+        self.show_tip(
+            self.locale
+                .tr("queued prompt #{n} updated", "排队消息 #{n} 已更新")
+                .replace("{n}", &(index + 1).to_string()),
+        );
         if self.state == RunState::Idle {
             self.dispatch_next_queued(ctl);
         }
@@ -3658,7 +3839,11 @@ impl App {
         self.prompt_queue.remove(index);
         self.queued = self.prompt_queue.len();
         self.finish_queue_edit();
-        self.show_tip(format!("queued prompt #{} deleted", index + 1));
+        self.show_tip(
+            self.locale
+                .tr("queued prompt #{n} deleted", "排队消息 #{n} 已删除")
+                .replace("{n}", &(index + 1).to_string()),
+        );
         if self.state == RunState::Idle {
             self.dispatch_next_queued(ctl);
         }
@@ -3802,7 +3987,7 @@ impl App {
     /// The abycore driver owns the workspace snapshot store.
     fn open_resume_picker(&mut self, ctl: &Controller) {
         ctl.send(Cmd::ListSessions { prefix: None });
-        self.show_tip("listing sessions…");
+        self.show_tip(self.locale.tr("listing sessions…", "正在列出会话…"));
     }
 
     /// Resume a durable session: replay its JSONL into the scrollback and
@@ -3846,13 +4031,30 @@ impl App {
     }
 
     fn load_acp_session(&mut self, id: &str, ctl: &Controller) {
+        // A load is a driver mutation, so a turn in flight holds it back until
+        // that turn ends. Read the flag first: the reset below puts the
+        // composer back to idle whatever the driver is still doing.
+        let after_turn = self.turn_busy();
         self.reset_session_ui();
         self.session_id = id.to_string();
         self.transcript.set_root_session(id.to_string());
         ctl.send(Cmd::LoadSession {
             session_id: id.to_string(),
         });
-        self.show_tip(format!("session/load {id} …"));
+        // The listing answers mid-turn (the driver serves store queries off
+        // its turn loop), but a load needs that loop: say the turn has to end
+        // instead of letting the tip imply the load is already running.
+        let suffix = if after_turn {
+            self.locale.tr(" (after this turn)", "（本轮结束后）")
+        } else {
+            ""
+        };
+        self.show_tip(format!(
+            "{}{suffix}",
+            self.locale
+                .tr("session/load {n} …", "正在加载会话 {n} …")
+                .replace("{n}", id)
+        ));
         self.needs_redraw = true;
     }
 
@@ -3866,7 +4068,7 @@ impl App {
         let sessions: Vec<SessionListItem> =
             sessions.into_iter().filter(|s| s.id != skip).collect();
         if let Some(prefix) = prefix.as_deref().filter(|p| !p.is_empty()) {
-            match unique_session_list_match(&sessions, prefix) {
+            match unique_session_list_match(self.locale, &sessions, prefix) {
                 Ok(id) => {
                     self.load_acp_session(&id, ctl);
                     return;
@@ -3882,7 +4084,11 @@ impl App {
         if sessions.is_empty() {
             self.transcript.push_notice(
                 NoticeLevel::Info,
-                "no durable sessions for this workspace yet — finish a turn and /resume finds it"
+                self.locale
+                    .tr(
+                        "no durable sessions for this workspace yet — finish a turn and /resume finds it",
+                        "这个工作区还没有持久会话 —— 先跑完一轮，/resume 就能看到",
+                    )
                     .into(),
             );
             return;
@@ -3976,7 +4182,11 @@ impl App {
     /// so a staged switch borrows the tip line to stay visible.
     fn set_permission(&mut self, preset: String, ctl: &Controller) {
         if self.modes.permission.as_deref() == Some(preset.as_str()) {
-            self.show_tip(format!("permission already {preset}"));
+            self.show_tip(
+                self.locale
+                    .tr("permission already {n}", "权限已经是 {n}")
+                    .replace("{n}", &preset),
+            );
             return;
         }
         ctl.send(Cmd::SetPermission {
@@ -3984,7 +4194,11 @@ impl App {
             preset: preset.clone(),
         });
         if !self.session_bound {
-            self.show_tip(format!("permission → {preset} …"));
+            self.show_tip(
+                self.locale
+                    .tr("permission → {n} …", "权限 → {n} …")
+                    .replace("{n}", &preset),
+            );
         }
     }
 
@@ -3995,18 +4209,21 @@ impl App {
         let current = self.current_permission().to_string();
         let items: Vec<PickerItem> = PERMISSION_PRESETS
             .iter()
-            .map(|(id, desc)| {
+            .map(|(id, _)| {
                 let mark = if reported.as_deref() == Some(*id) {
-                    " · current"
+                    format!(" · {}", self.locale.tr("current", "当前"))
                 } else if reported.is_none() && *id == current {
-                    " · default"
+                    format!(" · {}", self.locale.tr("default", "默认"))
                 } else {
-                    ""
+                    String::new()
                 };
                 PickerItem {
                     id: id.to_string(),
                     label: permission_label(id),
-                    meta: format!("{desc}{mark}"),
+                    meta: format!(
+                        "{}{mark}",
+                        permission_desc(self.locale, id).unwrap_or_default()
+                    ),
                     provider: None,
                 }
             })
@@ -4069,7 +4286,7 @@ impl App {
                 ctl.send(Cmd::Interrupt {
                     session_id: self.session_id.clone(),
                 });
-                self.state_note = "cancelling".into();
+                self.state_note = self.locale.tr("cancelling", "正在取消").into();
             }
             RunState::Idle => {
                 // Esc clears the draft — inline [image n] chips live in it,
@@ -4078,10 +4295,16 @@ impl App {
                     self.input.history.push(self.input.buf().clone());
                     self.input.clear();
                     self.reconcile_attachments();
-                    self.show_tip("draft cleared — ↑ recalls it");
+                    self.show_tip(
+                        self.locale
+                            .tr("draft cleared — ↑ recalls it", "草稿已清空 —— ↑ 可召回"),
+                    );
                     return;
                 }
-                self.show_tip("esc — idle · a running turn is interrupted with esc");
+                self.show_tip(self.locale.tr(
+                    "esc — idle · a running turn is interrupted with esc",
+                    "esc —— 空闲；运行中按 esc 会中断本轮",
+                ));
             }
         }
     }
@@ -4094,7 +4317,10 @@ impl App {
             self.input.history.push(self.input.buf().clone());
             self.input.clear();
             self.reconcile_attachments();
-            self.show_tip("draft cleared — ↑ recalls it");
+            self.show_tip(
+                self.locale
+                    .tr("draft cleared — ↑ recalls it", "草稿已清空 —— ↑ 可召回"),
+            );
             return;
         }
         let required = 2;
@@ -4111,9 +4337,16 @@ impl App {
         let remaining = chord.required - chord.presses;
         self.ctrl_c_armed = Some(chord);
         self.show_tip(if remaining == 1 {
-            "press ctrl+c again to exit".into()
+            self.locale
+                .tr("press ctrl+c again to exit", "再按一次 ctrl+c 退出")
+                .to_string()
         } else {
-            format!("press ctrl+c {remaining} more times to exit while the agent is running")
+            self.locale
+                .tr(
+                    "press ctrl+c {n} more times to exit while the agent is running",
+                    "Agent 运行中：再按 {n} 次 ctrl+c 退出",
+                )
+                .replace("{n}", &remaining.to_string())
         });
     }
 
@@ -4248,7 +4481,7 @@ impl App {
                 self.reset_session_ui();
                 ctl.send(Cmd::NewSession);
                 self.push_session_tip();
-                self.show_tip("session/new …");
+                self.show_tip(self.locale.tr("session/new …", "正在新建会话…"));
             }
             "status" => self.open_status_dialog(),
             "resume" => {
@@ -4258,7 +4491,7 @@ impl App {
                     ctl.send(Cmd::ListSessions {
                         prefix: Some(arg.to_string()),
                     });
-                    self.show_tip("listing sessions…");
+                    self.show_tip(self.locale.tr("listing sessions…", "正在列出会话…"));
                 }
             }
             "effort" => {
@@ -4577,7 +4810,10 @@ impl App {
         // Client namespaces don't take images — keep the chips editable
         // instead of silently dropping them.
         if !self.pending_images.is_empty() && text.starts_with('/') {
-            self.show_tip("send or delete the [image] chips first — /commands don't take images");
+            self.show_tip(self.locale.tr(
+                "send or delete the [image] chips first — /commands don't take images",
+                "先发送或删除草稿里的 [image] 图片 —— / 命令不接收图片",
+            ));
             return;
         }
         if let Some(cmdline) = text.strip_prefix('/') {
@@ -4626,17 +4862,24 @@ impl App {
         self.transcript.push_user(text.clone(), running);
         if running {
             self.enqueue_prompt(vec![StagedBlock::Text(text)], vec![cell]);
-            self.show_tip(format!(
-                "queued ({} waiting) — lands after this turn · ⌥↑ edits · ctrl+enter sends now",
-                self.queued
-            ));
+            self.show_tip(
+                self.locale
+                    .tr(
+                        "queued ({n} waiting) — lands after this turn · ⌥↑ edits · ctrl+enter sends now",
+                        "已排队（{n} 条等待）—— 本轮结束后送出 · ⌥↑ 编辑 · ctrl+enter 立即发送",
+                    )
+                    .replace("{n}", &self.queued.to_string()),
+            );
             self.scroll_up = 0;
             return;
         }
         self.prompt_pending = true;
         self.state = RunState::Starting;
         self.run_started = Some(Instant::now());
-        self.state_note = "contacting runtime".into();
+        self.state_note = self
+            .locale
+            .tr("contacting runtime", "正在连接运行时")
+            .into();
         self.scroll_up = 0;
         ctl.send(Cmd::Prompt {
             session_id: self.session_id.clone(),
@@ -4730,17 +4973,26 @@ impl App {
             None => (arg, String::new()),
         };
         if path.is_empty() {
-            self.show_tip("/image needs a path — /image ./pic.png [caption]");
+            self.show_tip(self.locale.tr(
+                "/image needs a path — /image ./pic.png [caption]",
+                "/image 需要路径 —— /image ./pic.png [说明]",
+            ));
             return;
         }
         let Some(media_type) = media_type_for(path) else {
-            self.show_tip("unsupported image — use .png .jpg .jpeg .webp .gif");
+            self.show_tip(self.locale.tr(
+                "unsupported image — use .png .jpg .jpeg .webp .gif",
+                "不支持的图片格式 —— 请用 .png .jpg .jpeg .webp .gif",
+            ));
             return;
         };
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(err) => {
-                self.show_tip(format!("cannot read {path}: {err}"));
+                self.show_tip(format!(
+                    "{} {path}: {err}",
+                    self.locale.tr("cannot read", "无法读取")
+                ));
                 return;
             }
         };
@@ -4763,7 +5015,10 @@ impl App {
                 bytes,
                 caption.to_string(),
             ),
-            None => self.show_tip("clipboard has no image, or this platform isn't supported"),
+            None => self.show_tip(self.locale.tr(
+                "clipboard has no image, or this platform isn't supported",
+                "剪贴板里没有图片，或当前平台不支持",
+            )),
         }
     }
 
@@ -4777,7 +5032,10 @@ impl App {
         data: Vec<u8>,
         caption: String,
     ) {
-        let token = match self.pending_images.add(name, path, media_type, data) {
+        let token = match self
+            .pending_images
+            .add(self.locale, name, path, media_type, data)
+        {
             Ok(att) => att.token.clone(),
             Err(full) => {
                 self.show_tip(full);
@@ -4798,7 +5056,10 @@ impl App {
             self.input.insert_char(' ');
         }
         self.input.insert_str(&token);
-        self.show_tip("image staged — ⌫ deletes its chip · hover it to preview");
+        self.show_tip(self.locale.tr(
+            "image staged — ⌫ deletes its chip · hover it to preview",
+            "图片已暂存 —— ⌫ 删除它的筹码 · 悬停可预览",
+        ));
         self.needs_redraw = true;
     }
 
@@ -4872,21 +5133,30 @@ impl App {
         let running = self.turn_busy();
         if running {
             self.show_tip(if n <= 1 {
-                format!(
-                    "image queued ({} waiting) — lands after this turn",
-                    self.queued + 1
-                )
+                self.locale
+                    .tr(
+                        "image queued ({n} waiting) — lands after this turn",
+                        "图片已排队（{n} 条等待）—— 本轮结束后送出",
+                    )
+                    .replace("{n}", &(self.queued + 1).to_string())
             } else {
-                format!("{n} images queued — land after this turn")
+                self.locale
+                    .tr(
+                        "{n} images queued — land after this turn",
+                        "已排队 {n} 张图片 —— 本轮结束后送出",
+                    )
+                    .replace("{n}", &n.to_string())
             });
         } else {
             self.prompt_pending = true;
             self.state = RunState::Starting;
             self.run_started = Some(Instant::now());
             self.state_note = if n <= 1 {
-                "sending image".into()
+                self.locale.tr("sending image", "正在发送图片").into()
             } else {
-                format!("sending {n} images")
+                self.locale
+                    .tr("sending {n} images", "正在发送 {n} 张图片")
+                    .replace("{n}", &n.to_string())
             };
         }
         self.emit_staged_prompt(staged, running, None, ctl);
@@ -4897,7 +5167,10 @@ impl App {
     fn send_now(&mut self, ctl: &Controller) {
         let raw = self.input.buf().trim().to_string();
         if !self.pending_images.is_empty() && raw.starts_with('/') {
-            self.show_tip("send or delete the [image] chips first — /commands don't take images");
+            self.show_tip(self.locale.tr(
+                "send or delete the [image] chips first — /commands don't take images",
+                "先发送或删除草稿里的 [image] 图片 —— / 命令不接收图片",
+            ));
             return;
         }
         let staged = if self.pending_images.is_empty() {
@@ -4922,15 +5195,20 @@ impl App {
                 .filter(|b| matches!(b, StagedBlock::Image(_)))
                 .count();
             if running {
-                self.show_tip("steered with image — lands at the next agent step");
+                self.show_tip(self.locale.tr(
+                    "steered with image — lands at the next agent step",
+                    "已 steer（带图片）—— 在 Agent 下一步生效",
+                ));
             } else {
                 self.prompt_pending = true;
                 self.state = RunState::Starting;
                 self.run_started = Some(Instant::now());
                 self.state_note = if n == 1 {
-                    "sending image".into()
+                    self.locale.tr("sending image", "正在发送图片").into()
                 } else {
-                    format!("sending {n} images")
+                    self.locale
+                        .tr("sending {n} images", "正在发送 {n} 张图片")
+                        .replace("{n}", &n.to_string())
                 };
             }
             let steer_message_id = running.then(|| self.next_prompt_id());
@@ -4943,7 +5221,10 @@ impl App {
             let cell = self.transcript.cells.len();
             self.transcript.push_user(text.clone(), queued);
             if running {
-                self.show_tip("steered — lands at the next agent step");
+                self.show_tip(self.locale.tr(
+                    "steered — lands at the next agent step",
+                    "已 steer —— 在 Agent 下一步生效",
+                ));
             } else {
                 self.prompt_pending = true;
                 self.state = RunState::Starting;
@@ -5614,6 +5895,245 @@ mod mode_tests {
         assert!(app3.modes.permission.is_none(), "cache is per workspace");
     }
 
+    /// The launch splash reports the four facts a user wants before the first
+    /// prompt: build version, working directory, permission preset, model.
+    /// A preset cached from an earlier run is what the splash names.
+    #[test]
+    fn splash_reports_version_cwd_permission_and_model() {
+        let cfg = test_cfg();
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let mut app = App::new(Theme::dark(), cfg, "s1".into());
+        app.locale = crate::locale::Locale::En;
+        app.modes.permission = Some("workspace-write".into());
+        app.modes.effort = Some("max".into());
+        app.push_banner();
+
+        assert_eq!(
+            banner_facts(&app),
+            vec![
+                ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+                ("cwd".to_string(), "/tmp".to_string()),
+                ("permission".to_string(), "workspace-write".to_string()),
+                (
+                    "model".to_string(),
+                    "deepseek-v4-flash · effort max".to_string()
+                ),
+            ]
+        );
+
+        // The labels follow the interface language; the values do not — the
+        // one exception is the effort word, which is a label of its own.
+        let mut zh = test_app().0;
+        zh.locale = crate::locale::Locale::Zh;
+        zh.modes.effort = Some("max".into());
+        zh.push_banner();
+        let facts = banner_facts(&zh);
+        let labels: Vec<String> = facts.iter().map(|(l, _)| l.clone()).collect();
+        assert_eq!(labels, ["版本", "工作目录", "权限", "模型"]);
+        assert_eq!(
+            facts[3].1, "deepseek-v4-flash · 推理强度 max",
+            "zh names the effort"
+        );
+    }
+
+    /// `/resume` mid-turn: the picker opens as soon as the driver's listing
+    /// lands (the driver answers store queries off its turn loop), while the
+    /// load itself waits for the turn and says so.
+    #[test]
+    fn resume_mid_turn_lists_now_and_says_when_the_load_lands() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::Zh;
+        app.state = RunState::Running;
+        app.run_started = Some(std::time::Instant::now());
+        assert!(app.turn_busy());
+
+        app.run_slash("resume", "", &ctl);
+        assert_eq!(
+            app.tip.as_ref().map(|(text, _)| text.as_str()),
+            Some("正在列出会话…")
+        );
+        assert!(app.picker.is_none(), "the picker waits for the listing");
+
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionList {
+                sessions: vec![crate::bus::SessionListItem {
+                    id: "aby-1".into(),
+                    title: Some("修复登录".into()),
+                    updated_at: None,
+                }],
+                prefix: None,
+            }),
+            &ctl,
+        );
+        let picker = app.picker.as_ref().expect("the listing opens the picker");
+        assert!(matches!(picker.kind, PickerKind::Session));
+        assert_eq!(picker.items[0].id, "aby-1");
+
+        // Picking one hands it to the driver, which is busy: the tip names the
+        // wait instead of pretending the load already started.
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        let tip = app
+            .tip
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        assert!(tip.starts_with("正在加载会话 aby-1 …"), "{tip}");
+        assert!(tip.ends_with("（本轮结束后）"), "{tip}");
+    }
+
+    /// `/lang` retells every timeline the app paints — the root one and each
+    /// subagent's — so the next notice already speaks the new language, and a
+    /// subagent that starts later is born in it.
+    #[test]
+    fn lang_switch_retells_the_timelines() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::En;
+        app.transcript.set_locale(Locale::En);
+        app.apply_ui(crate::events::UiEvent::SubagentStarted {
+            parent: "dsh-test".into(),
+            child: "child-1".into(),
+            label: None,
+        });
+
+        app.run_slash("lang", "zh", &ctl);
+        assert_eq!(app.locale, Locale::Zh);
+
+        app.apply_ui(crate::events::UiEvent::SessionTitle {
+            session: "dsh-test".into(),
+            title: "修复登录".into(),
+        });
+        app.apply_ui(crate::events::UiEvent::SessionTitle {
+            session: "child-1".into(),
+            title: "子会话".into(),
+        });
+        let notices = |tr: &crate::transcript::Transcript| -> Vec<String> {
+            tr.cells
+                .iter()
+                .filter_map(|cell| match &cell.kind {
+                    crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            notices(&app.transcript).contains(&"会话 · 修复登录".to_string()),
+            "{:?}",
+            notices(&app.transcript)
+        );
+        let child = app
+            .subagents
+            .iter()
+            .find(|view| view.id == "child-1")
+            .expect("subagent view");
+        assert!(
+            notices(&child.transcript).contains(&"会话 · 子会话".to_string()),
+            "{:?}",
+            notices(&child.transcript)
+        );
+
+        // A subagent that starts after the switch is born in the new language.
+        app.apply_ui(crate::events::UiEvent::SubagentStarted {
+            parent: "dsh-test".into(),
+            child: "child-2".into(),
+            label: None,
+        });
+        app.apply_ui(crate::events::UiEvent::SessionTitle {
+            session: "child-2".into(),
+            title: "第二个".into(),
+        });
+        let fresh = app
+            .subagents
+            .iter()
+            .find(|view| view.id == "child-2")
+            .expect("second subagent view");
+        assert!(
+            notices(&fresh.transcript).contains(&"会话 · 第二个".to_string()),
+            "the new timeline follows /lang: {:?}",
+            notices(&fresh.transcript)
+        );
+    }
+
+    /// Client-side command feedback speaks the interface language: the same
+    /// commands an English session answers in English answer a Chinese one in
+    /// Chinese (the values they carry stay identifiers).
+    #[test]
+    fn command_feedback_follows_the_interface_language() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::Zh;
+        let tip = |app: &App| app.tip.as_ref().map(|(text, _)| text.clone());
+
+        app.run_slash("image", "", &ctl);
+        assert_eq!(
+            tip(&app).as_deref(),
+            Some("/image 需要路径 —— /image ./pic.png [说明]")
+        );
+
+        app.run_slash("image", "./missing.mp3", &ctl);
+        assert_eq!(
+            tip(&app).as_deref(),
+            Some("不支持的图片格式 —— 请用 .png .jpg .jpeg .webp .gif")
+        );
+
+        app.run_slash("theme", "nope", &ctl);
+        assert_eq!(tip(&app).as_deref(), Some("未知主题包: nope"));
+        let notices: Vec<String> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.contains(&"未知主题包 `nope`".to_string()),
+            "{notices:?}"
+        );
+
+        app.run_slash("clear", "", &ctl);
+        assert!(notices_tail(&app).contains(&"滚动区已清空".to_string()));
+
+        // An empty store notices instead of opening a picker, in zh too.
+        app.run_slash("resume", "", &ctl);
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionList {
+                sessions: vec![],
+                prefix: None,
+            }),
+            &ctl,
+        );
+        assert!(
+            notices_tail(&app)
+                .contains(&"这个工作区还没有持久会话 —— 先跑完一轮，/resume 就能看到".to_string()),
+            "{:?}",
+            notices_tail(&app)
+        );
+    }
+
+    /// The notices currently in the timeline, newest last.
+    fn notices_tail(app: &App) -> Vec<String> {
+        app.transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The facts the splash cell carries, in paint order.
+    fn banner_facts(app: &App) -> Vec<(String, String)> {
+        app.transcript
+            .cells
+            .iter()
+            .find_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Banner { facts, .. } => Some(facts.clone()),
+                _ => None,
+            })
+            .expect("splash banner")
+    }
+
     #[test]
     fn selected_model_clears_once_a_turn_streams_on_it() {
         let (mut app, ctl, _rx) = test_app();
@@ -6059,6 +6579,75 @@ mod mode_tests {
         let picker = app.picker.as_ref().expect("picker reopens");
         assert_eq!(picker.sel, 2, "selection lands on the reported preset");
         assert!(picker.items[2].meta.contains("current"));
+    }
+
+    /// The picker's meanings and markers follow the interface language; the
+    /// preset ids never do.
+    #[test]
+    fn permission_picker_rows_speak_the_interface_language() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::Zh;
+        app.run_slash("permission", "", &ctl);
+        let picker = app.picker.as_ref().expect("permission picker opens");
+        assert_eq!(picker.sel, 2, "danger-full-access is the default");
+        assert!(
+            picker.items[0].meta.contains("只读"),
+            "{}",
+            picker.items[0].meta
+        );
+        assert!(
+            picker.items[2].meta.contains("完全文件访问") && picker.items[2].meta.contains("默认"),
+            "zh meaning + marker: {}",
+            picker.items[2].meta
+        );
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            ["read-only", "workspace-write", "danger-full-access"],
+            "ids stay the ids /permission takes"
+        );
+        assert_eq!(
+            permission_desc(Locale::Zh, "danger-full-access"),
+            Some("完全文件访问 · 关闭审批 —— 仅限信任目录")
+        );
+        assert_eq!(
+            permission_desc(Locale::En, "read-only"),
+            Some("read only — no file writes")
+        );
+        // A preset outside the stock table carries no invented meaning.
+        assert_eq!(permission_desc(Locale::Zh, "custom-preset"), None);
+
+        app.modes.permission = Some("read-only".into());
+        app.run_slash("permission", "", &ctl);
+        let picker = app.picker.as_ref().expect("picker reopens");
+        assert!(
+            picker.items[0].meta.contains("当前"),
+            "{}",
+            picker.items[0].meta
+        );
+    }
+
+    /// The slash menu's argument hints are chrome, so they translate too.
+    #[test]
+    fn slash_argument_hints_follow_the_interface_language() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.input.set("/effort ".into());
+        let en: Vec<String> = app.slash_matches().into_iter().map(|e| e.desc).collect();
+        assert!(en[0].contains("disable extended reasoning"), "{en:?}");
+
+        app.locale = Locale::Zh;
+        app.input.set("/effort ".into());
+        let zh: Vec<String> = app.slash_matches().into_iter().map(|e| e.desc).collect();
+        assert_eq!(zh, ["关闭扩展推理", "高推理强度", "最高推理强度"]);
+
+        app.input.set("/theme ".into());
+        let zh: Vec<String> = app.slash_matches().into_iter().map(|e| e.desc).collect();
+        assert_eq!(zh[0], "深色外观");
+        assert_eq!(zh[1], "浅色外观");
+        assert!(zh[2..].iter().all(|desc| desc == "主题包"), "{zh:?}");
     }
 
     #[test]
@@ -7576,6 +8165,7 @@ mod mode_tests {
         let mut staged = crate::attachments::Staged::default();
         staged
             .add(
+                crate::locale::Locale::En,
                 "a.png".into(),
                 "/tmp/a.png".into(),
                 "image/png".into(),
@@ -7584,6 +8174,7 @@ mod mode_tests {
             .unwrap();
         staged
             .add(
+                crate::locale::Locale::En,
                 "b.png".into(),
                 "/tmp/b.png".into(),
                 "image/png".into(),
@@ -7611,6 +8202,7 @@ mod mode_tests {
         let mut staged = crate::attachments::Staged::default();
         staged
             .add(
+                crate::locale::Locale::En,
                 "kept.png".into(),
                 "/tmp/kept.png".into(),
                 "image/png".into(),
@@ -7619,6 +8211,7 @@ mod mode_tests {
             .unwrap();
         staged
             .add(
+                crate::locale::Locale::En,
                 "orphan.png".into(),
                 "/tmp/orphan.png".into(),
                 "image/png".into(),
@@ -8705,6 +9298,147 @@ mod resume_replay_tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(!app.composer_expanded);
+    }
+
+    /// The driver's live catalog fills an open `/model` picker (a query it now
+    /// answers mid-turn), keeps the configured model selected when the
+    /// provider lists it, and is remembered for the next picker opening.
+    #[test]
+    fn the_catalog_fills_the_open_model_picker_and_is_remembered() {
+        let (mut app, ctl, _rx) = test_app();
+        app.cfg.model = "deepseek-v4-flash".into();
+        app.cfg.provider = "deepseek-official".into();
+        app.open_model_picker(&ctl);
+        assert!(matches!(
+            app.picker.as_ref().expect("picker opens").kind,
+            PickerKind::Model
+        ));
+        let stock = app.picker.as_ref().expect("picker").items.len();
+        assert!(stock > 1, "the picker opens on its stock rows");
+
+        app.handle(
+            AppEvent::Ctl(CtlEvent::Catalog {
+                models: vec![
+                    crate::bus::CatalogModel {
+                        provider: "coding-plan-b".into(),
+                        id: "deepseek-v4-pro".into(),
+                        name: "DeepSeek V4 Pro".into(),
+                        vision: false,
+                    },
+                    crate::bus::CatalogModel {
+                        provider: "deepseek-official".into(),
+                        id: "deepseek-v4-flash".into(),
+                        name: "DeepSeek V4 Flash".into(),
+                        vision: true,
+                    },
+                ],
+            }),
+            &ctl,
+        );
+        let picker = app.picker.as_ref().expect("picker stays open");
+        let ids: Vec<&str> = picker.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["deepseek-v4-pro", "deepseek-v4-flash"]);
+        assert_eq!(
+            picker.sel, 1,
+            "the configured model keeps the selection (provider included)"
+        );
+        assert_eq!(
+            picker.items[1].meta, "deepseek-official · DeepSeek V4 Flash · vision",
+            "the meta row names the provider, the label and vision"
+        );
+
+        // A reopened popup seeds the stock rows again (the driver re-fetches),
+        // while the cached listing is what the `/model ` candidates offer.
+        app.picker = None;
+        app.open_model_picker(&ctl);
+        assert_eq!(
+            app.picker.as_ref().expect("picker reopens").items.len(),
+            3,
+            "stock presets + the configured model"
+        );
+        app.input.set("/model ".into());
+        let candidates = app.slash_matches();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|e| e.desc.as_str())
+                .collect::<Vec<_>>(),
+            ["coding-plan-b", "deepseek-official"],
+            "the provider rides the meta"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter_map(|e| e.completion.as_deref())
+                .collect::<Vec<_>>(),
+            ["/model deepseek-v4-pro", "/model deepseek-v4-flash"],
+            "the completion inserts the id"
+        );
+    }
+
+    /// The meta row's `↓ N` chip is the way back down: clicking it drops the
+    /// scroll and follows the newest line again. The frame that draws the chip
+    /// records the cell, hover brightens it, and an open modal swallows the
+    /// click like it does for the other glyph buttons.
+    #[test]
+    fn clicking_the_scroll_chip_follows_the_tail_again() {
+        let (mut app, ctl, _rx) = test_app();
+        for i in 0..40 {
+            app.transcript.push_user(format!("line {i}"), false);
+        }
+        app.scroll_by(20);
+        let _ = crate::ui::dump_frame(&mut app, 100, 14);
+        let chip = app.scroll_btn.expect("the scrolled frame records the chip");
+        assert!(app.scroll_up > 0);
+
+        // Hover: the chip brightens (the pointer rests on it).
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: chip.x + 1,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.hover_scroll_btn, "hover lands on the chip");
+
+        // A modal owns the screen: the click is not the chip's while one is up.
+        app.view_overlay = Some(crate::app::ViewOverlay {
+            title: "status".into(),
+            nodes: Vec::new(),
+            scroll: 0,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.scroll_up > 0, "a modal swallows the click");
+        app.view_overlay = None;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll_up, 0, "the click follows the tail");
+        assert!(app.needs_redraw);
+
+        // A click that misses the chip leaves the scroll where it was.
+        app.scroll_by(20);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x.saturating_sub(6),
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.scroll_up > 0, "a miss keeps the scroll");
+
+        // With the tail on screen the chip is gone, so nothing is clickable.
+        app.scroll_up = 0;
+        let _ = crate::ui::dump_frame(&mut app, 100, 14);
+        assert!(app.scroll_btn.is_none());
+        let _ = ctl;
     }
 
     /// The cap row's progress chip opens the checklist dialog; esc closes it,
