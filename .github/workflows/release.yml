@@ -172,7 +172,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          # The site is not versioned by the release, so take it from the
+          # default branch rather than the tag: re-running this workflow for an
+          # older tag (a backfill) must deploy today's site, not that tag's
+          # copy of site/ — which predates site/install.sh and still carries
+          # the old /install.sh redirect.
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Check credentials
         id: creds
