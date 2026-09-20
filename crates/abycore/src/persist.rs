@@ -359,50 +359,27 @@ pub struct SessionWriter {
     len: u64,
     discovery: Discovery,
     log: Option<fs::File>,
-    /// Held open as the writer lock. On unix `Drop` unlocks it explicitly (a
-    /// concurrent fork can keep the description alive past our close); on
-    /// Windows the no-sharing open releases with the handle, so nothing reads
-    /// the field there.
-    #[cfg_attr(not(unix), allow(dead_code))]
     lock: fs::File,
     poisoned: bool,
 }
 
 impl SessionWriter {
     fn open(dir: PathBuf, header: SessionHeader) -> Result<Self> {
-        let lock_path = dir.join("session.lock");
-        let held = || {
-            invalid(format!(
-                "session {} is already open by another writer (lock held)",
-                header.id
-            ))
-        };
-        #[cfg(unix)]
         let lock = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&lock_path)
+            .open(dir.join("session.lock"))
             .map_err(|e| io_error("open session lock", e))?;
-        // Windows has no `flock`; opening the lock file with no sharing is the
-        // equivalent — a second writer's open fails the way a held lock makes
-        // it fail on unix, and closing the handle releases it.
-        #[cfg(not(unix))]
-        let lock = {
-            use std::os::windows::fs::OpenOptionsExt;
-            let mut options = fs::OpenOptions::new();
-            options
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .share_mode(0);
-            options.open(&lock_path).map_err(|_| held())?
-        };
-        #[cfg(unix)]
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-            .map_err(|_| held())?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |_| {
+                invalid(format!(
+                    "session {} is already open by another writer (lock held)",
+                    header.id
+                ))
+            },
+        )?;
         let mut writer = Self {
             id: header.id.clone(),
             file: dir.join("session.jsonl"),
@@ -538,8 +515,6 @@ impl Drop for SessionWriter {
     fn drop(&mut self) {
         // A concurrent fork can retain this open file description until exec.
         // Closing only our descriptor would leave its flock held in that child.
-        // Windows releases its exclusive open when the handle closes.
-        #[cfg(unix)]
         let _ = rustix::fs::flock(&self.lock, rustix::fs::FlockOperation::Unlock);
     }
 }

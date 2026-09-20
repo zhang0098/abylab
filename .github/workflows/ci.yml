@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   # Host-side checks: formatting, lints, tests. Runs once on Linux x86_64 so the
-  # five-target matrix below stays a pure "does it compile" job.
+  # four-target matrix below stays a pure "does it compile" job.
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
@@ -43,12 +43,8 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features --locked
 
-  # Cross-platform release builds for the five supported targets.
+  # Cross-platform release builds for the four supported targets.
   # macos-14 runners are Apple Silicon; macos-15-intel is the Intel image.
-  # Windows is arm64 for now: this job proves it compiles and packages, and
-  # `windows-11-arm` is the ARM64 image. x86_64-pc-windows-msvc follows once
-  # this one is green. Nothing installs the `.exe` yet — install.sh is a bash
-  # script for Linux/macOS.
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -58,31 +54,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: abylab
             archive: tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            bin: abylab
             archive: tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            bin: abylab
             archive: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            bin: abylab
-            archive: tar.gz
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            bin: abylab.exe
             archive: tar.gz
     steps:
       - uses: actions/checkout@v5
 
-      # `shell: bash` matters on the Windows runner: its default is pwsh, and
-      # this script is a bash continuation.
       - name: Install Rust toolchain
-        shell: bash
         run: |
           rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
           rustup default stable
@@ -100,7 +85,7 @@ jobs:
           set -euo pipefail
           name="abylab-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/abylab" "dist/$name/"
           cp LICENSE README.md README.en.md TECH.md TECH.en.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
@@ -110,7 +95,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          bin="target/${{ matrix.target }}/release/abylab"
           "$bin" --version || "$bin" --help
 
       - uses: actions/upload-artifact@v7

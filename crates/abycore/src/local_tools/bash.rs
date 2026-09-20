@@ -1,18 +1,16 @@
 use super::{
-    LocalTools,
+    LocalTools, PermissionMode,
     jobs::Jobs,
     workspace::{ToolResult, Workspace, failed, parse},
 };
-// The permission mode and the write-back directory only exist on the unix
-// process-group path; the non-unix branch refuses the tool outright.
-#[cfg(unix)]
-use super::PermissionMode;
 use crate::{Result, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
 use serde::Deserialize;
 use serde_json::{Value, json};
-#[cfg(unix)]
-use std::path::PathBuf;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 #[derive(Clone)]
 pub struct BashTool {
