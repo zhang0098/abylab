@@ -160,6 +160,13 @@ ctrl+z / ctrl+shift+z undo / redo · ctrl+p model · ctrl+t theme
 conversation history and applies to later file tools and Bash processes;
 Shift+Tab cycles the presets.
 
+Follow-ups typed while a turn runs wait in a client-owned queue, not in the
+driver's channel: `⌥↑` picks one to edit — enter saves it back into its slot,
+ctrl+d deletes it (twice), esc cancels, and none of the three sends anything.
+The queue pauses while an item is open, so a turn end cannot ship it out from
+under the editor. Enter on an empty draft promotes the head into the active
+turn (the same steer ctrl+enter takes for that item).
+
 While the agent keeps a checklist with `todo_write`, the cap row on the
 composer's top border shows the task in progress and the completed/total
 progress (`Todo · now: fix login · 2/5 done`). Transient action feedback
