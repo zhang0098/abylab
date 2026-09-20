@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>abylab — a minimalist DeepSeek harness</title>
+<meta name="description" content="abylab is a minimalist DeepSeek harness: what you install is one executable. No dependencies, about 11 MB, a cold start measured in milliseconds, open source and free.">
+<link rel="canonical" href="https://abylab.ai/en/">
+<link rel="alternate" hreflang="zh-CN" href="https://abylab.ai/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#0b0d10">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://abylab.ai/en/">
+<meta property="og:title" content="abylab — a minimalist DeepSeek harness">
+<meta property="og:description" content="One executable, no dependencies, fast to start, open source and free.">
+<meta property="og:locale" content="en_US">
+<link rel="stylesheet" href="/vendor/pico.min.css">
+<link rel="stylesheet" href="/styles.css">
+<script>try{var t=localStorage.getItem("theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body>
+
+<header class="container site-header">
+  <nav>
+    <ul>
+      <li><a href="/en/" class="brand"><strong>abylab</strong><span class="brand-dot">.ai</span></a></li>
+    </ul>
+    <ul>
+      <li><a href="#features">Features</a></li>
+      <li><a href="#start">Quick start</a></li>
+      <li><a href="#commands">Commands</a></li>
+      <li><a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a></li>
+      <li><button type="button" id="theme-toggle" class="outline secondary toggler" aria-label="Toggle dark / light">◐</button></li>
+      <li><a href="/" hreflang="zh-CN" lang="zh-CN">中文</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main class="container">
+
+  <section class="hero">
+    <hgroup>
+      <h1>abylab</h1>
+      <p>A minimalist DeepSeek harness. What you install is one executable: no dependencies, no waiting, open source and free.</p>
+    </hgroup>
+
+    <div class="install">
+      <code id="install-cmd">/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code>
+      <button type="button" class="copy outline" data-copy="#install-cmd" data-copied="Copied">Copy</button>
+    </div>
+    <p class="hint">Linux · macOS (x86_64 / aarch64) · installs to <code>~/.local/bin/abylab</code> · checked against <code>SHA256SUMS</code></p>
+  </section>
+
+  <section id="features">
+    <h2>Features</h2>
+    <div class="grid">
+      <article>
+        <h3>One file</h3>
+        <p>No Node, no Python, no dependency directory, no background process. A release build is about <strong>11 MB</strong> (about 4.9 MB compressed), and <code>abylab --version</code> cold-starts in roughly <strong>2 ms</strong>.</p>
+      </article>
+      <article>
+        <h3>One process</h3>
+        <p>Streaming, tool execution and session persistence all happen inside that one process: no IPC round trips, no GC pauses, no extra runtime.</p>
+      </article>
+      <article>
+        <h3>Credentials stay yours</h3>
+        <p>abylab never reads <code>DEEPSEEK_API_KEY</code> or any other variable. <code>/login</code> writes the key to <code>~/.abylab/.credentials.yaml</code> (0600, owner-only).</p>
+      </article>
+      <article>
+        <h3>Native to the terminal</h3>
+        <p>Nine embedded palettes, mouse wheel and drag-to-copy, <code>@</code> file mentions, image paste, and three permission presets: <code>read-only</code>, <code>workspace-write</code>, <code>danger-full-access</code>.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>Quick start</h2>
+    <ol class="steps">
+      <li>
+        <p>Install to <code>~/.local/bin/abylab</code> and put that directory on PATH in your shell startup file (marked with a comment):</p>
+        <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code></pre>
+      </li>
+      <li>
+        <p>Grab an API key from <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a>.</p>
+      </li>
+      <li>
+        <p>Run <code>abylab</code> and log in once from the composer:</p>
+        <pre><code>/login sk-xxxxxxxx</code></pre>
+      </li>
+      <li>
+        <p>Type what you want done. That is the whole setup.</p>
+      </li>
+    </ol>
+    <p class="hint">Building from source instead: <code>cargo build --release</code>. The installer also takes <code>--bin-dir</code>, <code>--version</code>, <code>--no-path</code>, <code>--path-file</code> and <code>--help</code>.</p>
+  </section>
+
+  <section id="commands">
+    <h2>Commands</h2>
+    <p class="mono-lines">
+      <code>/help</code> <code>/keys</code> <code>/new</code> <code>/resume [id]</code> <code>/compact</code> <code>/goal</code> <code>/clear</code> <code>/model [id]</code>
+      <code>/effort [off|low|high|max]</code> <code>/permission [preset]</code> <code>/plan [on|off]</code>
+      <code>/vim [on|off]</code> <code>/image &lt;path&gt; [text]</code> <code>/clip [text]</code> <code>/theme [dark|light|pack]</code>
+      <code>/session</code> <code>/lang [zh|en]</code> <code>/quit</code>
+    </p>
+
+    <h2>Keys</h2>
+    <p class="mono-lines">
+      <kbd>enter</kbd> send / queue · <kbd>ctrl+x</kbd> send now · <kbd>esc</kbd> interrupt / 2× clear draft ·
+      <kbd>ctrl+c</kbd> clear / quit · <kbd>↑</kbd> history · <kbd>/</kbd> commands · <kbd>@</kbd> file mention ·
+      <kbd>ctrl+z</kbd> undo · <kbd>ctrl+p</kbd> model · <kbd>ctrl+t</kbd> theme · <kbd>shift+tab</kbd> permission preset
+    </p>
+  </section>
+
+  <section id="inside">
+    <h2>What is inside</h2>
+    <div class="overflow-auto">
+      <table>
+        <tbody>
+          <tr><td><code>crates/abycore</code></td><td>the agent SDK: Agent, session snapshots, tools</td></tr>
+          <tr><td><code>crates/abylab-backend</code></td><td>abycore Agent driver: commands ⇄ <code>Agent::run</code>, hooks → permission ask</td></tr>
+          <tr><td><code>crates/abylab-tui</code></td><td>the canvas: composer card, markdown, palettes, <code>@</code>file, image thumbs</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">Internals — workspace instructions, context compaction, session persistence, goal rounds — are in <a href="https://github.com/zhang0098/abylab/blob/main/TECH.en.md" rel="noopener">TECH.en.md</a>.</p>
+  </section>
+
+</main>
+
+<footer class="container site-footer">
+  <small>
+    MIT licensed · <a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a> ·
+    <a href="https://github.com/zhang0098/abylab/blob/main/README.en.md" rel="noopener">Docs</a> ·
+    <a href="https://platform.deepseek.com/" rel="noopener">DeepSeek platform</a> ·
+    abylab.ai
+  </small>
+</footer>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

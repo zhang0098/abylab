@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>abylab — 极简主义的 DeepSeek harness</title>
+<meta name="description" content="abylab 是一个极简主义的 DeepSeek harness：装完就是一个可执行文件，没有依赖，约 11 MB，启动飞快，开源免费。">
+<link rel="canonical" href="https://abylab.ai/">
+<link rel="alternate" hreflang="en" href="https://abylab.ai/en/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#0b0d10">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://abylab.ai/">
+<meta property="og:title" content="abylab — 极简主义的 DeepSeek harness">
+<meta property="og:description" content="一个可执行文件，没有依赖，启动飞快，开源免费。">
+<meta property="og:locale" content="zh_CN">
+<link rel="stylesheet" href="/vendor/pico.min.css">
+<link rel="stylesheet" href="/styles.css">
+<script>try{var t=localStorage.getItem("theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body>
+
+<header class="container site-header">
+  <nav>
+    <ul>
+      <li><a href="/" class="brand"><strong>abylab</strong><span class="brand-dot">.ai</span></a></li>
+    </ul>
+    <ul>
+      <li><a href="#features">特性</a></li>
+      <li><a href="#start">快速开始</a></li>
+      <li><a href="#commands">命令</a></li>
+      <li><a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a></li>
+      <li><button type="button" id="theme-toggle" class="outline secondary toggler" aria-label="切换深色 / 浅色">◐</button></li>
+      <li><a href="/en/" hreflang="en" lang="en">EN</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main class="container">
+
+  <section class="hero">
+    <hgroup>
+      <h1>abylab</h1>
+      <p>极简主义的 DeepSeek harness。装完就是一个可执行文件，没有依赖，启动飞快，开源免费。</p>
+    </hgroup>
+
+    <div class="install">
+      <code id="install-cmd">/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code>
+      <button type="button" class="copy outline" data-copy="#install-cmd" data-copied="已复制">复制</button>
+    </div>
+    <p class="hint">Linux · macOS（x86_64 / aarch64）· 安装到 <code>~/.local/bin/abylab</code> · 校验 <code>SHA256SUMS</code></p>
+  </section>
+
+  <section id="features">
+    <h2>特性</h2>
+    <div class="grid">
+      <article>
+        <h3>一个文件</h3>
+        <p>没有 Node、没有 Python、没有依赖目录、没有后台进程。发布构建约 <strong>11 MB</strong>，压缩包约 4.9 MB，<code>abylab --version</code> 冷启动约 <strong>2 ms</strong>。</p>
+      </article>
+      <article>
+        <h3>一个进程</h3>
+        <p>流式输出、工具执行、会话持久化都发生在同一个进程里：没有 IPC 往返，没有 GC 停顿，没有额外的 runtime。</p>
+      </article>
+      <article>
+        <h3>凭证只落在你手里</h3>
+        <p>abylab 不读 <code>DEEPSEEK_API_KEY</code> 或任何环境变量。密钥由 <code>/login</code> 写入 <code>~/.abylab/.credentials.yaml</code>（0600，仅属主可读）。</p>
+      </article>
+      <article>
+        <h3>终端原生</h3>
+        <p>九个内置主题包、鼠标滚动与拖拽复制、<code>@</code> 文件提及、图片粘贴，以及 <code>read-only</code> / <code>workspace-write</code> / <code>danger-full-access</code> 三档权限。</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>快速开始</h2>
+    <ol class="steps">
+      <li>
+        <p>装到 <code>~/.local/bin/abylab</code>，并把这一行（带注释标记）写进你的 shell 启动文件：</p>
+        <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code></pre>
+      </li>
+      <li>
+        <p>去 <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a> 取一个 API Key。</p>
+      </li>
+      <li>
+        <p>在终端里运行 <code>abylab</code>，然后在输入框里登录一次：</p>
+        <pre><code>/login sk-xxxxxxxx</code></pre>
+      </li>
+      <li>
+        <p>直接输入你的要求，开始工作。</p>
+      </li>
+    </ol>
+    <p class="hint">想从源码构建：<code>cargo build --release</code>。安装脚本支持 <code>--bin-dir</code>、<code>--version</code>、<code>--no-path</code>、<code>--path-file</code>、<code>--help</code>。</p>
+  </section>
+
+  <section id="commands">
+    <h2>命令</h2>
+    <p class="mono-lines">
+      <code>/help</code> <code>/keys</code> <code>/new</code> <code>/resume [id]</code> <code>/compact</code> <code>/goal</code> <code>/clear</code> <code>/model [id]</code>
+      <code>/effort [off|low|high|max]</code> <code>/permission [preset]</code> <code>/plan [on|off]</code>
+      <code>/vim [on|off]</code> <code>/image &lt;path&gt; [text]</code> <code>/clip [text]</code> <code>/theme [dark|light|pack]</code>
+      <code>/session</code> <code>/lang [zh|en]</code> <code>/quit</code>
+    </p>
+
+    <h2>按键</h2>
+    <p class="mono-lines">
+      <kbd>enter</kbd> 发送 / 排队 · <kbd>ctrl+x</kbd> 立即发送 · <kbd>esc</kbd> 中断 / 双击清空草稿 ·
+      <kbd>ctrl+c</kbd> 清空 / 退出 · <kbd>↑</kbd> 历史 · <kbd>/</kbd> 命令 · <kbd>@</kbd> 文件提及 ·
+      <kbd>ctrl+z</kbd> 撤销 · <kbd>ctrl+p</kbd> 模型 · <kbd>ctrl+t</kbd> 主题 · <kbd>shift+tab</kbd> 权限预设
+    </p>
+  </section>
+
+  <section id="inside">
+    <h2>里面是什么</h2>
+    <div class="overflow-auto">
+      <table>
+        <tbody>
+          <tr><td><code>crates/abycore</code></td><td>agent SDK：Agent、会话快照、工具</td></tr>
+          <tr><td><code>crates/abylab-backend</code></td><td>abycore Agent 驱动：命令 ⇄ <code>Agent::run</code>，hooks → 权限询问</td></tr>
+          <tr><td><code>crates/abylab-tui</code></td><td>终端画布：输入卡片、markdown、主题包、<code>@</code> 文件、图片缩略图</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">实现细节（工作区指令、上下文压缩、会话持久化、目标轮次）见 <a href="https://github.com/zhang0098/abylab/blob/main/TECH.md" rel="noopener">TECH.md</a>。</p>
+  </section>
+
+</main>
+
+<footer class="container site-footer">
+  <small>
+    MIT 许可证 · <a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a> ·
+    <a href="https://github.com/zhang0098/abylab/blob/main/README.md" rel="noopener">文档</a> ·
+    <a href="https://platform.deepseek.com/" rel="noopener">DeepSeek 平台</a> ·
+    abylab.ai
+  </small>
+</footer>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+name: Site
+
+# abylab.ai is served by Cloudflare Pages. Two ways to deploy it — pick one:
+#
+#  1. Git integration (recommended, no secrets): connect this repo once in the
+#     Cloudflare dashboard with an empty build command and `site` as the output
+#     directory. Cloudflare then deploys on every push by itself, and this
+#     workflow is redundant.
+#  2. This workflow (Direct Upload): add CLOUDFLARE_API_TOKEN (Pages: Edit) and
+#     CLOUDFLARE_ACCOUNT_ID as repository secrets and pushes touching site/
+#     ship through wrangler instead.
+#
+# When the secrets are absent the job skips instead of failing, so the file is
+# safe to keep around under option 1.
+on:
+  push:
+    branches: [main, master]
+    paths: ['site/**', '.github/workflows/site.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check credentials
+        id: creds
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Site deploy skipped"
+              echo "CLOUDFLARE_API_TOKEN is not set. Deploy through the Pages"
+              echo "Git integration, or add the two secrets (see site/README.md)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Deploy site/ to Cloudflare Pages
+        if: steps.creds.outputs.ready == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # wrangler reads the branch from the checkout, so pushes to main land
+          # as production and other branches as preview deployments.
+          command: pages deploy site --project-name=abylab

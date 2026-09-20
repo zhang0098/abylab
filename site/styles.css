@@ -1,0 +1,114 @@
+/* abylab.ai — a thin layer on top of Pico CSS.
+   Everything is classless Pico except these few blocks; no resets, no grid
+   framework, no third-party CSS. Self-hosted Pico lives in vendor/. */
+
+:root {
+  --pico-font-size: 100%;
+  --aby-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html { scroll-behavior: smooth; }
+
+/* Header ------------------------------------------------------------- */
+
+.site-header nav { padding-block: 0.6rem; }
+
+.brand { text-decoration: none; letter-spacing: -0.02em; }
+.brand strong { font-size: 1.15rem; }
+.brand-dot { color: var(--pico-primary); }
+
+.toggler {
+  width: auto;
+  margin: 0;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+/* Hero + install one-liner ------------------------------------------- */
+
+.hero { padding-block: 3rem 1rem; }
+.hero hgroup { margin-bottom: 1.5rem; }
+.hero h1 { font-size: clamp(2.5rem, 8vw, 4rem); letter-spacing: -0.03em; }
+.hero hgroup p { font-size: 1.05rem; }
+
+.install {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.5rem 0.5rem 0.85rem;
+  border: var(--pico-border-width) solid var(--pico-muted-border-color);
+  border-radius: var(--pico-border-radius);
+  background-color: var(--pico-code-background-color);
+  overflow-x: auto;
+}
+
+.install code {
+  flex: 1;
+  padding: 0;
+  background: none;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.install .copy {
+  flex: 0 0 auto;
+  width: auto;
+  margin: 0;
+  padding: 0.3rem 0.85rem;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.hint {
+  margin-top: 0.75rem;
+  color: var(--pico-muted-color);
+  font-size: 0.85rem;
+}
+
+.hint code { font-size: 0.8rem; }
+
+/* Sections ----------------------------------------------------------- */
+
+section { margin-block: 3rem; }
+section > h2 { letter-spacing: -0.02em; }
+article h3 { font-size: 1rem; font-family: var(--aby-mono); }
+
+.grid article { margin-bottom: 0; }
+
+/* Pico's .grid fits one column per child, so four cards land 288px wide around
+   15 characters a line. Pair them up from tablet width instead. */
+@media (min-width: 768px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.steps { padding-left: 1.2rem; }
+.steps > li { margin-bottom: 1.25rem; }
+.steps p { margin-bottom: 0.5rem; }
+
+.mono-lines { line-height: 2.4; }
+.mono-lines code,
+.mono-lines kbd { font-size: 0.78rem; }
+
+table td { vertical-align: top; }
+table td:first-child { white-space: nowrap; }
+
+/* Footer ------------------------------------------------------------- */
+
+.site-footer {
+  margin-top: 4rem;
+  padding-block: 1.5rem 3rem;
+  border-top: var(--pico-border-width) solid var(--pico-muted-border-color);
+  color: var(--pico-muted-color);
+}
+
+@media (max-width: 640px) {
+  .hero { padding-block: 2rem 0.5rem; }
+  .site-header nav ul:last-child li:nth-child(-n + 3) { display: none; }
+
+  /* The one-liner is wider than a phone: let it wrap instead of scrolling the
+     copy button out of reach. */
+  .install { flex-wrap: wrap; padding: 0.6rem 0.75rem; }
+  .install code { flex: 1 1 100%; white-space: normal; overflow-wrap: anywhere; }
+  .install .copy { margin-left: auto; }
+}
