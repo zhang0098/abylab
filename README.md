@@ -10,7 +10,7 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 1. 安装（支持 Linux、macOS ）, 在你的终端中运行：
 
 ```sh
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
+/bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
 ```
 
 程序会装到 `~/.local/bin/abylab`, 并把这个目录写进你的 shell 启动文件(带注释

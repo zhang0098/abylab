@@ -11,15 +11,22 @@ site/
   404.html              Pages 的 404 页（自动生效，返回 404 状态码）
   styles.css            Pico 之上的薄薄一层：header、hero、安装块、footer
   app.js                主题切换 + 复制按钮（全部前端逻辑）
+  install.sh            安装脚本，仓库根目录那份的逐字节副本
   vendor/pico.min.css   Pico v2.1.1，自托管，不用 CDN
   favicon.svg · robots.txt · sitemap.xml
   _headers              Pages 响应头：安全头 + CSP + 缓存
-  _redirects            Pages 跳转：/install.sh → 仓库里的安装脚本
+  _redirects            目前没有规则，只留说明（见下）
 ```
 
 `_headers` 和 `_redirects` 只在 Cloudflare Pages 上生效（由 Pages 解析，不会被
 当成静态文件发给浏览器）。本地用 `python3 -m http.server` 预览时它们只是两个
 普通文件，看不到效果。
+
+`install.sh` 有两份：仓库根的（打包进 tarball、`gh` 拉取用）和 `site/` 的（公网
+提供 `https://abylab.ai/install.sh`）。以前是 `_redirects` 里一条 302 跳回
+raw.githubusercontent.com，网络到不了 GitHub 的人就装不了；现在站点直接发这份
+文件，`_redirects` 里也**不能**再写 install.sh 规则——跳转会盖过同路径的静态
+文件。两份靠 CI 里的一条 `diff` 检查保持一致，改一份不改另一份会挂。
 
 `site/` 里的每个文件都会原样发布到公网——所以这份说明放在仓库根目录（和
 [README.md](README.md)、[TECH.md](TECH.md) 做邻居），不跟站点一起上线。
@@ -112,9 +119,9 @@ Workers & Pages → Create → Pages → Connect to Git → 选本仓库，然�
 ```sh
 curl -sI https://abylab.ai/ | head -12            # 200 + CSP 等头部
 curl -sI http://abylab.ai/ | head -3              # 301 → https://abylab.ai/
-curl -s https://abylab.ai/install.sh | head -3    # 跟仓库里的脚本一致
+curl -sI https://abylab.ai/install.sh | head -1   # 200，不是 302（跳回 GitHub 就说明 _redirects 被写回去了）
 curl -sI https://abylab.ai/nope | head -1         # 404，且渲染我们的 404 页
-for f in index.html styles.css app.js vendor/pico.min.css; do
+for f in index.html styles.css app.js vendor/pico.min.css install.sh; do
   diff <(curl -s https://abylab.ai/$f) site/$f && echo "$f 一致"
 done
 ```
@@ -165,6 +172,8 @@ curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-
 - `styles.css` 只做 Pico 变量之外的一点点事；能靠 Pico classless 解决的样式就
   别往这儿加。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
+- 改了 `install.sh` 记得 `cp install.sh site/install.sh`（CI 会 diff 两份，忘了
+  会直接挂）。
 
 ## 自托管的 Pico
 

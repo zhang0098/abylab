@@ -23,6 +23,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The site serves its own copy of the installer, so
+      # `curl https://abylab.ai/install.sh | bash` never has to reach GitHub,
+      # while the packaged tarball ships the repo's file. Same script in two
+      # places; this is what keeps them from drifting.
+      - name: install.sh and site/install.sh are in sync
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          if ! diff -u install.sh site/install.sh; then
+            echo "::error::site/install.sh is stale — fix with: cp install.sh site/install.sh"
+            exit 1
+          fi
+          echo "site/install.sh matches install.sh"
+
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal \

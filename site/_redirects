@@ -1,7 +1,13 @@
 # Cloudflare Pages redirects. Parsed by Pages, never served as a file.
 # Host-level rules (www → apex) are not possible here: use a Bulk Redirect or a
-# Redirect Rule in the dashboard, see site/README.md.
+# Redirect Rule in the dashboard, see SITE.md.
 
-# Short install URL. 302, not 301: the canonical script lives in the repo and
-# clients should keep following it there.
-/install.sh https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh 302
+# No rule for /install.sh on purpose: site/install.sh is a real file here and
+# is served from this origin, so
+#
+#   /bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
+#
+# still works on networks where raw.githubusercontent.com is blocked. It used
+# to 302 to GitHub, which defeated the point — and a redirect beats the file,
+# so re-adding one would silently hide the copy. site/install.sh is a
+# byte-identical copy of the repo's install.sh; CI fails when the two drift.
