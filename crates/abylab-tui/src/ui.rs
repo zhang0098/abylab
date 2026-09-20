@@ -22,14 +22,16 @@ const PROMPT_JUMP_BTN_W: u16 = 2;
 
 /// Composer card height for a terminal `height` rows tall.
 /// Composer height: the input well plus one bottom meta row (state ·
-/// mode/permission chips · model). Taller terminals get a taller well.
+/// mode/permission chips · model). Taller terminals get a taller well — two
+/// rows more than the old 4/3/2 ladder, so a long prompt or a multi-line draft
+/// can be read without scrolling the well.
 fn composer_height(height: u16) -> u16 {
     if height >= 15 {
-        4
+        6
     } else if height >= 10 {
-        3
+        5
     } else {
-        2
+        4
     }
 }
 
@@ -41,7 +43,7 @@ fn resolved_composer_height(area: Rect, app: &App) -> u16 {
     let inner_width = area.width.saturating_sub(2);
     let prompt_width = "❯ ".width() as u16;
     let wrap_width = inner_width.saturating_sub(prompt_width).max(1) as usize;
-    let maximum = (area.height / 2).max(minimum).min(12);
+    let maximum = (area.height / 2).max(minimum).min(14);
     let desired = app
         .input
         .visual_row_count(wrap_width)
@@ -616,9 +618,8 @@ fn status_title(app: &App) -> Line<'static> {
     }
     let theme = app.theme;
     let mut spans: Vec<Span> = Vec::new();
-    // Chrome, not content: the mode label and its key hint share one plain
-    // tone — the accent that used to mark the key outshouted the value.
-    let key_style = Style::default().fg(theme.fg_tertiary);
+    // The label stands alone: the `shift+tab` hint that used to follow it is
+    // gone (the `/help` card and `/permission` still document the binding).
     // Mode chips: folded from the durable event stream (same facts as the
     // Web UI chips). Stock defaults render until the host reports its own
     // facts, so the landing screen still advertises the permission preset.
@@ -646,7 +647,6 @@ fn status_title(app: &App) -> Line<'static> {
             theme.fg_tertiary
         }),
     ));
-    spans.push(Span::styled(" shift+tab", key_style));
     if let Some(approval) = &app.modes.approval {
         spans.push(Span::styled(
             format!(" · {approval}"),
@@ -681,14 +681,20 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
             ("^x", "steer"),
             ("esc", app.locale.tr("interrupt", "中断")),
         ],
-        // Idle, empty: point at the full shortcut list.
-        (false, true) => vec![("^K", app.locale.tr("keys", "快捷键"))],
+        // Idle, empty: nothing to hint at. The `^K keys` discovery chip that
+        // used to sit here crowded the model id for no new information.
+        (false, true) => Vec::new(),
         // Idle with a draft: enter's meaning follows the prefix.
         (false, false) if app.input.buf().starts_with('/') => {
             vec![("⏎", app.locale.tr("command", "命令"))]
         }
         (false, false) => vec![("⏎", app.locale.tr("send", "发送"))],
     };
+    // No hints (idle, empty draft): return nothing at all — the model id
+    // follows, and a bare ` · ` separator would read as a stray bullet.
+    if pairs.is_empty() {
+        return Vec::new();
+    }
     let mut spans = Vec::new();
     for (i, (k, l)) in pairs.iter().enumerate() {
         if i > 0 {
@@ -1953,25 +1959,31 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
         let buf = terminal.backend().buffer().clone();
         let theme = app.theme;
-        // 80x20: the box is the last thing on screen — rows 15..19, top border
-        // 15 (tip + · workspace), well 16..18, bottom border 19 carrying the
-        // meta row (`╰· Standard … ╯`).
-        assert_eq!(buf[(0, 15)].symbol(), "╭", "top-left corner");
-        assert_eq!(buf[(79, 15)].symbol(), "╮", "top-right corner");
+        // 80x20: the box is the last thing on screen — rows 13..19, top border
+        // 13 (tip + · workspace), a five-row well, bottom border 19 carrying
+        // the meta row (`╰· Standard … ╯`).
+        assert_eq!(buf[(0, 13)].symbol(), "╭", "top-left corner");
+        assert_eq!(buf[(79, 13)].symbol(), "╮", "top-right corner");
         assert_eq!(buf[(0, 19)].symbol(), "╰", "bottom-left corner");
         assert_eq!(buf[(79, 19)].symbol(), "╯", "bottom-right corner");
-        assert_eq!(buf[(4, 15)].bg, theme.panel, "border row on the card");
-        assert_eq!(buf[(40, 16)].bg, theme.panel, "input well on panel surface");
-        assert_eq!(buf[(40, 17)].bg, theme.panel, "input well on panel surface");
-        assert_eq!(buf[(4, 18)].bg, theme.panel, "well fills the inner rows");
+        assert_eq!(buf[(4, 13)].bg, theme.panel, "border row on the card");
+        assert_eq!(buf[(40, 14)].bg, theme.panel, "input well on panel surface");
+        assert_eq!(buf[(40, 18)].bg, theme.panel, "well fills the inner rows");
         assert_eq!(
             buf[(1, 19)].symbol(),
             "·",
             "meta row rides the bottom border with small dots"
         );
-        // The row between the conversation and the cap line stays plain
-        // background: no stats dock row replaced it.
-        assert_eq!(buf[(4, 14)].bg, theme.bg, "gap row stays plain background");
+        // Five well rows above the meta row: the two extra input rows the
+        // composer grew by, with no chrome row sneaking back in below the box.
+        for row in 14..=18 {
+            assert_eq!(
+                buf[(40, row)].bg,
+                theme.panel,
+                "row {row} belongs to the input well"
+            );
+        }
+        assert_eq!(buf[(4, 12)].bg, theme.bg, "gap row stays plain background");
         assert_eq!(buf[(4, 9)].bg, theme.bg, "chat keeps the base background");
     }
 
@@ -2668,10 +2680,10 @@ mod tests {
         app.session_bound = false;
 
         assert_eq!(flat_line(status_title(&app)), "");
+        // Nothing on the right either: no hint chips and no model until the
+        // session binds.
         let pending = flat_spans(status_right(&app));
-        assert!(pending.contains("^K keys"), "{pending}");
-        assert!(!pending.contains("deepseek-chat"), "{pending}");
-        assert!(!pending.contains("high"), "{pending}");
+        assert!(pending.trim().is_empty(), "{pending}");
 
         let (ctl, _commands) = crate::controller::test_controller();
         app.handle(
@@ -2691,10 +2703,11 @@ mod tests {
         assert!(bound_right.contains("high"), "{bound_right}");
     }
 
-    /// The mode label and its `shift+tab` hint share one plain chrome tone:
-    /// the key is neither accented nor bold any more.
+    /// The mode label stands alone: the `shift+tab` key that used to follow it
+    /// is gone from the meta row (the binding still works, and `/help` and
+    /// `/permission` still document it), leaving one plain chrome tone.
     #[test]
-    fn status_mode_hint_renders_plain_next_to_its_value() {
+    fn status_title_shows_the_mode_label_alone() {
         let flat = |line: &Line| -> String {
             line.spans
                 .iter()
@@ -2702,49 +2715,37 @@ mod tests {
                 .collect::<String>()
         };
         let mut app = test_app();
-        // Pin the fact under test: the hint renders the reported preset's
-        // label, independent of the launch default.
+        // Pin the fact under test: the label follows the reported preset,
+        // independent of the launch default.
         app.modes.permission = Some("workspace-write".into());
 
         app.locale = crate::locale::Locale::Zh;
-        let zh_line = status_title(&app);
-        let zh = flat(&zh_line);
-        assert!(zh.contains("· 工作区可写 shift+tab"), "{zh}");
-        assert!(!zh.contains("permission"), "{zh}");
-        assert!(!zh.contains("权限"), "{zh}");
+        let zh = flat(&status_title(&app));
+        assert_eq!(zh, "· 工作区可写", "{zh}");
 
         app.locale = crate::locale::Locale::En;
         let en_line = status_title(&app);
         let en = flat(&en_line);
-        assert!(en.contains("· Workspace Write shift+tab"), "{en}");
+        assert_eq!(en, "· Workspace Write", "{en}");
+        assert!(!en.contains("shift"), "{en}");
+        assert!(!en.contains('+'), "{en}");
         assert!(!en.contains("permission"), "{en}");
-        assert!(!en.contains("access"), "{en}");
 
-        let key_spans = en_line
-            .spans
-            .iter()
-            .filter(|span| span.content.contains('+'))
-            .collect::<Vec<_>>();
-        assert_eq!(key_spans.len(), 1, "{en}");
         let value_spans = en_line
             .spans
             .iter()
             .filter(|span| span.content.contains("Workspace Write"))
             .collect::<Vec<_>>();
         assert_eq!(value_spans.len(), 1, "{en}");
-        for span in key_spans.iter().chain(value_spans.iter()) {
-            assert_eq!(
-                span.style.fg,
-                Some(app.theme.fg_tertiary),
-                "plain tone for {:?}",
-                span.content
-            );
-            assert!(
-                !span.style.add_modifier.contains(Modifier::BOLD),
-                "no emphasis on {:?}",
-                span.content
-            );
-        }
+        assert_eq!(
+            value_spans[0].style.fg,
+            Some(app.theme.fg_tertiary),
+            "plain tone on the label"
+        );
+        assert!(
+            !value_spans[0].style.add_modifier.contains(Modifier::BOLD),
+            "no emphasis on the label"
+        );
     }
 
     /// The model id on the meta row's right side is plain chrome too: no
@@ -2755,10 +2756,10 @@ mod tests {
         app.cfg.model = "deepseek-chat".into();
         app.input
             .set("a draft long enough to squeeze the right side ".repeat(4));
-        // 200 cols keeps the whole right side, 40 takes the model-only
-        // fallback, 30 drops it (left chrome + id no longer fit) — the id is
+        // 200 cols keeps the whole right side, 30 takes the model-only
+        // fallback, 28 drops it (left chrome + id no longer fit) — the id is
         // plain wherever it survives.
-        for (width, shown) in [(200usize, true), (40, true), (30, false)] {
+        for (width, shown) in [(200usize, true), (30, true), (28, false)] {
             let line = meta_line(&app, width);
             let spans: Vec<(String, Style)> = line
                 .spans
@@ -2787,8 +2788,8 @@ mod tests {
             spans.iter().map(|s| s.content.as_ref()).collect::<String>()
         };
         let mut app = test_app();
-        // idle · empty → discovery hint
-        assert!(flat(context_hints(&app)).contains("^K keys"));
+        // idle · empty → nothing at all: the row is the model id's alone
+        assert!(context_hints(&app).is_empty());
         // idle · draft → enter sends
         app.input.set("hello".into());
         let s = flat(context_hints(&app));
@@ -2912,6 +2913,28 @@ mod tests {
         );
     }
 
+    /// The input well is five rows tall on a normal terminal — two more than
+    /// the old ladder gave it — and the growth cap moved up with it so a
+    /// wrapped draft still has somewhere to go.
+    #[test]
+    fn composer_keeps_five_well_rows_on_a_normal_terminal() {
+        let app = test_app();
+
+        assert_eq!(composer_height(30), 6, "tall terminal");
+        assert_eq!(composer_height(15), 6, "threshold");
+        assert_eq!(composer_height(12), 5, "mid terminal");
+        assert_eq!(composer_height(8), 4, "short terminal");
+        assert_eq!(
+            resolved_composer_height(Rect::new(0, 0, 100, 30), &app),
+            6,
+            "an empty draft still gets the minimum well"
+        );
+        // The ladder and the cap stay in step: the well can grow past the
+        // minimum, up to 14 rows on a tall terminal.
+        let tall = Rect::new(0, 0, 100, 60);
+        assert_eq!(resolved_composer_height(tall, &app), 6);
+    }
+
     #[test]
     fn composer_grows_to_show_a_multiline_draft_until_its_cap() {
         let mut app = test_app();
@@ -3021,9 +3044,9 @@ mod tests {
         assert!(!tail.contains("session 00"), "head scrolled away:\n{tail}");
         assert!(tail.contains("█"), "scrollbar thumb shown:\n{tail}");
         assert!(tail.contains("╰"), "bottom corners intact:\n{tail}");
-        // 11 rows: the inset band above the composer, one row taller since the
-        // stats dock no longer takes the row below the box.
-        assert_eq!(app.picker_page_rows, 11, "page size = visible rows");
+        // 9 rows: the inset band above the composer, two rows shorter since
+        // the composer grew by two.
+        assert_eq!(app.picker_page_rows, 9, "page size = visible rows");
     }
 
     #[test]
