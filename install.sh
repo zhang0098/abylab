@@ -45,11 +45,6 @@ PATH_WROTE=0
 FORCE=0
 VERIFY=1
 DRY_RUN=0
-# The glibc the prebuilt Linux binaries are built against: they come out of a
-# Debian 11 (bullseye) container, and scripts/check-glibc-floor.sh keeps the
-# release honest about it. An older host is warned about here, and if the
-# binary really cannot start the install says so instead of claiming success.
-GLIBC_FLOOR=2.31
 
 # ---------------------------------------------------------------- output ----
 
@@ -206,13 +201,11 @@ detect_target() {
     arch=$(uname -m)
     case "$os" in
         Linux)
-            # The Linux binaries link glibc; Alpine-style musl systems cannot
-            # run them at all, so fail early with the source-build escape hatch.
-            if ldd --version 2>&1 | grep -qi musl; then
-                die "musl libc detected — the prebuilt Linux binaries need glibc.
-       Build from source instead: cargo install --git https://github.com/${REPO} abylab-tui"
-            fi
-            os_part="unknown-linux-gnu"
+            # One Linux asset for every distribution. The binary is linked
+            # statically against musl, so there is no host libc to match:
+            # glibc 2.x (however old), Alpine, and distroless-style images all
+            # install the same file.
+            os_part="unknown-linux-musl"
             ;;
         Darwin) os_part="apple-darwin" ;;
         *) die "unsupported OS '$os' — prebuilt binaries cover Linux and macOS" ;;
@@ -223,38 +216,6 @@ detect_target() {
         *) die "unsupported architecture '$arch' — prebuilt binaries cover x86_64 and aarch64" ;;
     esac
     printf '%s-%s\n' "$arch_part" "$os_part"
-}
-
-# The glibc the host actually has, e.g. `2.39`. `getconf` is the tidy source;
-# the `ldd` banner (`ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39`) is the fallback
-# for images whose getconf cannot answer. Empty means "could not tell", which
-# callers treat as "no opinion" rather than as an old system.
-host_glibc() {
-    local version
-    version=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $NF}')
-    [ -n "${version:-}" ] ||
-        version=$(ldd --version 2>/dev/null | head -n 1 | awk '{print $NF}')
-    printf '%s' "${version:-}"
-}
-
-# Warn — never block — when the host glibc is older than the floor the prebuilt
-# binaries are linked against. The verdict comes from running the binary after
-# installing, so a floor that is stricter than the build really needs cannot
-# cost anybody an install.
-warn_old_glibc() {
-    local host
-    case "$1" in
-        *-linux-gnu) ;;
-        *) return 0 ;;
-    esac
-    host=$(host_glibc)
-    [ -n "$host" ] || return 0
-    # sort -V is GNU; every path that reaches here is Linux.
-    if [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$host" | sort -V | head -n 1)" != "$GLIBC_FLOOR" ]; then
-        warn "glibc $host is older than the $GLIBC_FLOOR the prebuilt binaries are built against"
-        note "       installing anyway — if it cannot start, build from source:"
-        note "       cargo install --git https://github.com/${REPO} abylab-tui"
-    fi
 }
 
 # -------------------------------------------------------------- version ----
@@ -478,7 +439,6 @@ main() {
     local target tag asset base tmp tarball sums bin current installed dl_error mirrored
 
     target=$(detect_target)
-    warn_old_glibc "$target"
 
     # The mirror carries only the latest release; everything else — an explicit
     # --version, --no-mirror, a mirror that is down or does not have the file —
@@ -564,19 +524,14 @@ main() {
 
     install_binary "$bin"
 
-    # The binary is in place — but "in place" is not "runnable". A build linked
-    # against a newer glibc than the host has dies in the loader with
-    #   /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found
-    # which used to scroll by under a cheerful "installed abylab". Say what
-    # happened and where to go instead, and exit non-zero.
+    # The binary is in place — but "in place" is not "runnable": a truncated
+    # download, an asset for the wrong architecture or an unsupported (kernel,
+    # vDSO, seccomp) host would otherwise scroll by under a cheerful "installed
+    # abylab". Say what happened and where to go instead, and exit non-zero.
+    # The Linux builds are static, so a missing libc is no longer on this list.
     if ! installed=$("$BIN_DIR/$BIN_NAME" --version 2>&1); then
         warn "$BIN_DIR/$BIN_NAME is installed but will not start on this system:"
         printf '       %s\n' "$installed"
-        case "$installed" in
-            *GLIBC_*)
-                note "       glibc $(host_glibc) is older than the $GLIBC_FLOOR floor of these binaries"
-                ;;
-        esac
         note "       build from source instead: cargo install --git https://github.com/${REPO} abylab-tui"
         return 1
     fi

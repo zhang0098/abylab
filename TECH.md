@@ -105,3 +105,21 @@ incomplete/错误退出）都会在对外公布结算状态之前存好。
   而不是无限循环；esc 依然能中断某一轮。
 - 续跑是*你*说了算：模型用工具建的目标不会自己开跑，直到你执行
   `/goal resume`。SDK 从不自己开回合，开回合的是这里的驱动。
+
+## 构建与发布
+
+Linux 只发一种包：musl 静态链接的单一二进制（`x86_64`、`aarch64` 各一个），
+不依赖宿主的 libc —— 同一个文件在 glibc 2.x 的老发行版和 Alpine 上都能跑，
+所以没有 glibc 下限要长期维护。二进制在 Alpine 容器里用 musl gcc 按架构原生
+构建（见 `.github/workflows/release.yml`），`scripts/check-glibc-floor.sh
+--static` 断言产物没有动态段、没有 `PT_INTERP`、也没有 `GLIBC_` 符号。
+
+静态不等于自包含：运行时仍然读宿主的两样东西，精简镜像要注意。
+
+- TLS 信任库由 `rustls-platform-verifier` 按发行版探测：
+  `/etc/ssl/certs/ca-certificates.crt`（Debian/Ubuntu）、
+  `/etc/pki/tls/certs/ca-bundle.crt`（RHEL 系）、`/etc/ssl/cert.pem`（Alpine）
+  等路径，`SSL_CERT_FILE`／`SSL_CERT_DIR` 可以覆盖。distroless、scratch 这类
+  没有 CA bundle 的镜像会 TLS 握手失败。
+- DNS 解析用宿主的配置（`/etc/hosts`、`/etc/resolv.conf`）：静态链接的是我们
+  自己带的 libc，解析器还是走宿主那一套。

@@ -47,8 +47,8 @@ printf '%s\n' "$TAG" >"$DEST/downloads/latest/VERSION"
 
 for src in "$tmp"/*.tar.gz; do
     name=${src##*/}
-    # abylab-v0.1.2-x86_64-unknown-linux-gnu.tar.gz becomes
-    # abylab-latest-x86_64-unknown-linux-gnu.tar.gz — the name install.sh
+    # abylab-v0.1.2-x86_64-unknown-linux-musl.tar.gz becomes
+    # abylab-latest-x86_64-unknown-linux-musl.tar.gz — the name install.sh
     # asks the mirror for, so it survives the next release.
     stable=${name/abylab-${TAG}-/abylab-latest-}
     cp "$src" "$DEST/downloads/latest/$stable"

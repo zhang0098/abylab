@@ -120,3 +120,25 @@ One durable objective per session, with an explicit round allowance:
   doesn't start any rounds until you run `/goal resume`. The SDK never starts a
   turn on its own; the driver here does.
 
+
+## Packaging and releases
+
+Linux ships one kind of asset: a single musl static binary per architecture
+(`x86_64`, `aarch64`) that needs no libc from the host, so the same download
+runs on an old glibc distribution and on Alpine, and there is no glibc floor to
+maintain. The binaries are built natively per architecture inside an Alpine
+container with its musl gcc (see `.github/workflows/release.yml`), and
+`scripts/check-glibc-floor.sh --static` asserts the result has no dynamic
+section, no `PT_INTERP` and no `GLIBC_` symbol.
+
+Static is not self-contained: two things still come from the host, which
+matters on trimmed images.
+
+- TLS roots, probed per distribution by `rustls-platform-verifier`:
+  `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu),
+  `/etc/pki/tls/certs/ca-bundle.crt` (RHEL family), `/etc/ssl/cert.pem`
+  (Alpine) and friends, with `SSL_CERT_FILE`/`SSL_CERT_DIR` as overrides.
+  A distroless or scratch image with no CA bundle fails the TLS handshake.
+- DNS resolution uses the host's configuration (`/etc/hosts`,
+  `/etc/resolv.conf`): the static binary carries our libc, but resolving is
+  still the system's job.

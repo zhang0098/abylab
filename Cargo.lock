@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abycore"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-stream",
  "cap-std",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "abylab-backend"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "abycore",
  "futures-util",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "abylab-tui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "abylab-backend",
  "anyhow",

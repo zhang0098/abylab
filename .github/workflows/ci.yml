@@ -16,8 +16,8 @@ concurrency:
 
 jobs:
   # Host-side checks: formatting, lints, tests. Runs once on Linux x86_64 so the
-  # two build jobs below stay a pure "does it compile, and at the right glibc
-  # floor" pair.
+  # build jobs below stay a pure "does it compile, and does it link the way we
+  # promise" pair.
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
@@ -62,42 +62,63 @@ jobs:
   # Cross-platform release builds for the four supported targets.
   # macos-14 runners are Apple Silicon; macos-15-intel is the Intel image.
   #
-  # The Linux jobs build inside Debian 11 (bullseye) exactly like the release
-  # workflow, so the glibc floor is exercised on every push: building on
-  # ubuntu-24.04 would silently raise it to 2.39 and break older distros. See
-  # the longer note in release.yml and scripts/check-glibc-floor.sh.
+  # The Linux assets: one static binary per architecture, linked against musl
+  # inside Alpine, whose own libc that is. The image is the whole toolchain,
+  # each runner builds its architecture natively, and there is no glibc floor to
+  # build down to — the same file runs on glibc and musl hosts alike.
+  #
+  # `docker run` rather than a `container:` job, because JavaScript actions
+  # (checkout, rust-cache, upload-artifact) do not run inside an Alpine
+  # container on arm64 runners — the runner says so and stops the job:
+  #   JavaScript Actions in Alpine containers are only supported on x64 Linux
+  #   runners. Detected Linux Arm64
   build-linux:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    container: rust:bullseye
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             archive: tar.gz
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             archive: tar.gz
     steps:
       - uses: actions/checkout@v5
 
-      # rust:bullseye already carries rustup + stable; `cache-bin: false` keeps
-      # rust-cache from pruning the image's shims in $CARGO_HOME/bin.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          cache-bin: false
 
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p abylab-tui
+      # The image carries rust, musl-gcc and the musl libc; nothing is
+      # cross-compiled and no extra package is needed. `RUSTFLAGS` and `TARGET`
+      # are the only things passed in with the workspace.
+      - name: Build in Alpine
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$PWD:$PWD" --workdir "$PWD" \
+            --env CARGO_TARGET_DIR="$PWD/target" \
+            --env RUSTFLAGS \
+            --env TARGET \
+            rust:alpine \
+            sh -euc '
+              cargo build --release --locked --target "$TARGET" -p abylab-tui
+              # The image is the musl system the asset is for: run it here.
+              "./target/$TARGET/release/abylab" --version
+            '
+          # The container is root; hand the artifacts to the runner user so the
+          # cache save and the steps below can read and write them.
+          sudo chown -R "$(id -u):$(id -g)" target
 
-      - name: glibc floor
-        run: scripts/check-glibc-floor.sh "target/${{ matrix.target }}/release/abylab"
+      - name: static link
+        run: scripts/check-glibc-floor.sh --static "target/${{ matrix.target }}/release/abylab"
 
       - name: Package
-        shell: bash
         run: |
           set -euo pipefail
           name="abylab-${{ github.ref_name }}-${{ matrix.target }}"
@@ -108,8 +129,9 @@ jobs:
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
         id: package
 
+      # The Alpine smoke test ran above; this one runs the asset on the glibc
+      # runner, which is the other half of the promise.
       - name: Smoke test
-        shell: bash
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/abylab"
