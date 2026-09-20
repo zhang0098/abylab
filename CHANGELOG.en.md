@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-20
+
 ### Added
 
 - Skills: drop a markdown instruction document into the workspace's `.agents/skills/`
@@ -153,7 +155,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/zhang0098/abylab/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/zhang0098/abylab/compare/v0.1.2...v0.1.3

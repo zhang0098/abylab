@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-20
+
 ### 新增
 
 - 技能（skills）：把 markdown 指令文档放进当前工作区的 `.agents/skills/`（`<名字>.md` 或
@@ -126,7 +128,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/zhang0098/abylab/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/zhang0098/abylab/compare/v0.1.2...v0.1.3
