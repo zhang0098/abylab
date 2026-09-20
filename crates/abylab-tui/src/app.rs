@@ -533,16 +533,15 @@ pub struct PickerItem {
 /// CJK labels).
 pub(crate) const PICKER_LABEL_COL: usize = 30;
 
-/// One `/` menu entry: a builtin [`SlashCommand`] or a host skill (plugin
-/// mode). Builtins win a name collision — the command namespace is closed
-/// and resolved client-side before a line ever becomes a prompt; skill
-/// lines ship as prompts the host expands.
+/// One `/` menu entry: a builtin [`SlashCommand`] name row, or an argument
+/// candidate under one. The command namespace is closed and resolved
+/// client-side before a line ever becomes a prompt; host skills are not part
+/// of it — they are only listed as `/skill`'s argument candidates.
 #[derive(Clone)]
 pub struct SlashEntry {
     pub name: String,
     pub usage: String,
     pub desc: String,
-    pub skill: bool,
     /// Full composer text for an argument candidate. Command-name rows leave
     /// this empty and retain the historical `/name ` tab completion.
     pub completion: Option<String>,
@@ -689,8 +688,9 @@ pub struct App {
     /// Chip index under the mouse pointer (grok-style hover preview).
     pub hover_att: Option<usize>,
     pub modes: Modes,
-    /// User-invocable host skills (`available_commands_update`); merged into
-    /// the slash menu after the builtins.
+    /// User-invocable host skills (`available_commands_update`). They never
+    /// join the `/` menu — `/skill ` is their one listing surface, and a bare
+    /// `/name` line still ships as a prompt the host expands.
     pub skills: Vec<crate::bus::SkillInfo>,
     /// Last advertised composition select (`/agent`).
     /// Last advertised ACP model select (`/model`).
@@ -1362,7 +1362,7 @@ impl App {
     fn slash_theme_candidate(&self) -> Option<String> {
         let matches = self.slash_matches();
         let entry = matches.get(self.slash_sel.min(matches.len().checked_sub(1)?))?;
-        if entry.skill || entry.name != "theme" {
+        if entry.name != "theme" {
             return None;
         }
         let id = entry
@@ -1472,6 +1472,10 @@ impl App {
             return self.slash_argument_matches(name, arg);
         }
         let prefix = &self.input.buf()[1..];
+        // Builtins only. Skills stay out of this list: `/` is the command
+        // namespace, and a catalog of arbitrary user-chosen names would bury
+        // it. The same skills list under the one command that runs them,
+        // `/skill `.
         let mut out: Vec<SlashEntry> = SLASH_COMMANDS
             .iter()
             .filter(|c| c.name.starts_with(prefix))
@@ -1479,27 +1483,9 @@ impl App {
                 name: c.name.to_string(),
                 usage: c.usage.to_string(),
                 desc: self.locale.command_desc(c.name, c.desc).to_string(),
-                skill: false,
                 completion: None,
             })
             .collect();
-        // Host skills share the '/' namespace. Builtins win first, then a
-        // client command, because the latter never enters a prompt.
-        for s in &self.skills {
-            if s.name.starts_with(prefix) && !SLASH_COMMANDS.iter().any(|c| c.name == s.name) {
-                out.push(SlashEntry {
-                    name: s.name.clone(),
-                    usage: s
-                        .input_hint
-                        .as_ref()
-                        .map(|hint| format!("/{} {}", s.name, hint))
-                        .unwrap_or_else(|| format!("/{}", s.name)),
-                    desc: s.description.clone(),
-                    skill: true,
-                    completion: None,
-                });
-            }
-        }
         // An exact command must win over a longer name sharing its prefix.
         out.sort_by_key(|entry| entry.name != prefix);
         out
@@ -1518,7 +1504,6 @@ impl App {
                 name: name.to_string(),
                 usage: label,
                 desc,
-                skill: false,
                 completion: Some(format!("/{name} {value}")),
             })
             .collect()
@@ -4447,20 +4432,6 @@ impl App {
         if let Some(completion) = &entry.completion {
             self.input.set(completion.clone());
         }
-        if entry.skill {
-            // Web-UI semantics: picking a skill lands the literal "/name "
-            // in the composer; enter on the completed line ships it as an
-            // ordinary prompt and the host injects the skill body.
-            let full = format!("/{}", entry.name);
-            let line = self.input.buf().trim().to_string();
-            if line == full || line.starts_with(&format!("{full} ")) {
-                self.submit(ctl);
-            } else {
-                self.input.set(format!("{full} "));
-                self.slash_sel = 0;
-            }
-            return;
-        }
         // A skill that declares an argument placeholder opens a form: the row
         // completes the line and waits. One that takes no arguments runs on the
         // spot, like every other argument pick.
@@ -4653,7 +4624,7 @@ impl App {
 - /image · 暂存本地图片：/image ./pic.png [说明]
 - /clip · 暂存剪贴板图片；ctrl+v 同样可用
 - !cmd · 在会话级本地 shell 中运行命令，不经过 Agent；初始目录为 workspace，cd/环境变量跨命令保留
-- /<skill> · 技能行会进入 / 菜单，发出后由 Agent 注入技能正文
+- /<skill> · 手打的技能行由 Agent 注入技能正文（技能不进 / 菜单）
 - /skill · 列出/调用本工作区的技能（`.agents/skills/`）：/skill <名字> [参数]；空格后是候选清单
 - ctrl+o · 展开思考和工具输出 · ctrl+l · 清屏
 - 编辑 · readline 组合键 + ⌘/⌥ 方向键 · 完整映射见 /keys
@@ -4681,7 +4652,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - /image · stage a local image — /image ./pic.png [caption]
 - /clip · stage the clipboard image — /clip [caption] · ctrl+v also works
 - !cmd · run in the session's local shell (not the agent); starts in the workspace, keeps cd/env across commands
-- /<skill> · skill lines join the / menu; the agent injects the skill's body
+- /<skill> · a hand-typed skill line — the agent injects the skill's body (skills never list under /)
 - /skill · list or run this workspace's skills (`.agents/skills/`) — `/skill ` opens the catalog, Tab completes
 - ctrl+o · expand thoughts + tool output · ctrl+l · clear
 - editing · readline chords + ⌘/⌥ arrows (ctrl+arrows elsewhere) · full map in /keys
@@ -4873,8 +4844,8 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
                 text.push_str(&format!("- `{usage}` · {}{source}\n", skill.description));
             }
             text.push_str(self.locale.tr(
-                "\nA skill line ships as a prompt; the agent injects that file's body.",
-                "\n技能行会作为提示词发出，正文由 Agent 注入。",
+                "\nA skill line ships as a prompt; the agent injects that file's body. Skills never list under `/` — this catalog and `/skill ` candidates are the only place they show up.",
+                "\n技能行会作为提示词发出，正文由 Agent 注入。技能不会出现在 / 菜单里：这里和 /skill 的习惯候选就是它们唯一的展示位置。",
             ));
         }
         self.view_overlay = Some(ViewOverlay {
@@ -4953,9 +4924,10 @@ impl App {
             let mut parts = cmdline.splitn(2, ' ');
             let name = parts.next().unwrap_or("").to_string();
             let arg = parts.next().unwrap_or("").trim().to_string();
-            // Host skills share the '/' namespace (builtins win a name): a
-            // skill line ships as an ordinary prompt — the host's pre-step
+            // A skill line ships as an ordinary prompt — the host's pre-step
             // boundary recognizes the leading /name and injects the body.
+            // Builtins win a name; the menu never offered the skill rows, but
+            // a hand-typed `/name` still resolves here.
             let builtin = SLASH_COMMANDS.iter().any(|c| c.name == name);
             if !builtin && self.skills.iter().any(|s| s.name == name) {
                 self.input.history.push(text.clone());
@@ -7751,8 +7723,10 @@ mod mode_tests {
         assert!(app.quit);
     }
 
+    /// Skills are `/skill`'s business only: the `/` menu lists builtins and
+    /// nothing else, even when the catalog holds a name no builtin claims.
     #[test]
-    fn skills_merge_into_slash_menu_and_builtins_shadow() {
+    fn skills_stay_out_of_the_slash_menu() {
         let (mut app, _ctl, _rx) = test_app();
         app.skills = vec![
             crate::bus::SkillInfo {
@@ -7770,21 +7744,22 @@ mod mode_tests {
         ];
         app.input.set("/".into());
         let menu = app.slash_matches();
-        let skills: Vec<&str> = menu
-            .iter()
-            .filter(|e| e.skill)
-            .map(|e| e.name.as_str())
-            .collect();
         assert_eq!(
-            skills,
-            ["commit-helper"],
-            "builtin /help shadows the skill name"
+            menu.len(),
+            SLASH_COMMANDS.len(),
+            "the bare `/` menu is the builtin list, unmerged"
         );
+        assert!(
+            !menu.iter().any(|e| e.name == "commit-helper"),
+            "a skill never becomes a `/` row"
+        );
+        // Not even as a prefix: `/commit` matches no builtin, so the menu is
+        // empty and the line is left to ship as a skill prompt instead.
         app.input.set("/commit".into());
-        let menu = app.slash_matches();
-        assert_eq!(menu.len(), 1);
-        assert!(menu[0].skill);
-        assert_eq!(menu[0].usage, "/commit-helper");
+        assert!(app.slash_matches().is_empty());
+        // The catalog is one command away.
+        app.input.set("/skill ".into());
+        assert_eq!(app.slash_matches().len(), 2, "both skills are candidates");
     }
 
     #[test]
@@ -8157,6 +8132,8 @@ mod mode_tests {
         );
     }
 
+    /// The menu never rows a skill, but the line still reaches the host: a
+    /// hand-typed `/name` ships as a prompt and the agent injects the body.
     #[test]
     fn skill_line_ships_as_prompt_not_unknown_command() {
         let (mut app, ctl, _rx) = test_app();
@@ -8167,6 +8144,10 @@ mod mode_tests {
             source: None,
         }];
         app.input.set("/commit-helper for the last change".into());
+        assert!(
+            app.slash_matches().is_empty(),
+            "no completer row — the skill is not a command"
+        );
         app.submit(&ctl);
         assert!(
             matches!(app.state, RunState::Starting),
@@ -8175,30 +8156,6 @@ mod mode_tests {
         assert!(app.input.is_empty());
     }
 
-    #[test]
-    fn accepting_a_skill_completes_then_sends() {
-        let (mut app, ctl, _rx) = test_app();
-        app.skills = vec![crate::bus::SkillInfo {
-            name: "commit-helper".into(),
-            description: "draft a commit".into(),
-            input_hint: None,
-            source: None,
-        }];
-        app.input.set("/commit".into());
-        let entry = app.slash_matches()[0].clone();
-        app.accept_slash(&entry, &ctl);
-        assert_eq!(
-            app.input.buf(),
-            "/commit-helper ",
-            "first accept completes the name"
-        );
-        assert!(matches!(app.state, RunState::Idle));
-        app.accept_slash(&entry, &ctl);
-        assert!(
-            matches!(app.state, RunState::Starting),
-            "second accept ships the prompt"
-        );
-    }
     /// `/skill` with no argument renders the catalog the agent discovered,
     /// source file and all; its empty state names the directory instead of
     /// reading as "this build has no skills".
@@ -8367,7 +8324,6 @@ mod mode_tests {
         assert_eq!(menu[0].usage, "audit jp:{code}", "the hint rides the row");
         assert_eq!(menu[0].desc, "审核研究报告");
         assert_eq!(menu[0].completion.as_deref(), Some("/skill audit"));
-        assert!(!menu[0].skill, "an argument row is not a skill row");
         // The band above the composer is what the user asked to see. (The CJK
         // description renders glyph-spaced and clipped, so the ASCII rows are
         // what a frame assertion can rely on.)
@@ -8402,13 +8358,11 @@ mod mode_tests {
         assert!(commands.try_recv().is_err(), "nothing was sent yet");
     }
 
+    /// `/login` resolves in the TUI even when the agent advertises a skill of
+    /// that name — skills add no `/` row, so there is no race to lose.
     #[test]
     fn login_is_a_tui_builtin_and_shadows_the_agent_skill() {
         let (mut app, ctl, _rx) = test_app();
-        assert!(
-            SLASH_COMMANDS.iter().any(|c| c.name == "login"),
-            "/login is a builtin: the key lives in the aby home, not in the agent"
-        );
         app.skills = vec![crate::bus::SkillInfo {
             name: "login".into(),
             description: "Save a DeepSeek API key into the harness credential store".into(),
@@ -8416,14 +8370,12 @@ mod mode_tests {
             source: None,
         }];
         app.input.set("/log".into());
-        let entries = app.slash_matches();
-        assert!(
-            entries.iter().any(|e| !e.skill && e.name == "login"),
-            "the builtin wins the name"
-        );
-        assert!(
-            !entries.iter().any(|e| e.skill && e.name == "login"),
-            "the agent skill must not shadow the builtin"
+        let candidates = app.slash_matches();
+        let rows: Vec<&str> = candidates.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            rows,
+            ["login", "logout"],
+            "the two builtins, in table order — the skill adds no rows"
         );
         app.input.set("/login sk-test".into());
         app.submit(&ctl);
@@ -8438,13 +8390,11 @@ mod mode_tests {
         );
     }
 
+    /// Both twins stay local ops; the agent's same-named skills are reachable
+    /// only as `/skill login` / `/skill logout`.
     #[test]
     fn logout_is_a_tui_builtin_and_shadows_the_agent_skill() {
         let (mut app, _ctl, _rx) = test_app();
-        assert!(
-            SLASH_COMMANDS.iter().any(|c| c.name == "logout"),
-            "/logout is a builtin twin of /login"
-        );
         app.skills = vec![
             crate::bus::SkillInfo {
                 name: "logout".into(),
@@ -8460,21 +8410,27 @@ mod mode_tests {
             },
         ];
         app.input.set("/".into());
-        let matches = app.slash_matches();
-        assert!(
-            matches.iter().any(|e| !e.skill && e.name == "logout"),
-            "the builtin logout is listed"
+        let menu = app.slash_matches();
+        assert_eq!(
+            menu.len(),
+            SLASH_COMMANDS.len(),
+            "the bare `/` menu is the builtin table, nothing appended"
         );
-        let skill_names: Vec<&str> = matches
-            .iter()
-            .filter(|e| e.skill)
-            .map(|e| e.name.as_str())
-            .collect();
-        assert!(
-            skill_names.is_empty(),
-            "agent login/logout skills are shadowed by the builtins: {skill_names:?}"
-        );
-        assert!(matches.iter().any(|e| !e.skill && e.name == "login"));
+        for row in &menu {
+            assert!(
+                SLASH_COMMANDS.iter().any(|c| c.name == row.name),
+                "{} is not a builtin",
+                row.name
+            );
+        }
+        assert!(menu.iter().any(|e| e.name == "logout"));
+        assert!(menu.iter().any(|e| e.name == "login"));
+        // The skills did not disappear — `/skill ` still offers both.
+        app.input.set("/skill ".into());
+        let candidates = app.slash_matches();
+        let mut catalog: Vec<&str> = candidates.iter().map(|e| e.usage.as_str()).collect();
+        catalog.sort_unstable();
+        assert_eq!(catalog, ["login", "logout"], "the catalog keeps them both");
     }
 
     #[test]
