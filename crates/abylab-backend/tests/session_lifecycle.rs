@@ -450,3 +450,108 @@ fn interrupting_timeout_backoff_saves_the_unverified_result_without_retrying() {
     }));
     assert_eq!(snapshot.requests.len(), 1);
 }
+
+/// `/resume` while a turn runs: the listing is a store read with nothing to do
+/// with the agent, so it must answer mid-turn instead of queuing behind the
+/// model request (the picker used to stay empty until the turn ended).
+#[test]
+fn session_listing_answers_while_a_turn_is_running() {
+    let server = MockServer::start(vec![
+        // The turn stays open long enough that a queued listing could not
+        // possibly win the race: its answer is three seconds out.
+        Reply::sse(text_body("first", "the answer")).delayed(Duration::from_secs(3)),
+    ]);
+    let live = Live::start(&server);
+    live.send(Cmd::Prompt {
+        text: "take your time".into(),
+    });
+    live.wait(|event| matches!(event, Event::Ui(UiEvent::TurnStart { .. })));
+
+    live.send(Cmd::ListSessions { prefix: None });
+    // Two events can arrive: the listing, or the end of the turn that was
+    // supposed to hold it back. Whichever lands first tells the story.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut listed = false;
+    loop {
+        let event = live
+            .rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("driver event deadline");
+        match event {
+            Event::Ctl(CtlEvent::SessionList { prefix, .. }) => {
+                assert_eq!(prefix, None);
+                listed = true;
+                break;
+            }
+            Event::Ui(UiEvent::TurnEnd { .. }) => break,
+            _ => {}
+        }
+    }
+    assert!(listed, "the listing must beat the end of the turn");
+
+    // Leave the run clean: the turn still finishes and persists normally.
+    live.wait(
+        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "completed"),
+    );
+    assert!(
+        live.snapshot()
+            .items
+            .iter()
+            .any(|item| { matches!(item, abycore::Item::Message { .. }) })
+    );
+}
+
+/// The `/model` picker's live catalog is another read-only query: asking for
+/// it mid-turn must not wait behind the turn either (the picker opens on its
+/// stock rows either way, but the provider's listing used to arrive only after
+/// the turn ended).
+#[test]
+fn model_catalog_answers_while_a_turn_is_running() {
+    let server = MockServer::start(vec![
+        // The turn parks in a slow tool call: the loop is busy, the fixture
+        // free to serve the catalog request.
+        Reply::sse(single_call_reply(
+            "slow-call",
+            "bash",
+            r#"{"command":"sleep 3","description":"Hold the turn open"}"#,
+        )),
+        // The provider's listing, fetched while that tool runs.
+        Reply::status(200).body(r#"{"data":[{"id":"deepseek-v4-pro"}]}"#),
+        // The turn's own next request, once the tool returns.
+        Reply::sse(text_body("second", "done")),
+    ]);
+    let live = Live::start(&server);
+    live.send(Cmd::Prompt {
+        text: "hold the turn open".into(),
+    });
+    live.wait(|event| {
+        matches!(event, Event::Ui(UiEvent::ToolStarted { call_id, .. }) if call_id == "slow-call")
+    });
+
+    live.send(Cmd::FetchCatalog);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut listed = None;
+    loop {
+        let event = live
+            .rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("driver event deadline");
+        match event {
+            Event::Ctl(CtlEvent::Catalog { models }) => {
+                listed = Some(models);
+                break;
+            }
+            Event::Ui(UiEvent::TurnEnd { .. }) => break,
+            _ => {}
+        }
+    }
+    let models = listed.expect("the catalog must beat the end of the turn");
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["deepseek-v4-pro"]
+    );
+
+    live.wait(
+        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "completed"),
+    );
+}

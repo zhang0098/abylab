@@ -4,7 +4,9 @@
 //! Architecture mirrors the Martty ACP client (`acp.rs`): the driver thread
 //! runs one `block_on` loop; the UI thread never blocks. Interrupts ride a
 //! dedicated channel so they land even while a turn is in flight. A prompt
-//! arriving mid-turn queues behind the active turn (durable-inbox semantics).
+//! arriving mid-turn queues behind the active turn (durable-inbox semantics),
+//! while read-only queries (`/resume`'s listing, `/model`'s catalog) ride a
+//! third channel served off the loop — a running turn never holds a picker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,16 +27,26 @@ use crate::contract::{
 const SERVER_LABEL: &str = "abycore · deepseek-responses";
 
 /// Handle to one running driver. `send` never blocks; turns serialize inside
-/// the driver, so a prompt sent mid-turn queues after it.
+/// the driver, so a prompt sent mid-turn queues after it. Read-only queries
+/// (`ListSessions`, `FetchCatalog`) take a side channel instead: the driver
+/// loop is busy for the whole turn, and neither `/resume`'s picker nor the
+/// `/model` listing should wait for it.
 pub struct DriverHandle {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    query_tx: mpsc::UnboundedSender<Cmd>,
     interrupt_tx: mpsc::UnboundedSender<()>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DriverHandle {
     pub fn send(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.send(cmd);
+        // The turn loop answers everything in order; a query that touches no
+        // agent state is served by the side task so it lands immediately.
+        let tx = match &cmd {
+            Cmd::ListSessions { .. } | Cmd::FetchCatalog => &self.query_tx,
+            _ => &self.cmd_tx,
+        };
+        let _ = tx.send(cmd);
     }
 
     /// Cancel the active turn (no-op when idle).
@@ -72,6 +84,7 @@ pub fn spawn(
         return Err("--max-tokens must be between 1 and 4294967295".into());
     }
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+    let (query_tx, query_rx) = mpsc::unbounded_channel::<Cmd>();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
     let join = std::thread::Builder::new()
         .name("aby-driver".into())
@@ -89,11 +102,12 @@ pub fn spawn(
                     return;
                 }
             };
-            runtime.block_on(drive(cfg, cmd_rx, interrupt_rx, Arc::new(sink)));
+            runtime.block_on(drive(cfg, cmd_rx, query_rx, interrupt_rx, Arc::new(sink)));
         })
         .map_err(|err| format!("spawn aby driver: {err}"))?;
     Ok(DriverHandle {
         cmd_tx,
+        query_tx,
         interrupt_tx,
         join: Some(join),
     })
@@ -459,6 +473,7 @@ impl AgentHooks for UiHooks {
 async fn drive(
     cfg: DriverConfig,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    query_rx: mpsc::UnboundedReceiver<Cmd>,
     mut interrupt_rx: mpsc::UnboundedReceiver<()>,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
 ) {
@@ -486,6 +501,9 @@ async fn drive(
     // The TUI resolves the key (--api-key override, else the /login store);
     // the environment is not consulted.
     let mut api_key = cfg.api_key.clone().unwrap_or_default();
+    // The query task answers `/model`'s catalog fetch too, and `/login` can
+    // rotate the key mid-session: the loop publishes every change here.
+    let live_key = Arc::new(std::sync::Mutex::new(api_key.clone()));
     let mut model = cfg.model.clone();
     let mut effort = parse_effort(&cfg.reasoning);
 
@@ -518,6 +536,34 @@ async fn drive(
         Some(root) => abycore::SessionStore::at(root, &cfg.workspace).ok(),
         None => abycore::SessionStore::new(&cfg.workspace).ok(),
     };
+    // Read-only queries answer off the turn loop (`DriverHandle::send` routes
+    // them here): the loop is busy for a whole turn, and both `/resume`'s
+    // picker and the `/model` catalog have to answer while the agent is still
+    // working. The task owns a store clone, the live key and the same sink, so
+    // it needs nothing from the loop.
+    {
+        let store = store.clone();
+        let base_url = cfg.base_url.clone();
+        let live_key = Arc::clone(&live_key);
+        let sink = Arc::clone(&sink);
+        tokio::spawn(async move {
+            let mut queries = query_rx;
+            while let Some(cmd) = queries.recv().await {
+                match cmd {
+                    Cmd::ListSessions { prefix } => sink(Event::Ctl(CtlEvent::SessionList {
+                        sessions: session_rows(store.as_ref()),
+                        prefix,
+                    })),
+                    Cmd::FetchCatalog => spawn_catalog_fetch(
+                        current_key(&live_key),
+                        base_url.clone(),
+                        Arc::clone(&sink),
+                    ),
+                    _ => {}
+                }
+            }
+        });
+    }
     // Subagent delegation: one owner for the whole driver, shared by every
     // fresh/restored agent; its broadcast feeds the TUI's subagent views.
     let subagents: Option<Arc<abycore::Subagents>> = local.as_ref().map(|_| {
@@ -755,37 +801,14 @@ async fn drive(
                 }
             }
             Cmd::FetchCatalog => {
-                // Best-effort provider listing for the /model picker. The
-                // fetch rides its own task so a slow catalog never delays
-                // commands; failures leave the picker on its stock presets.
-                let key = api_key.clone();
-                let base = cfg.base_url.clone();
-                let sink = Arc::clone(&sink);
-                if key.trim().is_empty() {
-                    continue;
-                }
-                tokio::spawn(async move {
-                    let mut config = ClientConfig::new(&key);
-                    if let Some(url) = base {
-                        config.base_url = url;
-                    }
-                    let Ok(client) = DeepSeekClient::new(config) else {
-                        return;
-                    };
-                    let Ok(models) = client.models().await else {
-                        return;
-                    };
-                    let models = models
-                        .into_iter()
-                        .map(|model| crate::contract::CatalogModel {
-                            provider: "deepseek-official".into(),
-                            name: model.id.clone(),
-                            id: model.id,
-                            vision: false,
-                        })
-                        .collect();
-                    sink(Event::Ctl(CtlEvent::Catalog { models }));
-                });
+                // The handle routes this to the query task so a running turn
+                // can't hold the `/model` listing back; this arm serves a
+                // caller that pokes the command channel directly.
+                spawn_catalog_fetch(
+                    current_key(&live_key),
+                    cfg.base_url.clone(),
+                    Arc::clone(&sink),
+                );
             }
             Cmd::Shutdown => break,
             Cmd::SetModel {
@@ -904,27 +927,11 @@ async fn drive(
                 }
             }
             Cmd::ListSessions { prefix } => {
-                let rows = store
-                    .as_ref()
-                    .map(|store| {
-                        store
-                            .list()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|s| crate::contract::SessionRow {
-                                id: s.id,
-                                title: s.title.or(if s.preview.is_empty() {
-                                    None
-                                } else {
-                                    Some(s.preview)
-                                }),
-                                updated_at: Some(epoch_stamp(s.modified)),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // The handle routes this to the query task so a running turn
+                // can't hold the picker; this arm serves a caller that pokes
+                // the command channel directly.
                 ctl(CtlEvent::SessionList {
-                    sessions: rows,
+                    sessions: session_rows(store.as_ref()),
                     prefix,
                 });
             }
@@ -979,6 +986,8 @@ async fn drive(
                     .filter(|key| !key.is_empty())
                     .unwrap_or_default()
                     .to_string();
+                // The query task fetches catalogs with whatever key is live.
+                *live_key.lock().expect("key lock") = api_key.clone();
                 if api_key.is_empty() {
                     // `logout`: abycore refuses a keyless client config, so a
                     // running agent keeps its old key until /new or restart;
@@ -2237,6 +2246,72 @@ fn plan_summary(plan: &abycore::PlanView) -> String {
     parts.join(" · ")
 }
 
+/// The key the driver is currently using; the query task reads it so a
+/// mid-session `/login` reaches the catalog fetch too.
+fn current_key(live: &std::sync::Mutex<String>) -> String {
+    live.lock().expect("key lock").clone()
+}
+
+/// Best-effort provider listing for the `/model` picker. The fetch rides its
+/// own task so a slow catalog never delays anything else; failures leave the
+/// picker on its stock presets. Both the turn loop and the query task call it,
+/// so a catalog asked for mid-turn answers without waiting for that turn.
+fn spawn_catalog_fetch(
+    api_key: String,
+    base_url: Option<String>,
+    sink: Arc<dyn Fn(Event) + Send + Sync>,
+) {
+    if api_key.trim().is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut config = ClientConfig::new(&api_key);
+        if let Some(url) = base_url {
+            config.base_url = url;
+        }
+        let Ok(client) = DeepSeekClient::new(config) else {
+            return;
+        };
+        let Ok(models) = client.models().await else {
+            return;
+        };
+        let models = models
+            .into_iter()
+            .map(|model| crate::contract::CatalogModel {
+                provider: "deepseek-official".into(),
+                name: model.id.clone(),
+                id: model.id,
+                vision: false,
+            })
+            .collect();
+        sink(Event::Ctl(CtlEvent::Catalog { models }));
+    });
+}
+
+/// `/resume` rows from the durable store, newest first (`SessionStore::list`
+/// orders them). An absent store — persistence disabled, or a store that could
+/// not be opened — lists nothing instead of failing the command.
+fn session_rows(store: Option<&abycore::SessionStore>) -> Vec<crate::contract::SessionRow> {
+    store
+        .map(|store| {
+            store
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| crate::contract::SessionRow {
+                    id: s.id,
+                    title: s.title.or(if s.preview.is_empty() {
+                        None
+                    } else {
+                        Some(s.preview)
+                    }),
+                    updated_at: Some(epoch_stamp(s.modified)),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `YYYY-MM-DD HH:MM` (UTC) for a picker meta line; civil-from-days per
 /// Howard Hinnant's algorithm.
 fn epoch_stamp(t: std::time::SystemTime) -> String {
@@ -2650,6 +2725,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("abylab-permission-{}-{unique}", std::process::id()));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
@@ -2680,6 +2756,7 @@ mod tests {
                 compaction: None,
             },
             cmd_rx,
+            query_rx,
             interrupt_rx,
             sink,
         )
@@ -2712,6 +2789,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("abylab-bind-{}-{unique}", std::process::id()));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
@@ -2737,6 +2815,7 @@ mod tests {
                 compaction: None,
             },
             cmd_rx,
+            query_rx,
             interrupt_rx,
             sink,
         )
@@ -2774,6 +2853,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("abylab-login-{}-{unique}", std::process::id()));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
@@ -2804,6 +2884,7 @@ mod tests {
                 compaction: None,
             },
             cmd_rx,
+            query_rx,
             interrupt_rx,
             sink,
         )
@@ -2856,12 +2937,15 @@ mod tests {
         drop(writer);
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
             captured.lock().expect("event lock").push(event);
         });
+        // The handle routes `ListSessions` to the query task; a command
+        // written straight to the channel is served by the loop arm instead.
         cmd_tx
             .send(Cmd::ListSessions {
                 prefix: Some("resume-list".into()),
@@ -2885,6 +2969,7 @@ mod tests {
                 compaction: None,
             },
             cmd_rx,
+            query_rx,
             interrupt_rx,
             sink,
         )
