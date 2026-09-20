@@ -2,7 +2,8 @@
 
 # abylab technical notes
 
-Internals only — install, keys and commands live in [README.en.md](README.en.md).
+Internals only — install is in [README.en.md](README.en.md); commands, keys and
+size numbers are on [abylab.ai](https://abylab.ai/).
 
 ## Workspace instructions
 
@@ -79,9 +80,9 @@ failures (default 3; `0` stops on the first failure). Completed tool results
 survive; a tool truncated mid-execution is marked "unverified — check before
 repeating" and never replayed. Only once that allowance is spent does the error
 surface, listing the current limits; another message continues the session, and
-Esc interrupts both execution and the wait between segments. (The README's
-[Turn budgets](README.en.md#turn-budgets) covers the same ground from the user's
-side.) Serialized input has its own 4 MiB cap. The byte estimate is not a
+Esc interrupts both execution and the wait between segments. (These budgets and
+deadlines are abylab's own backstops, not DeepSeek limits — usage is billed as
+usual.) Serialized input has its own 4 MiB cap. The byte estimate is not a
 guaranteed upper bound.
 
 ## Session persistence
