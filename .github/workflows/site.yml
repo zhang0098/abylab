@@ -1,9 +1,9 @@
 name: Site
 
-# The site was pushed to Pages with `wrangler pages deploy` (see site/README.md).
+# The site was pushed to Pages with `wrangler pages deploy` (see SITE.md).
 # Three ways to keep it up to date — pick one:
 #
-#  1. The manual command from site/README.md, run on the box you are working on.
+#  1. The manual command from SITE.md, run on the box you are working on.
 #  2. Git integration: connect this repo once in the Cloudflare dashboard with
 #     an empty build command and `site` as the output directory. Cloudflare then
 #     deploys on every push by itself, and this workflow is redundant.
@@ -43,7 +43,7 @@ jobs:
             {
               echo "### Site deploy skipped"
               echo "CLOUDFLARE_API_TOKEN is not set. Deploy through the Pages"
-              echo "Git integration, or add the two secrets (see site/README.md)."
+              echo "Git integration, or add the two secrets (see SITE.md)."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 

@@ -21,6 +21,9 @@ site/
 当成静态文件发给浏览器）。本地用 `python3 -m http.server` 预览时它们只是两个
 普通文件，看不到效果。
 
+`site/` 里的每个文件都会原样发布到公网——所以这份说明放在仓库根目录（和
+[README.md](README.md)、[TECH.md](TECH.md) 做邻居），不跟站点一起上线。
+
 ## 本地预览
 
 ```sh
@@ -119,7 +122,7 @@ done
 ## 改内容
 
 - 文案只在两个 `index.html` 里，改中文别忘了 `en/index.html`；命令列表、按键、
-  体积这些数字与 [README.md](../README.md) 保持一致，改一处记得改另一处。
+  体积这些数字与 [README.md](README.md) 保持一致，改一处记得改另一处。
 - `styles.css` 只做 Pico 变量之外的一点点事；能靠 Pico classless 解决的样式就
   别往这儿加。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
