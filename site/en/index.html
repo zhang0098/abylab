@@ -26,8 +26,8 @@
       <li><a href="/en/" class="brand"><strong>abylab</strong><span class="brand-dot">.ai</span></a></li>
     </ul>
     <ul>
-      <li><a href="#features">Features</a></li>
       <li><a href="#start">Quick start</a></li>
+      <li><a href="#features">Features</a></li>
       <li><a href="#commands">Commands</a></li>
       <li><a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a></li>
       <li><button type="button" id="theme-toggle" class="outline secondary toggler" aria-label="Toggle dark / light">◐</button></li>
@@ -51,6 +51,27 @@
     <p class="hint">Linux · macOS · installs to <code>~/.local/bin/abylab</code></p>
   </section>
 
+  <section id="start">
+    <h2>Quick start</h2>
+    <ol class="steps">
+      <li>
+        <p>Run this command in your terminal:</p>
+        <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code></pre>
+      </li>
+      <li>
+        <p>Grab an API key from <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a>.</p>
+      </li>
+      <li>
+        <p>Run <code>abylab</code> and log in once from the composer:</p>
+        <pre><code>/login sk-xxxxxxxx</code></pre>
+      </li>
+      <li>
+        <p>Type what you want done. That is the whole setup.</p>
+      </li>
+    </ol>
+    <p class="hint">Building from source instead: <code>cargo build --release</code>. The installer also takes <code>--bin-dir</code>, <code>--version</code>, <code>--no-path</code>, <code>--path-file</code> and <code>--help</code>.</p>
+  </section>
+
   <section id="features">
     <h2>Features</h2>
     <div class="grid">
@@ -71,27 +92,6 @@
         <p>Nine embedded palettes, mouse wheel and drag-to-copy, <code>@</code> file mentions, image paste, and three permission presets: <code>read-only</code>, <code>workspace-write</code>, <code>danger-full-access</code>.</p>
       </article>
     </div>
-  </section>
-
-  <section id="start">
-    <h2>Quick start</h2>
-    <ol class="steps">
-      <li>
-        <p>Run this command in your terminal:</p>
-        <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code></pre>
-      </li>
-      <li>
-        <p>Grab an API key from <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a>.</p>
-      </li>
-      <li>
-        <p>Run <code>abylab</code> and log in once from the composer:</p>
-        <pre><code>/login sk-xxxxxxxx</code></pre>
-      </li>
-      <li>
-        <p>Type what you want done. That is the whole setup.</p>
-      </li>
-    </ol>
-    <p class="hint">Building from source instead: <code>cargo build --release</code>. The installer also takes <code>--bin-dir</code>, <code>--version</code>, <code>--no-path</code>, <code>--path-file</code> and <code>--help</code>.</p>
   </section>
 
   <section id="commands">

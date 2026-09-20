@@ -26,8 +26,8 @@
       <li><a href="/" class="brand"><strong>abylab</strong><span class="brand-dot">.ai</span></a></li>
     </ul>
     <ul>
-      <li><a href="#features">特性</a></li>
       <li><a href="#start">快速开始</a></li>
+      <li><a href="#features">特性</a></li>
       <li><a href="#commands">命令</a></li>
       <li><a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a></li>
       <li><button type="button" id="theme-toggle" class="outline secondary toggler" aria-label="切换深色 / 浅色">◐</button></li>
@@ -51,6 +51,27 @@
     <p class="hint">支持 Linux · macOS · 安装到 <code>~/.local/bin/abylab</code></p>
   </section>
 
+  <section id="start">
+    <h2>快速开始</h2>
+    <ol class="steps">
+      <li>
+        <p>在你的终端中执行这个命令：</p>
+        <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code></pre>
+      </li>
+      <li>
+        <p>去 <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a> 取一个 API Key。</p>
+      </li>
+      <li>
+        <p>在终端里运行 <code>abylab</code>，然后在输入框里登录一次：</p>
+        <pre><code>/login sk-xxxxxxxx</code></pre>
+      </li>
+      <li>
+        <p>直接输入你的要求，开始工作。</p>
+      </li>
+    </ol>
+    <p class="hint">想从源码构建：<code>cargo build --release</code>。安装脚本支持 <code>--bin-dir</code>、<code>--version</code>、<code>--no-path</code>、<code>--path-file</code>、<code>--help</code>。</p>
+  </section>
+
   <section id="features">
     <h2>特性</h2>
     <div class="grid">
@@ -71,27 +92,6 @@
         <p>九个内置主题包、鼠标滚动与拖拽复制、<code>@</code> 文件提及、图片粘贴，以及 <code>read-only</code> / <code>workspace-write</code> / <code>danger-full-access</code> 三档权限。</p>
       </article>
     </div>
-  </section>
-
-  <section id="start">
-    <h2>快速开始</h2>
-    <ol class="steps">
-      <li>
-        <p>在你的终端中执行这个命令：</p>
-        <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"</code></pre>
-      </li>
-      <li>
-        <p>去 <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a> 取一个 API Key。</p>
-      </li>
-      <li>
-        <p>在终端里运行 <code>abylab</code>，然后在输入框里登录一次：</p>
-        <pre><code>/login sk-xxxxxxxx</code></pre>
-      </li>
-      <li>
-        <p>直接输入你的要求，开始工作。</p>
-      </li>
-    </ol>
-    <p class="hint">想从源码构建：<code>cargo build --release</code>。安装脚本支持 <code>--bin-dir</code>、<code>--version</code>、<code>--no-path</code>、<code>--path-file</code>、<code>--help</code>。</p>
   </section>
 
   <section id="commands">
