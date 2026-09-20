@@ -33,9 +33,35 @@ python3 -m http.server 8000 --directory site
 
 ## 部署到 Cloudflare Pages
 
-现状：项目 `abylab` 已经建好（Production branch = `main`），站点已经部署上去，
-生产地址 <https://abylab.pages.dev> 就是 `site/` 的内容（逐字节一致）。自定义
-域名 `abylab.ai` 已挂到项目上，卡在 **等待一条 DNS 记录**——见下面第 2 步。
+现状：**已经上线**。<https://abylab.ai> 与 <https://abylab.pages.dev> 都在服务
+`site/` 的内容（与本地逐字节一致，只有 `/index.html` 被 308 规范到 `/`）。
+项目 `abylab` 的 Production branch = `main`，Pages 对 `abylab.ai` 的域名校验
+已 active（Let's Encrypt 证书，SAN `abylab.ai` + `*.abylab.ai`）。
+
+### 0. 域名上的两个坑（都踩过了）
+
+**apex 必须 CNAME 到 `abylab.pages.dev`**，不能是一条指向 `192.0.2.1` 之类的 A
+记录。代理开着、记录存在，看起来一切正常，但边缘连不到源站，整站返回 **522**，
+同时 Pages 那边一直显示 `CNAME record not set`。另外在 dashboard 点
+"Add custom domain" 时 Cloudflare 会顺手建记录，而用 API 挂域名时**不会**。
+
+**zone 级 Web Analytics 会往 HTML 里塞 beacon**。abylab.ai 走的是 zone，所以
+Cloudflare 会对浏览器请求注入一段 `static.cloudflareinsights.com/beacon.min.js`
+（带 `data-cf-beacon` 和 SRI）。我们的 CSP 只有 `script-src 'self' 'unsafe-inline'`，
+于是这段脚本被拦（`requestfailed: csp`，`transferSize: 0`）——没有真的发出请求，
+但**每次加载都报一条 CSP 错误**，而统计也什么都收不到。二选一：
+
+- 想要"零第三方 + 干净控制台"：Analytics & Logs → Web Analytics 关掉该站点。
+- 想留统计：在 `_headers` 的 CSP 里放开来源，然后重新部署：
+
+  ```
+  script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com
+  connect-src https://cloudflareinsights.com
+  ```
+
+`www` 目前还没解析。要做 `www → apex` 的 301：DNS 加 `A www → 192.0.2.1`
+（Proxied）**并且**建 Bulk Redirect（`www.abylab.ai` → `https://abylab.ai`，301，
+勾 Subpath matching + Preserve query string）——只有记录没有跳转，www 会 522。
 
 ### 1. 部署
 
@@ -64,36 +90,30 @@ Workers & Pages → Create → Pages → Connect to Git → 选本仓库，然�
 （权限 Pages: Edit）和 `CLOUDFLARE_ACCOUNT_ID`，`.github/workflows/site.yml`
 就会在 `site/**` 有改动时用 wrangler 部署；没配 secret 时它自己跳过。
 
-### 2. 绑定域名
+### 2. 绑定域名（已完成，备份步骤）
 
-1. 自定义域名已经添加。剩下一条 DNS 记录：**DNS → Records → 添加**
+1. Pages 项目 → **Custom domains** → 添加 `abylab.ai`（已添加，校验 active）。
+2. DNS → Records 加一条 apex 记录：
 
    | Type | Name | Target | Proxy |
    | --- | --- | --- | --- |
    | CNAME | `@`（即 `abylab.ai`） | `abylab.pages.dev` | **Proxied** |
 
    apex 上用 CNAME 是可以的，Cloudflare 会做 flattening。记录一出现，Pages
-   那边的校验（`CNAME record not set`）就会通过并自动签发证书，不用再做别的。
-
-   注意：在 dashboard 里点 "Add custom domain" 时 Cloudflare 会顺手把这条记录
-   建好；通过 API 挂域名时它**不会**——所以要么在面板里加，要么用带
-   *Zone → DNS → Edit* 权限的 token 调
-   `POST /zones/{zone_id}/dns_records`。
-
-2. `www` 跳 apex（可选）：Cloudflare 官方做法是
-   DNS 加一条 `A www → 192.0.2.1`（**Proxied**），再建一个
-   **Bulk Redirect** 列表：`www.abylab.ai` → `https://abylab.ai`，状态 301，
-   勾上 *Subpath matching* 和 *Preserve query string*。
-   `_redirects` 里写不了带域名的整站跳转，所以这件事必须在 dashboard 做。
-3. **SSL/TLS → Edge Certificates → Always Use HTTPS** 打开。
+   那边 `CNAME record not set` 的校验就通过并自动签发证书。
+3. **SSL/TLS → Edge Certificates → Always Use HTTPS** 打开（`http://abylab.ai`
+   现在 301 到 https）。
 
 ### 3. 检查
 
 ```sh
-curl -sI https://abylab.pages.dev/ | head -12     # CSP 等头部、200
-curl -sI https://abylab.ai/ | head -3             # 域名生效后：200
-curl -sI https://www.abylab.ai/ | head -3         # 301 → https://abylab.ai/
+curl -sI https://abylab.ai/ | head -12            # 200 + CSP 等头部
+curl -sI http://abylab.ai/ | head -3              # 301 → https://abylab.ai/
 curl -s https://abylab.ai/install.sh | head -3    # 跟仓库里的脚本一致
+curl -sI https://abylab.ai/nope | head -1         # 404，且渲染我们的 404 页
+for f in index.html styles.css app.js vendor/pico.min.css; do
+  diff <(curl -s https://abylab.ai/$f) site/$f && echo "$f 一致"
+done
 ```
 
 ## 改内容
