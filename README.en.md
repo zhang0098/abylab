@@ -25,7 +25,7 @@ GC pauses.
 ## Quick start
 
 ```sh
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
+/bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
 abylab
 ```
 
