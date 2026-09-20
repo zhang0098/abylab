@@ -1839,7 +1839,12 @@ impl App {
                     }
                     return;
                 }
-                self.input.insert_str(&text.replace('\n', " "));
+                // The composer is multi-line (soft wrap, ctrl+j), so a paste
+                // keeps its line structure instead of being flattened to
+                // spaces. `insert_str` understands `\n`; normalize the stray
+                // CR-only endings some terminals (iTerm2 et al.) send.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.input.insert_str(&text);
                 self.reconcile_attachments();
                 self.needs_redraw = true;
             }
@@ -2744,7 +2749,10 @@ impl App {
 
         let ctx = crate::input::KeyCtx {
             input_empty: self.input.is_empty(),
-            history_active: false,
+            // While a history entry is on screen, ↑/↓ keep browsing it instead
+            // of moving inside the recalled draft; any edit clears `hist_pos`
+            // in the editor and hands the arrows back to cursor motion.
+            history_active: self.input.hist_pos.is_some(),
         };
         if let Some(action) = crate::input::classify(&key, ctx) {
             self.dispatch(action, ctl);
@@ -2940,7 +2948,15 @@ impl App {
             Action::JumpTail => self.scroll_up = 0,
             Action::CursorLeft => self.input.move_left(),
             Action::CursorRight => self.input.move_right(),
-            Action::CursorUp => self.input.move_up(),
+            Action::CursorUp => {
+                // ↑ at the draft's first visual row recalls the input history
+                // (the editor stashes the draft first, so ↓ restores it).
+                let before = self.input.cursor_char();
+                self.input.move_up();
+                if self.input.cursor_char() == before {
+                    self.history_prev_from_draft();
+                }
+            }
             Action::CursorDown => self.input.move_down(),
             Action::WordLeft => self.input.word_left(),
             Action::WordRight => self.input.word_right(),
@@ -3077,7 +3093,7 @@ impl App {
                     &key,
                     crate::input::KeyCtx {
                         input_empty: self.input.is_empty(),
-                        history_active: false,
+                        history_active: self.input.hist_pos.is_some(),
                     },
                 ),
                 Some(Action::ToggleTheme)
@@ -3689,6 +3705,26 @@ impl App {
                 self.input.stash = self.input.buf().clone();
                 self.input.history.len() - 1
             }
+            Some(0) => 0,
+            Some(p) => p - 1,
+        };
+        self.input.hist_pos = Some(pos);
+        self.input.set(self.input.history[pos].clone());
+    }
+
+    /// Recall history from a *non-empty* draft — ↑ at the draft's first visual
+    /// row, or on a dismissed `/` line. Unlike [`Self::history_prev`] this one
+    /// opens the history even while the draft holds text: the editor's stash
+    /// keeps that draft, and `↓` past the newest entry restores it.
+    fn history_prev_from_draft(&mut self) {
+        if self.input.history.is_empty() {
+            return;
+        }
+        if self.input.hist_pos.is_none() {
+            self.input.stash = self.input.buf().clone();
+        }
+        let pos = match self.input.hist_pos {
+            None => self.input.history.len() - 1,
             Some(0) => 0,
             Some(p) => p - 1,
         };
@@ -5846,8 +5882,65 @@ mod mode_tests {
             &ctl,
         );
 
-        assert_eq!(app.input.buf(), "hello world literal \u{1b}[99;5u");
+        // The composer is multi-line, so the pasted break survives (a CRLF or
+        // a bare CR from iTerm2-style terminals lands as a plain `\n`).
+        assert_eq!(
+            app.input.buf(),
+            "hello\nworld literal \u{1b}[99;5u",
+            "a paste keeps its line structure"
+        );
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn a_pasted_crlf_lands_as_one_newline_and_never_sends() {
+        let (mut app, ctl, _rx) = test_app();
+
+        app.handle(
+            AppEvent::Term(Event::Paste("fn main() {\r\n    run();\r\n}\r".to_string())),
+            &ctl,
+        );
+
+        assert_eq!(
+            app.input.buf(),
+            "fn main() {\n    run();\n}\n",
+            "CRLF and a trailing CR normalize to `\\n`"
+        );
+        assert!(
+            app.transcript.cells.is_empty(),
+            "a multi-line paste must not submit the draft"
+        );
+    }
+
+    /// ↑ recalls the input history from a *non-empty* draft once the caret is
+    /// already on the first visual row, and ↓ past the newest entry puts the
+    /// stashed draft back.
+    #[test]
+    fn up_at_the_first_row_recalls_history_and_down_restores_the_draft() {
+        let (mut app, ctl, _rx) = test_app();
+        app.input.history.push("first prompt".into());
+        app.input.history.push("second prompt".into());
+
+        app.input.set("half-typed".into());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "second prompt");
+        assert_eq!(app.input.hist_pos, Some(1));
+
+        // While browsing, ↑/↓ keep walking the history (no caret motion).
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "first prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "half-typed", "the draft was stashed");
+        assert_eq!(app.input.hist_pos, None);
+
+        // A multi-line draft moves the caret first; only the top row recalls.
+        app.input.set("one\ntwo".into());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "one\ntwo", "the caret stayed in the draft");
+        assert_eq!(app.input.hist_pos, None, "no recall while the caret moves");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "second prompt");
     }
 
     #[test]
