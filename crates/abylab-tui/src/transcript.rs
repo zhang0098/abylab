@@ -85,6 +85,13 @@ pub enum CellKind {
     MarkdownNotice {
         text: String,
     },
+    /// The startup splash: an ASCII wordmark plus the project URL, painted
+    /// once at the top of a fresh run. `art` rows keep their own spacing, so
+    /// they are painted verbatim (never re-wrapped).
+    Banner {
+        art: Vec<String>,
+        url: String,
+    },
 }
 
 pub struct Cell {
@@ -143,8 +150,9 @@ pub struct UsageTotals {
 }
 
 /// Native transcript timing/step facts used by session state and tests. The
-/// LLM usage/timing details surface through `/session` (and the Client-side
-/// `acpSessionStats` service for plugins), not a persistent status row.
+/// LLM usage/timing details surface through `/session` and `/status` (plus the
+/// Client-side `acpSessionStats` service for plugins) — never in a persistent
+/// row of its own: the composer frame ends at the input box.
 #[derive(Default, Clone, Copy)]
 pub struct SessionStats {
     pub turns: u64,
@@ -278,6 +286,12 @@ impl Transcript {
     pub fn push_markdown(&mut self, text: String) {
         self.cells
             .push(Cell::new(CellKind::MarkdownNotice { text }));
+    }
+
+    /// Push the startup splash: preformatted `art` rows plus the URL that
+    /// follows the mark (`App::push_banner`).
+    pub fn push_banner(&mut self, art: Vec<String>, url: String) {
+        self.cells.push(Cell::new(CellKind::Banner { art, url }));
     }
 
     /// Mark one client-owned queued prompt group as delivered.
@@ -1179,6 +1193,45 @@ impl Transcript {
                         emit(&mut out, &mut owners, l, None);
                     }
                 }
+                CellKind::Banner { art, url } => {
+                    emit(&mut out, &mut owners, Line::default(), None);
+                    // The mark and the URL share one centered column so the
+                    // splash reads as a block; rows wider than the pane (a
+                    // tiny terminal) fall back to the left margin.
+                    let widest = art
+                        .iter()
+                        .map(|row| row.width())
+                        .chain(std::iter::once(url.width()))
+                        .max()
+                        .unwrap_or(0);
+                    let pad = " ".repeat(width.saturating_sub(widest) / 2);
+                    for row in art {
+                        emit(
+                            &mut out,
+                            &mut owners,
+                            Line::from(vec![
+                                Span::raw(pad.clone()),
+                                Span::styled(row.clone(), Style::default().fg(theme.brand_soft)),
+                            ]),
+                            None,
+                        );
+                    }
+                    emit(&mut out, &mut owners, Line::default(), None);
+                    emit(
+                        &mut out,
+                        &mut owners,
+                        Line::from(vec![
+                            Span::raw(pad),
+                            Span::styled(
+                                url.clone(),
+                                Style::default()
+                                    .fg(theme.brand_soft)
+                                    .add_modifier(Modifier::UNDERLINED),
+                            ),
+                        ]),
+                        None,
+                    );
+                }
             }
         }
         TranscriptLayout {
@@ -2059,6 +2112,56 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(text.contains("/tmp/pic.png"), "fallback path shown: {text}");
+    }
+
+    #[test]
+    fn banner_splash_centers_the_mark_and_the_url() {
+        let theme = Theme::dark();
+        let mut tr = t("s");
+        tr.push_banner(
+            vec![
+                "▄▀█ █▄▄ █▄█ █   ▄▀█ █▄▄".into(),
+                "█▀█ █▄█  █  █▄▄ █▀█ █▄█".into(),
+            ],
+            "https://abylab.ai".into(),
+        );
+        let row = |layout: &TranscriptLayout, i: usize| -> String {
+            layout.lines[i]
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+
+        // 60 cols, mark 23 wide → 18 leading spaces keep both rows aligned.
+        let layout = tr.layout(&theme, 60, ' ', false);
+        let art_top = row(&layout, 1);
+        let art_bottom = row(&layout, 2);
+        assert_eq!(
+            art_top,
+            format!("{}{}", " ".repeat(18), "▄▀█ █▄▄ █▄█ █   ▄▀█ █▄▄")
+        );
+        assert_eq!(art_bottom.len() - art_bottom.trim_start().len(), 18);
+        // The URL shares the mark's left column, one blank row below.
+        assert!(
+            row(&layout, 3).trim().is_empty(),
+            "blank row under the mark"
+        );
+        assert_eq!(
+            row(&layout, 4),
+            format!("{}https://abylab.ai", " ".repeat(18))
+        );
+        // Art rows keep the brand tone; the URL is underlined.
+        let art_style = layout.lines[1].spans.last().expect("art span").style;
+        assert_eq!(art_style.fg, Some(theme.brand_soft));
+        let url_style = layout.lines[4].spans.last().expect("url span").style;
+        assert_eq!(url_style.fg, Some(theme.brand_soft));
+        assert!(url_style.add_modifier.contains(Modifier::UNDERLINED));
+
+        // Narrower than the mark: the splash falls back to the left margin
+        // instead of losing its head to padding.
+        let narrow = tr.layout(&theme, 20, ' ', false);
+        assert_eq!(row(&narrow, 1), "▄▀█ █▄▄ █▄█ █   ▄▀█ █▄▄");
     }
 
     #[test]

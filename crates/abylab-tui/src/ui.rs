@@ -102,27 +102,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         resolved_composer_height(main, app)
     };
-    // The stats dock rides below the box when the terminal is tall enough.
-    let stats_h = if !child_view && main.height >= 20 {
-        1
-    } else {
-        0
-    };
+    // The live counters the dock used to show (tokens, turns, timing) live in
+    // `/status` now, so the box's bottom row is the last row of the frame.
     let chat_h = main
         .height
-        .saturating_sub(composer_h + cap_h + stats_h + agents_h + gap_h);
+        .saturating_sub(composer_h + cap_h + agents_h + gap_h);
 
     let chat = Rect::new(main.x, main.y, main.width, chat_h);
     let chrome_y = main.y + chat_h + gap_h;
     let agents = Rect::new(main.x, chrome_y, main.width, agents_h);
     let composer_box = Rect::new(main.x, chrome_y + agents_h, main.width, cap_h + composer_h);
     let composer = Rect::new(main.x, composer_box.y + cap_h, main.width, composer_h);
-    let stats_dock = Rect::new(
-        main.x,
-        composer_box.y + composer_box.height,
-        main.width,
-        stats_h,
-    );
 
     draw_chat(f, app, chat);
     if agents_h > 0 {
@@ -134,9 +124,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_composer_box(f, app, composer_box);
     } else {
         draw_composer(f, app, composer);
-    }
-    if stats_h > 0 {
-        draw_stats_dock(f, app, stats_dock);
     }
     if !child_view {
         draw_slash_menu(f, app, composer, chat);
@@ -386,98 +373,6 @@ fn indent_wrapped(
         .collect()
 }
 
-/// The bottom stats dock: one compact row under the composer box — token
-/// flow, cache hit rate, turn/step counts and timing. Narrow terminals
-/// drop tail sections; zero-data sessions still render the row (zeros).
-fn draw_stats_dock(f: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme;
-    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
-    let inner = Rect::new(
-        area.x + 1,
-        area.y,
-        area.width.saturating_sub(2),
-        area.height,
-    );
-    if inner.width < 12 {
-        return;
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(stats_dock_spans(app, inner.width as usize))),
-        inner,
-    );
-}
-
-/// Compact key/value spans for the dock; the caller caps the width by
-/// dropping trailing sections.
-fn stats_dock_spans(app: &App, width: usize) -> Vec<Span<'static>> {
-    let theme = app.theme;
-    let u = app.transcript.usage;
-    let s = app.transcript.stats;
-    // u.input is total input including cache reads (driver maps Usage::input_tokens).
-    let cache_pct = if u.input > 0 {
-        (u.cached as f64 / u.input as f64 * 100.0).round() as u64
-    } else {
-        0
-    };
-    let sections: Vec<(String, String)> = vec![
-        (
-            "tokens".into(),
-            format!(
-                "↑{} ↓{} · cache {}%",
-                crate::app::fmt_tokens(u.input),
-                crate::app::fmt_tokens(u.output),
-                cache_pct
-            ),
-        ),
-        (
-            "turns".into(),
-            format!("{} turns · {} steps", s.turns, s.steps),
-        ),
-        (
-            "timing".into(),
-            format!(
-                "LLM {} · tool {}",
-                crate::app::fmt_duration(s.turn_millis),
-                crate::app::fmt_duration(s.tool_millis)
-            ),
-        ),
-        (
-            "ttft".into(),
-            format!(
-                "TTFT avg {}",
-                s.ttft_total_millis
-                    .checked_div(s.ttft_count)
-                    .map_or_else(|| "—".to_string(), crate::app::fmt_duration)
-            ),
-        ),
-    ];
-    let mut spans = vec![Span::raw(" ")];
-    let mut used = 2;
-    for (index, (key, value)) in sections.iter().enumerate() {
-        let mut section_width = key.width() + 3 + value.width();
-        if index > 0 {
-            section_width += 3; // " | "
-        }
-        if used + section_width > width.saturating_sub(2) {
-            break; // tail sections drop first on narrow terminals
-        }
-        if index > 0 {
-            spans.push(Span::styled(" | ", Style::default().fg(theme.border)));
-        }
-        spans.push(Span::styled(
-            format!("{key} · "),
-            Style::default().fg(theme.caption),
-        ));
-        spans.push(Span::styled(
-            value.clone(),
-            Style::default().fg(theme.fg_secondary),
-        ));
-        used += section_width;
-    }
-    spans.push(Span::raw(" "));
-    spans
-}
-
 fn draw_child_navigation(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
     let label = app
@@ -618,7 +513,7 @@ fn meta_line(app: &App, width: usize) -> Line<'static> {
         }
         compact.push(Span::styled(
             format!("{shown_model} "),
-            Style::default().fg(theme.brand_soft),
+            Style::default().fg(theme.fg_tertiary),
         ));
         let compact_width = span_widths(&compact);
         if lw + compact_width + 2 <= width {
@@ -626,7 +521,7 @@ fn meta_line(app: &App, width: usize) -> Line<'static> {
         } else if lw + shown_model.width() + 3 <= width {
             right_spans = vec![Span::styled(
                 format!("{shown_model} "),
-                Style::default().fg(theme.brand_soft),
+                Style::default().fg(theme.fg_tertiary),
             )];
         } else {
             right_spans = Vec::new();
@@ -721,9 +616,9 @@ fn status_title(app: &App) -> Line<'static> {
     }
     let theme = app.theme;
     let mut spans: Vec<Span> = Vec::new();
-    let key_style = Style::default()
-        .fg(theme.brand_soft)
-        .add_modifier(Modifier::BOLD);
+    // Chrome, not content: the mode label and its key hint share one plain
+    // tone — the accent that used to mark the key outshouted the value.
+    let key_style = Style::default().fg(theme.fg_tertiary);
     // Mode chips: folded from the durable event stream (same facts as the
     // Web UI chips). Stock defaults render until the host reports its own
     // facts, so the landing screen still advertises the permission preset.
@@ -812,9 +707,9 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
-/// Meta row, right side: contextual shortcut hints, model chip (brand
-/// accent), and the requested reasoning effort. Token flow lives in the
-/// usage footer; the session id lives in `/session`.
+/// Meta row, right side: contextual shortcut hints, the model id and the
+/// requested reasoning effort — plain chrome tones, no accent. Token flow
+/// lives in `/status`; the session id lives in `/session`.
 fn status_right(app: &App) -> Vec<Span<'static>> {
     let theme = app.theme;
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
@@ -835,7 +730,7 @@ fn status_right(app: &App) -> Vec<Span<'static>> {
             .unwrap_or_else(|| app.cfg.model.clone());
         spans.push(Span::styled(
             shown_model,
-            Style::default().fg(theme.brand_soft),
+            Style::default().fg(theme.fg_tertiary),
         ));
         if let Some(effort) = &app.modes.effort {
             spans.push(Span::styled(
@@ -1014,12 +909,14 @@ struct CapLine {
 }
 
 /// Priority: transient action feedback (a few seconds) → the live todo
-/// checklist → the rotating ambient hints. Only the todo line reports agent
-/// progress, so it holds the row between actions.
+/// checklist. The rotating usage hints that used to fall through here are
+/// gone — a new session greets with one in the timeline instead
+/// (`App::push_session_tip`) — so an idle cap line stays empty and only the
+/// workspace title on the right marks the row.
 fn cap_line(app: &App) -> CapLine {
     let theme = app.theme;
     if let Some((text, _)) = &app.tip {
-        // Action feedback reads brighter than the rotating hints.
+        // Action feedback reads brighter than the other cap states.
         return CapLine {
             line: Line::from(vec![
                 Span::raw(" "),
@@ -1034,22 +931,7 @@ fn cap_line(app: &App) -> CapLine {
     }
 
     CapLine {
-        line: Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                app.locale.tr("Tip", "提示").to_string(),
-                Style::default()
-                    .fg(theme.brand_soft)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            // Rotating hints read a tier below the chat body text above — the
-            // banner is furniture, not content. Gray-blue keeps it on-brand.
-            Span::styled(
-                format!(" · {}", app.locale.ambient_tip(app.ambient_tip_idx)),
-                Style::default().fg(theme.hint),
-            ),
-            Span::raw(" "),
-        ]),
+        line: Line::default(),
         chip: None,
     }
 }
@@ -1985,6 +1867,18 @@ pub(crate) fn dump_frame(app: &mut App, width: u16, height: u16) -> String {
     out
 }
 
+/// The composer cap row inside a dumped frame: the box's top border, which
+/// carries the left-hand title (feedback / todo) and the workspace on the
+/// right. Tests locate it by the corner glyph — the row has no fixed label
+/// any more, an idle cap is blank.
+#[cfg(test)]
+pub(crate) fn cap_row(frame: &str) -> &str {
+    frame
+        .lines()
+        .find(|line| line.contains('╭'))
+        .expect("composer cap row")
+}
+
 #[allow(dead_code)]
 pub fn theme_for(name: &str) -> Theme {
     match name {
@@ -2059,27 +1953,25 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
         let buf = terminal.backend().buffer().clone();
         let theme = app.theme;
-        // 80x20: the stats dock owns row 19, so the rounded box spans rows
-        // 14..18 — top border 14 (tip + · workspace), well 15..17, bottom
-        // border 18 carrying the meta row (`╰· Standard … ╯`).
-        assert_eq!(buf[(0, 14)].symbol(), "╭", "top-left corner");
-        assert_eq!(buf[(79, 14)].symbol(), "╮", "top-right corner");
-        assert_eq!(buf[(0, 18)].symbol(), "╰", "bottom-left corner");
-        assert_eq!(buf[(79, 18)].symbol(), "╯", "bottom-right corner");
-        assert_eq!(buf[(4, 14)].bg, theme.panel, "border row on the card");
-        assert_eq!(buf[(40, 15)].bg, theme.panel, "input well on panel surface");
+        // 80x20: the box is the last thing on screen — rows 15..19, top border
+        // 15 (tip + · workspace), well 16..18, bottom border 19 carrying the
+        // meta row (`╰· Standard … ╯`).
+        assert_eq!(buf[(0, 15)].symbol(), "╭", "top-left corner");
+        assert_eq!(buf[(79, 15)].symbol(), "╮", "top-right corner");
+        assert_eq!(buf[(0, 19)].symbol(), "╰", "bottom-left corner");
+        assert_eq!(buf[(79, 19)].symbol(), "╯", "bottom-right corner");
+        assert_eq!(buf[(4, 15)].bg, theme.panel, "border row on the card");
         assert_eq!(buf[(40, 16)].bg, theme.panel, "input well on panel surface");
-        assert_eq!(buf[(4, 17)].bg, theme.panel, "well fills the inner rows");
+        assert_eq!(buf[(40, 17)].bg, theme.panel, "input well on panel surface");
+        assert_eq!(buf[(4, 18)].bg, theme.panel, "well fills the inner rows");
         assert_eq!(
-            buf[(1, 18)].symbol(),
+            buf[(1, 19)].symbol(),
             "·",
             "meta row rides the bottom border with small dots"
         );
-        // The stats dock owns the row under the box.
-        assert!(
-            buf[(2, 19)].symbol() != "╭" && buf[(1, 19)].bg != theme.panel,
-            "stats dock rides row 19, not the card surface"
-        );
+        // The row between the conversation and the cap line stays plain
+        // background: no stats dock row replaced it.
+        assert_eq!(buf[(4, 14)].bg, theme.bg, "gap row stays plain background");
         assert_eq!(buf[(4, 9)].bg, theme.bg, "chat keeps the base background");
     }
 
@@ -2138,10 +2030,7 @@ mod tests {
         app.cfg.workspace = "/work/acme/projects/deepseek-harness-tui-plan-view".into();
 
         let frame = dump_frame(&mut app, 120, 20);
-        let cap = frame
-            .lines()
-            .find(|line| line.contains("Tip"))
-            .expect("composer cap");
+        let cap = cap_row(&frame);
 
         assert!(
             cap.contains("· /work/acme/projects/deepseek-harness-tui-plan-view"),
@@ -2211,10 +2100,7 @@ mod tests {
         app.git_branch = head_branch(&workspace);
 
         let frame = dump_frame(&mut app, 120, 20);
-        let cap = frame
-            .lines()
-            .find(|line| line.contains("Tip"))
-            .expect("composer cap");
+        let cap = cap_row(&frame);
 
         assert!(cap.contains(":feature/cap"), "{cap}");
         // Colon-tight: no space between the project path and the branch.
@@ -2238,10 +2124,7 @@ mod tests {
         app.git_branch = Some("feature/a-very-long-branch-name".into());
 
         let frame = dump_frame(&mut app, 60, 20);
-        let cap = frame
-            .lines()
-            .find(|line| line.contains("Tip"))
-            .expect("composer cap");
+        let cap = cap_row(&frame);
 
         assert!(cap.contains("· …/deepseek-harness"), "{cap}");
         assert!(
@@ -2256,10 +2139,7 @@ mod tests {
         app.cfg.workspace = "/work/acme/very-long-directory-name/deepseek-harness".into();
 
         let frame = dump_frame(&mut app, 60, 20);
-        let cap = frame
-            .lines()
-            .find(|line| line.contains("Tip"))
-            .expect("composer cap");
+        let cap = cap_row(&frame);
 
         assert!(cap.contains("· …/deepseek-harness"), "{cap}");
     }
@@ -2388,7 +2268,7 @@ mod tests {
     }
 
     /// A live todo checklist takes over the composer cap with the task in
-    /// progress plus completed/total, in place of the ambient tip rotation.
+    /// progress plus completed/total.
     #[test]
     fn composer_cap_shows_the_live_todo_checklist() {
         let mut app = test_app();
@@ -2406,7 +2286,8 @@ mod tests {
     }
 
     /// Transient action feedback owns the cap row for its TTL, then the todo
-    /// checklist reclaims it; a cleared checklist restores the ambient tips.
+    /// checklist reclaims it; with neither, the row goes blank — the usage
+    /// hints it used to rotate now greet a new session in the timeline.
     #[test]
     fn composer_cap_prefers_feedback_then_the_todo_checklist() {
         let mut app = test_app();
@@ -2435,9 +2316,14 @@ mod tests {
 
         app.plan = None;
         let frame = dump_frame(&mut app, 120, 20);
+        let cap = cap_row(&frame);
         assert!(
-            frame.lines().any(|line| line.contains("Tip")),
-            "an empty checklist falls back to the ambient hints:\n{frame}"
+            !cap.contains("Tip") && !cap.contains("Todo") && !cap.contains("copied"),
+            "an idle cap carries no title:\n{cap}"
+        );
+        assert!(
+            cap.contains("/tmp"),
+            "the workspace title still marks the row:\n{cap}"
         );
     }
 
@@ -2805,8 +2691,10 @@ mod tests {
         assert!(bound_right.contains("high"), "{bound_right}");
     }
 
+    /// The mode label and its `shift+tab` hint share one plain chrome tone:
+    /// the key is neither accented nor bold any more.
     #[test]
-    fn status_shortcut_hints_follow_their_values_and_use_key_styling() {
+    fn status_mode_hint_renders_plain_next_to_its_value() {
         let flat = |line: &Line| -> String {
             line.spans
                 .iter()
@@ -2838,20 +2726,59 @@ mod tests {
             .filter(|span| span.content.contains('+'))
             .collect::<Vec<_>>();
         assert_eq!(key_spans.len(), 1, "{en}");
-        assert!(key_spans.iter().all(|span| {
-            span.style.fg == Some(app.theme.brand_soft)
-                && span.style.add_modifier.contains(Modifier::BOLD)
-        }));
         let value_spans = en_line
             .spans
             .iter()
             .filter(|span| span.content.contains("Workspace Write"))
             .collect::<Vec<_>>();
         assert_eq!(value_spans.len(), 1, "{en}");
-        assert!(value_spans
-            .iter()
-            .all(|span| span.style.fg == Some(app.theme.fg_tertiary)));
-        assert_ne!(key_spans[0].style.fg, value_spans[0].style.fg);
+        for span in key_spans.iter().chain(value_spans.iter()) {
+            assert_eq!(
+                span.style.fg,
+                Some(app.theme.fg_tertiary),
+                "plain tone for {:?}",
+                span.content
+            );
+            assert!(
+                !span.style.add_modifier.contains(Modifier::BOLD),
+                "no emphasis on {:?}",
+                span.content
+            );
+        }
+    }
+
+    /// The model id on the meta row's right side is plain chrome too: no
+    /// accent in the full row and none in the compact fallback.
+    #[test]
+    fn meta_row_model_id_renders_plain() {
+        let mut app = test_app();
+        app.cfg.model = "deepseek-chat".into();
+        app.input
+            .set("a draft long enough to squeeze the right side ".repeat(4));
+        // 200 cols keeps the whole right side, 40 takes the model-only
+        // fallback, 30 drops it (left chrome + id no longer fit) — the id is
+        // plain wherever it survives.
+        for (width, shown) in [(200usize, true), (40, true), (30, false)] {
+            let line = meta_line(&app, width);
+            let spans: Vec<(String, Style)> = line
+                .spans
+                .iter()
+                .filter(|span| span.content.contains("deepseek"))
+                .map(|span| (span.content.to_string(), span.style))
+                .collect();
+            assert_eq!(spans.is_empty(), !shown, "model at width {width}");
+            for (content, style) in spans {
+                assert_eq!(
+                    style.fg,
+                    Some(app.theme.fg_tertiary),
+                    "{content:?} stays plain at width {width}"
+                );
+                assert!(
+                    !style.add_modifier.contains(Modifier::BOLD),
+                    "{content:?} is not emphasised at width {width}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3094,7 +3021,9 @@ mod tests {
         assert!(!tail.contains("session 00"), "head scrolled away:\n{tail}");
         assert!(tail.contains("█"), "scrollbar thumb shown:\n{tail}");
         assert!(tail.contains("╰"), "bottom corners intact:\n{tail}");
-        assert_eq!(app.picker_page_rows, 10, "page size = visible rows");
+        // 11 rows: the inset band above the composer, one row taller since the
+        // stats dock no longer takes the row below the box.
+        assert_eq!(app.picker_page_rows, 11, "page size = visible rows");
     }
 
     #[test]
