@@ -87,9 +87,38 @@ curl -s https://abylab.ai/install.sh | head -3   # 跟仓库里的脚本一致
 - `styles.css` 只做 Pico 变量之外的一点点事；能靠 Pico classless 解决的样式就
   别往这儿加。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
-- 升级 Pico：
 
-  ```sh
-  curl -fsSL -o site/vendor/pico.min.css \
-    https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css
-  ```
+## 自托管的 Pico
+
+页面只引 `/vendor/pico.min.css`，没有任何 CDN、webfont 或第三方请求：整站唯一
+的 origin 就是站点自己。这份文件就是官方 npm 包里的那一份，逐字节一致：
+
+```
+版本    Pico CSS v2.1.1（MIT，版权声明写在文件头的注释里）
+sha256  fbc9a63fc9fc9f72d12fd7fc9806e11fa9f77ae4f9cad146b27003a1119ba3db
+大小    83,319 字节
+```
+
+它内部没有 `@import`，所有 `url()` 都是内嵌的 `data:image/svg+xml`（自带的表单
+控件图标），所以自托管之后不会再往外发请求。升级时从 npm registry 取包（不经
+CDN），并核对 `css/pico.min.css` 的哈希：
+
+```sh
+ver=2.1.1
+curl -fsSL -o /tmp/pico.tgz "https://registry.npmjs.org/@picocss/pico/-/pico-$ver.tgz"
+tar xzOf /tmp/pico.tgz package/css/pico.min.css > site/vendor/pico.min.css
+sha256sum site/vendor/pico.min.css      # 与上面那行比对，然后更新这里的版本号
+```
+
+版本号和哈希同时写在上面这个块里和本文件开头的目录清单里，升级后两处都要改。
+
+想确认线上确实没有任何外链，抓一下页面里的静态资源引用就够了——它们必须全
+是本站路径（`canonical` / `alternate` 是给搜索引擎看的声明，不是会去请求的
+资源，所以排除掉）：
+
+```sh
+curl -s https://abylab.ai/ \
+  | grep -Eo '<(link|script)[^>]*(href|src)="[^"]*"' \
+  | grep -vE 'rel="(canonical|alternate)"' | grep -v '"[/]' \
+  || echo "no external assets"
+```
