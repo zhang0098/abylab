@@ -531,7 +531,7 @@ fn meta_line(app: &App, width: usize) -> Line<'static> {
         let mut compact = Vec::new();
         if app.scroll_up > 0 {
             compact.push(Span::styled(
-                format!("↓{} · ", app.scroll_up),
+                format!("↓ {} · ", app.scroll_up),
                 Style::default().fg(theme.caption),
             ));
         }
@@ -761,7 +761,7 @@ fn status_right(app: &App) -> Vec<Span<'static>> {
     }
     if app.scroll_up > 0 {
         spans.push(Span::styled(
-            format!("↓{} · ", app.scroll_up),
+            format!("↓ {} · ", app.scroll_up),
             Style::default().fg(theme.caption),
         ));
     }
