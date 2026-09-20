@@ -150,7 +150,7 @@ lands in the transcript — same chrome as `/help` and `/keys`.
 
 ## Keys
 
-enter send/queue · ctrl+x send-now · esc interrupt / 2×clear draft ·
+enter send/queue · ctrl+enter send-now · esc interrupt / 2×clear draft ·
 ctrl+c clear/quit · ↑ history · `/` commands · `@` file mention ·
 ctrl+z / ctrl+shift+z undo / redo · ctrl+p model · ctrl+t theme
 
@@ -167,7 +167,7 @@ progress chip (`2/5 done`) opens the full checklist in a dialog; esc closes it.
 With neither, the row stays blank.
 
 Usage hints no longer live in that row: a new session (launch, `/new`) opens
-the transcript with one rotating hint (esc interrupts, ctrl+x steers, the token
+the transcript with one rotating hint (esc interrupts, ctrl+enter steers, the token
 counters in `/status`, …), and the next session moves on to the next one. The
 full list stays in `/help` and `/keys`.
 

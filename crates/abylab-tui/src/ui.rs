@@ -675,10 +675,11 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
     let pairs: Vec<(&str, &str)> = match (running, app.input.is_empty()) {
         // Working, nothing typed: the only move is stopping it.
         (true, true) => vec![("esc", app.locale.tr("interrupt", "中断"))],
-        // Working with a draft: enter queues; ^x steers without cancellation.
+        // Working with a draft: enter queues; ctrl+⏎ steers without
+        // cancellation (ctrl+x cuts the selection instead).
         (true, false) => vec![
             ("⏎", app.locale.tr("queue", "排队")),
-            ("^x", "steer"),
+            ("ctrl+⏎", "steer"),
             ("esc", app.locale.tr("interrupt", "中断")),
         ],
         // Idle, empty: nothing to hint at. The `^K keys` discovery chip that
@@ -1296,8 +1297,8 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
             _ => app
                 .locale
                 .tr(
-                    "queue a follow-up — ctrl+x steers now",
-                    "输入后续消息 — ctrl+x 立即 steer",
+                    "queue a follow-up — ctrl+enter steers now",
+                    "输入后续消息 — ctrl+enter 立即 steer",
                 )
                 .to_string(),
         };
@@ -2808,7 +2809,7 @@ mod tests {
         app.input.set("follow-up".into());
         let s = flat(context_hints(&app));
         assert!(
-            s.contains("⏎ queue") && s.contains("^x steer") && s.contains("esc interrupt"),
+            s.contains("⏎ queue") && s.contains("ctrl+⏎ steer") && s.contains("esc interrupt"),
             "{s}"
         );
     }

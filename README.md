@@ -57,7 +57,7 @@ iceberg · kanagawa · solarized · tomorrow）。
 
 ## 按键
 
-enter 发送/排队 · ctrl+x 立即发送 · esc 中断 / 双击清空草稿 ·
+enter 发送/排队 · ctrl+enter 立即发送 · esc 中断 / 双击清空草稿 ·
 ctrl+c 清空/退出 · ↑ 历史 · `/` 命令 · `@` 文件提及 ·
 ctrl+z / ctrl+shift+z 撤销/重做 · ctrl+p 模型 · ctrl+t 主题
 
@@ -71,7 +71,7 @@ Shift+Tab 循环切换预设。
 esc 关闭。空闲时这一行留空。
 
 使用提示不常驻输入框：每次新会话（启动、`/new`）在对话区开头给出一条轮换的
-提示（esc 中断、ctrl+x steer、`/status` 里的 token 用量……），下一条会话换成
+提示（esc 中断、ctrl+enter steer、`/status` 里的 token 用量……），下一条会话换成
 下一条；完整清单见 `/help` 和 `/keys`。
 
 启动时对话区最上面是 ASCII wordmark 加项目地址 `https://abylab.ai`（居中），

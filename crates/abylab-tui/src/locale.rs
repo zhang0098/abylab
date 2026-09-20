@@ -71,7 +71,7 @@ impl Locale {
     pub fn session_tip(self, index: usize) -> &'static str {
         const EN: [&str; 7] = [
             "esc interrupts a running turn — your draft survives",
-            "enter queues a follow-up; ctrl+x steers the active turn now",
+            "enter queues a follow-up; ctrl+enter steers the active turn now",
             "click a tool to expand it · wheel always scrolls the conversation",
             "token usage + cache hit rate live in /status · it also names the session",
             "answers render markdown: headings, code, links, and images",
@@ -80,7 +80,7 @@ impl Locale {
         ];
         const ZH: [&str; 7] = [
             "esc 可中断当前轮次，草稿会保留",
-            "enter 会排队后续消息；ctrl+x 立即 steer 当前轮次",
+            "enter 会排队后续消息；ctrl+enter 立即 steer 当前轮次",
             "点击工具可展开 · 滚轮始终滚动对话",
             "token 用量和缓存命中率见 /status · 会话身份也在那里",
             "回答支持 Markdown：标题、代码、链接和图片",

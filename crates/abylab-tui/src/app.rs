@@ -3894,7 +3894,8 @@ impl App {
         let text = if self.locale == Locale::Zh {
             "\
 - enter · 发送；当前轮次运行时将后续消息排队
-- ctrl+x · 立即 steer 当前轮次
+- ctrl+enter · 立即 steer 当前轮次（老终端会退化成普通 enter）
+- ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 中断（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
 - shift+tab · 轮换权限预设 · /permission 打开选择器
@@ -3920,7 +3921,8 @@ token 用量（含缓存命中）以及轮次结束原因。"
         } else {
             "\
 - enter · send · queues a follow-up while a turn runs
-- ctrl+x · steer the active turn immediately
+- ctrl+enter · steer the active turn immediately (legacy terminals fall back to plain enter)
+- ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · interrupt (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
 - shift+tab · cycle permission (workspace-write ⇄ full access) · /permission opens the preset picker
@@ -4169,7 +4171,7 @@ impl App {
         if running {
             self.queued += 1;
             self.queued_cells.push_back(vec![cell]);
-            self.show_tip("queued — lands after this turn · ctrl+x would send now");
+            self.show_tip("queued — lands after this turn · ctrl+enter would send now");
         } else {
             self.prompt_pending = true;
             self.state = RunState::Starting;
@@ -4590,7 +4592,7 @@ mod resume_tests {
         assert_eq!(overlay.title, "Help");
         let frame = crate::ui::dump_frame(&mut app, 100, 34);
         assert!(frame.contains("Help · ↑↓/wheel scroll"), "modal:\n{frame}");
-        assert!(frame.contains("ctrl+x"), "binding missing:\n{frame}");
+        assert!(frame.contains("ctrl+enter"), "binding missing:\n{frame}");
         assert!(frame.contains("!cmd"), "shell hint missing:\n{frame}");
         assert!(
             !frame.contains("## help"),
@@ -7301,7 +7303,7 @@ mod right_slot_tests {
         app.run_slash("new", "", &ctl);
         assert_eq!(
             greeting(&app),
-            "- **Tip** · enter queues a follow-up; ctrl+x steers the active turn now"
+            "- **Tip** · enter queues a follow-up; ctrl+enter steers the active turn now"
         );
     }
 }

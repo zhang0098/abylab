@@ -874,6 +874,16 @@ pub const MOUSE_ROWS: &[MouseRow] = &[
         desc_zh: "点击展开/折叠工具 · 滚轮滚动",
     },
     MouseRow {
+        chords: &["click 2/5"],
+        desc_en: "open the todo checklist behind the composer cap chip",
+        desc_zh: "打开输入框上沿进度芯片（2/5）的完整清单",
+    },
+    MouseRow {
+        chords: &["click ↥"],
+        desc_en: "jump to your prompt on the composer cap's right end",
+        desc_zh: "跳到输入框上沿右端的 ↥ 处（你上一条输入）",
+    },
+    MouseRow {
         chords: &["drag"],
         desc_en: "select text · copies on release",
         desc_zh: "拖动选择文本，松开即复制",
