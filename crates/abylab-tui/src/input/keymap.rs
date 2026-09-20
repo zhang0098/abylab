@@ -21,6 +21,8 @@ pub enum Action {
     ToggleTheme,
     ToggleExpandAll,
     SendNow,
+    /// `⌥↑`: pick one queued follow-up to edit in the composer.
+    EditQueuedPrompt,
     AttachClipboard,
     ModelPicker,
     CyclePermission,
@@ -146,6 +148,10 @@ pub fn classify(key: &KeyEvent, ctx: KeyCtx) -> Option<Action> {
         // esc-b/esc-f: ⌥←/⌥→ in most macOS terminals (option-as-meta).
         KeyCode::Char('b') if alt => WordLeft,
         KeyCode::Char('f') if alt => WordRight,
+
+        // ⌥↑ edits a queued follow-up (Martty's EditQueuedPrompt). Plain ↑
+        // keeps browsing history, so the modified chord is what claims it.
+        KeyCode::Up if alt => EditQueuedPrompt,
 
         // --- scrolling ----------------------------------------------------
         KeyCode::PageUp => PageUp,
@@ -363,6 +369,16 @@ pub const KEY_ROWS: &[KeyRow] = &[
             p(KeyCode::Enter, CTRL, false),
             p(KeyCode::Enter, SUPER, false),
         ],
+    },
+    KeyRow {
+        action: EditQueuedPrompt,
+        group: KeyGroup::Send,
+        chords_mac: &["⌥↑"],
+        chords_other: &["alt+↑"],
+        ctx: CtxNote::Always,
+        desc_en: "choose a queued follow-up to edit",
+        desc_zh: "选择一条排队消息编辑",
+        probes: &[p(KeyCode::Up, ALT, true)],
     },
     KeyRow {
         action: Esc,

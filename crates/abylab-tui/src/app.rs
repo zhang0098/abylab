@@ -536,6 +536,8 @@ pub enum PickerKind {
     Permission,
     Session,
     Subagent,
+    /// `⌥↑`: pick one client-queued prompt to edit in the composer.
+    Queue,
 }
 
 #[derive(Clone)]
@@ -781,9 +783,13 @@ pub struct App {
     pub quit: bool,
     pub queued: usize,
     /// Transcript cells grouped by the client FIFO prompt that owns them.
-    queued_cells: VecDeque<Vec<usize>>,
-    /// Send Now bubbles awaiting the concurrent ACP request result.
-    pending_steer_cells: HashMap<u64, Vec<usize>>,
+    /// Client-owned FIFO of prompts waiting for the active turn to end; `queued`
+    /// mirrors its length, and the queue is what `⌥↑` edits.
+    prompt_queue: VecDeque<QueuedPrompt>,
+    /// The queued prompt loaded back into the composer for editing (`⌥↑`).
+    queue_edit: Option<QueueEditState>,
+    /// Send Now bubbles awaiting the driver's settlement.
+    pending_steer_cells: HashMap<u64, PendingSteer>,
     next_prompt_id: u64,
     /// A first prompt was handed to the controller but has not reached the
     /// ACP request task yet. Runtime startup alone does not make a turn busy.
@@ -825,6 +831,35 @@ fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
 enum StagedBlock {
     Text(String),
     Image(crate::attachments::Attachment),
+}
+
+/// One client-owned queued prompt: the blocks (text and/or staged images)
+/// waiting for the active turn to end, plus the transcript cells echoing them
+/// (marked queued until the prompt is actually sent).
+///
+/// The queue lives here rather than in the driver's command channel so a
+/// queued prompt stays addressable: `⌥↑` lists it, Enter loads it back into
+/// the composer for editing, and an empty-draft Enter promotes the head into
+/// the active turn (Martty's client-owned FIFO).
+pub(crate) struct QueuedPrompt {
+    id: u64,
+    blocks: Vec<StagedBlock>,
+    cells: Vec<usize>,
+}
+
+/// A Send Now bubble awaiting settlement: the echo cells to re-tint (or to
+/// hand back to the queue) plus the blocks themselves, so a deferred steer
+/// requeues as the very prompt the user sent — images included.
+struct PendingSteer {
+    cells: Vec<usize>,
+    blocks: Vec<StagedBlock>,
+}
+
+/// The queued prompt currently loaded into the composer for editing.
+pub(crate) struct QueueEditState {
+    prompt_id: u64,
+    /// `ctrl+d` arms before it deletes: the first press asks, the second does.
+    delete_confirm: bool,
 }
 
 fn token_spans_in(
@@ -954,12 +989,44 @@ fn image_part_from(att: &crate::attachments::Attachment) -> crate::bus::ImagePar
     }
 }
 
-fn prompt_blocks_from_staged(staged: Vec<StagedBlock>) -> Vec<crate::bus::PromptBlock> {
+/// One-line label for a queued prompt: its first non-blank text line plus a
+/// count of the images riding along (Martty's queue rows).
+fn queue_prompt_summary(blocks: &[StagedBlock]) -> String {
+    let mut text = String::new();
+    let mut images = 0usize;
+    for block in blocks {
+        match block {
+            StagedBlock::Text(part) => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(part);
+            }
+            StagedBlock::Image(_) => images += 1,
+        }
+    }
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut label = clamp_str(line, 48).to_string();
+    match (images, label.is_empty()) {
+        (0, _) => label,
+        (n, true) => format!("[{n} image]"),
+        (n, false) => {
+            label.push_str(&format!(" [+{n} image]"));
+            label
+        }
+    }
+}
+
+fn prompt_blocks_from_staged(staged: &[StagedBlock]) -> Vec<crate::bus::PromptBlock> {
     staged
-        .into_iter()
+        .iter()
         .map(|block| match block {
-            StagedBlock::Text(text) => crate::bus::PromptBlock::Text(text),
-            StagedBlock::Image(att) => crate::bus::PromptBlock::Image(image_part_from(&att)),
+            StagedBlock::Text(text) => crate::bus::PromptBlock::Text(text.clone()),
+            StagedBlock::Image(att) => crate::bus::PromptBlock::Image(image_part_from(att)),
         })
         .collect()
 }
@@ -1066,7 +1133,8 @@ impl App {
             session_bound: true,
             quit: false,
             queued: 0,
-            queued_cells: VecDeque::new(),
+            prompt_queue: VecDeque::new(),
+            queue_edit: None,
             pending_steer_cells: HashMap::new(),
             next_prompt_id: 1,
             prompt_pending: false,
@@ -1519,14 +1587,28 @@ impl App {
                 self.quit = true;
             }
             AppEvent::Term(term) => self.handle_term(term, ctl),
-            AppEvent::Ui(ui) => self.apply_ui(ui),
+            AppEvent::Ui(ui) => {
+                // The turn that a queued prompt waited behind has ended: hand
+                // the FIFO head to the driver. Read the fact before `apply_ui`
+                // folds it (the fold clears the run state).
+                let idle = matches!(
+                    &ui,
+                    crate::events::UiEvent::SessionStatus { session, running: false }
+                        if *session == self.session_id
+                );
+                self.apply_ui(ui);
+                if idle {
+                    self.dispatch_next_queued(ctl);
+                }
+            }
             AppEvent::RuntimeStderr(_line) => {
                 // kept in proto's tail buffer for diagnostics; stay quiet here
             }
             AppEvent::RuntimeExited(code) => {
                 self.prompt_pending = false;
                 self.queued = 0;
-                self.queued_cells.clear();
+                self.prompt_queue.clear();
+                self.queue_edit = None;
                 self.pending_steer_cells.clear();
                 if self.state != RunState::Idle {
                     self.state = RunState::Idle;
@@ -1558,28 +1640,23 @@ impl App {
                         }
                     }
                     CtlEvent::PromptQueued { .. } => {
-                        let started_queued_prompt = !self.prompt_pending && self.queued > 0;
+                        // The driver picked a prompt up: the turn is running.
+                        // Queued items in the client's FIFO are dispatched on
+                        // the idle status, not here.
                         self.prompt_pending = false;
                         if self.state == RunState::Starting {
                             self.state = RunState::Running;
                         }
                         self.state_note.clear();
-                        if started_queued_prompt {
-                            self.queued = self.queued.saturating_sub(1);
-                            if let Some(cells) = self.queued_cells.pop_front() {
-                                self.transcript.mark_prompt_delivered(&cells);
-                            }
-                        }
                     }
                     CtlEvent::SteerSettled {
                         message_id,
                         deferred,
                     } => {
-                        if let Some(cells) = self.pending_steer_cells.remove(&message_id) {
+                        if let Some(pending) = self.pending_steer_cells.remove(&message_id) {
                             if deferred {
-                                self.transcript.mark_prompt_queued(&cells);
-                                self.queued += 1;
-                                self.queued_cells.push_back(cells);
+                                self.transcript.mark_prompt_queued(&pending.cells);
+                                self.enqueue_prompt(pending.blocks, pending.cells);
                                 self.show_tip(
                                     "agent deferred Send Now — queued after the active turn",
                                 );
@@ -2920,6 +2997,16 @@ impl App {
             }
         }
 
+        // The queue editor owns ctrl+d while an item is loaded (the keymap
+        // would read it as delete-forward): first press arms, second deletes.
+        if self.queue_edit.is_some()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('d')
+        {
+            self.delete_queue_edit(ctl);
+            return;
+        }
+
         let ctx = crate::input::KeyCtx {
             input_empty: self.input.is_empty(),
             // While a history entry is on screen, ↑/↓ keep browsing it instead
@@ -3087,6 +3174,20 @@ impl App {
             }
             Action::Newline => self.input.insert_newline(),
             Action::Enter => {
+                // The queue editor owns enter: it saves the edited item
+                // instead of sending it.
+                if self.queue_edit.is_some() {
+                    self.save_queue_edit(ctl);
+                    return;
+                }
+                // An empty draft promotes the FIFO head into the active turn.
+                if self.input.is_empty()
+                    && self.pending_images.is_empty()
+                    && !self.prompt_queue.is_empty()
+                {
+                    self.send_queue_head_now(ctl);
+                    return;
+                }
                 let menu = self.slash_matches();
                 if !menu.is_empty() {
                     let entry = menu[self.slash_sel.min(menu.len() - 1)].clone();
@@ -3134,6 +3235,7 @@ impl App {
                 });
             }
             Action::SendNow => self.send_now(ctl),
+            Action::EditQueuedPrompt => self.open_queue_selector(),
             Action::AttachClipboard => self.clip_image("", ctl),
             Action::ModelPicker => self.open_model_picker(ctl),
             Action::CyclePermission => self.cycle_permission(ctl),
@@ -3349,6 +3451,7 @@ impl App {
                     PickerKind::Theme => self.select_palette(&item.id),
                     PickerKind::Permission => self.set_permission(item.id, ctl),
                     PickerKind::Session => self.load_acp_session(&item.id, ctl),
+                    PickerKind::Queue => self.begin_queue_edit(&item.id, ctl),
                     PickerKind::Subagent => {
                         self.active_subagent = if item.id == self.session_id {
                             None
@@ -3469,6 +3572,246 @@ impl App {
         });
     }
 
+    /// `⌥↑` — pick one queued prompt to edit (Martty's queue selector). The
+    /// composer must be free: the chosen item is loaded into it.
+    fn open_queue_selector(&mut self) {
+        if self.prompt_queue.is_empty() {
+            self.show_tip(
+                self.locale
+                    .tr("no queued prompt to edit", "没有可编辑的排队消息"),
+            );
+            return;
+        }
+        if !self.input.is_empty() || !self.pending_images.is_empty() {
+            self.show_tip(self.locale.tr(
+                "send or clear the current draft before editing the queue",
+                "编辑队列前请先发送或清空当前草稿",
+            ));
+            return;
+        }
+        let editing = self.queue_edit.as_ref().map(|edit| edit.prompt_id);
+        let items: Vec<PickerItem> = self
+            .prompt_queue
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| PickerItem {
+                id: prompt.id.to_string(),
+                label: queue_prompt_summary(&prompt.blocks),
+                meta: format!(
+                    "#{} · {}",
+                    index + 1,
+                    if editing == Some(prompt.id) {
+                        self.locale.tr("editing", "编辑中")
+                    } else {
+                        self.locale.tr("queued", "排队中")
+                    }
+                ),
+                provider: None,
+            })
+            .collect();
+        let sel = editing
+            .and_then(|id| items.iter().position(|item| item.id == id.to_string()))
+            .unwrap_or(0);
+        self.picker = Some(Picker {
+            kind: PickerKind::Queue,
+            title: self
+                .locale
+                .tr(
+                    " queued prompts · ↑/↓ select · enter edit · esc close ",
+                    " 排队消息 · ↑/↓ 选择 · enter 编辑 · esc 关闭 ",
+                )
+                .into(),
+            sel,
+            items,
+        });
+    }
+
+    /// Load one queued prompt back into the composer. The item keeps its FIFO
+    /// slot (marked "editing") together with its original blocks: save
+    /// replaces them, delete drops them, cancel leaves them alone — nothing
+    /// can be sent twice.
+    fn begin_queue_edit(&mut self, id: &str, _ctl: &Controller) {
+        /// What the rebuild needs from one queued block: attachments cannot be
+        /// cloned (only their payloads are cheap `Arc`s), and `stage_image`
+        /// wants `&mut self`, so the item is read out before the borrow ends.
+        enum Piece {
+            Text(String),
+            Image(String, String, String, Vec<u8>),
+        }
+        let Some((prompt_id, pieces)) = self
+            .prompt_queue
+            .iter()
+            .find(|prompt| prompt.id.to_string() == id)
+            .map(|prompt| {
+                let pieces: Vec<Piece> = prompt
+                    .blocks
+                    .iter()
+                    .map(|block| match block {
+                        StagedBlock::Text(text) => Piece::Text(text.clone()),
+                        StagedBlock::Image(att) => Piece::Image(
+                            att.name.clone(),
+                            att.path.clone(),
+                            att.media_type.clone(),
+                            att.data.to_vec(),
+                        ),
+                    })
+                    .collect();
+                (prompt.id, pieces)
+            })
+        else {
+            self.show_tip(
+                self.locale
+                    .tr("queued prompt already left the queue", "这条消息已离开队列"),
+            );
+            return;
+        };
+        // Rebuild the draft from the item's blocks. Images are staged afresh
+        // (their tokens and the tray entries behind them are new), so the edit
+        // owns its attachments outright and cancel can leave the queue alone.
+        self.input.clear();
+        for piece in pieces {
+            match piece {
+                Piece::Text(text) => self.input.insert_str(&text),
+                Piece::Image(name, path, media_type, data) => {
+                    self.stage_image(name, path, media_type, data, String::new())
+                }
+            }
+        }
+        self.queue_edit = Some(QueueEditState {
+            prompt_id,
+            delete_confirm: false,
+        });
+        self.reconcile_attachments();
+        self.show_tip(self.locale.tr(
+            "editing queued prompt · enter save · ctrl+d delete · esc cancel",
+            "编辑排队消息 · enter 保存 · ctrl+d 删除 · esc 取消",
+        ));
+    }
+
+    /// Enter while editing: replace the queued item with the edited draft.
+    fn save_queue_edit(&mut self, ctl: &Controller) {
+        let Some(edit) = self.queue_edit.as_ref() else {
+            return;
+        };
+        let prompt_id = edit.prompt_id;
+        if edit.delete_confirm {
+            self.delete_queue_edit(ctl);
+            return;
+        }
+        let raw = self.input.buf().trim().to_string();
+        if raw.is_empty() && self.pending_images.is_empty() {
+            self.show_tip(self.locale.tr(
+                "queued prompt cannot be empty · ctrl+d deletes it",
+                "排队消息不能为空 · ctrl+d 可删除",
+            ));
+            return;
+        }
+        let blocks = if self.pending_images.is_empty() {
+            vec![StagedBlock::Text(raw)]
+        } else {
+            self.take_staged_blocks()
+        };
+        let Some(index) = self
+            .prompt_queue
+            .iter()
+            .position(|prompt| prompt.id == prompt_id)
+        else {
+            self.finish_queue_edit();
+            self.show_tip(
+                self.locale
+                    .tr("queued prompt already left the queue", "这条消息已离开队列"),
+            );
+            return;
+        };
+        self.prompt_queue[index].blocks = blocks;
+        self.finish_queue_edit();
+        self.show_tip(format!("queued prompt #{} updated", index + 1));
+        if self.state == RunState::Idle {
+            self.dispatch_next_queued(ctl);
+        }
+    }
+
+    /// `ctrl+d` while editing: the first press arms, the second deletes.
+    fn delete_queue_edit(&mut self, ctl: &Controller) {
+        let Some(edit) = self.queue_edit.as_mut() else {
+            return;
+        };
+        if !edit.delete_confirm {
+            edit.delete_confirm = true;
+            self.show_tip(self.locale.tr(
+                "ctrl+d again deletes this queued prompt · esc cancels",
+                "再按一次 ctrl+d 删除这条排队消息 · esc 取消",
+            ));
+            return;
+        }
+        let prompt_id = edit.prompt_id;
+        let Some(index) = self
+            .prompt_queue
+            .iter()
+            .position(|prompt| prompt.id == prompt_id)
+        else {
+            self.finish_queue_edit();
+            return;
+        };
+        self.prompt_queue.remove(index);
+        self.queued = self.prompt_queue.len();
+        self.finish_queue_edit();
+        self.show_tip(format!("queued prompt #{} deleted", index + 1));
+        if self.state == RunState::Idle {
+            self.dispatch_next_queued(ctl);
+        }
+    }
+
+    /// Leave edit mode: the draft (and the tray it resolved into) is dropped;
+    /// the queued item keeps whatever it already had.
+    fn finish_queue_edit(&mut self) {
+        self.queue_edit = None;
+        self.input.clear();
+        self.pending_images.clear();
+        self.reconcile_attachments();
+    }
+
+    /// Empty-draft Enter: promote the FIFO head into the active turn. While a
+    /// turn runs this is the same steer the composer's ctrl+enter takes
+    /// (interrupt + resend); idle it simply goes out now.
+    fn send_queue_head_now(&mut self, ctl: &Controller) {
+        if self.queue_edit.is_some() {
+            return;
+        }
+        let running = self.turn_busy();
+        let Some(prompt) = self.prompt_queue.pop_front() else {
+            return;
+        };
+        self.queued = self.prompt_queue.len();
+        self.scroll_up = 0;
+        let message_id = prompt.id;
+        let wire = prompt_blocks_from_staged(&prompt.blocks);
+        if running {
+            self.pending_steer_cells.insert(
+                message_id,
+                PendingSteer {
+                    cells: prompt.cells,
+                    blocks: prompt.blocks,
+                },
+            );
+            self.show_tip(self.locale.tr(
+                "queue head sent now — lands at the next agent step",
+                "队首已立即发送 —— 在下一步 Agent 处生效",
+            ));
+            self.send_wire_prompt(wire, Some(message_id), ctl);
+            return;
+        }
+        self.transcript.mark_prompt_delivered(&prompt.cells);
+        self.prompt_pending = true;
+        self.state = RunState::Starting;
+        self.run_started = Some(Instant::now());
+        self.state_note = self
+            .locale
+            .tr("sending queued followup", "正在发送排队消息")
+            .into();
+        self.send_wire_prompt(wire, None, ctl);
+    }
+
     fn open_model_picker(&mut self, ctl: &Controller) {
         // Ask the driver for its catalog; seed the picker with the
         // stock presets meanwhile.
@@ -3578,7 +3921,8 @@ impl App {
         self.selected_model = None;
         self.session_title = None;
         self.queued = 0;
-        self.queued_cells.clear();
+        self.prompt_queue.clear();
+        self.queue_edit = None;
         self.pending_steer_cells.clear();
         self.prompt_pending = false;
         self.sel = None;
@@ -3843,6 +4187,15 @@ impl App {
             self.scroll_up = 0;
             self.sel = None;
             self.needs_redraw = true;
+            return;
+        }
+        // A queued prompt loaded for editing leaves the item untouched.
+        if self.queue_edit.is_some() {
+            self.finish_queue_edit();
+            self.show_tip(
+                self.locale
+                    .tr("queued prompt edit cancelled", "已取消编辑排队消息"),
+            );
             return;
         }
         // A lingering copy highlight is dismissed first (idle only — while
@@ -4148,8 +4501,9 @@ impl App {
         // the body is the list itself — the same surface `/keys` uses.
         let text = if self.locale == Locale::Zh {
             "\
-- enter · 发送；当前轮次运行时将后续消息排队
+- enter · 发送；当前轮次运行时将后续消息排队（草稿为空时立即发送队首）
 - ctrl+enter · 立即 steer 当前轮次（老终端会退化成普通 enter）
+- ⌥↑ · 编辑排队的后续消息（enter 保存 · ctrl+d 删除 · esc 取消）
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 中断（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
@@ -4175,8 +4529,9 @@ impl App {
 token 用量（含缓存命中）以及轮次结束原因。"
         } else {
             "\
-- enter · send · queues a follow-up while a turn runs
+- enter · send · queues a follow-up while a turn runs (an empty draft sends the queue head now)
 - ctrl+enter · steer the active turn immediately (legacy terminals fall back to plain enter)
+- ⌥↑ · edit a queued follow-up (enter save · ctrl+d delete · esc cancel)
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · interrupt (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
@@ -4418,25 +4773,107 @@ impl App {
     }
 
     /// Send raw text as an agent prompt (shared by submit and command
-    /// passthroughs like /plan).
+    /// passthroughs like /plan). While a turn runs the text joins the client's
+    /// FIFO instead of the driver's channel, so `⌥↑` can still edit it.
     fn send_agent_text(&mut self, text: String, ctl: &Controller) {
-        let running = self.state == RunState::Running || self.prompt_pending || self.queued > 0;
+        let running = self.turn_busy();
         let cell = self.transcript.cells.len();
         self.transcript.push_user(text.clone(), running);
         if running {
-            self.queued += 1;
-            self.queued_cells.push_back(vec![cell]);
-            self.show_tip("queued — lands after this turn · ctrl+enter would send now");
-        } else {
-            self.prompt_pending = true;
-            self.state = RunState::Starting;
-            self.run_started = Some(Instant::now());
-            self.state_note = "contacting runtime".into();
+            self.enqueue_prompt(vec![StagedBlock::Text(text)], vec![cell]);
+            self.show_tip(format!(
+                "queued ({} waiting) — lands after this turn · ⌥↑ edits · ctrl+enter sends now",
+                self.queued
+            ));
+            self.scroll_up = 0;
+            return;
         }
+        self.prompt_pending = true;
+        self.state = RunState::Starting;
+        self.run_started = Some(Instant::now());
+        self.state_note = "contacting runtime".into();
         self.scroll_up = 0;
         ctl.send(Cmd::Prompt {
             session_id: self.session_id.clone(),
             text,
+        });
+    }
+
+    /// Is a turn in flight (or a prompt already handed over)? A runtime that is
+    /// still *starting* with nothing in flight takes a prompt immediately —
+    /// otherwise a first prompt could wait for an idle status that never comes.
+    fn turn_busy(&self) -> bool {
+        matches!(self.state, RunState::Running)
+            || self.prompt_pending
+            || !self.prompt_queue.is_empty()
+    }
+
+    /// Queue one prompt behind the active turn and mark its echo cells.
+    fn enqueue_prompt(&mut self, blocks: Vec<StagedBlock>, cells: Vec<usize>) {
+        let id = self.next_prompt_id();
+        self.prompt_queue
+            .push_back(QueuedPrompt { id, blocks, cells });
+        self.queued = self.prompt_queue.len();
+    }
+
+    /// Send the FIFO head — the turn it waited behind has ended. The echo
+    /// bubbles lose their queued tint (they were painted when queued), and the
+    /// item leaves the queue before the driver sees it, so a `/clear` or a
+    /// session switch can never double-send it.
+    fn dispatch_next_queued(&mut self, ctl: &Controller) {
+        if self.queue_edit.is_some() {
+            // The item under edit keeps its slot and its pre-edit wording.
+            self.state_note = self
+                .locale
+                .tr("queue paused for edit", "队列已暂停 · 正在编辑")
+                .into();
+            return;
+        }
+        let Some(prompt) = self.prompt_queue.pop_front() else {
+            return;
+        };
+        self.queued = self.prompt_queue.len();
+        self.transcript.mark_prompt_delivered(&prompt.cells);
+        self.prompt_pending = true;
+        self.state = RunState::Starting;
+        self.run_started = Some(Instant::now());
+        self.state_note = self
+            .locale
+            .tr("sending queued followup", "正在发送排队消息")
+            .into();
+        self.scroll_up = 0;
+        let wire = prompt_blocks_from_staged(&prompt.blocks);
+        self.send_wire_prompt(wire, None, ctl);
+    }
+
+    /// Fire one prompt at the driver: a lone text block takes the plain
+    /// `Cmd::Prompt` (so a `/`-prefixed line still reaches the skill path),
+    /// anything carrying images rides the image variants, and a steer carries
+    /// its pending-bubble id.
+    fn send_wire_prompt(
+        &self,
+        blocks: Vec<crate::bus::PromptBlock>,
+        steer: Option<u64>,
+        ctl: &Controller,
+    ) {
+        let text = match blocks.as_slice() {
+            [crate::bus::PromptBlock::Text(text)] => Some(text.clone()),
+            _ => None,
+        };
+        let session_id = self.session_id.clone();
+        ctl.send(match (steer, text) {
+            (Some(message_id), Some(text)) => Cmd::Steer {
+                session_id,
+                message_id,
+                text,
+            },
+            (Some(message_id), None) => Cmd::SteerImages {
+                session_id,
+                message_id,
+                blocks,
+            },
+            (None, Some(text)) => Cmd::Prompt { session_id, text },
+            (None, None) => Cmd::PromptImages { session_id, blocks },
         });
     }
 
@@ -4555,30 +4992,26 @@ impl App {
                 ),
             }
         }
+        let cells: Vec<usize> = (first_cell..self.transcript.cells.len()).collect();
+        self.scroll_up = 0;
         if queued {
-            self.queued_cells
-                .push_back((first_cell..self.transcript.cells.len()).collect());
+            self.enqueue_prompt(staged, cells);
+            return;
         }
+        // The wire form borrows the staged blocks (image payloads are `Arc`
+        // clones), so a steer can hand the very same blocks to the pending
+        // record for a deferred requeue.
+        let wire = prompt_blocks_from_staged(&staged);
         if let Some(message_id) = steer_message_id {
             self.pending_steer_cells.insert(
                 message_id,
-                (first_cell..self.transcript.cells.len()).collect(),
+                PendingSteer {
+                    cells,
+                    blocks: staged,
+                },
             );
         }
-        self.scroll_up = 0;
-        let blocks = prompt_blocks_from_staged(staged);
-        ctl.send(if let Some(message_id) = steer_message_id {
-            Cmd::SteerImages {
-                session_id: self.session_id.clone(),
-                message_id,
-                blocks,
-            }
-        } else {
-            Cmd::PromptImages {
-                session_id: self.session_id.clone(),
-                blocks,
-            }
-        });
+        self.send_wire_prompt(wire, steer_message_id, ctl);
     }
 
     /// Submit path for the staged tray: set run state / queue bookkeeping,
@@ -4591,11 +5024,13 @@ impl App {
             .iter()
             .filter(|b| matches!(b, StagedBlock::Image(_)))
             .count();
-        let running = self.state == RunState::Running || self.prompt_pending || self.queued > 0;
+        let running = self.turn_busy();
         if running {
-            self.queued += 1;
             self.show_tip(if n <= 1 {
-                "image queued — lands after this turn".to_string()
+                format!(
+                    "image queued ({} waiting) — lands after this turn",
+                    self.queued + 1
+                )
             } else {
                 format!("{n} images queued — land after this turn")
             });
@@ -4670,20 +5105,20 @@ impl App {
                 self.run_started = Some(Instant::now());
             }
             self.scroll_up = 0;
-            ctl.send(if running {
+            let message_id = if running {
                 let message_id = self.next_prompt_id();
-                self.pending_steer_cells.insert(message_id, vec![cell]);
-                Cmd::Steer {
-                    session_id: self.session_id.clone(),
+                self.pending_steer_cells.insert(
                     message_id,
-                    text,
-                }
+                    PendingSteer {
+                        cells: vec![cell],
+                        blocks: vec![StagedBlock::Text(text.clone())],
+                    },
+                );
+                Some(message_id)
             } else {
-                Cmd::Prompt {
-                    session_id: self.session_id.clone(),
-                    text,
-                }
-            });
+                None
+            };
+            self.send_wire_prompt(vec![crate::bus::PromptBlock::Text(text)], message_id, ctl);
         }
     }
 
@@ -4845,7 +5280,8 @@ mod resume_tests {
         );
         let overlay = app.view_overlay.as_ref().expect("/help modal should open");
         assert_eq!(overlay.title, "Help");
-        let frame = crate::ui::dump_frame(&mut app, 100, 34);
+        // 40 rows: the card is scrollable, and the body has to reach `!cmd`.
+        let frame = crate::ui::dump_frame(&mut app, 100, 40);
         assert!(frame.contains("Help · ↑↓/wheel scroll"), "modal:\n{frame}");
         assert!(frame.contains("ctrl+enter"), "binding missing:\n{frame}");
         assert!(frame.contains("!cmd"), "shell hint missing:\n{frame}");
@@ -6340,7 +6776,7 @@ mod mode_tests {
 
         assert!(app.pending_steer_cells.is_empty());
         assert_eq!(app.queued, 0, "late settlement cannot taint a new session");
-        assert!(app.queued_cells.is_empty());
+        assert!(app.prompt_queue.is_empty());
     }
 
     #[test]
@@ -6356,7 +6792,7 @@ mod mode_tests {
         app.handle(AppEvent::RuntimeExited(Some(1)), &ctl);
 
         assert_eq!(app.queued, 0);
-        assert!(app.queued_cells.is_empty());
+        assert!(app.prompt_queue.is_empty());
         assert!(app.pending_steer_cells.is_empty());
     }
 
@@ -6428,7 +6864,7 @@ mod mode_tests {
         );
 
         assert_eq!(app.queued, 2);
-        assert_eq!(app.queued_cells.len(), 2);
+        assert_eq!(app.prompt_queue.len(), 2);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::Image { queued: true, .. })
@@ -6456,11 +6892,103 @@ mod mode_tests {
         ));
     }
 
+    /// `⌥↑` lists the queued follow-ups; entering one loads it into the
+    /// composer, and enter saves the edit back into the same FIFO slot.
     #[test]
-    fn agent_idle_status_does_not_discard_the_client_owned_fifo() {
-        let (mut app, ctl, _rx) = test_app();
+    fn alt_up_edits_a_queued_prompt_in_place() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
         app.state = RunState::Running;
-        app.send_agent_text("followup".into(), &ctl);
+        app.send_agent_text("first followup".into(), &ctl);
+        app.send_agent_text("second followup".into(), &ctl);
+        let kept_id = app.prompt_queue[1].id;
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &ctl);
+        let picker = app.picker.as_ref().expect("queue picker");
+        assert!(matches!(picker.kind, PickerKind::Queue));
+        assert_eq!(picker.items.len(), 2);
+        assert_eq!(picker.items[1].label, "second followup");
+        assert!(
+            picker.items[1].meta.contains("#2"),
+            "{}",
+            picker.items[1].meta
+        );
+
+        // ↓ then enter opens the second item for editing.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(app.picker.is_none(), "the picker closed on enter");
+        assert_eq!(app.input.buf(), "second followup");
+        assert!(app.queue_edit.is_some());
+        assert_eq!(app.prompt_queue.len(), 2, "the item keeps its slot");
+
+        // Enter saves: the item is replaced in place and nothing was sent.
+        app.input.set("second followup, revised".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(app.queue_edit.is_none());
+        assert!(app.input.is_empty());
+        assert_eq!(app.queued, 2);
+        assert_eq!(app.prompt_queue[1].id, kept_id, "the slot is unchanged");
+        assert!(
+            matches!(&app.prompt_queue[1].blocks[..], [StagedBlock::Text(text)] if text == "second followup, revised"),
+            "the edit replaced the blocks"
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "editing a queued prompt never sends anything"
+        );
+    }
+
+    /// Esc cancels an edit and leaves the item alone; ctrl+d arms and then
+    /// deletes it. Neither path sends anything.
+    #[test]
+    fn queue_edit_cancels_or_deletes_without_sending() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("keep me".into(), &ctl);
+        let id = app.prompt_queue[0].id;
+        app.begin_queue_edit(&id.to_string(), &ctl);
+        app.input.set("changed my mind".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.queue_edit.is_none(), "esc cancelled the edit");
+        assert!(app.input.is_empty(), "the draft is dropped");
+        assert!(
+            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "keep me"),
+            "the queued item is untouched"
+        );
+        assert_eq!(app.queued, 1);
+
+        // ctrl+d asks once, then deletes.
+        app.begin_queue_edit(&id.to_string(), &ctl);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(app.queue_edit.is_some(), "the first press only arms");
+        assert_eq!(app.prompt_queue.len(), 1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(app.queue_edit.is_none());
+        assert!(app.prompt_queue.is_empty(), "the second press deleted it");
+        assert_eq!(app.queued, 0);
+        assert!(commands.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// While an item is loaded for editing the FIFO holds: a turn end must not
+    /// ship the head out from under the editor.
+    #[test]
+    fn the_queue_pauses_dispatch_while_an_item_is_edited() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("head".into(), &ctl);
+        app.send_agent_text("tail".into(), &ctl);
+        let head = app.prompt_queue[0].id;
+        app.begin_queue_edit(&head.to_string(), &ctl);
 
         app.handle(
             AppEvent::Ui(crate::events::UiEvent::SessionStatus {
@@ -6470,16 +6998,92 @@ mod mode_tests {
             &ctl,
         );
 
+        assert_eq!(app.queued, 2, "the queue held");
+        assert!(commands.try_recv().is_err(), "nothing went out");
+        assert!(app.state_note.contains("paused"), "{}", app.state_note);
+
+        // Closing the editor lets the next idle status ship the head.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
         assert_eq!(app.queued, 1);
-        assert_eq!(app.queued_cells.len(), 1);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Prompt { text, .. }) if text == "head"
+        ));
+    }
+
+    /// An empty draft's enter promotes the FIFO head: a steer while the turn
+    /// runs, and it waits for the idle status like any other send otherwise.
+    #[test]
+    fn empty_enter_sends_the_queue_head_now() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("head".into(), &ctl);
+        app.send_agent_text("tail".into(), &ctl);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Steer { text, .. }) if text == "head"
+        ));
+        assert_eq!(app.queued, 1, "the tail stays queued");
+        assert_eq!(app.prompt_queue.len(), 1);
+        assert!(
+            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "tail")
+        );
+        assert_eq!(
+            app.pending_steer_cells.len(),
+            1,
+            "the steer awaits settlement"
+        );
+    }
+
+    /// The idle status is what hands the FIFO head to the driver: it is not
+    /// merely kept (that was the driver-channel queue's job), it goes out —
+    /// exactly one item, whose echo loses the queued tint.
+    #[test]
+    fn an_idle_status_dispatches_the_client_owned_fifo_head() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("followup".into(), &ctl);
+        assert_eq!(app.queued, 1);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::User { queued: true, .. })
         ));
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
+
+        assert_eq!(app.queued, 0);
+        assert!(app.prompt_queue.is_empty(), "the head left the queue");
+        assert!(matches!(
+            app.transcript.cells.last().map(|cell| &cell.kind),
+            Some(crate::transcript::CellKind::User { queued: false, .. })
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Prompt { text, .. }) if text == "followup"
+        ));
+        assert!(app.prompt_pending, "the dispatched turn is armed");
     }
 
     #[test]
-    fn actor_prompt_acceptance_delivers_only_the_first_queued_prompt_group() {
+    fn an_idle_status_delivers_exactly_one_queued_prompt_group() {
         let (mut app, ctl, _rx) = test_app();
         app.state = RunState::Running;
         app.send_staged(
@@ -6498,25 +7102,24 @@ mod mode_tests {
         );
         app.send_agent_text("after".into(), &ctl);
 
+        assert_eq!(app.queued, 2);
+
         app.handle(
-            AppEvent::Ui(crate::events::UiEvent::TurnStart {
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
                 session: "dsh-test".into(),
-                turn: 2,
+                running: false,
             }),
             &ctl,
         );
+        assert_eq!(app.queued, 1, "only the head went out");
 
-        assert_eq!(
-            app.queued, 2,
-            "TurnStart also fires for the active prompt and cannot identify FIFO delivery"
-        );
+        // The driver's own acceptance of a prompt never moves the queue.
         app.handle(
             AppEvent::Ctl(CtlEvent::PromptQueued {
                 message_id: "dsh-test".into(),
             }),
             &ctl,
         );
-
         assert_eq!(app.queued, 1);
         let queued = app
             .transcript
@@ -6697,12 +7300,19 @@ mod mode_tests {
         assert_eq!(app.transcript.cells.len(), cells_before);
     }
 
+    /// The direct turn facts still drive the client lifecycle — the queue
+    /// itself is only moved by the idle status now.
     #[test]
     fn direct_ui_turn_facts_update_client_lifecycle() {
         let (mut app, ctl, _rx) = test_app();
         app.state = RunState::Running;
         app.run_started = Some(Instant::now());
         app.state_note = "working".into();
+        app.prompt_queue.push_back(QueuedPrompt {
+            id: 1,
+            blocks: vec![StagedBlock::Text("followup".into())],
+            cells: vec![],
+        });
         app.queued = 1;
 
         app.handle(
@@ -6712,15 +7322,34 @@ mod mode_tests {
             }),
             &ctl,
         );
-        assert_eq!(app.queued, 1);
+        assert_eq!(app.queued, 1, "a turn start never moves the queue");
         app.handle(
             AppEvent::Ctl(CtlEvent::PromptQueued {
                 message_id: "dsh-test".into(),
             }),
             &ctl,
         );
-        assert_eq!(app.queued, 0);
+        assert_eq!(app.queued, 1, "acceptance never moves the queue either");
 
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.queued, 0, "the idle status dispatched the queued head");
+        assert!(matches!(app.state, RunState::Starting));
+        assert!(app.run_started.is_some(), "the dispatched turn is timed");
+        assert!(app.state_note.contains("queued"), "{}", app.state_note);
+
+        // The next turn end has an empty queue and settles back to idle.
+        app.handle(
+            AppEvent::Ctl(CtlEvent::PromptQueued {
+                message_id: "dsh-test".into(),
+            }),
+            &ctl,
+        );
         app.handle(
             AppEvent::Ui(crate::events::UiEvent::SessionStatus {
                 session: "dsh-test".into(),
@@ -7140,7 +7769,7 @@ mod mode_tests {
         assert!(matches!(&blocks[2], StagedBlock::Text(t) if t == " then "));
         assert!(matches!(&blocks[3], StagedBlock::Image(a) if a.name == "b.png"));
         assert!(matches!(&blocks[4], StagedBlock::Text(t) if t == "done"));
-        let prompt = prompt_blocks_from_staged(blocks);
+        let prompt = prompt_blocks_from_staged(&blocks);
         assert!(matches!(&prompt[0], crate::bus::PromptBlock::Text(t) if t == "see"));
         assert!(matches!(&prompt[1], crate::bus::PromptBlock::Image(a) if a.path == "/tmp/a.png"));
         assert!(matches!(&prompt[2], crate::bus::PromptBlock::Text(t) if t == " then "));

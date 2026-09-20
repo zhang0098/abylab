@@ -80,6 +80,11 @@ impl Staged {
         before - self.items.len()
     }
 
+    /// Drop every staged attachment (the draft's tokens go stale with them).
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
     pub fn drain(&mut self) -> Vec<Attachment> {
         std::mem::take(&mut self.items)
     }

@@ -695,7 +695,12 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
     let lbl = Style::default().fg(theme.caption);
     let running = !matches!(app.state, RunState::Idle);
     let pairs: Vec<(&str, &str)> = match (running, app.input.is_empty()) {
-        // Working, nothing typed: the only move is stopping it.
+        // Working, nothing typed: stop it — or, with a queue waiting, ship
+        // its head now (plain enter promotes the FIFO head).
+        (true, true) if app.queued > 0 => vec![
+            ("⏎", app.locale.tr("send queue head", "发送队首")),
+            ("esc", app.locale.tr("interrupt", "中断")),
+        ],
         (true, true) => vec![("esc", app.locale.tr("interrupt", "中断"))],
         // Working with a draft: enter queues; ctrl+⏎ steers without
         // cancellation (ctrl+x cuts the selection instead).
@@ -1767,7 +1772,8 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
         crate::app::PickerKind::Permission => item.id == current_permission,
         crate::app::PickerKind::Effort
         | crate::app::PickerKind::Session
-        | crate::app::PickerKind::Subagent => false,
+        | crate::app::PickerKind::Subagent
+        | crate::app::PickerKind::Queue => false,
     };
     // The popup caps at the screen; `ListView` scrolls the overflow instead
     // of clipping it out of reach.
