@@ -1132,7 +1132,14 @@ fn turn_error_text(err: &abycore::Error, limits: TurnLimits) -> String {
             return "context limit reached — /compact condenses the history, /new starts a fresh session / 上下文已达上限：/compact 压缩历史，/new 开新会话".into();
         }
         ErrorKind::Timeout => {
-            "timed out — the model or a tool ran too long; the turn is unfinished, send a message to continue it / 超时：模型或工具运行过久；回合未完成，继续输入可续跑"
+            return format!(
+                "timed out (ABY_TURN_TIMEOUT={}, ABY_TOOL_TIMEOUT={} seconds; ABY_AUTO_CONTINUE={}) \
+                 — the turn is unfinished; send a message to continue it or adjust these environment variables \
+                 / 超时：回合未完成，继续输入可续跑；可调整上述环境变量中的时限和自动续跑次数{detail}",
+                limits.run_timeout.as_secs(),
+                limits.tool_timeout.as_secs(),
+                limits.continuations,
+            );
         }
         // The watchdog tripped and auto-continuation already spent its
         // headroom. The cap is abylab's own backstop, not an API limit, so
@@ -1498,16 +1505,19 @@ fn effort_label(effort: ReasoningEffort) -> &'static str {
 
 /// Supply explicit error outputs for any unresolved tool calls, in transcript
 /// order, so the interrupted turn can be continued or settled. `reason` is the
-/// model-visible explanation; it must not claim a tool ran.
-fn settle_pending(agent: &mut Agent, reason: &str) {
-    while let Some(call_id) = agent
-        .snapshot()
-        .pending
-        .first()
-        .map(|call| call.call_id.clone())
-    {
+/// model-visible explanation for calls that never started. A call whose
+/// execution was interrupted may already have side effects, so its output
+/// always asks the model to verify the result before repeating it.
+fn settle_pending(agent: &mut Agent, reason: &str, ctx: &TurnCtx<'_>) {
+    while let Some(call) = agent.snapshot().pending.first().cloned() {
+        let reason = match call.state {
+            abycore::PendingState::Unknown => {
+                "previous tool call was interrupted; its result is unverified — check before repeating"
+            }
+            abycore::PendingState::Ready => reason,
+        };
         let _ = agent.resolve_tool(
-            &call_id,
+            &call.call_id,
             ToolOutput {
                 content: reason.into(),
                 is_error: true,
@@ -1516,6 +1526,13 @@ fn settle_pending(agent: &mut Agent, reason: &str) {
                 meta: None,
             },
         );
+        (ctx.sink)(Event::Ui(UiEvent::ToolResult {
+            session: ctx.session.into(),
+            call_id: call.call_id,
+            is_error: true,
+            text: reason.into(),
+            error: None,
+        }));
     }
 }
 
@@ -1875,8 +1892,8 @@ async fn run_segment(
 ///
 /// Like deepseek-harness's agent loop, the turn ends when the model stops or
 /// the user interrupts — not because requests ran out. A segment that stops on
-/// the per-run watchdog budget or on a transient request failure leaves the
-/// session at a continuable boundary (abycore's `continue_run`), so the driver
+/// the per-run watchdog budget, a timeout or a transient request failure leaves
+/// the session at a continuable boundary (abycore's `continue_run`), so the driver
 /// settles any tool calls the stop left unresolved and resumes the same open
 /// turn, up to [`TurnLimits::continuations`] times, before surfacing the error.
 /// Without that, one cheap `web_search` batch or a dropped connection silently
@@ -1890,6 +1907,7 @@ async fn turn(
         settle_pending(
             agent,
             "previous tool call was interrupted; its result is unverified — check before repeating",
+            ctx,
         );
     }
     let session = ctx.session.to_string();
@@ -1952,15 +1970,16 @@ async fn turn(
         if continuations >= ctx.limits.continuations || !agent.snapshot().needs_response {
             break outcome;
         }
-        // A pending batch the stopped segment never executed: the model must
-        // not believe those tools ran. Settle them, then keep going.
+        // Pending calls may be unstarted or interrupted mid-execution. Settle
+        // each according to its state so a timeout never invites a blind replay.
         if !agent.snapshot().pending.is_empty() {
             settle_pending(
                 agent,
                 "the turn stopped before this tool ran — it did not execute; re-issue it if it is still needed",
+                ctx,
             );
         }
-        // Rate limits and server errors carry their own pacing; a cheap retry
+        // Transient failures carry their own pacing; a cheap retry
         // storm would only burn the remaining headroom. The wait stays
         // interruptible so esc still ends the turn.
         if let Some(delay) = continuation_delay(failure) {
@@ -2017,14 +2036,16 @@ async fn turn(
 /// Whether a failed segment is worth resuming inside the same open turn.
 ///
 /// Mirrors deepseek-harness's retryable step failures (`dsh-llm-retry`:
-/// `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`) — with one exception:
-/// abycore's `ErrorKind::Timeout` also covers its whole-run deadline, whose
-/// entire point is that the turn already ran too long, so it stays terminal and
-/// the next prompt resumes it. `BudgetExceeded` is abylab's own watchdog.
+/// `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`). A timeout, including
+/// the whole-segment deadline, also leaves the turn resumable: a long task can
+/// need a fresh segment even when every individual request/tool made progress.
+/// Timeout continuations share the same finite headroom as all other retries.
+/// `BudgetExceeded` is abylab's own watchdog.
 fn resumable_failure(err: &abycore::Error) -> bool {
     matches!(
         err.kind,
         ErrorKind::BudgetExceeded
+            | ErrorKind::Timeout
             | ErrorKind::Transport
             | ErrorKind::StreamClosed
             | ErrorKind::Server
@@ -2034,9 +2055,10 @@ fn resumable_failure(err: &abycore::Error) -> bool {
 
 /// Pacing before a transient continuation: the provider's `Retry-After` when it
 /// sent one, else one second, capped like abycore's own retry backoff. Budget
-/// stops retry immediately.
+/// stops retry immediately. Timeouts wait one second and remain interruptible.
 fn continuation_delay(err: &abycore::Error) -> Option<Duration> {
     match err.kind {
+        ErrorKind::Timeout => Some(Duration::from_secs(1)),
         ErrorKind::RateLimit | ErrorKind::Server => Some(
             err.retry_after
                 .unwrap_or(Duration::from_secs(1))
@@ -2051,6 +2073,11 @@ fn continuation_notice(err: &abycore::Error, round: usize, rounds: usize) -> Str
     if err.kind == ErrorKind::BudgetExceeded {
         return format!(
             "turn budget reached — continuing the unfinished turn ({round}/{rounds}) / 达到回合预算，自动续跑（{round}/{rounds}）"
+        );
+    }
+    if err.kind == ErrorKind::Timeout {
+        return format!(
+            "timed out — continuing the unfinished turn ({round}/{rounds}) / 超时，自动续跑（{round}/{rounds}）"
         );
     }
     let (en, zh) = match err.kind {

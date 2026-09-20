@@ -81,10 +81,12 @@ numbers as a backstop, never as a normal way to end a turn:
 
 - `ABY_MAX_REQUESTS` / `ABY_MAX_TOOL_CALLS` default to **1000** each. Set either
   to `0` and the cap is gone: the turn runs until the model finishes, you press
-  esc, the run deadline passes, or you hit the context limit.
-- When a segment stops on a cap, or on a transient failure (connection lost,
-  rate limit, server error), abylab settles any tool call it left unexecuted as
-  an error result — the model never assumes a write landed — prints an `info`
+  esc, timeout continuations are exhausted, or you hit the context limit.
+- When a segment stops on a cap, a timeout (including the total segment
+  deadline), or a transient failure (connection lost, rate limit, server error),
+  abylab settles unresolved tool calls as error results. Calls interrupted during
+  execution are marked unverified, with instructions to check before repeating;
+  completed tool results stay in history. It prints an `info`
   notice, waits out `Retry-After` when the provider sent one, and resumes the
   same open turn, up to `ABY_AUTO_CONTINUE` times (default 3).
 - The turn ends with an error only once that headroom is spent, and the session
@@ -97,9 +99,14 @@ numbers as a backstop, never as a normal way to end a turn:
   hooks.
 
 The budgets are abylab's own backstops, not DeepSeek limits — usage is billed as
-usual. The deadlines are abylab's too: once the budgets are out of the way, what
-actually binds is `ABY_TURN_TIMEOUT` (the turn stays resumable, so send a
-message to continue it), and `ABY_TOOL_TIMEOUT` bounds a single tool call.
+usual. The deadlines are abylab's too: `ABY_TURN_TIMEOUT` defaults to **600
+seconds per segment**, and `ABY_TOOL_TIMEOUT` to **60 seconds per tool call**.
+Timeouts wait one second before continuing the same open turn, sharing the
+`ABY_AUTO_CONTINUE` allowance with budget stops and other retries. Set that
+allowance to `0` to stop on the first failure. Once it is spent, the error names
+the current limits; send a message to continue, or adjust those environment
+variables before starting abylab again. Esc can interrupt both execution and
+the wait between segments.
 
 `incomplete` means the model hit its per-request output limit. The driver reports
 the limit and pauses automatic goal rounds until you do something. Your next
