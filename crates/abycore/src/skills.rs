@@ -29,7 +29,7 @@ pub const SKILL_FILENAME: &str = "SKILL.md";
 /// invocation rather than every turn, so it may be a long document; an
 /// oversized body is truncated (with a visible marker and a warning) instead of
 /// skipped, because a half skill still beats a skill that silently vanished
-/// from the menu.
+/// from the catalog.
 pub const MAX_SKILL_BYTES: usize = 64 * 1024;
 /// Skills discovered per session; later files are skipped with a warning.
 pub const MAX_SKILLS: usize = 128;
@@ -37,7 +37,7 @@ pub const MAX_SKILLS: usize = 128;
 pub const MAX_INDEX_SKILLS: usize = 32;
 /// Longest name a skill may carry.
 const MAX_NAME_BYTES: usize = 64;
-/// Longest description rendered in the menu and the index.
+/// Longest description rendered in a UI listing and the index.
 const MAX_DESCRIPTION_CHARS: usize = 200;
 
 /// One discovered skill: the metadata the UI shows and the body the model runs
@@ -320,7 +320,7 @@ impl SkillCatalog {
 /// `skill`: read one skill's instructions, or list what this session has.
 ///
 /// The catalog is discovered once per session, so the tool serves a fixed
-/// snapshot — the same one the host injects and the menu lists.
+/// snapshot — the same one the host injects and the UI lists.
 pub struct SkillTool {
     catalog: Arc<SkillCatalog>,
 }
@@ -642,7 +642,7 @@ mod tests {
     }
 
     /// The workspace's `.agents/skills` directory is the only root: two layouts,
-    /// both named after the file, sorted for a stable menu.
+    /// both named after the file, sorted for a stable listing.
     #[test]
     fn discovers_flat_and_directory_skills() {
         let workspace = tempfile::tempdir().unwrap();
@@ -838,7 +838,7 @@ mod tests {
     }
 
     /// Long descriptions are written as YAML block scalars; reading `>-` as the
-    /// literal string would put `>-` in the menu, the index and the tool
+    /// literal string would put `>-` in the listing, the index and the tool
     /// listing. Extra keys (`tools: Bash, Write`) are kept but unused.
     #[test]
     fn folded_and_literal_block_scalars_are_read() {

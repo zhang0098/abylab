@@ -59,8 +59,8 @@ nothing recurses deeper. Two files for one name is a mistake: the first in path
 order wins and the other is reported.
 
 Skills are scanned once, at driver startup, and that one snapshot serves the
-whole session: the `/` menu's skill rows, the `/skill` listing, the `skill`
-tool and the `/<name>` injection all read it. Adding a file takes a new session.
+whole session: the `/skill` listing and its candidates, the `skill` tool and the
+`/<name>` injection all read it. Adding a file takes a new session.
 
 How they behave:
 
@@ -79,11 +79,13 @@ How they behave:
   `skill` tool, so a subagent sees the same skill set.
 - The `skill` tool only reads text discovery already loaded, so no permission
   preset asks for approval.
-- Builtins keep their precedence: a skill cannot take over `/skill`, `/help`,
-  and friends, and a line like `//` or `/usr/bin` is never treated as a skill.
-  To run a skill whose name a builtin shadows, use
-  `/skill <name> [args]` — it resolves the name and ships `/<name> [args]` all
-  the same.
+- Builtins keep their precedence: a line like `//` or `/usr/bin` is never
+  treated as a skill, and a skill never displaces a same-named builtin — a
+  hand-typed `/<name>` reaches the builtin, so `/skill <name> [args]` is the way
+  through; it resolves the name and ships `/<name> [args]` all the same.
+- Skills never join the `/` menu: that column is the builtin command table.
+  Skill names are whatever the user typed into a directory, and a catalog of
+  them would bury the commands, so skill rows exist only under `/skill`.
 - `/skill` is the one entry point — there is no separate listing command. Its
   candidate list is the catalog: the space opens every skill's row (name,
   argument hint, description), typing filters by prefix, and Tab completes

@@ -112,8 +112,9 @@ pub struct CatalogModel {
     pub vision: bool,
 }
 
-/// One user-invocable skill: typing `/name …` as a prompt makes the agent
-/// inject the skill's body.
+/// One user-invocable skill: `/skill <name>` runs it, and a hand-typed
+/// `/name …` line ships as a prompt the agent expands into the skill's body.
+/// Skills are never `/` menu rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillInfo {
     pub name: String,
@@ -179,7 +180,7 @@ pub enum Cmd {
         effort: Option<String>,
     },
     FetchCatalog,
-    /// Fetch user-invocable host skills for the slash menu.
+    /// Fetch user-invocable host skills for `/skill`'s catalog and candidates.
     FetchSkills,
     FetchEfforts {
         provider: String,

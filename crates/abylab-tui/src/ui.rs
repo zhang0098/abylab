@@ -1688,8 +1688,7 @@ fn draw_slash_menu(f: &mut Frame, app: &App, input: Rect, chat: Rect) {
     let theme = app.theme;
     let n = matches.len();
     let sel = app.slash_sel.min(n - 1);
-    // Cap the popup: tall skill catalogs scroll instead of swallowing the
-    // chat pane.
+    // Cap the popup: a long list scrolls instead of swallowing the chat pane.
     let vis = SLASH_MENU_ROWS
         .min(n)
         .min(chat.height.saturating_sub(2) as usize);
@@ -1720,28 +1719,17 @@ fn draw_slash_menu(f: &mut Frame, app: &App, input: Rect, chat: Rect) {
             Style::default()
                 .fg(theme.brand)
                 .add_modifier(Modifier::BOLD)
-        } else if cmd.skill {
-            // Host skills read one shade apart from the builtins — the
-            // gray-blue hint tone, not a loud accent.
-            Style::default().fg(theme.hint)
         } else {
             Style::default().fg(theme.fg_secondary)
-        };
-        let desc = if cmd.skill {
-            format!("{} · {}", cmd.desc, app.locale.tr("skill", "技能"))
-        } else {
-            cmd.desc.to_string()
         };
         lines.push(Line::from(vec![
             Span::styled(marker.to_string(), Style::default().fg(theme.brand)),
             Span::styled(pad_or_ellipsize(&cmd.usage, name_w), name_style),
-            Span::styled(format!(" {desc}"), Style::default().fg(theme.caption)),
+            Span::styled(format!(" {}", cmd.desc), Style::default().fg(theme.caption)),
         ]));
     }
     let title = if matches.iter().any(|m| m.completion.is_some()) {
         app.locale.tr(" options ", " 候选 ")
-    } else if matches.iter().any(|m| m.skill) {
-        app.locale.tr(" commands · skills ", " 命令 · 技能 ")
     } else {
         app.locale.tr(" commands ", " 命令 ")
     };
@@ -1768,7 +1756,7 @@ fn draw_slash_menu(f: &mut Frame, app: &App, input: Rect, chat: Rect) {
 }
 
 /// Pad `s` to exactly `w` display cells, ellipsizing when longer — keeps
-/// the desc column aligned even for long skill names.
+/// the desc column aligned even for long names.
 fn pad_or_ellipsize(s: &str, w: usize) -> String {
     let sw = s.width();
     if sw <= w {

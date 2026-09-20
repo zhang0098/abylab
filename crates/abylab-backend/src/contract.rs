@@ -175,9 +175,9 @@ pub enum CtlEvent {
         /// Echoed `/resume <prefix>` argument, if any.
         prefix: Option<String>,
     },
-    /// The skills discovered at launch (the `/skill` listing, the `/` menu's skill
-    /// rows). Same snapshot the driver injects on `/<name>` and hands the
-    /// `skill` tool, so the menu never offers a skill the driver would not run.
+    /// The skills discovered at launch (the `/skill` listing and its argument
+    /// candidates). Same snapshot the driver injects on `/<name>` and hands the
+    /// `skill` tool, so the listing never offers a skill the driver would not run.
     Skills {
         skills: Vec<SkillRow>,
     },
