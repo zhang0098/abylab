@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use unicode_width::UnicodeWidthChar;
+use ratatui::layout::Rect;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::bus::{
     permission_ask_default_sel, AppEvent, Cmd, CtlEvent, PermissionAskOption, PermissionAskReply,
@@ -463,6 +464,18 @@ impl Selection {
     }
 }
 
+/// Composer drag-selection (the same gesture as the chat pane): both
+/// endpoints are cells in the input well's text-area coordinates — `(row,
+/// col)`, where the drag began and where the pointer is now. The covered char
+/// range comes from [`App::input_selection_range`], which treats both endpoint
+/// cells as inclusive, so a drag in either direction covers exactly the cells
+/// the pointer crossed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InputSel {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
 /// Snapshot of the chat pane layout from the last draw — the seam that
 /// mouse hit-testing and copy extraction read (grok-build's resolved
 /// selection model, scaled way down): pane rect, index of the first
@@ -632,6 +645,14 @@ pub struct App {
     pub input: ComposerEditor,
     /// Display-cell width of the composer text well from the latest frame.
     pub(crate) composer_wrap_width: usize,
+    /// The composer well's screen rect from the latest frame (prompt column
+    /// included) — the seam mouse hit-testing reads between frames.
+    pub(crate) composer_area: Rect,
+    /// Composer drag-selection highlight. Cleared by a click, Esc, and every
+    /// text edit (`App::dispatch`).
+    pub(crate) input_sel: Option<InputSel>,
+    /// A left-button drag that began inside the well is in progress.
+    input_selecting: bool,
     /// First text row shown inside the well (the viewport scroll from
     /// `ui::draw_input`), mirrored from the editor's own scroll offset.
     pub(crate) input_top: usize,
@@ -978,6 +999,9 @@ impl App {
             active_subagent: None,
             input: ComposerEditor::new(),
             composer_wrap_width: 80,
+            composer_area: Rect::default(),
+            input_sel: None,
+            input_selecting: false,
             input_top: 0,
             caret_cell: None,
             state: RunState::Idle,
@@ -1885,12 +1909,16 @@ impl App {
                 // The cap row's progress chip opens the todo dialog. No other
                 // modal may be up: the chip sits under an open dialog.
                 if self.plan_chip_at(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
                     self.open_todo_dialog();
                     return;
                 }
                 // The `↥` glyph right of the project path walks the session's
                 // user prompts (newest first, then back, then wrapping).
                 if self.prompt_jump_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
                     self.jump_to_user_prompt();
                     return;
                 }
@@ -1900,15 +1928,40 @@ impl App {
                     self.sel = None;
                     self.selecting = false;
                     self.last_click = None;
+                    self.input_selecting = false;
                     self.toggle_tool(ci);
+                    return;
+                }
+                // A click inside the composer well places the caret at the
+                // clicked char and arms a drag-selection; the chat highlight is
+                // dismissed first, like any click outside that pane.
+                if !self.modal_open() && self.input_hit(mouse.column, mouse.row) {
+                    self.sel = None;
+                    self.selecting = false;
+                    self.last_click = None;
+                    let cell = self.input_cell_at(mouse.column, mouse.row);
+                    let offset =
+                        self.input
+                            .screen_to_char(self.composer_wrap_width, cell.0, cell.1);
+                    self.input.set_cursor_char(offset);
+                    self.input_sel = Some(InputSel {
+                        anchor: cell,
+                        head: cell,
+                    });
+                    self.input_selecting = true;
+                    self.refresh_file_menu();
                     return;
                 }
                 let Some(p) = self.chat_hit(mouse.column, mouse.row) else {
                     // Click outside the chat pane dismisses the highlight.
                     self.sel = None;
                     self.selecting = false;
+                    self.input_sel = None;
+                    self.input_selecting = false;
                     return;
                 };
+                self.input_sel = None;
+                self.input_selecting = false;
                 let double = self.last_click.take().is_some_and(|(at, x, y)| {
                     at.elapsed() < DOUBLE_CLICK_WINDOW
                         && x.abs_diff(mouse.column) <= 1
@@ -1940,6 +1993,19 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) if self.selecting => {
                 self.selecting = false;
                 self.finish_selection();
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.input_selecting => {
+                // The head snaps to the well's edges: a drag above the well
+                // selects to its top visible row, below it to the bottom row.
+                let head = self.input_cell_at(mouse.column, mouse.row);
+                if let Some(sel) = &mut self.input_sel {
+                    sel.head = head;
+                }
+                self.needs_redraw = true;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.input_selecting => {
+                self.input_selecting = false;
+                self.finish_input_selection();
             }
             MouseEventKind::Moved => {
                 // grok-style hover: track which inline chip the pointer is
@@ -2257,6 +2323,75 @@ impl App {
         } else {
             self.show_tip("copy failed — hold shift and drag for the terminal's native selection");
         }
+    }
+
+    /// The composer well's text width — the same wrap width the widget was
+    /// laid out with this frame (`ui::draw_input`).
+    fn input_avail(&self) -> usize {
+        self.composer_wrap_width.max(1)
+    }
+
+    /// Is this screen cell inside the composer well?
+    fn input_hit(&self, col: u16, row: u16) -> bool {
+        let a = self.composer_area;
+        a.width > 0
+            && a.height > 0
+            && col >= a.x
+            && col < a.right()
+            && row >= a.y
+            && row < a.bottom()
+    }
+
+    /// Map a screen cell to a well-local `(row, col)` in the same coordinates
+    /// as [`ComposerEditor::screen_to_char`] (prompt column and the well's
+    /// viewport scroll applied), clamped into the visible text area.
+    fn input_cell_at(&self, col: u16, row: u16) -> (usize, usize) {
+        let a = self.composer_area;
+        let prompt = "❯ ".width() as u16;
+        let rel_row = (row.saturating_sub(a.y) as usize)
+            .min(a.height.saturating_sub(1) as usize)
+            .saturating_add(self.input_top);
+        let rel_col = (col.saturating_sub(a.x.saturating_add(prompt)) as usize)
+            .min(self.input_avail().saturating_sub(1));
+        (rel_row, rel_col)
+    }
+
+    /// Ordered char boundaries covered by the composer drag-selection — both
+    /// endpoint cells inclusive, so either drag direction covers exactly the
+    /// cells the pointer crossed. `None` without a selection.
+    pub(crate) fn input_selection_range(&mut self) -> Option<(usize, usize)> {
+        let sel = self.input_sel?;
+        let (s, e) = if sel.anchor <= sel.head {
+            (sel.anchor, sel.head)
+        } else {
+            (sel.head, sel.anchor)
+        };
+        let avail = self.input_avail();
+        let start = self.input.screen_to_char(avail, s.0, s.1);
+        let end = self.input.screen_to_char_end(avail, e.0, e.1);
+        (start < end).then_some((start, end))
+    }
+
+    /// Copy the dragged composer selection; the highlight persists until the
+    /// next click or Esc, mirroring the chat pane. A plain click (a caret)
+    /// just clears the highlight.
+    fn finish_input_selection(&mut self) {
+        self.needs_redraw = true;
+        let Some(sel) = self.input_sel else { return };
+        if sel.anchor == sel.head {
+            self.input_sel = None;
+            return;
+        }
+        let Some((a, b)) = self.input_selection_range() else {
+            self.input_sel = None;
+            return;
+        };
+        let text = self.input.chars_between(a, b);
+        if text.trim().is_empty() {
+            self.input_sel = None;
+            return;
+        }
+        self.copy_text(&text);
     }
 
     /// Extract the selected text from the layout snapshot: cell-range slices
@@ -2881,6 +3016,32 @@ impl App {
     /// Apply one classified [`Action`] — the only place key semantics touch
     /// app state, so `input::keymap` stays a pure table.
     fn dispatch(&mut self, action: Action, ctl: &Controller) {
+        if matches!(
+            action,
+            Action::Insert(_)
+                | Action::Newline
+                | Action::Backspace
+                | Action::DeleteForward
+                | Action::DeleteWordBack
+                | Action::KillToEnd
+                | Action::KillToStart
+                | Action::KillLine
+                | Action::Undo
+                | Action::Redo
+                | Action::YankPaste
+                | Action::SelectLeft
+                | Action::SelectRight
+                | Action::SelectUp
+                | Action::SelectDown
+                | Action::SelectWordLeft
+                | Action::SelectWordRight
+                | Action::SelectLineStart
+                | Action::SelectLineEnd
+        ) {
+            // Text edits invalidate the drag-selection highlight: the cells it
+            // covered no longer describe the same text.
+            self.input_sel = None;
+        }
         match action {
             Action::Insert(ch) => {
                 self.input.insert_char(ch);
@@ -2996,25 +3157,43 @@ impl App {
             Action::SelectLineStart => self.input.select_line_start(),
             Action::SelectLineEnd => self.input.select_line_end(),
             Action::CopySelection => {
-                // The composer's keyboard selection, then the chat drag.
+                // The composer's keyboard selection, then its mouse drag.
                 if let Some(text) = self.input.selection_text() {
                     if !text.trim().is_empty() {
                         self.input.copy_selection_to_yank();
                         self.copy_text(&text);
                     }
+                } else if let Some((a, b)) = self.input_selection_range() {
+                    let text = self.input.chars_between(a, b);
+                    if !text.trim().is_empty() {
+                        self.copy_text(&text);
+                    }
                 }
             }
             Action::CutSelection => {
+                let nothing = self.locale.tr(
+                    "nothing to cut — select with shift+arrows, or drag in the box",
+                    "无可剪切 —— 用 shift+方向键或直接在输入框里拖选",
+                );
+                // The composer's keyboard selection, then its mouse drag.
                 if let Some(text) = self.input.selection_text() {
                     if !text.trim().is_empty() {
                         self.input.cut_selection_to_yank();
                         self.copy_text(&text);
                     } else {
-                        self.show_tip(self.locale.tr(
-                            "nothing to cut — select with shift+arrows",
-                            "无可剪切 —— 用 shift+方向键先选中文本",
-                        ));
+                        self.show_tip(nothing);
                     }
+                } else if let Some((a, b)) = self.input_selection_range() {
+                    let text = self.input.chars_between(a, b);
+                    if !text.trim().is_empty() {
+                        self.input.delete_char_range(a, b);
+                        self.input_sel = None;
+                        self.copy_text(&text);
+                    } else {
+                        self.show_tip(nothing);
+                    }
+                } else {
+                    self.show_tip(nothing);
                 }
             }
         }
@@ -3629,8 +3808,10 @@ impl App {
             return;
         }
         // A lingering copy highlight is dismissed first (idle only — while
-        // running, esc keeps its interrupt meaning and clears it in passing).
-        if self.sel.take().is_some() && matches!(self.state, RunState::Idle) {
+        // running, esc keeps its interrupt meaning and clears it in passing);
+        // the composer's drag highlight follows the same rule.
+        let had_input_sel = self.input_sel.take().is_some();
+        if (self.sel.take().is_some() || had_input_sel) && matches!(self.state, RunState::Idle) {
             self.needs_redraw = true;
             return;
         }
@@ -4843,6 +5024,104 @@ mod selection_tests {
         // dragging upward yields the same text
         let rev = app.selection_text(sel((2, 2), (0, 6)));
         assert_eq!(fwd, rev);
+    }
+
+    /// A click in the well places the caret at the clicked char; a drag arms
+    /// the composer highlight, and releasing copies the covered text.
+    #[test]
+    fn clicking_and_dragging_in_the_well_places_the_caret_and_selects() {
+        let mut app = test_app();
+        app.input.set("hello world".into());
+        // The well: rows 10..13, prompt "❯ " in columns 0..2.
+        app.composer_area = Rect::new(0, 10, 40, 3);
+        app.composer_wrap_width = 38;
+
+        // Click on the 4th text column → char 3 (right of "hel").
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.input.cursor_char(), 3, "the caret follows the click");
+        assert!(app.input_selecting, "the click arms a drag");
+
+        // Drag right to the 10th text column (cell 11 - prompt 2), inclusive.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 11,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        let (a, b) = app.input_selection_range().expect("a drag covers text");
+        assert_eq!(
+            app.input.chars_between(a, b),
+            "lo worl",
+            "cells inclusive, either direction"
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 11,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.input_selecting);
+        assert!(
+            app.input_sel.is_some(),
+            "the highlight survives the release (esc clears it)"
+        );
+
+        // Ctrl+X cuts the dragged range: the highlight goes with it.
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert_eq!(app.input.buf(), "held", "the selection was cut");
+        assert!(app.input_sel.is_none(), "cut clears the highlight");
+    }
+
+    /// A click that never moves is a caret placement, not a selection, and a
+    /// click outside the well dismisses a lingering highlight.
+    #[test]
+    fn a_caret_click_clears_the_highlight_and_outside_clicks_dismiss_it() {
+        let mut app = test_app();
+        app.input.set("hello".into());
+        app.composer_area = Rect::new(0, 10, 40, 3);
+        app.composer_wrap_width = 38;
+
+        app.input_sel = Some(InputSel {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.input_sel.is_none(), "a plain click is just a caret");
+        assert_eq!(app.input.cursor_char(), 1);
+
+        app.input_sel = Some(InputSel {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 39,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.input_sel.is_none(), "outside the well dismisses it");
+        assert!(!app.input_selecting);
     }
 
     #[test]

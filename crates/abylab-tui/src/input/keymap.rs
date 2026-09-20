@@ -870,8 +870,8 @@ pub const KEY_ROWS: &[KeyRow] = &[
 pub const MOUSE_ROWS: &[MouseRow] = &[
     MouseRow {
         chords: &["click"],
-        desc_en: "expand/collapse a tool · wheel scrolls",
-        desc_zh: "点击展开/折叠工具 · 滚轮滚动",
+        desc_en: "expand/collapse a tool · wheel scrolls · in the input box it places the caret",
+        desc_zh: "点击展开/折叠工具 · 滚轮滚动 · 在输入框里点击定位光标",
     },
     MouseRow {
         chords: &["click 2/5"],
@@ -885,8 +885,8 @@ pub const MOUSE_ROWS: &[MouseRow] = &[
     },
     MouseRow {
         chords: &["drag"],
-        desc_en: "select text · copies on release",
-        desc_zh: "拖动选择文本，松开即复制",
+        desc_en: "select text · copies on release (transcript and the input box)",
+        desc_zh: "拖动选择文本，松开即复制（对话区和输入框都行）",
     },
     MouseRow {
         chords: &["2×click"],

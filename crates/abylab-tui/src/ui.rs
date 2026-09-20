@@ -1288,6 +1288,9 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     // Overlays that own input never paint the composer caret.
     let composer_owns_cursor = true;
+    // The well's rect is the seam mouse hit-testing reads between frames
+    // (placed before the early return: an empty draft is still clickable).
+    app.composer_area = area;
     if area.width < 4 || area.height == 0 {
         return;
     }
@@ -1427,6 +1430,27 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                     Rect::new(text_area.x + c0 as u16, y, (c1 - c0) as u16, 1),
                     idx,
                 ));
+            }
+        }
+        // Drag selection: reversed cells over the covered graphemes — the same
+        // treatment as the chat pane's highlight. Drawn after the chips so a
+        // drag across an inline `[image n]` reads as one selection.
+        if let Some((a, b)) = app.input_selection_range() {
+            let layout = app.input.layout(avail);
+            for (row, r) in layout.rows.iter().enumerate() {
+                if row < top || row >= top + h {
+                    continue;
+                }
+                let y = area.y + (row - top) as u16;
+                for g in &r.graphemes {
+                    if g.start_char < b && g.end_char > a {
+                        for c in g.start_col..g.start_col + g.width {
+                            if let Some(cell) = buf.cell_mut((text_area.x + c as u16, y)) {
+                                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2743,6 +2767,50 @@ mod tests {
         app.vim.set(false);
         let off = flat(status_right(&app));
         assert!(!off.contains("NORMAL") && !off.contains("INSERT"), "{off}");
+    }
+
+    /// A composer drag-selection paints reversed cells over the covered
+    /// graphemes — the same treatment as the chat pane's highlight.
+    #[test]
+    fn a_composer_drag_selection_paints_reversed_cells() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        let (w, h) = (80u16, 20u16);
+        let mut app = live_test_app();
+        app.input.set("hello world".into());
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
+
+        // The first frame records the well; the drag covers chars 1..=4
+        // ("ello") in well-local cells `(row 0, col 1..=4)`.
+        let area = app.composer_area;
+        assert!(area.height > 0 && area.width > 8, "well: {area:?}");
+        app.input_sel = Some(crate::app::InputSel {
+            anchor: (0, 1),
+            head: (0, 4),
+        });
+        terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
+
+        let buf = terminal.backend().buffer().clone();
+        let x = area.x + 2; // the "❯ " prompt column
+        for col in 1..=4u16 {
+            let cell = &buf[(x + col, area.y)];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "cell {col} must be highlighted: {:?}",
+                cell.symbol()
+            );
+        }
+        for col in [0u16, 5, 10] {
+            let cell = &buf[(x + col, area.y)];
+            assert!(
+                !cell.modifier.contains(Modifier::REVERSED),
+                "cell {col} stays plain: {:?}",
+                cell.symbol()
+            );
+        }
     }
 
     /// The mode label stands alone: the `shift+tab` key that used to follow it

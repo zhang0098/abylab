@@ -186,7 +186,8 @@ click jumps one prompt back (newest first, wrapping from the oldest), scrolls
 it to the top of the pane and highlights it for a few seconds.
 
 Mouse: wheel scrolls · click a tool card expands it · drag selects, release
-copies (native tool → tmux → OSC52) · `@` opens the file browser.
+copies (native tool → tmux → OSC52) · inside the input box a click places the
+caret and a drag selects (`ctrl+x` cuts it) · `@` opens the file browser.
 
 The `@` browser filters as you type (exact > prefix > contains > fuzzy
 subsequence) and, when the current directory has no match, follows the query
