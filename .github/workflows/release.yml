@@ -69,10 +69,22 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features --locked
 
-  build:
+  # Linux binaries are built inside Debian 11 (bullseye), whose glibc is 2.31 —
+  # the container *is* the glibc floor. Building on the ubuntu-24.04 runner
+  # instead (glibc 2.39) links the host's newer symbols: `__isoc23_*@GLIBC_2.38`
+  # from the vendored BoringSSL C code in aws-lc-sys, and `pidfd_spawnp@GLIBC_2.39`
+  # from std's weak process reference. The result installs fine and then dies on
+  # every older distro with
+  #   /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found
+  # scripts/check-glibc-floor.sh asserts the floor on the built binary, so a
+  # future image bump fails the release instead of shipping it.
+  #
+  # macOS runners cannot take a `container:`, hence the two jobs.
+  build-linux:
     name: build ${{ matrix.target }}
     needs: check
     runs-on: ${{ matrix.os }}
+    container: rust:bullseye
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +93,60 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # The image ships rustup and a current stable, so the toolchain step the
+      # macOS job needs is not repeated here. `cache-bin: false` keeps
+      # rust-cache from pruning the image's shims in $CARGO_HOME/bin.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-bin: false
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p abylab-tui
+
+      - name: glibc floor
+        run: scripts/check-glibc-floor.sh "target/${{ matrix.target }}/release/abylab"
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="abylab-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/abylab" "dist/$name/"
+          cp LICENSE README.md README.en.md TECH.md TECH.en.md install.sh "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # Runs inside bullseye, so this is the floor test end to end: a binary
+      # that needs a newer glibc cannot even print its version here.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/abylab"
+          "$bin" --version || "$bin" --help
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+
+  build-macos:
+    name: build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-14
@@ -129,7 +195,7 @@ jobs:
 
   publish:
     name: publish ${{ inputs.tag || github.ref_name }}
-    needs: build
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

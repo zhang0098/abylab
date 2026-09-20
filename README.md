@@ -17,6 +17,15 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 标记, 想撤销就删那一行); `--no-path` 只打印命令不落盘, `--path-file` 指定写到
 哪个文件, `--bin-dir` 换安装目录, `--help` 看全部选项.
 
+预编译的 Linux 二进制在 Debian 11(bullseye) 里构建, 所以要求 glibc ≥ 2.31:
+Ubuntu 20.04+、Debian 11+、RHEL 9、Amazon Linux 2023 都能直接跑. 更老的系统
+(RHEL 8、Amazon Linux 2)和 musl 发行版(Alpine)请从源码构建, 需要一个 C 编译器
+(依赖里的 aws-lc-sys 会自己编译 BoringSSL):
+
+```sh
+cargo install --git https://github.com/zhang0098/abylab abylab-tui
+```
+
 你可以直接让你的ai帮你安装.
 
 2. 去 Deepseek官网 获取一个API Key, 点击这里 [https://platform.deepseek.com/](https://platform.deepseek.com/)
