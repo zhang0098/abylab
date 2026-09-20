@@ -33,12 +33,21 @@ context compaction, session persistence, goal rounds) live in
 
 ### Changed
 
-- Chinese/English parity: the Chinese README gained the crate table, the
-  minimal-single-file section, the quick-start details (platforms, `SHA256SUMS`,
-  `--mirror`, `--version <tag>`), the options table, the environment variables,
-  `settings.json` and the whole Turn budgets section; the English README gained
-  the "ask your AI to install it" line and `--mirror`. The two site pages were
-  checked to be structurally identical.
+- The README is down to one section in both languages: quick start (install, key,
+  `/login`, options, environment variables, `settings.json`). The
+  minimal/single-file, commands, keys, turn-budget, technical-note and license
+  sections are gone — commands, keys, features and the crate table already live
+  on abylab.ai, and the TECH pair keeps the internals. Cross-references that
+  pointed at the dropped README sections and anchors now point at TECH or the
+  site.
+- Quick start no longer explains the install mechanics either: the prebuilt
+  platform matrix, `SHA256SUMS` check, install directory, PATH handling, musl
+  static linking and source builds are gone, leaving one install line (those
+  options live in the site's hint and `install.sh --help`).
+- Chinese/English parity: the Chinese README gained the options table, the
+  environment variables and `settings.json`; the English README gained the
+  "ask your AI to install it" line. The two site pages were checked to be
+  structurally identical.
 - Client-owned chrome now follows `/lang` everywhere: timeline notices and the
   tool-card footer, subagent/agent rails, the plan chip, permission-preset
   meanings and the `· current`/`· default` markers, slash-argument hints,

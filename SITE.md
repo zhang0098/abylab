@@ -181,7 +181,7 @@ curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-
 ## 改内容
 
 - 文案只在两个 `index.html` 里，改中文别忘了 `en/index.html`；命令列表、按键、
-  体积这些数字与 [README.md](README.md) 保持一致，改一处记得改另一处。
+  体积这些数字以站点为唯一出处（README 只留快速开始），改动时两版页面一起改。
 - `styles.css` 只做 Pico 变量之外的一点点事；能靠 Pico classless 解决的样式就
   别往这儿加。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
