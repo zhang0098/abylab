@@ -242,6 +242,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "remove the stored API key",
     },
     SlashCommand {
+        name: "skill",
+        usage: "/skill <name> [args]",
+        desc: "invoke a skill by name, builtin name or not",
+    },
+    SlashCommand {
         name: "quit",
         usage: "/quit",
         desc: "exit abylab",
@@ -249,6 +254,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
 ];
 
 pub const MODEL_PRESETS: &[&str] = &["deepseek-flash", "deepseek-v4-pro"];
+
+/// Where the agent reads skills from: the workspace's `.agents/skills`
+/// directory, and nowhere else. Kept in step with abycore's discovery root —
+/// the dialog points at this path, and the driver is what actually scans it.
+const SKILLS_DIR: &str = ".agents/skills";
 
 /// Stock composition presets served by `FetchCatalog` until a host
 /// catalog replaces them.
@@ -1579,8 +1589,38 @@ impl App {
                 choices
             }
             "lang" => vec![plain("zh", "中文"), plain("en", "English")],
+            // A skill is what `/skill` takes. The list follows the typed
+            // prefix, and the same description the menu and the model's index
+            // show rides along as the row's second column.
+            "skill" => self
+                .skills
+                .iter()
+                .map(|skill| {
+                    let label = match &skill.input_hint {
+                        Some(hint) => format!("{} {hint}", skill.name),
+                        None => skill.name.clone(),
+                    };
+                    (skill.name.clone(), label, skill.description.clone())
+                })
+                .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// Whether a `/skill` argument candidate names a skill that declares an
+    /// argument placeholder. Those open a form — the line completes and waits
+    /// for the argument — instead of running on the bare name.
+    fn skill_candidate_awaits_args(&self, entry: &SlashEntry) -> bool {
+        let Some(value) = entry
+            .completion
+            .as_deref()
+            .and_then(|completion| completion.rsplit(' ').next())
+        else {
+            return false;
+        };
+        self.skills
+            .iter()
+            .any(|skill| skill.name == value && skill.input_hint.is_some())
     }
 
     pub fn handle(&mut self, ev: AppEvent, ctl: &Controller) {
@@ -4421,6 +4461,15 @@ impl App {
             }
             return;
         }
+        // A skill that declares an argument placeholder opens a form: the row
+        // completes the line and waits. One that takes no arguments runs on the
+        // spot, like every other argument pick.
+        if entry.name == "skill" && self.skill_candidate_awaits_args(entry) {
+            let line = format!("{} ", self.input.buf().trim_end());
+            self.input.set(line);
+            self.slash_sel = 0;
+            return;
+        }
         let line = self.input.buf().clone();
         let rest = line
             .strip_prefix('/')
@@ -4484,6 +4533,7 @@ impl App {
                 self.show_tip(self.locale.tr("session/new …", "正在新建会话…"));
             }
             "status" => self.open_status_dialog(),
+            "skill" => self.invoke_skill(arg, ctl),
             "resume" => {
                 if arg.is_empty() {
                     self.open_resume_picker(ctl);
@@ -4603,7 +4653,8 @@ impl App {
 - /image · 暂存本地图片：/image ./pic.png [说明]
 - /clip · 暂存剪贴板图片；ctrl+v 同样可用
 - !cmd · 在会话级本地 shell 中运行命令，不经过 Agent；初始目录为 workspace，cd/环境变量跨命令保留
-- /<skill> · Agent 命令会进入 / 菜单，选择后由 Host 注入技能正文
+- /<skill> · 技能行会进入 / 菜单，发出后由 Agent 注入技能正文
+- /skill · 列出/调用本工作区的技能（`.agents/skills/`）：/skill <名字> [参数]；空格后是候选清单
 - ctrl+o · 展开思考和工具输出 · ctrl+l · 清屏
 - 编辑 · readline 组合键 + ⌘/⌥ 方向键 · 完整映射见 /keys
 - 点击工具 · 展开/折叠 · 滚轮滚动对话
@@ -4630,7 +4681,8 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - /image · stage a local image — /image ./pic.png [caption]
 - /clip · stage the clipboard image — /clip [caption] · ctrl+v also works
 - !cmd · run in the session's local shell (not the agent); starts in the workspace, keeps cd/env across commands
-- /<skill> · agent commands join the / menu — enter ships it and the host injects the skill body
+- /<skill> · skill lines join the / menu; the agent injects the skill's body
+- /skill · list or run this workspace's skills (`.agents/skills/`) — `/skill ` opens the catalog, Tab completes
 - ctrl+o · expand thoughts + tool output · ctrl+l · clear
 - editing · readline chords + ⌘/⌥ arrows (ctrl+arrows elsewhere) · full map in /keys
 - click tool · expand/collapse that tool · wheel scrolls the conversation
@@ -4781,6 +4833,87 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             }],
             scroll: 0,
         });
+    }
+
+    /// `/skill` with no argument: what this workspace can invoke, and where
+    /// each file lives (the same shape `/model` and `/permission` use for an
+    /// empty argument). The catalog is discovered by the agent at startup, so
+    /// the empty state names the directory instead of pretending the feature
+    /// is missing.
+    fn open_skills_dialog(&mut self) {
+        let mut text = String::new();
+        if self.skills.is_empty() {
+            let dir = format!("{}/{SKILLS_DIR}", self.cfg.workspace);
+            text.push_str(&format!(
+                "- {}\n- {}\n",
+                self.locale
+                    .tr("no skills in this workspace", "本工作区没有技能"),
+                match self.locale {
+                    Locale::Zh => format!("技能放在 `{dir}/`：`<名字>.md` 或 `<名字>/SKILL.md`"),
+                    Locale::En => {
+                        format!("skills live in `{dir}/`: `<name>.md` or `<name>/SKILL.md`")
+                    }
+                },
+            ));
+            text.push_str(self.locale.tr(
+                "A skill is a markdown file: optional `---` frontmatter with `name`, `description` and `input-hint`, then the instructions. abylab reads them at startup — restart after adding one.",
+                "技能就是一个 markdown 文件：可选的 `---` frontmatter 写 `name`、`description`、`input-hint`，然后是正文指令。abylab 在启动时读取，加完要重启。",
+            ));
+        } else {
+            for skill in &self.skills {
+                let usage = match &skill.input_hint {
+                    Some(hint) => format!("/{} {hint}", skill.name),
+                    None => format!("/{}", skill.name),
+                };
+                let source = skill
+                    .source
+                    .as_deref()
+                    .map(|path| format!("\n  `{path}`"))
+                    .unwrap_or_default();
+                text.push_str(&format!("- `{usage}` · {}{source}\n", skill.description));
+            }
+            text.push_str(self.locale.tr(
+                "\nA skill line ships as a prompt; the agent injects that file's body.",
+                "\n技能行会作为提示词发出，正文由 Agent 注入。",
+            ));
+        }
+        self.view_overlay = Some(ViewOverlay {
+            title: self.locale.tr("Skills", "技能").to_string(),
+            nodes: vec![crate::slots::TuiNode::Markdown {
+                text,
+                streaming: false,
+            }],
+            scroll: 0,
+        });
+    }
+
+    /// `/skill <name> [args]`: the same path a bare `/<name>` takes, with the
+    /// name resolved client-side — the way to reach a skill whose name a
+    /// builtin, or the menu's prefix rules, would otherwise swallow.
+    fn invoke_skill(&mut self, arg: &str, ctl: &Controller) {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            self.open_skills_dialog();
+            return;
+        }
+        let (name, rest) = match arg.split_once(char::is_whitespace) {
+            Some((name, rest)) => (name, rest.trim()),
+            None => (arg, ""),
+        };
+        if !self.skills.iter().any(|skill| skill.name == name) {
+            let notice = match self.locale {
+                Locale::Zh => format!("未知技能 {name} —— /skill 后打一个空格即可看到清单"),
+                Locale::En => format!("unknown skill {name} — /skill then a space lists them"),
+            };
+            self.transcript.push_notice(NoticeLevel::Warn, notice);
+            return;
+        }
+        let line = if rest.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("/{name} {rest}")
+        };
+        self.send_agent_text(line, ctl);
     }
 }
 
@@ -7626,11 +7759,13 @@ mod mode_tests {
                 name: "commit-helper".into(),
                 description: "draft a commit".into(),
                 input_hint: None,
+                source: None,
             },
             crate::bus::SkillInfo {
                 name: "help".into(),
                 description: "shadowed by builtin".into(),
                 input_hint: None,
+                source: None,
             },
         ];
         app.input.set("/".into());
@@ -7787,6 +7922,7 @@ mod mode_tests {
             name: "plan".into(),
             description: "Enter plan mode".into(),
             input_hint: None,
+            source: None,
         }];
 
         app.run_slash("plan", "focus on the parser", &ctl);
@@ -8028,6 +8164,7 @@ mod mode_tests {
             name: "commit-helper".into(),
             description: "draft a commit".into(),
             input_hint: None,
+            source: None,
         }];
         app.input.set("/commit-helper for the last change".into());
         app.submit(&ctl);
@@ -8045,6 +8182,7 @@ mod mode_tests {
             name: "commit-helper".into(),
             description: "draft a commit".into(),
             input_hint: None,
+            source: None,
         }];
         app.input.set("/commit".into());
         let entry = app.slash_matches()[0].clone();
@@ -8061,6 +8199,209 @@ mod mode_tests {
             "second accept ships the prompt"
         );
     }
+    /// `/skill` with no argument renders the catalog the agent discovered,
+    /// source file and all; its empty state names the directory instead of
+    /// reading as "this build has no skills".
+    #[test]
+    fn bare_skill_command_lists_the_catalog_or_the_root() {
+        let (mut app, _ctl, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.skills = vec![
+            crate::bus::SkillInfo {
+                name: "deploy".into(),
+                description: "ship it".into(),
+                input_hint: Some("<env>".into()),
+                source: Some("/w/.abylab/skills/deploy/SKILL.md".into()),
+            },
+            crate::bus::SkillInfo {
+                name: "triage".into(),
+                description: "sort the inbox".into(),
+                input_hint: None,
+                source: None,
+            },
+        ];
+        app.run_slash("skill", "", &ctl);
+        let overlay = app.view_overlay.as_ref().expect("/skill opens a card");
+        assert!(
+            !SLASH_COMMANDS
+                .iter()
+                .any(|command| command.name == "skills"),
+            "the listing is `/skill`'s empty-argument surface, not its own command"
+        );
+        assert_eq!(overlay.title, "Skills");
+        let frame = crate::ui::dump_frame(&mut app, 100, 40);
+        assert!(frame.contains("/deploy <env>"), "usage missing:\n{frame}");
+        assert!(frame.contains("ship it"), "description missing:\n{frame}");
+        assert!(
+            frame.contains("deploy/SKILL.md"),
+            "the source file is shown:\n{frame}"
+        );
+        assert!(
+            frame.contains("/triage"),
+            "a hintless skill shows bare:\n{frame}"
+        );
+
+        let (mut empty, _empty_ctl, _rx) = test_app();
+        let (empty_ctl, _commands) = crate::controller::test_controller();
+        empty.run_slash("skill", "", &empty_ctl);
+        let frame = crate::ui::dump_frame(&mut empty, 100, 40);
+        assert!(frame.contains("no skills in this workspace"), "{frame}");
+        assert!(
+            frame.contains(&format!("{}/.agents/skills", empty.cfg.workspace)),
+            "the one discovery root is named:\n{frame}"
+        );
+        assert!(
+            !frame.contains(&empty.cfg.home),
+            "the home directory is not a skills root any more:\n{frame}"
+        );
+    }
+
+    /// `/skill <name> [args]` ships the plain `/<name> [args]` line the agent
+    /// expands — including for a name a builtin shadows, which is the whole
+    /// point of the two-word form.
+    #[test]
+    fn skill_invocation_resolves_the_name_before_shipping() {
+        let (mut app, _ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.skills = vec![
+            crate::bus::SkillInfo {
+                name: "deploy".into(),
+                description: "ship it".into(),
+                input_hint: None,
+                source: None,
+            },
+            crate::bus::SkillInfo {
+                name: "plan".into(),
+                description: "shadowed by the builtin".into(),
+                input_hint: None,
+                source: None,
+            },
+        ];
+        app.run_slash("skill", "deploy prod", &ctl);
+        assert!(
+            matches!(app.state, RunState::Starting),
+            "the skill line leaves as a prompt"
+        );
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            matches!(&sent[..], [Cmd::Prompt { text, .. }] if text == "/deploy prod"),
+            "{sent:?}"
+        );
+        assert!(
+            app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::User { text, .. } if text == "/deploy prod"
+            )),
+            "the shipped line is what the transcript shows"
+        );
+
+        // `/plan on` would be swallowed by the builtin; the two-word form is
+        // how a skill of that name still runs. (The first send marked the app
+        // busy, so settle it back to idle first.)
+        app.state = RunState::Idle;
+        app.prompt_pending = false;
+        app.run_slash("skill", "plan on", &ctl);
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            matches!(&sent[..], [Cmd::Prompt { text, .. }] if text == "/plan on"),
+            "{sent:?}"
+        );
+
+        // No argument at all is the listing, not an error.
+        let (mut app, _ctl, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.run_slash("skill", "", &ctl);
+        assert!(app.view_overlay.is_some(), "an empty name lists instead");
+    }
+
+    /// An unknown name is caught client-side: shipping `/nope` would just ask
+    /// the model about a slash command.
+    #[test]
+    fn unknown_skill_names_warn_without_shipping() {
+        let (mut app, _ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.skills = vec![crate::bus::SkillInfo {
+            name: "deploy".into(),
+            description: "ship it".into(),
+            input_hint: None,
+            source: None,
+        }];
+        app.run_slash("skill", "nope now", &ctl);
+        assert!(commands.try_recv().is_err(), "nothing is sent");
+        assert!(matches!(app.state, RunState::Idle));
+        assert!(
+            app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::Notice { text, .. }
+                    if text.contains("unknown skill nope")
+            )),
+            "the miss is named"
+        );
+    }
+
+    /// `/skill ` lists the catalog as argument candidates, filtered by what is
+    /// typed, with the hint and the description on the row.
+    #[test]
+    fn slash_skill_offers_the_catalog_as_candidates() {
+        let (mut app, _ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.skills = vec![
+            crate::bus::SkillInfo {
+                name: "audit".into(),
+                description: "审核研究报告".into(),
+                input_hint: Some("jp:{code}".into()),
+                source: None,
+            },
+            crate::bus::SkillInfo {
+                name: "triage".into(),
+                description: "sort the inbox".into(),
+                input_hint: None,
+                source: None,
+            },
+        ];
+
+        app.input.set("/skill ".into());
+        let menu = app.slash_matches();
+        assert_eq!(menu.len(), 2, "every skill is a candidate");
+        assert_eq!(menu[0].name, "skill", "the row belongs to the builtin");
+        assert_eq!(menu[0].usage, "audit jp:{code}", "the hint rides the row");
+        assert_eq!(menu[0].desc, "审核研究报告");
+        assert_eq!(menu[0].completion.as_deref(), Some("/skill audit"));
+        assert!(!menu[0].skill, "an argument row is not a skill row");
+        // The band above the composer is what the user asked to see. (The CJK
+        // description renders glyph-spaced and clipped, so the ASCII rows are
+        // what a frame assertion can rely on.)
+        let frame = crate::ui::dump_frame(&mut app, 100, 40);
+        assert!(frame.contains("audit jp:{code}"), "{frame}");
+        assert!(frame.contains("sort the inbox"), "{frame}");
+
+        app.input.set("/skill tr".into());
+        let menu = app.slash_matches();
+        assert_eq!(menu.len(), 1, "the typed prefix filters");
+        assert_eq!(menu[0].usage, "triage");
+
+        // A skill that takes no arguments runs on the pick.
+        app.accept_slash(&menu[0].clone(), &ctl);
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            matches!(&sent[..], [Cmd::Prompt { text, .. }] if text == "/triage"),
+            "{sent:?}"
+        );
+
+        // One that declares a placeholder completes and waits instead.
+        app.prompt_pending = false;
+        app.state = RunState::Idle;
+        app.input.set("/skill au".into());
+        let menu = app.slash_matches();
+        app.accept_slash(&menu[0].clone(), &ctl);
+        assert_eq!(
+            app.input.buf(),
+            "/skill audit ",
+            "the argument is the user's to type"
+        );
+        assert!(commands.try_recv().is_err(), "nothing was sent yet");
+    }
+
     #[test]
     fn login_is_a_tui_builtin_and_shadows_the_agent_skill() {
         let (mut app, ctl, _rx) = test_app();
@@ -8072,6 +8413,7 @@ mod mode_tests {
             name: "login".into(),
             description: "Save a DeepSeek API key into the harness credential store".into(),
             input_hint: None,
+            source: None,
         }];
         app.input.set("/log".into());
         let entries = app.slash_matches();
@@ -8108,11 +8450,13 @@ mod mode_tests {
                 name: "logout".into(),
                 description: "sign out".into(),
                 input_hint: None,
+                source: None,
             },
             crate::bus::SkillInfo {
                 name: "login".into(),
                 description: "agent login".into(),
                 input_hint: None,
+                source: None,
             },
         ];
         app.input.set("/".into());

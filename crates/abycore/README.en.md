@@ -65,6 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Goals** — one durable completion objective per session
   (`get_goal`/`create_goal`/`update_goal`) with a revision-checked completion
   protocol; the host drives rounds.
+- **Skills** — `SkillCatalog::discover` reads the `SKILL.md` documents a user
+  wrote under the workspace's `.agents/skills/` directory (optional frontmatter
+  for name, description and argument hint; bodies cap at 64 KiB and are
+  truncated with a marker rather than dropped), `expand` renders a `/name [args]`
+  line into the user message that carries the body, `index_block` is the skill
+  index a host puts in `AgentHooks::request_context`, and `SkillTool` lets the
+  model read one body on demand. The SDK reads text only; nothing here executes.
 - **Structured events** — `AgentEvent`/`StreamEvent` keep the model-facing
   view, plan views, tool results, and usage records separable for any UI.
 

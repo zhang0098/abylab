@@ -43,7 +43,7 @@ impl DriverHandle {
         // The turn loop answers everything in order; a query that touches no
         // agent state is served by the side task so it lands immediately.
         let tx = match &cmd {
-            Cmd::ListSessions { .. } | Cmd::FetchCatalog => &self.query_tx,
+            Cmd::ListSessions { .. } | Cmd::FetchCatalog | Cmd::FetchSkills => &self.query_tx,
             _ => &self.cmd_tx,
         };
         let _ = tx.send(cmd);
@@ -122,6 +122,9 @@ struct HostPolicy {
     max_tokens: Option<u32>,
     agent_sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     instructions: crate::instructions::InstructionSource,
+    /// Discovered once at launch; the menu, the `/<name>` injection and the
+    /// `skill` tool all serve this one snapshot.
+    skills: Arc<abycore::SkillCatalog>,
 }
 
 /// Host hooks: sandboxed modes can route tool calls through the TUI's
@@ -138,7 +141,9 @@ struct UiHooks {
     /// ([`abycore::AgentHooks::view_request`]); `None` disables automatic
     /// compaction, leaving only `/compact` and overflow recovery.
     compaction: Option<CompactionConfig>,
-    instructions: Option<String>,
+    /// The stable user-context prefix: the workspace instruction baseline plus
+    /// the skill index, or whichever of the two exists.
+    context: Option<String>,
 }
 
 /// deepseek-harness's `dsh-repeat-tool-reminder`, as host policy: count
@@ -286,13 +291,19 @@ impl SessionAgent {
                 "workspace instructions: {warning}"
             ))));
         }
+        // The skill index rides the same stable prefix: both are fixed for the
+        // session, so provider calibration stays valid.
+        let context = match (instructions.text, host.skills.index_block()) {
+            (Some(baseline), Some(index)) => Some(format!("{baseline}\n{index}")),
+            (baseline, index) => baseline.or(index),
+        };
         self.inner.set_hooks(Arc::new(UiHooks {
             sink: Arc::clone(&host.sink),
             permission_mode: mode,
             persist: self.persist.as_ref().map(Arc::downgrade),
             guard: RepeatGuard::default(),
             compaction: host.compaction,
-            instructions: instructions.text,
+            context,
         }));
     }
 }
@@ -336,7 +347,7 @@ impl PersistState {
 
 impl AgentHooks for UiHooks {
     fn request_context(&self) -> Option<&str> {
-        self.instructions.as_deref()
+        self.context.as_deref()
     }
 
     fn checkpoint<'a>(
@@ -428,6 +439,8 @@ impl AgentHooks for UiHooks {
             // Goal tools only read and update session metadata, exactly like
             // the checklist: they never touch the workspace or the network.
             || matches!(call.name.as_str(), "get_goal" | "create_goal" | "update_goal")
+            // `skill` reads a markdown file discovery already loaded.
+            || call.name == abycore::SkillTool::NAME
             || (self.permission_mode == PermissionMode::WorkspaceWrite
                 && matches!(call.name.as_str(), "write" | "edit"))
         {
@@ -482,6 +495,16 @@ async fn drive(
     // silently alter how the next segment behaves.
     let limits = cfg.limits;
     let compaction = cfg.compaction;
+    // Skills come from the workspace's `.agents/skills`, discovered once per
+    // run. Discovery is a directory read, but the snapshot must stay stable:
+    // the menu, the injection and the tool all answer from it, and a mid-session
+    // rescan would let them disagree.
+    let skills = Arc::new(abycore::SkillCatalog::discover(std::path::Path::new(
+        &cfg.workspace,
+    )));
+    for warning in skills.warnings() {
+        ctl(CtlEvent::Error(format!("skills: {warning}")));
+    }
     let host = HostPolicy {
         sink: Arc::clone(&sink),
         compaction,
@@ -493,6 +516,7 @@ async fn drive(
             workspace: cfg.workspace.clone().into(),
             home: cfg.home.as_ref().map(Into::into),
         },
+        skills: Arc::clone(&skills),
     };
     // Harness arms goal continuation explicitly: creating a goal from the model
     // does not start spending rounds, `/goal <objective>` or `/goal resume` does.
@@ -546,6 +570,7 @@ async fn drive(
         let base_url = cfg.base_url.clone();
         let live_key = Arc::clone(&live_key);
         let sink = Arc::clone(&sink);
+        let skills = Arc::clone(&skills);
         tokio::spawn(async move {
             let mut queries = query_rx;
             while let Some(cmd) = queries.recv().await {
@@ -559,6 +584,9 @@ async fn drive(
                         base_url.clone(),
                         Arc::clone(&sink),
                     ),
+                    Cmd::FetchSkills => sink(Event::Ctl(CtlEvent::Skills {
+                        skills: skill_rows(&skills),
+                    })),
                     _ => {}
                 }
             }
@@ -585,8 +613,10 @@ async fn drive(
                         persist: None,
                         guard: RepeatGuard::default(),
                         compaction,
-                        // The SDK inherits the active parent's instruction baseline.
-                        instructions: None,
+                        // The SDK inherits the parent's request context, so a
+                        // child sees the same skill index; the skill tool
+                        // itself arrives through tool inheritance.
+                        context: None,
                     }))
                 })),
                 ..Default::default()
@@ -655,6 +685,12 @@ async fn drive(
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
+            // The skill catalog is a pure read of the launch snapshot and the handle
+            // routes it to the query task so it answers mid-turn; this arm
+            // covers a direct send on the loop channel.
+            Cmd::FetchSkills => ctl(CtlEvent::Skills {
+                skills: skill_rows(&skills),
+            }),
             Cmd::Goal { arg } => {
                 let Some(agent) = agent.as_mut() else {
                     ctl(CtlEvent::TuiOpFailed(
@@ -1062,6 +1098,10 @@ async fn drive(
                     ));
                     continue;
                 };
+                // `/name [args]` naming a skill becomes that skill's body: the
+                // host injects it here, at the one seam every prompt crosses
+                // (typed, queued, steered). Any other line ships unchanged.
+                let text = skills.expand(&text).unwrap_or(text);
                 let message_id = format!("aby-{}", agent.snapshot().run_sequence + 1);
                 ctl(CtlEvent::PromptQueued { message_id });
                 let mut ctx = TurnCtx {
@@ -1332,6 +1372,11 @@ fn fresh_agent(
     agent.register_tool(abycore::GetGoalTool).ok()?;
     agent.register_tool(abycore::CreateGoalTool).ok()?;
     agent.register_tool(abycore::UpdateGoalTool).ok()?;
+    // Skills are read-only text: the tool serves the launch snapshot, exactly
+    // like the `/<name>` injection and the `/` menu.
+    if let Some(tool) = skill_tool(host) {
+        agent.register_tool(tool).ok()?;
+    }
     if let Some(subagents) = subagents {
         subagents.register(&mut agent).ok()?;
     }
@@ -1392,6 +1437,11 @@ fn resume_agent(
     agent.register_tool(abycore::GetGoalTool).ok()?;
     agent.register_tool(abycore::CreateGoalTool).ok()?;
     agent.register_tool(abycore::UpdateGoalTool).ok()?;
+    // Skills are read-only text: the tool serves the launch snapshot, exactly
+    // like the `/<name>` injection and the `/` menu.
+    if let Some(tool) = skill_tool(host) {
+        agent.register_tool(tool).ok()?;
+    }
     if let Some(subagents) = subagents {
         subagents.register(&mut agent).ok()?;
     }
@@ -2288,6 +2338,25 @@ fn spawn_catalog_fetch(
     });
 }
 
+/// The model-facing skill reader, or `None` when the session has no skills —
+/// an empty catalog would only spend tool-definition tokens.
+fn skill_tool(host: &HostPolicy) -> Option<abycore::SkillTool> {
+    (!host.skills.is_empty()).then(|| host.skills.tool())
+}
+
+/// The `/skill` listing: the launch snapshot, in name order (`SkillCatalog` sorts).
+fn skill_rows(catalog: &abycore::SkillCatalog) -> Vec<crate::contract::SkillRow> {
+    catalog
+        .skills()
+        .iter()
+        .map(|skill| crate::contract::SkillRow {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            input_hint: skill.input_hint.clone(),
+            path: skill.path.display().to_string(),
+        })
+        .collect()
+}
 /// `/resume` rows from the durable store, newest first (`SessionStore::list`
 /// orders them). An absent store — persistence disabled, or a store that could
 /// not be opened — lists nothing instead of failing the command.
@@ -2338,6 +2407,9 @@ fn epoch_stamp(t: std::time::SystemTime) -> String {
 }
 
 /// The first user prompt in a snapshot (the session title / preview).
+/// The first non-empty line of the first user message, for the session title.
+/// A line rather than the whole text: a skill invocation and any multi-line
+/// prompt both open with the part worth naming, and the title stays one line.
 fn first_user_text(snapshot: &abycore::SessionSnapshot) -> Option<String> {
     snapshot.items.iter().find_map(|item| match item {
         abycore::Item::Message {
@@ -2350,7 +2422,10 @@ fn first_user_text(snapshot: &abycore::SessionSnapshot) -> Option<String> {
                 .map(|part| part.text().to_string())
                 .collect::<Vec<_>>()
                 .join("");
-            (!text.is_empty()).then_some(text)
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
         }
         _ => None,
     })
@@ -2536,7 +2611,7 @@ mod tests {
             persist: None,
             guard: RepeatGuard::default(),
             compaction: None,
-            instructions: None,
+            context: None,
         }
     }
 
@@ -2554,6 +2629,18 @@ mod tests {
             arguments: arguments.into(),
             ..pending(name)
         }
+    }
+
+    /// A unique scratch directory for tests that need real files on disk.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("abylab-{tag}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
     }
 
     /// The harness thresholds are the contract: a reminder on the 3rd, 5th and
@@ -2918,6 +3005,150 @@ mod tests {
     }
 
     /// `/resume` discovery: a persisted workspace snapshot is listed with a
+    /// A skill is a read of text discovery already loaded: no prompt, in any
+    /// permission preset.
+    #[tokio::test]
+    async fn the_skill_tool_never_asks_for_approval() {
+        let allowed = hooks(PermissionMode::ReadOnly)
+            .authorize(pending(abycore::SkillTool::NAME))
+            .await
+            .expect("authorization succeeds");
+        assert_eq!(allowed, ToolDecision::Allow);
+    }
+
+    /// Rows carry what the menu and `/skill` render, and the path tells the
+    /// user which file won.
+    #[test]
+    fn skill_rows_expose_the_menu_metadata() {
+        let workspace = scratch_dir("skills-workspace");
+        let file = workspace.join(".agents/skills/deploy/SKILL.md");
+        std::fs::create_dir_all(file.parent().expect("skill directory")).expect("create");
+        std::fs::write(
+            &file,
+            "---\ndescription: ship it\ninput-hint: <env>\n---\nDeploy to <env>.\n",
+        )
+        .expect("write skill");
+
+        let catalog = abycore::SkillCatalog::discover(&workspace);
+        assert!(catalog.warnings().is_empty(), "{:?}", catalog.warnings());
+        let rows = skill_rows(&catalog);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "deploy");
+        assert_eq!(rows[0].description, "ship it");
+        assert_eq!(rows[0].input_hint.as_deref(), Some("<env>"));
+        assert_eq!(rows[0].path, file.to_string_lossy());
+
+        // The tool registers only when there is something to read.
+        let host = HostPolicy {
+            sink: Arc::new(|_| {}),
+            compaction: None,
+            max_tokens: None,
+            agent_sessions: Arc::default(),
+            instructions: crate::instructions::InstructionSource {
+                workspace: workspace.clone(),
+                home: None,
+            },
+            skills: Arc::new(catalog),
+        };
+        assert!(skill_tool(&host).is_some(), "a session with skills has it");
+        let without = scratch_dir("skills-none");
+        let empty = HostPolicy {
+            skills: Arc::new(abycore::SkillCatalog::discover(&without)),
+            instructions: crate::instructions::InstructionSource {
+                workspace: without.clone(),
+                home: None,
+            },
+            ..host
+        };
+        assert!(
+            skill_tool(&empty).is_none(),
+            "no skills, no tool definition to pay for"
+        );
+        std::fs::remove_dir_all(&without).expect("remove scratch directory");
+        std::fs::remove_dir_all(&workspace).expect("remove scratch workspace");
+    }
+
+    /// The title names the first line: a skill invocation opens with the typed
+    /// command, and a multi-line prompt with its own first sentence.
+    #[test]
+    fn session_titles_take_the_first_line_only() {
+        let mut snapshot = abycore::SessionSnapshot::new("sys", ModelOptions::default());
+        assert_eq!(first_user_text(&snapshot), None, "no user message yet");
+        snapshot.items.push(abycore::Item::user(
+            "\n\n/deploy prod\n\n<system-reminder>\nbody",
+        ));
+        assert_eq!(first_user_text(&snapshot).as_deref(), Some("/deploy prod"));
+    }
+
+    /// `drive` discovers from its launch config, so `/skill` answers with what
+    /// the menu and the injection would use.
+    #[tokio::test]
+    async fn skills_reach_the_ui_from_the_workspace() {
+        let home = scratch_dir("drive-skills-home");
+        let workspace = scratch_dir("drive-skills-workspace");
+        std::fs::create_dir_all(workspace.join(".agents/skills/deploy")).expect("skill directory");
+        std::fs::write(
+            workspace.join(".agents/skills/deploy/SKILL.md"),
+            "---\ndescription: ship it\n---\nDeploy it.\n",
+        )
+        .expect("directory skill");
+        std::fs::write(
+            workspace.join(".agents/skills/review.md"),
+            "Review the diff.\n",
+        )
+        .expect("flat skill");
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx.send(Cmd::FetchSkills).expect("queue fetch");
+        cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        drive(
+            DriverConfig {
+                session_id: "skills-list-test".into(),
+                resume: None,
+                sessions_root: Some(workspace.join("store").to_string_lossy().into_owned()),
+                home: Some(home.to_string_lossy().into_owned()),
+                workspace: workspace.to_string_lossy().into_owned(),
+                model: "deepseek-flash".into(),
+                reasoning: "off".into(),
+                permission: None,
+                max_tokens: None,
+                api_key: Some("test-key".into()),
+                base_url: None,
+                limits: TurnLimits::default(),
+                compaction: None,
+            },
+            cmd_rx,
+            query_rx,
+            interrupt_rx,
+            sink,
+        )
+        .await;
+
+        let events = events.lock().expect("event lock");
+        let rows = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Ctl(CtlEvent::Skills { skills }) => Some(skills.clone()),
+                _ => None,
+            })
+            .expect("Skills arrives");
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["deploy", "review"], "both layouts, name order");
+        assert_eq!(rows[0].description, "ship it");
+        assert_eq!(rows[1].description, "Review the diff.", "from the body");
+        assert!(rows[1].path.ends_with(".agents/skills/review.md"));
+        drop(events);
+        std::fs::remove_dir_all(&home).expect("remove scratch home");
+        std::fs::remove_dir_all(&workspace).expect("remove scratch workspace");
+    }
+
     /// human `updated_at` stamp and the echoed `/resume <prefix>` argument.
     #[tokio::test]
     async fn list_sessions_reports_workspace_snapshots() {

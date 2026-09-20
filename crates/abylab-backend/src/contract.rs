@@ -175,6 +175,23 @@ pub enum CtlEvent {
         /// Echoed `/resume <prefix>` argument, if any.
         prefix: Option<String>,
     },
+    /// The skills discovered at launch (the `/skill` listing, the `/` menu's skill
+    /// rows). Same snapshot the driver injects on `/<name>` and hands the
+    /// `skill` tool, so the menu never offers a skill the driver would not run.
+    Skills {
+        skills: Vec<SkillRow>,
+    },
+}
+
+/// One skill: a markdown instruction document the user invokes with `/<name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRow {
+    pub name: String,
+    pub description: String,
+    /// Frontmatter `input-hint`: the `/name <hint>` argument placeholder.
+    pub input_hint: Option<String>,
+    /// Absolute path of the skill file — `/skill`'s listing shows where it came from.
+    pub path: String,
 }
 
 /// One model advertised by the provider's live catalog (`GET /models`).
@@ -397,6 +414,9 @@ pub enum Cmd {
     },
     /// Fetch the provider's live model listing for the `/model` picker.
     FetchCatalog,
+    /// Fetch the skills discovered at launch (`/skills`). A pure read of the
+    /// launch snapshot, so it answers while a turn is running.
+    FetchSkills,
     /// Change the local tool sandbox without dropping conversation history.
     SetPermission {
         preset: String,

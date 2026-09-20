@@ -29,6 +29,72 @@ request prefix: it never turns into a user transcript entry or a session title.
 abylab loads the startup directory chain only; after editing instructions, start
 a new session or resume the current one to reload them.
 
+## Skills
+
+A skill is an instruction document you write yourself. The workspace is the
+only root: `<workspace>/.agents/skills/`. Skills travel with the project they belong to
+and never leak between projects, so nothing looks in the aby home.
+
+A skill is either `<name>.md` or `<name>/SKILL.md`; the file name (the directory
+name in the directory form) is the skill name, and it must be 1-64 characters of
+`[A-Za-z0-9-_]` starting with a letter or digit. The optional `---` block at the
+top is frontmatter: abylab reads `name`, `description` and `input-hint` (other
+keys are kept but unused, `tools:` for instance), and falls back to the first
+body line (minus markdown decoration) when `description` is missing. The parser
+knows exactly enough YAML: one `key: value` per line plus the block scalar forms
+`>` / `>-` / `|` / `|-`, which is how long descriptions are usually written — a
+folded `>-` becomes one line rather than the literal string `>-`.
+
+Bodies are capped at 64 KiB — the same budget the AGENTS.md baseline gets per
+request, which a skill spends only when it is invoked. An oversized body is cut
+on a char boundary, gets a closing `[Truncated: …]` line and one warning in the
+UI: the skill still runs, and both the author and the model can see that the end
+was dropped. An invalid name, more than 128 skills in a workspace, and two files
+for one name are each skipped with the reason surfaced. Frontmatter without a
+closing `---` stays body text, so a typo does not make the document disappear.
+
+Only that one directory level is scanned: non-`.md` files, entries whose name
+starts with a dot, and subdirectories without a `SKILL.md` are not skills, and
+nothing recurses deeper. Two files for one name is a mistake: the first in path
+order wins and the other is reported.
+
+Skills are scanned once, at driver startup, and that one snapshot serves the
+whole session: the `/` menu's skill rows, the `/skill` listing, the `skill`
+tool and the `/<name>` injection all read it. Adding a file takes a new session.
+
+How they behave:
+
+- `/name [args]` still ships as a prompt; the driver injects the body where the
+  prompt arrives. The message opens with the line you typed, then a
+  `<system-reminder>` (skill name, file path, the argument note, and the
+  statement that the skill does not override system, developer or direct user
+  instructions), then the body. The session title takes the first line of that
+  message, so a resumed session still shows the command rather than the body.
+- The body is an ordinary user message: it compacts with the history and lands
+  in the snapshot.
+- The request prefix carries a skill index (name + description, at most 32), sent
+  every turn like the AGENTS.md baseline. That is how the model knows which
+  skills exist; it can read one on demand with the `skill` tool (called with no
+  name it lists them all). Children inherit the parent's request prefix and the
+  `skill` tool, so a subagent sees the same skill set.
+- The `skill` tool only reads text discovery already loaded, so no permission
+  preset asks for approval.
+- Builtins keep their precedence: a skill cannot take over `/skill`, `/help`,
+  and friends, and a line like `//` or `/usr/bin` is never treated as a skill.
+  To run a skill whose name a builtin shadows, use
+  `/skill <name> [args]` — it resolves the name and ships `/<name> [args]` all
+  the same.
+- `/skill` is the one entry point — there is no separate listing command. Its
+  candidate list is the catalog: the space opens every skill's row (name,
+  argument hint, description), typing filters by prefix, and Tab completes
+  without sending. Picking a skill that declares an `input-hint` only completes
+  the line to `/skill <name> ` and leaves the argument to you; picking one that
+  takes no arguments sends it.
+
+With no skills in the workspace, `/skill` with no argument names the
+`.agents/skills` directory; with none at all, the `skill` tool is not
+registered, so no tool definition is paid for.
+
 ## Context compaction
 
 Long sessions get condensed instead of failing, matching harness's

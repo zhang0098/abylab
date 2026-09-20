@@ -10,6 +10,31 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+### Added
+
+- Skills: drop a markdown instruction document into the workspace's `.agents/skills/`
+  directory (`<name>.md` or `<name>/SKILL.md`) and it joins the `/` menu. Running
+  `/name [args]` makes the agent inject that file's body into the turn; the body
+  is an ordinary user message that compacts with the history and lands in the
+  snapshot, while the session title still takes the command line you typed.
+- `/skill <name> [args]` invokes a skill by name, which also works when a
+  builtin (`/plan`, say) shadows that name. There is no separate listing
+  command: a space after `/skill` opens the whole catalog as candidates (name,
+  argument hint, description, source file), filtering as you type, and Tab only
+  completes. Picking a skill that declares an argument hint waits for the
+  argument; picking one that takes none sends it. With no argument `/skill`
+  opens that same listing, and with no skills it names `.agents/skills/`
+  instead of showing nothing.
+- The model side gains a `skill` tool: the request prefix carries a skill index,
+  so the model can read one skill's body on demand, or list them all when called
+  without a name. One workspace holds at most 128 skills, they are read from the
+  workspace's `.agents/skills/` only — never from the aby home — and they are
+  scanned once at startup, so adding a file takes a new session.
+- Skill bodies are capped at 64 KiB, the budget the AGENTS.md baseline gets per
+  request. Over the cap a body is cut on a char boundary with a closing
+  `[Truncated: …]` line and one warning in the UI instead of being skipped: the
+  skill still runs, and the dropped tail is visible to the author and the model.
+
 ## [0.1.5] - 2026-09-20
 
 ### Added
