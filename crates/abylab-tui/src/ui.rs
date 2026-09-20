@@ -714,12 +714,24 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
-/// Meta row, right side: contextual shortcut hints, the model id and the
-/// requested reasoning effort — plain chrome tones, no accent. Token flow and
-/// the session identity live in `/status`.
+/// Meta row, right side: contextual shortcut hints, the vim mode chip, the
+/// model id and the requested reasoning effort — plain chrome tones, no accent.
+/// Token flow and the session identity live in `/status`.
 fn status_right(app: &App) -> Vec<Span<'static>> {
     let theme = app.theme;
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    // `/vim` is modal, so the row has to say which mode the keys are in:
+    // normal mode swallows the letters a reader would expect to type.
+    if app.vim.is_active() {
+        let (label, color) = match app.vim.mode {
+            crate::input::VimMode::Insert => ("-- INSERT --", theme.caption),
+            _ => ("-- NORMAL --", theme.brand),
+        };
+        spans.push(Span::styled(
+            format!("{label} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
     if app.scroll_up > 0 {
         spans.push(Span::styled(
             format!("▲{} · ", app.scroll_up),
@@ -2702,6 +2714,35 @@ mod tests {
         assert!(bound_left.contains("Full access"), "{bound_left}");
         assert!(bound_right.contains("deepseek-chat"), "{bound_right}");
         assert!(bound_right.contains("high"), "{bound_right}");
+    }
+
+    /// `/vim` is modal: the meta row names the mode while vim editing is on
+    /// (normal mode swallows the letters a reader would expect to type), and
+    /// says nothing once it is off again.
+    #[test]
+    fn the_meta_row_names_the_vim_mode_while_it_is_on() {
+        let flat = |spans: Vec<Span>| -> String {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let mut app = test_app();
+
+        assert!(!flat(status_right(&app)).contains("INSERT"));
+
+        app.vim.set(true);
+        let insert = flat(status_right(&app));
+        assert!(insert.contains("-- INSERT --"), "{insert}");
+
+        app.vim.mode = crate::input::VimMode::Normal;
+        let normal = flat(status_right(&app));
+        assert!(normal.contains("-- NORMAL --"), "{normal}");
+        assert!(!normal.contains("INSERT"), "{normal}");
+
+        app.vim.set(false);
+        let off = flat(status_right(&app));
+        assert!(!off.contains("NORMAL") && !off.contains("INSERT"), "{off}");
     }
 
     /// The mode label stands alone: the `shift+tab` key that used to follow it
