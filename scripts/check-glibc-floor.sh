@@ -88,6 +88,10 @@ if [ "$MODE" = static ]; then
             flavor=static-PIE
         fi
     elif command -v objdump >/dev/null 2>&1; then
+        # Same two questions, answered from the program headers objdump prints.
+        if objdump -p "$bin" 2>/dev/null | grep -q 'INTERP'; then
+            fail "has a PT_INTERP header — the host's loader would have to exist"
+        fi
         if objdump -p "$bin" 2>/dev/null | grep -q 'NEEDED'; then
             fail "links a shared library (NEEDED) — this is not a static build"
         fi
