@@ -36,6 +36,13 @@ struct CtrlCQuitChord {
     required: u8,
 }
 const TIP_TTL: Duration = Duration::from_secs(4);
+/// How long the `↥` jump flash keeps the jumped user prompt background-washed
+/// before it restores to normal (Martty's issue #103).
+pub(crate) const PROMPT_FLASH_TTL: Duration = Duration::from_secs(5);
+/// How often the composer cap re-checks the workspace git branch (tick
+/// cadence). Catches checkouts made by the agent's shell tool or in another
+/// terminal while the session is open.
+const GIT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Some terminal layers incorrectly wrap Kitty/CSI-u key reports in
 /// bracketed-paste markers. Crossterm then exposes the key bytes as a paste,
@@ -190,6 +197,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "clip",
         usage: "/clip [text]",
         desc: "attach the clipboard image (macOS/Linux)",
+    },
+    SlashCommand {
+        name: "vim",
+        usage: "/vim [on|off]",
+        desc: "toggle vim modal editing in the composer",
     },
     SlashCommand {
         name: "theme",
@@ -540,6 +552,13 @@ pub struct ViewOverlay {
     pub scroll: usize,
 }
 
+/// The clickable todo progress dialog: the full checklist behind the composer
+/// cap row's `2/5 完成` chip. Its content is rendered from `App::plan` on every
+/// frame, so a live `todo_write` update refreshes an open dialog in place.
+pub struct TodoDialog {
+    pub scroll: usize,
+}
+
 pub struct Picker {
     pub kind: PickerKind,
     pub title: String,
@@ -592,6 +611,12 @@ pub struct App {
     pub locale: Locale,
     pub palettes: Vec<crate::theme::PalettePack>,
     pub active_palette_id: String,
+    /// Palette currently only *previewed* — the theme dialog row or the
+    /// `/theme ` slash candidate under the highlight — but not yet confirmed
+    /// with Enter. A preview repaints `theme` without touching
+    /// `active_palette_id` (or the settings file), so Esc or a moved
+    /// highlight reverts to the committed theme.
+    theme_preview: Option<String>,
     pub transcript: Transcript,
     pub subagents: Vec<SubagentView>,
     pub active_subagent: Option<String>,
@@ -665,6 +690,33 @@ pub struct App {
     /// Last advertised effort catalog for the current model.
     effort_choices: Vec<String>,
     pub tip: Option<(String, Instant)>,
+    /// Live todo checklist from the driver's plan snapshots. While set (and no
+    /// transient tip is showing) the composer cap row shows the task in
+    /// progress plus completed/total — the transcript keeps the full digest.
+    pub plan: Option<crate::events::PlanProgress>,
+    /// The open todo progress dialog (`App::plan`'s checklist), if any.
+    pub todo_dialog: Option<TodoDialog>,
+    /// Screen rect of the cap row's clickable progress chip, recorded by
+    /// `ui::draw_composer_box` every frame (`None` when it isn't drawn).
+    pub(crate) plan_chip: Option<ratatui::layout::Rect>,
+    /// The pointer rests on the progress chip: render it as clickable.
+    pub(crate) hover_plan_chip: bool,
+    /// Screen rect of the cap row's mouse-only `↥` user-prompt jump glyph,
+    /// recorded by `ui::draw_composer_box` every frame.
+    pub(crate) prompt_jump_btn: Option<ratatui::layout::Rect>,
+    /// The pointer rests on the `↥` glyph: brighten it.
+    pub(crate) hover_prompt_jump_btn: bool,
+    /// Transcript cell of the user prompt the last `↥` click jumped to; the
+    /// next click walks one prompt further back (the oldest wraps around).
+    /// In-memory only, and it rides across clicks so jumping resumes where the
+    /// previous jump stopped.
+    pub(crate) prompt_jump_cell: Option<usize>,
+    /// The `↥` jump flash: transcript cell of the prompt just jumped to, with
+    /// the instant the wash expires.
+    pub(crate) prompt_flash: Option<(usize, Instant)>,
+    /// The flashing prompt's line span for the current frame, resolved by
+    /// `ui::draw_chat` from the live layout (streaming can move it).
+    pub(crate) prompt_flash_lines: Option<(usize, usize)>,
     /// DSH_TUI_KEYDEBUG=1: echo every delivered key event in the tip row.
     key_debug: bool,
     /// Optional vim modal editing for the composer (`/vim`).
@@ -674,6 +726,12 @@ pub struct App {
     ctrl_c_armed: Option<CtrlCQuitChord>,
     pub session_id: String,
     pub cfg: RuntimeConfig,
+    /// Current branch of the workspace checkout, shown after the project path
+    /// in the composer cap (`path:branch`). `None` covers a non-repo
+    /// workspace, a detached HEAD, and a repo whose HEAD cannot be read.
+    pub git_branch: Option<String>,
+    /// Last time the workspace git branch was re-checked (tick throttle).
+    git_check_at: Instant,
     /// Model explicitly picked this session (`/model`); wins over
     /// `transcript.last_model` in the chip until a turn realizes it.
     pub selected_model: Option<String>,
@@ -873,12 +931,13 @@ impl App {
         let settings = Self::load_settings(&cfg);
         let locale = settings.language;
         // The persisted palette pack survives restarts; the appearance mode
-        // arrives already resolved (flag > persisted > dark).
+        // arrives already resolved (flag > persisted > dark). A fresh install
+        // opens on One, dark — the built-in DeepSeek pack stays selectable.
         let active_palette_id = settings
             .palette
             .clone()
             .filter(|id| palettes.iter().any(|pack| &pack.id == id))
-            .unwrap_or_else(|| "default".into());
+            .unwrap_or_else(|| crate::theme::DEFAULT_PACK.into());
         let theme = palettes
             .iter()
             .find(|pack| pack.id == active_palette_id)
@@ -893,11 +952,16 @@ impl App {
         if modes.permission.is_none() {
             modes.permission = settings.permission.clone();
         }
+        // ":branch" after the project path in the composer cap. Seeded once
+        // here; `tick` re-checks on a throttle so mid-session checkouts (the
+        // agent's shell tool, another terminal) stay in sync.
+        let git_branch = crate::ui::head_branch(&cfg.workspace);
         App {
             theme,
             locale,
             palettes,
             active_palette_id,
+            theme_preview: None,
             transcript: Transcript::new(session_id.clone()),
             subagents: Vec::new(),
             active_subagent: None,
@@ -935,6 +999,15 @@ impl App {
             permission_choices: Vec::new(),
             effort_choices: Vec::new(),
             tip: None,
+            plan: None,
+            todo_dialog: None,
+            plan_chip: None,
+            hover_plan_chip: false,
+            prompt_jump_btn: None,
+            hover_prompt_jump_btn: false,
+            prompt_jump_cell: None,
+            prompt_flash: None,
+            prompt_flash_lines: None,
             key_debug: std::env::var("ABYLAB_KEYDEBUG").is_ok_and(|v| v == "1"),
             vim: crate::input::VimState::default(),
             ambient_tip_idx: 0,
@@ -942,6 +1015,8 @@ impl App {
             ctrl_c_armed: None,
             session_id,
             cfg,
+            git_branch,
+            git_check_at: Instant::now(),
             selected_model: None,
             session_bound: true,
             quit: false,
@@ -978,7 +1053,25 @@ impl App {
         &mut self.transcript
     }
 
+    /// Re-detect the workspace git branch for the composer cap label. One
+    /// in-process read of `.git/HEAD` (no subprocess), at most every
+    /// `GIT_CHECK_INTERVAL`.
+    fn refresh_git_branch(&mut self) {
+        if self.git_check_at.elapsed() < GIT_CHECK_INTERVAL {
+            return;
+        }
+        self.git_check_at = Instant::now();
+        let branch = crate::ui::head_branch(&self.cfg.workspace);
+        if branch != self.git_branch {
+            self.git_branch = branch;
+            self.needs_redraw = true;
+        }
+    }
+
     pub fn tick(&mut self) {
+        // The cap's ":branch" label tracks mid-session checkouts on a
+        // throttled cadence.
+        self.refresh_git_branch();
         if self.state != RunState::Idle
             || self.transcript.streaming()
             || self
@@ -992,6 +1085,14 @@ impl App {
         if let Some((_, at)) = &self.tip {
             if at.elapsed() > TIP_TTL {
                 self.tip = None;
+                self.needs_redraw = true;
+            }
+        }
+        // The ↥ jump flash restores the prompt to normal after its few seconds.
+        if let Some((_, until)) = &self.prompt_flash {
+            if Instant::now() >= *until {
+                self.prompt_flash = None;
+                self.prompt_flash_lines = None;
                 self.needs_redraw = true;
             }
         }
@@ -1019,6 +1120,9 @@ impl App {
         if !self.palettes.iter().any(|p| p.id == id) {
             return;
         }
+        // A commit (Enter, or `/theme <pack>`) supersedes any preview still
+        // on screen — the row it painted *is* the committed pack now.
+        self.theme_preview = None;
         self.active_palette_id = id.to_string();
         self.sync_theme_from_active();
         self.save_settings();
@@ -1041,6 +1145,92 @@ impl App {
             .find(|p| p.id == self.active_palette_id)
         {
             self.theme = pack.theme(mode);
+        }
+    }
+
+    /// Arrows over the theme dialog rows (or the `/theme ` slash candidates)
+    /// only *preview*: the committed palette stays `active_palette_id` until
+    /// Enter, and nothing is written to settings. Esc or a moved highlight
+    /// restores the committed theme.
+    fn preview_palette(&mut self, id: &str) {
+        if self.active_palette_id == id {
+            // Highlight back on the committed pack — nothing to preview.
+            self.clear_theme_preview();
+            return;
+        }
+        let Some(pack) = self.palettes.iter().find(|pack| pack.id == id) else {
+            return;
+        };
+        let mode = self.theme.mode;
+        self.theme = pack.theme(mode);
+        self.theme_preview = Some(id.to_string());
+        self.needs_redraw = true;
+    }
+
+    /// Drop a preview and repaint the committed theme.
+    fn clear_theme_preview(&mut self) {
+        if self.theme_preview.take().is_some() {
+            self.sync_theme_from_active();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// The open theme dialog paints the row under its highlight.
+    fn preview_picker_theme(&mut self) {
+        let Some(id) = self.picker.as_ref().and_then(|picker| {
+            (picker.kind == PickerKind::Theme)
+                .then(|| picker.items.get(picker.sel))
+                .flatten()
+                .map(|item| item.id.clone())
+        }) else {
+            return;
+        };
+        self.preview_palette(&id);
+    }
+
+    /// The open `/theme ` candidate popup previews the palette the highlight
+    /// just landed on (the dark/light rows never name a pack).
+    fn preview_slash_theme(&mut self) {
+        if let Some(id) = self.slash_theme_candidate() {
+            self.preview_palette(&id);
+        }
+    }
+
+    /// The palette candidate under the open `/theme ` popup highlight, if
+    /// that row names a registered pack.
+    fn slash_theme_candidate(&self) -> Option<String> {
+        let matches = self.slash_matches();
+        let entry = matches.get(self.slash_sel.min(matches.len().checked_sub(1)?))?;
+        if entry.skill || entry.name != "theme" {
+            return None;
+        }
+        let id = entry
+            .completion
+            .as_deref()
+            .and_then(|completion| completion.strip_prefix("/theme "))?;
+        self.palettes
+            .iter()
+            .any(|pack| pack.id == id)
+            .then(|| id.to_string())
+    }
+
+    /// A preview only lives while its row is still highlighted: Esc, a closed
+    /// list, a moved highlight or an edited draft all land here and revert to
+    /// the committed theme, so a preview never sticks.
+    fn reconcile_theme_preview(&mut self) {
+        let Some(preview) = self.theme_preview.clone() else {
+            return;
+        };
+        let still_highlighted = self.picker.as_ref().is_some_and(|picker| {
+            picker.kind == PickerKind::Theme
+                && picker
+                    .items
+                    .get(picker.sel)
+                    .is_some_and(|item| item.id == preview)
+        }) || self.slash_theme_candidate().as_deref()
+            == Some(preview.as_str());
+        if !still_highlighted {
+            self.clear_theme_preview();
         }
     }
 
@@ -1089,13 +1279,19 @@ impl App {
             title: self
                 .locale
                 .tr(
-                    " theme · enter apply · esc close · ctrl+t dark/light ",
-                    " 主题 · enter 应用 · esc 关闭 · ctrl+t 切换明暗 ",
+                    " theme · ↑↓ preview · enter apply · esc close · ctrl+t dark/light ",
+                    " 主题 · ↑↓ 预览 · enter 应用 · esc 关闭 · ctrl+t 切换明暗 ",
                 )
                 .into(),
             sel,
             items,
         });
+    }
+
+    /// The `/` command menu owns the band above the composer while it has
+    /// rows to show — the `@` browser never opens underneath it.
+    pub(crate) fn slash_completion_open(&self) -> bool {
+        !self.slash_matches().is_empty()
     }
 
     pub fn slash_matches(&self) -> Vec<SlashEntry> {
@@ -1233,6 +1429,9 @@ impl App {
         let modes_before = self.modes.clone();
         let model_before = self.cfg.model.clone();
         self.handle_inner(ev, ctl);
+        // A previewed palette never sticks: after every event, one that is no
+        // longer under a highlight reverts the painter to the committed theme.
+        self.reconcile_theme_preview();
         // Persist mode-fact changes (chips survive restarts — the cache is
         // the landing state's source of truth until the host reports).
         if self.modes != modes_before {
@@ -1551,6 +1750,15 @@ impl App {
             E::SessionTitle { session, title } if *session == self.session_id => {
                 self.session_title = Some(title.clone());
             }
+            E::Plan { session, .. } if *session == self.session_id => {
+                // The driver sends one snapshot per committed todo_write; an
+                // empty checklist clears the composer's todo line with it, and
+                // an open progress dialog has nothing left to show.
+                self.plan = ui.plan_progress();
+                if self.plan.is_none() {
+                    self.todo_dialog = None;
+                }
+            }
             _ => {}
         }
 
@@ -1611,21 +1819,41 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if self.view_overlay.is_some() {
+                if self.todo_dialog.is_some() {
+                    self.todo_dialog_scroll_by(-3);
+                } else if self.view_overlay.is_some() {
                     self.view_scroll_by(-3);
+                } else if self.picker.is_some() {
+                    self.picker_scroll_by(-1);
                 } else {
                     self.mouse_scroll(3, mouse.column, mouse.row);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.view_overlay.is_some() {
+                if self.todo_dialog.is_some() {
+                    self.todo_dialog_scroll_by(3);
+                } else if self.view_overlay.is_some() {
                     self.view_scroll_by(3);
+                } else if self.picker.is_some() {
+                    self.picker_scroll_by(1);
                 } else {
                     self.mouse_scroll(-3, mouse.column, mouse.row);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.needs_redraw = true;
+                // The cap row's progress chip opens the todo dialog. No other
+                // modal may be up: the chip sits under an open dialog.
+                if self.plan_chip_at(mouse.column, mouse.row) && !self.modal_open() {
+                    self.open_todo_dialog();
+                    return;
+                }
+                // The `↥` glyph right of the project path walks the session's
+                // user prompts (newest first, then back, then wrapping).
+                if self.prompt_jump_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
+                    self.jump_to_user_prompt();
+                    return;
+                }
                 // Clicking a tool block toggles its expand/collapse instead of
                 // starting a text selection.
                 if let Some(ci) = self.tool_at(mouse.column, mouse.row) {
@@ -1679,6 +1907,20 @@ impl App {
                 let hover = self.chip_at(mouse.column, mouse.row);
                 if hover != self.hover_att {
                     self.hover_att = hover;
+                    self.needs_redraw = true;
+                }
+                // The todo progress chip is a button: brighten it under the
+                // pointer so the dialog is discoverable without a tooltip.
+                let chip_hover = self.plan_chip_at(mouse.column, mouse.row) && !self.modal_open();
+                if chip_hover != self.hover_plan_chip {
+                    self.hover_plan_chip = chip_hover;
+                    self.needs_redraw = true;
+                }
+                // Same affordance for the `↥` prompt-jump glyph.
+                let jump_hover =
+                    self.prompt_jump_btn_hit(mouse.column, mouse.row) && !self.modal_open();
+                if jump_hover != self.hover_prompt_jump_btn {
+                    self.hover_prompt_jump_btn = jump_hover;
                     self.needs_redraw = true;
                 }
             }
@@ -1759,6 +2001,123 @@ impl App {
                     && row < r.y.saturating_add(r.height)
             })
             .map(|(_, idx)| *idx)
+    }
+
+    /// Hit-test a screen cell against the cap row's todo progress chip drawn
+    /// this frame.
+    fn plan_chip_at(&self, col: u16, row: u16) -> bool {
+        self.plan_chip.is_some_and(|r| {
+            col >= r.x
+                && col < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        })
+    }
+
+    /// A modal owns the screen: clicks must not reach the chrome behind it.
+    fn modal_open(&self) -> bool {
+        self.todo_dialog.is_some()
+            || self.view_overlay.is_some()
+            || self.permission_ask.is_some()
+            || self.picker.is_some()
+    }
+
+    /// Hit-test a screen cell against the cap row's `↥` prompt-jump glyph
+    /// drawn this frame.
+    fn prompt_jump_btn_hit(&self, col: u16, row: u16) -> bool {
+        self.prompt_jump_btn.is_some_and(|r| {
+            col >= r.x
+                && col < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        })
+    }
+
+    /// `↥` click: jump the chat view to a user prompt. The first click goes to
+    /// the newest prompt, each further click walks one prompt back, and the
+    /// oldest wraps to the newest again. The target is anchored to the top of
+    /// the chat pane and flashed for [`PROMPT_FLASH_TTL`]; the last target is
+    /// remembered in memory only, so jumping resumes where it stopped.
+    fn jump_to_user_prompt(&mut self) {
+        let area = self.chat_view.area;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // Same inputs as `ui::draw_chat`: the line indices must match the
+        // frame the anchor lands on (thumbnail rows included).
+        let layout = self.displayed_transcript().layout(
+            &self.theme,
+            area.width,
+            self.spinner(),
+            crate::pet::kitty_supported(),
+        );
+        if layout.users.is_empty() {
+            self.show_tip(self.locale.tr(
+                "no user prompts yet — ↥ finds them once you send one",
+                "还没有用户输入 —— 发送后 ↥ 即可跳转",
+            ));
+            return;
+        }
+        // The running indicator rides as one extra tail line in `draw_chat`;
+        // include it so the anchored viewport matches the next frame.
+        let total = layout.lines.len() + usize::from(crate::ui::state_line_shown(self));
+        let h = area.height as usize;
+        let max_scroll = total.saturating_sub(h);
+        let target = match self
+            .prompt_jump_cell
+            .and_then(|cell| layout.users.iter().position(|p| p.cell == cell))
+        {
+            // A previous jump: continue walking backward from it…
+            Some(rank) if rank > 0 => layout.users[rank - 1],
+            // …and the oldest prompt wraps back to the newest.
+            Some(_) => layout.users[layout.users.len() - 1],
+            // No previous jump (fresh session, view switch, or the target cell
+            // is gone): start at the newest prompt.
+            None => layout.users[layout.users.len() - 1],
+        };
+        let from_newest = layout
+            .users
+            .iter()
+            .rposition(|p| p.cell == target.cell)
+            .map(|rank| layout.users.len() - rank)
+            .unwrap_or(1);
+        self.prompt_jump_cell = Some(target.cell);
+        // Anchor the prompt's first line to the top of the chat pane and flash
+        // its rows for a few seconds.
+        let start = target.line.min(max_scroll);
+        let end = start.saturating_add(h).min(total);
+        self.scroll_up = total.saturating_sub(end);
+        self.prompt_flash = Some((target.cell, Instant::now() + PROMPT_FLASH_TTL));
+        self.needs_redraw = true;
+        self.show_tip(format!(
+            "↥ {} {from_newest}/{} · {}",
+            self.locale.tr("user prompt", "用户输入"),
+            layout.users.len(),
+            self.locale.tr("newest first", "从最新往前"),
+        ));
+    }
+
+    /// Open the todo progress dialog for the live checklist (the cap row's
+    /// progress chip). A cleared plan has nothing to show and never opens.
+    fn open_todo_dialog(&mut self) {
+        if self.plan.is_none() {
+            return;
+        }
+        self.todo_dialog = Some(TodoDialog { scroll: 0 });
+        self.needs_redraw = true;
+    }
+
+    /// Scroll the open todo dialog (wheel and keyboard share this path); the
+    /// renderer clamps to the content height, so a large value reaches the end.
+    fn todo_dialog_scroll_by(&mut self, delta: i64) {
+        if let Some(dialog) = self.todo_dialog.as_mut() {
+            if delta < 0 {
+                dialog.scroll = dialog.scroll.saturating_sub(delta.unsigned_abs() as usize);
+            } else {
+                dialog.scroll = dialog.scroll.saturating_add(delta as usize);
+            }
+            self.needs_redraw = true;
+        }
     }
 
     /// Hit-test a screen cell against the chat pane; `None` outside it.
@@ -2100,6 +2459,36 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// The todo dialog is a read-only review pane: arrows/wheel scroll it and
+    /// esc/enter close it, exactly like the view overlay.
+    fn handle_todo_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.todo_dialog_scroll_by(-1),
+            KeyCode::Down => self.todo_dialog_scroll_by(1),
+            KeyCode::PageUp => self.todo_dialog_scroll_by(-5),
+            KeyCode::PageDown => self.todo_dialog_scroll_by(5),
+            KeyCode::Home => {
+                if let Some(dialog) = self.todo_dialog.as_mut() {
+                    dialog.scroll = 0;
+                    self.needs_redraw = true;
+                }
+            }
+            KeyCode::End => {
+                // Render clamps to the content height, so `usize::MAX` is
+                // reliably the bottom of the checklist.
+                if let Some(dialog) = self.todo_dialog.as_mut() {
+                    dialog.scroll = usize::MAX;
+                    self.needs_redraw = true;
+                }
+            }
+            KeyCode::Esc | KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                self.todo_dialog = None;
+                self.needs_redraw = true;
+            }
+            _ => {}
+        }
+    }
+
     fn handle_view_key(&mut self, key: KeyEvent) {
         // Scroll keys work regardless of modifier bits: terminals that
         // report arrows with modifiers (kitty keyboard protocol and friends)
@@ -2150,6 +2539,14 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, ctl: &Controller) {
+        self.handle_key_inner(key, ctl);
+        // Every handled key ends here: Esc, a closed list or a moved
+        // highlight drops a stale theme preview (see `handle` for the
+        // non-key events).
+        self.reconcile_theme_preview();
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent, ctl: &Controller) {
         self.needs_redraw = true;
         // DSH_TUI_KEYDEBUG=1: surface exactly what the terminal delivered
         // (after CG rescue) in the tip row — kills keybinding mysteries.
@@ -2160,6 +2557,11 @@ impl App {
         // ACP tool permission sits above session pickers (Backchat ask panel).
         if self.permission_ask.is_some() {
             self.handle_permission_ask_key(key);
+            return;
+        }
+
+        if self.todo_dialog.is_some() {
+            self.handle_todo_dialog_key(key);
             return;
         }
 
@@ -2230,8 +2632,15 @@ impl App {
         // through `refresh_file_menu`). Enter settles, Tab drills into a
         // directory, → follows the explorer's enter semantics.
         if let Some(menu) = &mut self.file_menu {
+            use crate::file_ref::{navigate, ExplorerInput as XIn};
+            // ctrl+h toggles hidden files/dirs (the explorer's own binding
+            // for ToggleShowHidden); it stays modal while the browser is
+            // open, like the navigation keys.
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('h') {
+                navigate(menu, XIn::ToggleShowHidden);
+                return;
+            }
             if key.modifiers == KeyModifiers::NONE {
-                use crate::file_ref::{navigate, ExplorerInput as XIn};
                 match key.code {
                     KeyCode::Up => {
                         navigate(menu, XIn::Up);
@@ -2289,6 +2698,10 @@ impl App {
                     _ => {}
                 }
                 if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+                    // A `/theme ` candidate row previews the palette the
+                    // highlight just landed on (mirrors the theme dialog);
+                    // the dark/light rows name no pack and revert instead.
+                    self.preview_slash_theme();
                     return;
                 }
             }
@@ -2313,6 +2726,11 @@ impl App {
     fn refresh_file_menu(&mut self) {
         // Vim normal mode is command editing — no mention browser.
         if self.vim.is_active() && self.vim.mode == crate::input::VimMode::Normal {
+            self.file_menu = None;
+            return;
+        }
+        // The slash menu and the @ menu are mutually exclusive.
+        if self.slash_completion_open() {
             self.file_menu = None;
             return;
         }
@@ -2627,13 +3045,36 @@ impl App {
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent, ctl: &Controller) {
+        // The theme dialog owns dark/light too (its title advertises it):
+        // ctrl+t flips the *previewed* pack's mode and keeps browsing, and
+        // the preview maps carry both modes, so the toggle stays in-pack.
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == PickerKind::Theme)
+            && matches!(
+                crate::input::classify(
+                    &key,
+                    crate::input::KeyCtx {
+                        input_empty: self.input.is_empty(),
+                        history_active: false,
+                    },
+                ),
+                Some(Action::ToggleTheme)
+            )
+        {
+            self.dispatch(Action::ToggleTheme, ctl);
+            return;
+        }
         let Some(picker) = &mut self.picker else {
             return;
         };
+        let kind = picker.kind;
         let n = picker.items.len().max(1);
         // Page keys jump a screenful of the open popup (rows recorded by the
         // draw pass); they never wrap, unlike ↑/↓.
         let page = self.picker_page_rows.max(1);
+        let sel_before = picker.sel;
         match key.code {
             KeyCode::Esc => self.picker = None,
             KeyCode::Up => picker.sel = picker.sel.checked_sub(1).unwrap_or(n - 1),
@@ -2665,6 +3106,11 @@ impl App {
                         };
                         self.scroll_up = 0;
                         self.sel = None;
+                        // The ↥ jump cursor indexes the displayed transcript's
+                        // cells; it must not carry a cell from another view.
+                        self.prompt_jump_cell = None;
+                        self.prompt_flash = None;
+                        self.prompt_flash_lines = None;
                     }
                     PickerKind::Effort => {
                         let effort = item.id;
@@ -2681,6 +3127,55 @@ impl App {
                 }
             }
             _ => {}
+        }
+        // The theme dialog lives on its highlight: moving the selection
+        // paints the row under it right away, without waiting for Enter.
+        // Enter above still closes and commits (persisted preference), Esc
+        // closes and `reconcile_theme_preview` puts the committed pack back.
+        if kind == PickerKind::Theme
+            && matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == PickerKind::Theme && picker.sel != sel_before)
+        {
+            self.preview_picker_theme();
+        }
+    }
+
+    /// The wheel over an open picker walks its highlight (one notch = one
+    /// ↑/↓ press), so the theme dialog previews the pack the wheel landed on.
+    fn picker_scroll_by(&mut self, delta: i64) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let kind = picker.kind;
+        let sel_before = picker.sel;
+        let last = picker.items.len().saturating_sub(1);
+        if delta < 0 {
+            picker.sel = picker
+                .sel
+                .saturating_sub(delta.unsigned_abs() as usize)
+                .min(last);
+        } else {
+            picker.sel = picker.sel.saturating_add(delta as usize).min(last);
+        }
+        self.needs_redraw = true;
+        if kind == PickerKind::Theme
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.sel != sel_before)
+        {
+            self.preview_picker_theme();
         }
     }
 
@@ -2819,6 +3314,13 @@ impl App {
         self.vim.reset_pending();
         self.reset_subagent_views();
         self.transcript.clear();
+        self.plan = None;
+        self.todo_dialog = None;
+        self.plan_chip = None;
+        self.hover_plan_chip = false;
+        self.prompt_jump_cell = None;
+        self.prompt_flash = None;
+        self.prompt_flash_lines = None;
         self.modes = Self::load_modes_cache(&self.cfg).unwrap_or_default();
         self.selected_model = None;
         self.session_title = None;
@@ -3363,10 +3865,10 @@ impl App {
     }
 
     fn push_help(&mut self) {
-        if self.locale == Locale::Zh {
-            let text = "\
-## help
-
+        // A dialog, not a timeline entry: the border names it (`/help`), so
+        // the body is the list itself — the same surface `/keys` uses.
+        let text = if self.locale == Locale::Zh {
+            "\
 - enter · 发送；当前轮次运行时将后续消息排队
 - ctrl+x · 立即 steer 当前轮次
 - esc · 中断（保留草稿）；空闲时清除草稿
@@ -3377,6 +3879,7 @@ impl App {
 - /login · 保存 API key 到 aby 主目录，不回显明文
 - /logout · 删除已保存的 API key
 - /effort · 推理强度 · /permission 权限预设 · /plan 计划模式
+- /vim · 切换 vim 模态编辑（/vim on|off，默认关闭）
 - /resume · 恢复持久会话并继续写入原日志
 - /image · 暂存本地图片：/image ./pic.png [说明]
 - /clip · 暂存剪贴板图片；ctrl+v 同样可用
@@ -3389,13 +3892,9 @@ impl App {
 - 鼠标拖动 · 选择并复制文本 · 双击复制单词
 
 每轮会显示：流式思考与回答、工具调用与结果、注入上下文、Subagent 生命周期、
-token 用量（含缓存命中）以及轮次结束原因。";
-            self.transcript.push_markdown(text.to_string());
-            return;
-        }
-        let text = "\
-## help
-
+token 用量（含缓存命中）以及轮次结束原因。"
+        } else {
+            "\
 - enter · send · queues a follow-up while a turn runs
 - ctrl+x · steer the active turn immediately
 - esc · interrupt (draft survives) · clears the draft when idle
@@ -3403,6 +3902,7 @@ token 用量（含缓存命中）以及轮次结束原因。";
 - shift+tab · cycle permission (workspace-write ⇄ full access) · /permission opens the preset picker
 - ctrl+p · model picker → effort picker
 - /effort · reasoning effort · /permission preset · /plan plan mode
+- /vim · toggle vim modal editing (/vim on|off, off by default)
 - /login · store the API key in the aby home (never echoed in full)
 - /logout · remove the stored API key (a --api-key override keeps running)
 - /resume · pick up a durable session — transcript replays, log continues
@@ -3417,8 +3917,16 @@ token 用量（含缓存命中）以及轮次结束原因。";
 - mouse drag · select text — copied on release · 2×click copies a word
 
 Per turn: streamed reasoning, answer, tool calls with results, injected
-context, subagent lifecycles, token usage (incl. cache hits), end reason.";
-        self.transcript.push_markdown(text.to_string());
+context, subagent lifecycles, token usage (incl. cache hits), end reason."
+        };
+        self.view_overlay = Some(ViewOverlay {
+            title: self.locale.tr("Help", "帮助").to_string(),
+            nodes: vec![crate::slots::TuiNode::Markdown {
+                text: text.to_string(),
+                streaming: false,
+            }],
+            scroll: 0,
+        });
     }
 
     fn push_keys(&mut self) {
@@ -4033,10 +4541,59 @@ mod resume_tests {
         assert!(frame.contains("ctrl+q"), "quit binding missing:\n{frame}");
 
         app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &ctl);
-        let frame = crate::ui::dump_frame(&mut app, 100, 30);
+        // 44 rows: the card keeps `DIALOG_MARGIN_Y` off the screen edges and
+        // stops above the composer, so this tail needs a taller terminal than
+        // the 30 rows the pre-margin card got away with.
+        let frame = crate::ui::dump_frame(&mut app, 100, 44);
         assert!(
             frame.contains("shift+tab") && frame.contains("permission"),
             "permission binding missing:\n{frame}"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.view_overlay.is_none(), "esc closes the local modal");
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "closing a builtin modal must not emit a plugin overlay event"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/help` uses the same local modal as `/keys`: a dialog over the chat,
+    /// never a timeline entry.
+    #[test]
+    fn help_slash_opens_a_local_modal_without_polluting_the_timeline() {
+        let root = tmp_root("help");
+        let (mut app, _demo_ctl) = test_app_with_root(root.to_str().unwrap(), "/w");
+        let (ctl, commands) = crate::controller::test_controller();
+        let cells_before = app.transcript.cells.len();
+        app.input.set("/help".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+
+        assert_eq!(
+            app.transcript.cells.len(),
+            cells_before,
+            "/help is chrome and must not enter the conversation timeline"
+        );
+        let overlay = app.view_overlay.as_ref().expect("/help modal should open");
+        assert_eq!(overlay.title, "Help");
+        let frame = crate::ui::dump_frame(&mut app, 100, 34);
+        assert!(frame.contains("Help · ↑↓/wheel scroll"), "modal:\n{frame}");
+        assert!(frame.contains("ctrl+x"), "binding missing:\n{frame}");
+        assert!(frame.contains("!cmd"), "shell hint missing:\n{frame}");
+        assert!(
+            !frame.contains("## help"),
+            "the border names the dialog — no repeated heading:\n{frame}"
+        );
+        // The card covers the middle of the screen, not the composer: the
+        // draft well (and its placeholder) is still painted.
+        assert!(
+            frame.contains("describe what you want to build"),
+            "composer well:\n{frame}"
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
@@ -4441,6 +4998,33 @@ mod mode_tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "lang");
         assert_eq!(matches[0].usage, "/lang [zh|en]");
+    }
+
+    /// `/vim` was dispatch-only — typing it worked, but the `/` menu never
+    /// listed it. Both halves are pinned here: the row exists (with its
+    /// localized description) and the bare command still toggles.
+    #[test]
+    fn slash_menu_offers_the_vim_toggle() {
+        let (mut app, ctl, _rx) = test_app();
+        app.input.set("/vim".into());
+
+        let matches = app.slash_matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "vim");
+        assert_eq!(matches[0].usage, "/vim [on|off]");
+        assert_eq!(matches[0].desc, "toggle vim modal editing in the composer");
+
+        app.locale = crate::locale::Locale::Zh;
+        assert_eq!(
+            app.slash_matches()[0].desc,
+            "切换 vim 模态编辑（默认关闭）",
+            "the menu uses the zh description"
+        );
+
+        app.run_slash("vim", "", &ctl);
+        assert!(app.vim.is_active(), "a bare /vim toggles it on");
+        app.run_slash("vim", "off", &ctl);
+        assert!(!app.vim.is_active(), "/vim off turns it off");
     }
 
     #[test]
@@ -6229,12 +6813,19 @@ mod palette_tests {
         (app, ctl, rx)
     }
 
+    /// A fresh install opens on One, dark. The built-in DeepSeek pack is not
+    /// gone — it is a row of the gallery, not the starting point.
     #[test]
-    fn starts_on_default_pack() {
+    fn starts_on_the_one_pack() {
         let (app, _ctl, _rx) = test_app();
-        assert_eq!(app.active_palette_id, "default");
-        assert_eq!(app.theme.brand, DEEPSEEK_450);
-        assert!(app.palettes.iter().any(|p| p.id == "default"));
+        assert_eq!(app.active_palette_id, "one");
+        assert_eq!(app.theme.mode, crate::theme::Mode::Dark);
+        assert_eq!(app.theme.brand, pack_brand(&app, "one"));
+        assert_eq!(
+            pack_brand(&app, "default"),
+            DEEPSEEK_450,
+            "the built-in pack still paints DeepSeek blue"
+        );
     }
 
     #[test]
@@ -6263,6 +6854,232 @@ mod palette_tests {
             "usage should mention pack ids, got {}",
             theme.usage
         );
+    }
+
+    /// The brand a gallery pack paints in `mode` — the value live previews and
+    /// commits must land on.
+    fn pack_brand_in(app: &App, id: &str, mode: crate::theme::Mode) -> Color {
+        app.palettes
+            .iter()
+            .find(|pack| pack.id == id)
+            .unwrap_or_else(|| panic!("pack {id}"))
+            .theme(mode)
+            .brand
+    }
+
+    fn pack_brand(app: &App, id: &str) -> Color {
+        pack_brand_in(app, id, crate::theme::Mode::Dark)
+    }
+
+    fn key(app: &mut App, ctl: &Controller, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), ctl);
+    }
+
+    /// Walk the open theme dialog's highlight onto `id`'s row, ↓ one row at a
+    /// time so the tests do not depend on where the gallery puts it.
+    fn highlight_pack(app: &mut App, ctl: &Controller, id: &str) {
+        let highlighted = |app: &App| {
+            app.picker
+                .as_ref()
+                .and_then(|picker| picker.items.get(picker.sel))
+                .map(|item| item.id.clone())
+        };
+        for _ in 0..app.palettes.len() {
+            if highlighted(app).as_deref() == Some(id) {
+                return;
+            }
+            key(app, ctl, KeyCode::Down);
+        }
+        panic!("the dialog never reached {id}");
+    }
+
+    fn wheel(app: &mut App, ctl: &Controller, kind: MouseEventKind) {
+        app.handle(
+            AppEvent::Term(Event::Mouse(MouseEvent {
+                kind,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })),
+            ctl,
+        );
+    }
+
+    /// The theme dialog lives on its highlight: arrows paint the row under it
+    /// immediately, but only Enter commits — the committed pack and
+    /// `settings.json` wait for the confirmation.
+    #[test]
+    fn theme_dialog_arrows_preview_and_only_enter_commits() {
+        let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
+        let ayu = pack_brand(&app, "ayu");
+        assert_ne!(ayu, one, "the test pack must differ from the committed one");
+        app.run_slash("theme", "", &ctl);
+        {
+            let picker = app.picker.as_ref().expect("the dialog opens");
+            assert_eq!(
+                picker.items[picker.sel].id, app.active_palette_id,
+                "the committed row opens highlighted"
+            );
+        }
+
+        // ↓ onto ayu: the painter follows right away, the committed pack does
+        // not.
+        highlight_pack(&mut app, &ctl, "ayu");
+        assert_eq!(app.theme.brand, ayu);
+        assert_eq!(app.active_palette_id, "one", "arrows only preview");
+        assert!(app.picker.is_some(), "preview must keep browsing open");
+        assert_eq!(app.theme_preview.as_deref(), Some("ayu"));
+
+        // Back onto the committed row → the preview is gone.
+        highlight_pack(&mut app, &ctl, "one");
+        assert_eq!(app.theme.brand, one);
+        assert!(app.theme_preview.is_none());
+
+        // Onto ayu once more, then Enter confirms: the dialog closes, ayu
+        // commits.
+        highlight_pack(&mut app, &ctl, "ayu");
+        assert_eq!(app.theme.brand, ayu);
+        assert_eq!(app.active_palette_id, "one", "still only previewed");
+        key(&mut app, &ctl, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        assert_eq!(app.active_palette_id, "ayu");
+        assert_eq!(app.theme.brand, ayu);
+        assert!(app.theme_preview.is_none(), "the commit clears the preview");
+    }
+
+    /// Esc and the wheel follow the same rule: the wheel previews, Esc closes
+    /// the dialog and the committed pack comes back — nothing sticks.
+    #[test]
+    fn theme_dialog_esc_and_wheel_revert_to_the_committed_pack() {
+        let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
+        let ayu = pack_brand(&app, "ayu");
+        app.run_slash("theme", "", &ctl);
+
+        wheel(&mut app, &ctl, MouseEventKind::ScrollDown);
+        assert_ne!(app.theme.brand, one, "one notch previews the next row");
+        assert!(app.picker.is_some(), "the wheel keeps the dialog open");
+        wheel(&mut app, &ctl, MouseEventKind::ScrollUp);
+        assert_eq!(app.theme.brand, one, "back on the committed row");
+
+        highlight_pack(&mut app, &ctl, "ayu");
+        assert_eq!(app.theme.brand, ayu);
+        key(&mut app, &ctl, KeyCode::Esc);
+        assert!(app.picker.is_none());
+        assert_eq!(app.active_palette_id, "one");
+        assert_eq!(
+            app.theme.brand, one,
+            "Esc must revert the preview — arrows never confirm"
+        );
+    }
+
+    /// A preview must never reach `settings.json`; the Enter that follows it
+    /// must.
+    #[test]
+    fn theme_preview_paints_without_persisting() {
+        let (mut app, ctl, _rx) = test_app();
+        let path = App::locale_settings_path(&app.cfg);
+        let ayu = pack_brand(&app, "ayu");
+        app.run_slash("theme", "", &ctl);
+
+        highlight_pack(&mut app, &ctl, "ayu");
+        assert_eq!(app.theme.brand, ayu);
+        let saved = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !saved.contains("ayu"),
+            "a preview must not land in settings.json, got {saved}"
+        );
+
+        key(&mut app, &ctl, KeyCode::Enter);
+        let saved = std::fs::read_to_string(&path).expect("enter persists the pack");
+        assert!(
+            saved.contains("\"palette\": \"ayu\""),
+            "the commit persists the pack, got {saved}"
+        );
+    }
+
+    /// ctrl+t inside the dialog (the title advertises it) flips the mode of
+    /// the *previewed* pack and keeps browsing.
+    #[test]
+    fn theme_dialog_ctrl_t_toggles_the_previewed_pack() {
+        let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
+        let ayu_dark = pack_brand(&app, "ayu");
+        let ayu_light = pack_brand_in(&app, "ayu", crate::theme::Mode::Light);
+        assert_ne!(ayu_dark, ayu_light, "the test pack must differ per mode");
+        app.run_slash("theme", "", &ctl);
+        highlight_pack(&mut app, &ctl, "ayu");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert_eq!(app.theme.mode, crate::theme::Mode::Light);
+        assert_eq!(app.theme.brand, ayu_light, "the toggle stays in-pack");
+        assert_eq!(app.active_palette_id, "one", "still only previewed");
+        assert!(app.picker.is_some(), "ctrl+t must not close the dialog");
+
+        // Esc drops the preview back to the committed pack — in the mode the
+        // toggle left behind.
+        key(&mut app, &ctl, KeyCode::Esc);
+        assert_eq!(app.theme.mode, crate::theme::Mode::Light);
+        assert_eq!(
+            app.theme.brand,
+            pack_brand_in(&app, "one", crate::theme::Mode::Light),
+            "One light, not ayu"
+        );
+        assert_ne!(app.theme.brand, one, "…in the mode, not the old one");
+    }
+
+    /// The `/theme ` candidate popup previews the palette under its
+    /// highlight and reverts when the popup closes — arrows never confirm.
+    #[test]
+    fn slash_theme_popup_previews_and_reverts_without_enter() {
+        let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
+        let ayu = pack_brand(&app, "ayu");
+        app.input.set("/theme ".into());
+
+        // Rows: dark · light · default · ayu …
+        key(&mut app, &ctl, KeyCode::Down);
+        assert_eq!(app.theme.brand, one, "the `light` row previews nothing");
+        key(&mut app, &ctl, KeyCode::Down);
+        assert_eq!(
+            app.theme.brand, DEEPSEEK_450,
+            "the `default` row previews the built-in pack"
+        );
+        key(&mut app, &ctl, KeyCode::Down);
+        assert_eq!(app.theme.brand, ayu, "the ayu row previews it");
+        assert_eq!(app.active_palette_id, "one", "arrows only preview");
+        assert_eq!(app.input.buf(), "/theme ", "the draft survives the preview");
+
+        // Esc dismisses the popup and reverts with it.
+        key(&mut app, &ctl, KeyCode::Esc);
+        assert!(app.input.is_empty());
+        assert_eq!(app.theme.brand, one, "Esc reverts the popup preview");
+    }
+
+    /// Enter on the highlighted row is the confirmation there too.
+    #[test]
+    fn slash_theme_popup_enter_commits_the_previewed_pack() {
+        let (mut app, ctl, _rx) = test_app();
+        let ayu = pack_brand(&app, "ayu");
+        app.input.set("/theme ".into());
+        for _ in 0..3 {
+            key(&mut app, &ctl, KeyCode::Down);
+        }
+        assert_eq!(app.theme.brand, ayu);
+        assert_eq!(app.active_palette_id, "one");
+
+        key(&mut app, &ctl, KeyCode::Enter);
+        assert_eq!(app.active_palette_id, "ayu");
+        assert_eq!(app.theme.brand, ayu);
+        assert!(
+            app.input.is_empty(),
+            "Enter runs the command and clears the draft"
+        );
+        assert!(app.theme_preview.is_none());
     }
 }
 
@@ -6392,7 +7209,16 @@ mod at_menu_tests {
     }
 
     fn test_app() -> (App, Controller, Receiver<AppEvent>) {
-        let cfg = test_cfg();
+        test_app_in("/tmp")
+    }
+
+    /// Same app, but rooted at a fixture workspace (the browser lists real
+    /// directories, so the `@` tests need a real tree).
+    fn test_app_in(workspace: &str) -> (App, Controller, Receiver<AppEvent>) {
+        let cfg = RuntimeConfig {
+            workspace: workspace.into(),
+            ..test_cfg()
+        };
         let (_tx, rx) = std::sync::mpsc::channel::<AppEvent>();
         let (ctl, _commands) = crate::controller::test_controller();
         let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
@@ -6445,6 +7271,151 @@ mod at_menu_tests {
         assert!(app.file_menu.is_none(), "whitespace ends the token");
         assert!(app.file_menu_dismissed.is_none());
     }
+
+    /// A fixture workspace with a hidden `.env` the browser can reveal.
+    struct Workspace {
+        root: std::path::PathBuf,
+    }
+
+    impl Workspace {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "abylab-at-menu-ws-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("src/nested")).expect("create tree");
+            std::fs::write(root.join("src/main.rs"), "").expect("write");
+            std::fs::write(root.join("README.md"), "").expect("write");
+            std::fs::write(root.join("notes.txt"), "").expect("write");
+            Self { root }
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// ctrl+h is the explorer's own hidden-entries toggle, and it stays
+    /// modal while the browser is open (the draft keeps its text).
+    #[test]
+    fn ctrl_h_toggles_hidden_files_in_the_browser() {
+        let ws = Workspace::new();
+        std::fs::write(ws.root.join(".env"), "").expect("write");
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        fn hidden_state(app: &App) -> bool {
+            app.file_menu
+                .as_ref()
+                .expect("menu open")
+                .explorer()
+                .show_hidden()
+        }
+        fn has_env(app: &App) -> bool {
+            app.file_menu
+                .as_ref()
+                .expect("menu open")
+                .explorer()
+                .files()
+                .iter()
+                .any(|f| f.name == ".env")
+        }
+        assert!(!hidden_state(&app));
+        assert!(!has_env(&app), ".env hidden by default");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(hidden_state(&app), "ctrl+h reveals hidden entries");
+        assert!(has_env(&app), ".env listed while hidden shown");
+        assert_eq!(app.input.buf(), "@", "the toggle is modal, not typed");
+
+        // Toggling back hides them again and the browser still navigates.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(!hidden_state(&app));
+        assert!(!has_env(&app), ".env hidden again");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl); // src/
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl); // README.md
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "@README.md");
+    }
+
+    /// The `/` menu and the `@` browser are mutually exclusive: a banner
+    /// command draft never opens the mention browser under it.
+    #[test]
+    fn slash_draft_does_not_open_the_browser() {
+        let (mut app, ctl, _rx) = test_app();
+        for ch in "/th".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &ctl);
+        }
+        assert!(app.slash_completion_open(), "the / menu owns the band");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        assert!(
+            app.file_menu.is_none(),
+            "slash context never opens the @ menu"
+        );
+
+        // Drop the command prefix and the browser takes over.
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &ctl);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        assert!(app.file_menu.is_some(), "a plain @ opens the browser");
+    }
+
+    /// Send-now (ctrl+enter) clears the draft — the browser must not
+    /// survive the send and float over the busy transcript.
+    #[test]
+    fn send_now_closes_the_browser() {
+        let ws = Workspace::new();
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        assert!(app.file_menu.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+        assert!(app.file_menu.is_none(), "the send closes the browser");
+    }
+
+    /// Typing narrows the listing itself (Martty's live filter), not just
+    /// the highlight: non-matching entries leave the popup.
+    #[test]
+    fn browser_filter_narrows_the_listing() {
+        let ws = Workspace::new();
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        for ch in "@read".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &ctl);
+        }
+
+        let frame = crate::ui::dump_frame(&mut app, 100, 24);
+        assert!(frame.contains("README.md"), "the match stays:\n{frame}");
+        assert!(
+            !frame.contains("notes.txt") && !frame.contains("src/"),
+            "non-matching entries leave the listing:\n{frame}"
+        );
+    }
+
+    /// The browser's hint row names the modal keys, ctrl+h included.
+    #[test]
+    fn browser_hint_names_the_hidden_toggle() {
+        let ws = Workspace::new();
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+
+        let frame = crate::ui::dump_frame(&mut app, 100, 24);
+        assert!(frame.contains("ctrl+h hidden"), "hint row:\n{frame}");
+        assert!(frame.contains("enter pick"), "hint row:\n{frame}");
+    }
 }
 
 #[cfg(test)]
@@ -6488,6 +7459,212 @@ mod resume_replay_tests {
     }
 
     #[test]
+    fn plan_snapshots_drive_the_composer_todo_line() {
+        let (mut app, ctl, _rx) = test_app();
+        let todos = vec![
+            crate::events::PlanItem {
+                content: "inspect".into(),
+                status: crate::events::PlanStatus::Completed,
+            },
+            crate::events::PlanItem {
+                content: "patch".into(),
+                status: crate::events::PlanStatus::InProgress,
+            },
+            crate::events::PlanItem {
+                content: "test".into(),
+                status: crate::events::PlanStatus::Pending,
+            },
+        ];
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::Plan {
+                session: "dsh-test".into(),
+                summary: "1 of 3 done · now: patch · 1 pending".into(),
+                todos: todos.clone(),
+                active: Some("patch".into()),
+                active_extra: 1,
+                completed: 1,
+                total: 3,
+            }),
+            &ctl,
+        );
+        assert_eq!(
+            app.plan,
+            Some(crate::events::PlanProgress {
+                todos: todos.clone(),
+                active: Some("patch".into()),
+                active_extra: 1,
+                completed: 1,
+                total: 3,
+            }),
+            "a committed todo_write reaches the cap row"
+        );
+
+        // The driver's blank plan event (no list, or an explicit clear) takes
+        // the todo line away again.
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::Plan {
+                session: "dsh-test".into(),
+                summary: String::new(),
+                todos: Vec::new(),
+                active: None,
+                active_extra: 0,
+                completed: 0,
+                total: 0,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.plan, None);
+
+        // A plan may never survive into the next session.
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::Plan {
+                session: "dsh-test".into(),
+                summary: "1 of 3 done · now: patch · 1 pending".into(),
+                todos: todos.clone(),
+                active: Some("patch".into()),
+                active_extra: 0,
+                completed: 1,
+                total: 3,
+            }),
+            &ctl,
+        );
+        app.reset_session_ui();
+        assert_eq!(app.plan, None);
+    }
+
+    /// The cap row's progress chip opens the checklist dialog; esc closes it,
+    /// and a cleared checklist takes an open dialog down with it.
+    #[test]
+    fn todo_progress_chip_opens_and_closes_the_dialog() {
+        let (mut app, ctl, _rx) = test_app();
+        app.plan = Some(crate::events::PlanProgress {
+            todos: vec![crate::events::PlanItem {
+                content: "patch".into(),
+                status: crate::events::PlanStatus::InProgress,
+            }],
+            active: Some("patch".into()),
+            active_extra: 0,
+            completed: 0,
+            total: 1,
+        });
+        // The frame that draws the chip records its hit target.
+        app.plan_chip = Some(ratatui::layout::Rect::new(20, 14, 8, 1));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 24,
+            row: 14,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.todo_dialog.is_some(), "the progress chip is a button");
+
+        app.handle(
+            AppEvent::Term(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            &ctl,
+        );
+        assert!(app.todo_dialog.is_none(), "esc closes the dialog");
+
+        app.open_todo_dialog();
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::Plan {
+                session: "dsh-test".into(),
+                summary: String::new(),
+                todos: Vec::new(),
+                active: None,
+                active_extra: 0,
+                completed: 0,
+                total: 0,
+            }),
+            &ctl,
+        );
+        assert!(
+            app.todo_dialog.is_none(),
+            "a cleared checklist closes the dialog"
+        );
+    }
+
+    /// The `↥` button walks the session's user prompts: newest first, then one
+    /// prompt back per click, and the oldest wraps to the newest. Each jump
+    /// anchors the prompt at the top of the pane and flashes its rows.
+    #[test]
+    fn prompt_jump_walks_user_prompts_newest_first() {
+        let (mut app, _ctl, _rx) = test_app();
+        for text in ["first prompt", "second prompt", "third prompt"] {
+            app.transcript.push_user(text.into(), false);
+            // Long bodies make each bubble several rows, so the anchor math
+            // has room to move the viewport.
+            app.transcript.apply(crate::events::UiEvent::TextDelta {
+                session: "dsh-test".into(),
+                text: "answer\n".repeat(6),
+            });
+        }
+        app.chat_view.area = ratatui::layout::Rect::new(1, 0, 60, 4);
+        let layout = app.transcript.layout(&app.theme, 60, app.spinner(), false);
+        assert_eq!(layout.users.len(), 3);
+        let newest = layout.users[2].cell;
+        let middle = layout.users[1].cell;
+        let oldest = layout.users[0].cell;
+
+        app.jump_to_user_prompt();
+        assert_eq!(
+            app.prompt_jump_cell,
+            Some(newest),
+            "the newest prompt first"
+        );
+        let h = 4usize;
+        let total = layout.lines.len();
+        let anchor = |app: &App| total - app.scroll_up - h;
+        assert_eq!(
+            anchor(&app),
+            layout.users[2].line.min(total - h),
+            "the jumped prompt is anchored at the top"
+        );
+        assert_eq!(app.prompt_flash.map(|(cell, _)| cell), Some(newest));
+
+        app.jump_to_user_prompt();
+        assert_eq!(app.prompt_jump_cell, Some(middle), "then one prompt back");
+        app.jump_to_user_prompt();
+        assert_eq!(app.prompt_jump_cell, Some(oldest), "down to the oldest");
+        app.jump_to_user_prompt();
+        assert_eq!(
+            app.prompt_jump_cell,
+            Some(newest),
+            "the oldest wraps around"
+        );
+
+        // The flash expires on the next tick after its window.
+        app.prompt_flash = Some((newest, Instant::now() - Duration::from_millis(1)));
+        app.tick();
+        assert!(app.prompt_flash.is_none());
+        assert!(app.prompt_flash_lines.is_none());
+    }
+
+    /// A session with no prompts says so instead of moving the viewport.
+    #[test]
+    fn prompt_jump_without_prompts_tips_instead_of_scrolling() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.transcript.push_notice(
+            crate::transcript::NoticeLevel::Info,
+            "a notice, not a prompt".into(),
+        );
+        app.chat_view.area = ratatui::layout::Rect::new(1, 0, 60, 10);
+        app.scroll_up = 3;
+
+        app.jump_to_user_prompt();
+
+        assert_eq!(app.scroll_up, 3, "the viewport stays put");
+        assert!(app.prompt_jump_cell.is_none());
+        assert!(
+            app.tip
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("no user prompts")),
+            "{:?}",
+            app.tip
+        );
+    }
+
+    #[test]
     fn session_bound_then_user_message_renders_replay() {
         let (mut app, ctl, _rx) = test_app();
         app.handle(
@@ -6519,5 +7696,89 @@ mod resume_replay_tests {
             users.iter().any(|t| t.contains("hello persistence")),
             "replayed user line lands in the transcript: {users:?}"
         );
+    }
+}
+
+/// The composer cap's `:branch` suffix: seeded from the workspace once at
+/// startup, then re-checked on the tick throttle so a checkout made
+/// mid-session (the agent's shell tool, another terminal) reaches the label.
+#[cfg(test)]
+mod git_branch_tests {
+    use super::*;
+
+    fn fresh_root() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-tui-git-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// A workspace directory whose `.git/HEAD` points at `branch`.
+    fn repo(branch: &str) -> String {
+        let workspace = fresh_root();
+        std::fs::create_dir_all(std::path::Path::new(&workspace).join(".git")).unwrap();
+        std::fs::write(
+            std::path::Path::new(&workspace).join(".git/HEAD"),
+            format!("ref: refs/heads/{branch}\n"),
+        )
+        .unwrap();
+        workspace
+    }
+
+    fn test_app(workspace: &str) -> App {
+        let cfg = RuntimeConfig {
+            workspace: workspace.into(),
+            home: fresh_root(),
+            sessions_root: fresh_root(),
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            max_tokens: None,
+            base_url: None,
+            api_key: None,
+            key_origin: None,
+        };
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        App::new(crate::theme::Theme::dark(), cfg, "dsh-test".into())
+    }
+
+    #[test]
+    fn startup_seeds_the_branch_from_the_workspace_head() {
+        assert_eq!(test_app(&repo("main")).git_branch.as_deref(), Some("main"));
+        // A workspace that is not a checkout keeps the cap path-only.
+        assert_eq!(test_app("/work/acme/not-a-repo").git_branch, None);
+    }
+
+    #[test]
+    fn tick_picks_up_a_checkout_on_the_throttled_cadence() {
+        let workspace = repo("main");
+        let mut app = test_app(&workspace);
+        std::fs::write(
+            std::path::Path::new(&workspace).join(".git/HEAD"),
+            "ref: refs/heads/feature/next\n",
+        )
+        .unwrap();
+
+        // Inside the window: no re-read, and no repaint either.
+        app.git_check_at = Instant::now();
+        app.needs_redraw = false;
+        app.tick();
+        assert_eq!(
+            app.git_branch.as_deref(),
+            Some("main"),
+            "the throttled tick must not re-read HEAD"
+        );
+        assert!(!app.needs_redraw);
+
+        // Past it, the cap label follows the checkout.
+        app.git_check_at = Instant::now() - GIT_CHECK_INTERVAL;
+        app.needs_redraw = false;
+        app.tick();
+        assert_eq!(app.git_branch.as_deref(), Some("feature/next"));
+        assert!(app.needs_redraw, "a branch change repaints the cap");
     }
 }

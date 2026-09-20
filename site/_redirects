@@ -1,0 +1,7 @@
+# Cloudflare Pages redirects. Parsed by Pages, never served as a file.
+# Host-level rules (www → apex) are not possible here: use a Bulk Redirect or a
+# Redirect Rule in the dashboard, see site/README.md.
+
+# Short install URL. 302, not 301: the canonical script lives in the repo and
+# clients should keep following it there.
+/install.sh https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh 302

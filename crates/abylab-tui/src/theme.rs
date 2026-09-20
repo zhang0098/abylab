@@ -208,6 +208,10 @@ impl std::fmt::Display for PaletteError {
     }
 }
 
+/// Pack a fresh install opens on: One, dark. The built-in `default` pack —
+/// the DeepSeek tokens — stays in the gallery and selectable like the rest.
+pub const DEFAULT_PACK: &str = "one";
+
 /// A named dark/light token pack. Built-in `default` plus the Martty gallery.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PalettePack {
@@ -276,8 +280,8 @@ impl PalettePack {
                 "palette label must be a non-empty string".into(),
             ));
         }
-        let dark = parse_token_map(obj.get("dark").unwrap_or(&Value::Null))?;
-        let light = parse_token_map(obj.get("light").unwrap_or(&Value::Null))?;
+        let dark = lifted_chip(parse_token_map(obj.get("dark").unwrap_or(&Value::Null))?);
+        let light = lifted_chip(parse_token_map(obj.get("light").unwrap_or(&Value::Null))?);
         Ok(Self {
             id: id.to_string(),
             label: label.to_string(),
@@ -285,6 +289,33 @@ impl PalettePack {
             light,
         })
     }
+}
+
+/// How far a chip is lifted toward the pack's text colour when the pack hands
+/// us `chip_bg == panel`. The built-in pack's own panel→chip step is 18/255;
+/// this lands the gallery packs at 15–24, so the wash reads the same there.
+const CHIP_LIFT: f32 = 0.12;
+
+/// `chip_bg` is the background of a selected row (the picker highlight) drawn
+/// *on* the panel layer. Every gallery pack ships `chip_bg` equal to its
+/// `panel`, which highlights nothing — the row paints the same colour as the
+/// popup under it. Lift the chip toward the text colour so it reads as a wash.
+/// The gallery JSONs are embedded verbatim from `npm/lib/palettes`, so the
+/// nudge belongs here rather than in the files.
+fn lifted_chip(mut tokens: TokenMap) -> TokenMap {
+    if tokens.chip_bg == tokens.panel {
+        tokens.chip_bg = blend(tokens.panel, tokens.fg, CHIP_LIFT);
+    }
+    tokens
+}
+
+/// Linear blend `a → b` by `t` (`0.0` keeps `a`, `1.0` is `b`), per channel.
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a, b) else {
+        return a;
+    };
+    let mix = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
 }
 
 fn parse_token_map(v: &Value) -> Result<TokenMap, PaletteError> {
@@ -588,5 +619,40 @@ mod tests {
         let ayu = packs.iter().find(|pack| pack.id == "ayu").unwrap();
         assert_eq!(ayu.label, "Ayu");
         assert_eq!(ayu.theme(Mode::Dark).bg, Color::Rgb(11, 14, 20));
+    }
+
+    /// The picker paints its selected row in `chip_bg` on a `panel` block. A
+    /// pack that shipped the two colours equal would highlight nothing, so
+    /// every pack — built-in, gallery, both modes — must lift the chip, and by
+    /// a wash-sized step rather than a slab.
+    #[test]
+    fn every_pack_has_a_chip_that_stands_out_from_its_panel() {
+        let mut packs = vec![PalettePack::builtin_default()];
+        packs.extend(PalettePack::builtin_gallery());
+        for pack in packs {
+            for mode in [Mode::Dark, Mode::Light] {
+                let theme = pack.theme(mode);
+                let (Color::Rgb(pr, pg, pb), Color::Rgb(cr, cg, cb)) = (theme.panel, theme.chip_bg)
+                else {
+                    panic!("{} {mode:?}: palettes resolve to RGB", pack.id);
+                };
+                let step = [pr, pg, pb]
+                    .iter()
+                    .zip([cr, cg, cb])
+                    .map(|(panel, chip)| panel.abs_diff(chip))
+                    .max()
+                    .unwrap_or_default();
+                assert!(
+                    step >= 10,
+                    "{} {mode:?}: chip is a no-op, step {step}",
+                    pack.id
+                );
+                assert!(
+                    step <= 60,
+                    "{} {mode:?}: chip is a slab, step {step}",
+                    pack.id
+                );
+            }
+        }
     }
 }

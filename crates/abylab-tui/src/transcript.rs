@@ -112,6 +112,17 @@ pub struct ImageShot {
     pub data: Arc<[u8]>,
 }
 
+/// One user prompt in a rendered transcript: the transcript cell index and
+/// the half-open line span `[line, end)` its bubble occupies (the leading
+/// blank separator row is not counted). The composer cap's `↥` button walks
+/// these from the newest one back and flashes the jumped span.
+#[derive(Clone, Copy, Debug)]
+pub struct UserPromptLine {
+    pub cell: usize,
+    pub line: usize,
+    pub end: usize,
+}
+
 /// A rendered transcript: styled lines plus, for each line, the index of the
 /// transcript cell that owns it (only tool cells report ownership, so mouse
 /// clicks can toggle a specific tool preview).
@@ -119,6 +130,8 @@ pub struct TranscriptLayout {
     pub lines: Vec<Line<'static>>,
     pub owners: Vec<Option<usize>>,
     pub images: Vec<ImageShot>,
+    /// Every laid-out user prompt with its first and last text line.
+    pub users: Vec<UserPromptLine>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -750,12 +763,14 @@ impl Transcript {
         let mut out: Vec<Line> = Vec::new();
         let mut owners: Vec<Option<usize>> = Vec::new();
         let mut images: Vec<ImageShot> = Vec::new();
+        let mut users: Vec<UserPromptLine> = Vec::new();
         for (ci, cell) in self.cells.iter().enumerate() {
             let expanded = cell.expanded || self.expand_all;
             match &cell.kind {
                 CellKind::User { text, queued } => {
                     emit(&mut out, &mut owners, Line::default(), None);
                     // Web UI fidelity: the user bubble uses --dsw-specific-bubble.
+                    let line = out.len();
                     for (i, l) in wrap(text, width.saturating_sub(2)).into_iter().enumerate() {
                         let mut spans = vec![
                             Span::styled(
@@ -780,6 +795,11 @@ impl Transcript {
                         }
                         emit(&mut out, &mut owners, Line::from(spans), None);
                     }
+                    users.push(UserPromptLine {
+                        cell: ci,
+                        line,
+                        end: out.len(),
+                    });
                 }
                 CellKind::Image {
                     name,
@@ -1165,6 +1185,7 @@ impl Transcript {
             lines: out,
             owners,
             images,
+            users,
         }
     }
 }
@@ -1461,6 +1482,45 @@ mod tests {
 
     fn t(session: &str) -> Transcript {
         Transcript::new(session.to_string())
+    }
+
+    /// The `↥` jump walks this index: every user prompt with its bubble rows
+    /// (the leading blank separator row is excluded), in transcript order.
+    #[test]
+    fn layout_indexes_every_user_prompt_span() {
+        let mut tr = t("s");
+        tr.push_user("first prompt".into(), false);
+        tr.apply(UiEvent::TextDelta {
+            session: "s".into(),
+            text: "an answer".into(),
+        });
+        tr.push_user("second\nprompt".into(), false);
+
+        let layout = tr.layout(&Theme::dark(), 40, '⠋', false);
+        assert_eq!(layout.users.len(), 2);
+        let [first, second] = [layout.users[0], layout.users[1]];
+        let row = |line: usize| -> String {
+            layout.lines[line]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert!(
+            row(first.line).contains("first prompt"),
+            "{}",
+            row(first.line)
+        );
+        assert!(
+            !row(first.line - 1).contains("first prompt"),
+            "the separator row is not part of the span"
+        );
+        assert!(row(second.line).contains("second"));
+        assert!(row(second.end - 1).contains("prompt"), "wrapped tail row");
+        assert!(
+            second.line >= first.end,
+            "spans never overlap: {first:?} {second:?}"
+        );
     }
 
     #[test]
@@ -1802,6 +1862,11 @@ mod tests {
         tr.apply(UiEvent::Plan {
             session: "s".into(),
             summary: "locate fn main [completed]".into(),
+            todos: Vec::new(),
+            active: None,
+            active_extra: 0,
+            completed: 1,
+            total: 1,
         });
         match &tr.cells[0].kind {
             CellKind::User { text, queued } => {
@@ -1836,12 +1901,22 @@ mod tests {
         tr.apply(UiEvent::Plan {
             session: "s".into(),
             summary: "inspect [in_progress]".into(),
+            todos: Vec::new(),
+            active: Some("inspect".into()),
+            active_extra: 0,
+            completed: 0,
+            total: 1,
         });
         let cells_after_first = tr.cells.len();
 
         tr.apply(UiEvent::Plan {
             session: "s".into(),
             summary: "inspect [completed] · test [in_progress]".into(),
+            todos: Vec::new(),
+            active: Some("test".into()),
+            active_extra: 0,
+            completed: 1,
+            total: 2,
         });
 
         assert_eq!(
@@ -1864,10 +1939,20 @@ mod tests {
         tr.apply(UiEvent::Plan {
             session: "s".into(),
             summary: "inspect [in_progress]".into(),
+            todos: Vec::new(),
+            active: Some("inspect".into()),
+            active_extra: 0,
+            completed: 0,
+            total: 1,
         });
         tr.apply(UiEvent::Plan {
             session: "s".into(),
             summary: String::new(),
+            todos: Vec::new(),
+            active: None,
+            active_extra: 0,
+            completed: 0,
+            total: 0,
         });
 
         let rendered = tr

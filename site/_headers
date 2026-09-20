@@ -1,0 +1,23 @@
+# Cloudflare Pages response headers. Parsed by Pages, never served as a file.
+# The whole site is first-party (Pico CSS is vendored in /vendor), so the CSP
+# can stay this tight; a third-party script (analytics, fonts) needs its origin
+# added to the matching directive.
+
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'
+
+# Pico is pinned to a version, but the filename is not: keep this short enough
+# that a Pico upgrade reaches returning visitors without a hard refresh.
+/vendor/*
+  Cache-Control: public, max-age=604800
+
+/styles.css
+  Cache-Control: public, max-age=3600
+/app.js
+  Cache-Control: public, max-age=3600
+/favicon.svg
+  Cache-Control: public, max-age=604800

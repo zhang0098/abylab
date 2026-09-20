@@ -86,7 +86,7 @@ jobs:
           name="abylab-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/abylab" "dist/$name/"
-          cp LICENSE README.md README.en.md "dist/$name/"
+          cp LICENSE README.md README.en.md TECH.md TECH.en.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
         id: package

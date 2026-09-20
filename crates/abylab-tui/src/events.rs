@@ -89,9 +89,20 @@ pub enum UiEvent {
         title: String,
     },
     /// ACP `plan` / `plan_update` snapshot (todo entries, not `plan/mode`).
+    /// `summary` feeds the transcript's plan cell; the structured fields feed
+    /// the composer's live todo line and its clickable progress dialog, so the
+    /// TUI owns their wording. An empty `summary` hides every surface.
     Plan {
         session: String,
         summary: String,
+        /// The whole checklist, in list order — the dialog lists every row.
+        todos: Vec<PlanItem>,
+        /// First in-progress task, in list order.
+        active: Option<String>,
+        /// Additional concurrently in-progress tasks.
+        active_extra: usize,
+        completed: usize,
+        total: usize,
     },
     /// `plan/mode` — dsh-plan-mode collaboration state (last one wins);
     /// awaiting a direct driver producer (plan mode facts currently ride
@@ -137,4 +148,61 @@ pub enum UiEvent {
         session: String,
         outcome: String,
     },
+}
+
+impl UiEvent {
+    /// Live todo progress behind the composer's todo line and its clickable
+    /// progress dialog, or `None` when a plan event carries no checklist
+    /// (`UiEvent::Plan` with an empty summary). The transcript keeps the full
+    /// digest; the cap row shows only the task in progress plus completed/total,
+    /// worded by the active locale.
+    pub fn plan_progress(&self) -> Option<PlanProgress> {
+        match self {
+            UiEvent::Plan {
+                summary,
+                todos,
+                active,
+                active_extra,
+                completed,
+                total,
+                ..
+            } if !summary.is_empty() && *total > 0 => Some(PlanProgress {
+                todos: todos.clone(),
+                active: active.clone(),
+                active_extra: *active_extra,
+                completed: *completed,
+                total: *total,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The checklist facts the composer's todo line and progress dialog render
+/// (see [`UiEvent::plan_progress`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanProgress {
+    /// The whole checklist, in list order.
+    pub todos: Vec<PlanItem>,
+    /// First in-progress task, in list order.
+    pub active: Option<String>,
+    /// Additional concurrently in-progress tasks.
+    pub active_extra: usize,
+    pub completed: usize,
+    pub total: usize,
+}
+
+/// One checklist row, in the order the agent wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanItem {
+    pub content: String,
+    pub status: PlanStatus,
+}
+
+/// Lifecycle of one [`PlanItem`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
 }

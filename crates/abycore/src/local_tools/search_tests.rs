@@ -38,8 +38,13 @@ async fn grep(
 #[tokio::test]
 async fn glob_orders_newest_first_and_matches_any_depth() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".hidden.txt"), "hidden\n").unwrap();
+    // Oldest first, one sleep per file: the sort is newest-first with a path
+    // tie-break, and file timestamps share the kernel's coarse tick — two
+    // files written back-to-back used to tie and flip the last row from run
+    // to run.
     std::fs::write(dir.path().join("a.txt"), "oldest\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::write(dir.path().join(".hidden.txt"), "hidden\n").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     std::fs::write(dir.path().join("b.txt"), "newer\n").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
