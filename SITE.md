@@ -121,8 +121,14 @@ curl -sI https://abylab.ai/ | head -12            # 200 + CSP 等头部
 curl -sI http://abylab.ai/ | head -3              # 301 → https://abylab.ai/
 curl -sI https://abylab.ai/install.sh | head -1   # 200，不是 302（跳回 GitHub 就说明 _redirects 被写回去了）
 curl -sI https://abylab.ai/nope | head -1         # 404，且渲染我们的 404 页
-for f in index.html styles.css app.js vendor/pico.min.css install.sh; do
-  diff <(curl -s https://abylab.ai/$f) site/$f && echo "$f 一致"
+
+# 比对线上和仓库。HTML 那两个必须用目录 URL：Pages 会把 /index.html 用 308 跳到
+# /，拿 /index.html 取到的 body 是空的，必然报"不一致"。
+diff <(curl -s https://abylab.ai/)           site/index.html    && echo "首页一致"
+diff <(curl -s https://abylab.ai/en/)        site/en/index.html && echo "英文页一致"
+diff <(curl -s https://abylab.ai/install.sh) install.sh         && echo "安装脚本一致"
+for f in styles.css app.js vendor/pico.min.css robots.txt sitemap.xml favicon.svg; do
+  diff <(curl -s "https://abylab.ai/$f") "site/$f" && echo "$f 一致"
 done
 ```
 
