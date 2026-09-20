@@ -139,6 +139,78 @@ jobs:
           path: ${{ steps.package.outputs.artifact }}
           if-no-files-found: error
 
+  # musl static builds, published next to the glibc pair while the switch is
+  # being validated; the plan is to ship these two assets and retire the gnu
+  # ones. See the note in ci.yml and scripts/check-glibc-floor.sh --static.
+  #
+  # Alpine's own libc is musl, so each runner builds its architecture natively:
+  # no cross toolchain, no zig, nothing to pin beyond the image tag.
+  build-linux-musl:
+    name: build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    container: rust:alpine
+    # The container's default shell is sh; the steps below are bash.
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      # bash for the run steps, git for actions/checkout: neither is in the
+      # image. `shell: sh` because this is the step that creates bash.
+      - name: bash + git
+        shell: sh
+        run: apk add --no-cache bash git
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # `cache-bin: false` keeps rust-cache from pruning the image's shims in
+      # /usr/local/cargo/bin.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-bin: false
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p abylab-tui
+
+      - name: static link
+        run: scripts/check-glibc-floor.sh --static "target/${{ matrix.target }}/release/abylab"
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          name="abylab-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/abylab" "dist/$name/"
+          cp LICENSE README.md README.en.md TECH.md TECH.en.md install.sh "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # Runs on the musl system the binary was built for — the asset's real
+      # platform — so this is a native smoke test, not just a self-check.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/abylab"
+          "$bin" --version || "$bin" --help
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+
   build-macos:
     name: build ${{ matrix.target }}
     needs: check
@@ -195,7 +267,7 @@ jobs:
 
   publish:
     name: publish ${{ inputs.tag || github.ref_name }}
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-linux-musl, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
