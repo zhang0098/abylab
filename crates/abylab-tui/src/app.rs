@@ -736,6 +736,14 @@ pub struct App {
     pub(crate) prompt_jump_btn: Option<ratatui::layout::Rect>,
     /// The pointer rests on the `↥` glyph: brighten it.
     pub(crate) hover_prompt_jump_btn: bool,
+    /// Screen rect of the cap row's mouse-only `⛶` expand glyph, recorded by
+    /// `ui::draw_composer_box` every frame.
+    pub(crate) expand_btn: Option<ratatui::layout::Rect>,
+    /// The pointer rests on the `⛶` glyph: brighten it.
+    pub(crate) hover_expand_btn: bool,
+    /// The `⛶` click pins the well to the amplified height (issue #92) until
+    /// the next click; the auto layout returns.
+    pub(crate) composer_expanded: bool,
     /// Transcript cell of the user prompt the last `↥` click jumped to; the
     /// next click walks one prompt further back (the oldest wraps around).
     /// In-memory only, and it rides across clicks so jumping resumes where the
@@ -1040,6 +1048,9 @@ impl App {
             hover_plan_chip: false,
             prompt_jump_btn: None,
             hover_prompt_jump_btn: false,
+            expand_btn: None,
+            hover_expand_btn: false,
+            composer_expanded: false,
             prompt_jump_cell: None,
             prompt_flash: None,
             prompt_flash_lines: None,
@@ -1932,6 +1943,15 @@ impl App {
                     self.toggle_tool(ci);
                     return;
                 }
+                // The mouse-only `⛶` glyph (issue #92) pins the well to the
+                // amplified height and restores it on the next click.
+                if self.expand_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
+                    self.composer_expanded = !self.composer_expanded;
+                    self.needs_redraw = true;
+                    return;
+                }
                 // A click inside the composer well places the caret at the
                 // clicked char and arms a drag-selection; the chat highlight is
                 // dismissed first, like any click outside that pane.
@@ -2027,6 +2047,13 @@ impl App {
                     self.prompt_jump_btn_hit(mouse.column, mouse.row) && !self.modal_open();
                 if jump_hover != self.hover_prompt_jump_btn {
                     self.hover_prompt_jump_btn = jump_hover;
+                    self.needs_redraw = true;
+                }
+                // …and for the `⛶` expand glyph beside it.
+                let expand_hover =
+                    self.expand_btn_hit(mouse.column, mouse.row) && !self.modal_open();
+                if expand_hover != self.hover_expand_btn {
+                    self.hover_expand_btn = expand_hover;
                     self.needs_redraw = true;
                 }
             }
@@ -2132,6 +2159,17 @@ impl App {
     /// drawn this frame.
     fn prompt_jump_btn_hit(&self, col: u16, row: u16) -> bool {
         self.prompt_jump_btn.is_some_and(|r| {
+            col >= r.x
+                && col < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        })
+    }
+
+    /// Hit-test a screen cell against the cap row's `⛶` expand glyph drawn
+    /// this frame.
+    fn expand_btn_hit(&self, col: u16, row: u16) -> bool {
+        self.expand_btn.is_some_and(|r| {
             col >= r.x
                 && col < r.x.saturating_add(r.width)
                 && row >= r.y
@@ -8142,6 +8180,34 @@ mod resume_replay_tests {
         );
         app.reset_session_ui();
         assert_eq!(app.plan, None);
+    }
+
+    /// The cap row's `⛶` glyph is a mouse-only toggle: each click pins the
+    /// well to the amplified height or hands it back to the auto layout.
+    #[test]
+    fn the_expand_glyph_pins_and_restores_the_well_height() {
+        let (mut app, _ctl, _rx) = test_app();
+        // The frame that draws the glyph records its hit target.
+        app.expand_btn = Some(ratatui::layout::Rect::new(80, 4, 3, 1));
+
+        for expected in [true, false] {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 81,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.composer_expanded, expected, "click {expected}");
+        }
+
+        // A click that misses the glyph leaves the height alone.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.composer_expanded);
     }
 
     /// The cap row's progress chip opens the checklist dialog; esc closes it,

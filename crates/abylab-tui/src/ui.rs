@@ -19,6 +19,9 @@ use crate::transcript::wrap;
 /// The `↥` prompt-jump glyph's hit width: the glyph cell plus the margin cell
 /// left of it (Martty's two-cell button).
 const PROMPT_JUMP_BTN_W: u16 = 2;
+/// The `⛶` expand glyph's hit width: a margin, the glyph, and one more cell so
+/// the corner `╮` keeps its room (Martty's issue #92 button).
+const EXPAND_BTN_W: u16 = 3;
 
 /// Composer card height for a terminal `height` rows tall.
 /// Composer height: the input well plus one bottom meta row (state ·
@@ -37,18 +40,30 @@ fn composer_height(height: u16) -> u16 {
 
 /// Grow with hard/soft-wrapped draft rows, while leaving at least half of a
 /// normal terminal to the conversation. Beyond the cap, `draw_input` keeps a
-/// cursor-following viewport inside the composer.
+/// cursor-following viewport inside the composer. The mouse-only expand button
+/// (`⛶`) pins the well to the amplified height instead.
 fn resolved_composer_height(area: Rect, app: &App) -> u16 {
     let minimum = composer_height(area.height);
     let inner_width = area.width.saturating_sub(2);
     let prompt_width = "❯ ".width() as u16;
     let wrap_width = inner_width.saturating_sub(prompt_width).max(1) as usize;
-    let maximum = (area.height / 2).max(minimum).min(14);
-    let desired = app
-        .input
-        .visual_row_count(wrap_width)
-        .saturating_add(1)
-        .min(maximum as usize) as u16;
+    // Expanded: up to 5/8 of the frame and no compact cap — the conversation
+    // keeps the rest. Auto: half the screen, ≤ 14.
+    let maximum = if app.composer_expanded {
+        (area.height * 5 / 8)
+            .max(minimum)
+            .min(area.height.saturating_sub(4).max(minimum))
+    } else {
+        (area.height / 2).max(minimum).min(14)
+    };
+    let desired = if app.composer_expanded {
+        maximum
+    } else {
+        app.input
+            .visual_row_count(wrap_width)
+            .saturating_add(1)
+            .min(maximum as usize) as u16
+    };
     desired.max(minimum).min(maximum)
 }
 
@@ -63,6 +78,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // them may leave a target behind.
     app.plan_chip = None;
     app.prompt_jump_btn = None;
+    app.expand_btn = None;
     f.render_widget(
         Block::default().style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,
@@ -1072,14 +1088,20 @@ pub fn head_branch(workspace: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The cap row's right side: the project path with the `:branch` suffix,
-/// plus the mouse-only `↥` user prompt jump glyph (Martty's issue #103
-/// button). The glyph keeps one cell of margin from the corner; hovering
-/// brightens it to the strongest foreground.
+/// The cap row's right side: the project path with the `:branch` suffix, plus
+/// the mouse-only `⛶` expand button (Martty's issue #92) and, one cell left of
+/// it, the `↥` user prompt jump glyph (issue #103). Both keep one cell of
+/// margin from the corner; hovering brightens them to the strongest
+/// foreground.
 fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
     let title_width = (area_width / 2).clamp(8, 64);
     let path_width = title_width.saturating_sub(4);
     let tone = if app.hover_prompt_jump_btn {
+        app.theme.fg
+    } else {
+        app.theme.caption
+    };
+    let expand_tone = if app.hover_expand_btn {
         app.theme.fg
     } else {
         app.theme.caption
@@ -1099,6 +1121,8 @@ fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
         Span::styled(text, Style::default().fg(app.theme.caption)),
         Span::raw(" "),
         Span::styled("↥", Style::default().fg(tone)),
+        Span::raw(" "),
+        Span::styled("⛶", Style::default().fg(expand_tone)),
         Span::raw(" "),
     ])
     .right_aligned()
@@ -1155,12 +1179,19 @@ fn draw_composer_box(f: &mut Frame, app: &mut App, area: Rect) {
         (end > start).then(|| Rect::new(area.x + 1 + start as u16, area.y, (end - start) as u16, 1))
     });
     let title = ellipsize_line(cap.line, title_budget, Style::default().fg(theme.caption));
-    // The `↥` glyph rides the right-aligned workspace title with a trailing
-    // space before the corner, so its cell is fixed; the hit target adds the
-    // margin cell on its left (Martty's two-cell button).
-    if area.width > PROMPT_JUMP_BTN_W + 3 {
+    // Both cap-row glyphs ride the right-aligned workspace title with a
+    // trailing space before the corner, so their cells are fixed: `⛶` two
+    // cells left of the corner, `↥` two cells left of that. Each hit target
+    // adds the margin cell on its left (Martty's two-cell buttons).
+    if area.width > EXPAND_BTN_W + PROMPT_JUMP_BTN_W + 4 {
+        app.expand_btn = Some(Rect::new(
+            area.x + area.width - EXPAND_BTN_W - 1,
+            area.y,
+            EXPAND_BTN_W,
+            1,
+        ));
         app.prompt_jump_btn = Some(Rect::new(
-            area.x + area.width - PROMPT_JUMP_BTN_W - 2,
+            area.x + area.width - EXPAND_BTN_W - PROMPT_JUMP_BTN_W - 1,
             area.y,
             PROMPT_JUMP_BTN_W,
             1,
@@ -2191,6 +2222,62 @@ mod tests {
         let cap = cap_row(&frame);
 
         assert!(cap.contains("· …/deepseek-harness"), "{cap}");
+    }
+
+    /// The `⛶` expand glyph sits right of the `↥` jump glyph on the cap row
+    /// (two cells left of the corner), its hit rect covers it, and a click
+    /// pins the well to the amplified height until the next one.
+    #[test]
+    fn the_expand_glyph_rides_the_cap_row_and_pins_the_well() {
+        let mut app = test_app();
+        app.cfg.workspace = "/work/acme/deepseek-harness".into();
+
+        let frame = dump_frame(&mut app, 100, 20);
+        let row = frame
+            .lines()
+            .position(|line| line.contains('⛶'))
+            .expect("cap row with the ⛶ glyph");
+        let cap = frame.lines().nth(row).unwrap();
+        assert!(
+            cap.find('⛶').unwrap() > cap.find('↥').unwrap(),
+            "⛶ follows ↥: {cap}"
+        );
+        assert!(
+            cap.find('↥').unwrap() > cap.find("deepseek-harness").unwrap(),
+            "both glyphs follow the path: {cap}"
+        );
+
+        let btn = app.expand_btn.expect("expand button rect");
+        assert_eq!(btn.y as usize, row, "the hit rect rides the cap row");
+        assert_eq!(btn.right(), 99, "it ends one cell short of the corner");
+        let glyph = cap.chars().position(|c| c == '⛶').unwrap() as u16;
+        assert!(
+            glyph >= btn.x && glyph < btn.x + btn.width,
+            "glyph at {glyph} inside {btn:?}"
+        );
+
+        // Hover is the only affordance: it brightens, like `↥`.
+        let tone = |app: &App| -> Style {
+            workspace_cap_title(app, 100)
+                .spans
+                .iter()
+                .find(|span| span.content.contains('⛶'))
+                .expect("glyph span")
+                .style
+        };
+        let idle = tone(&app);
+        app.hover_expand_btn = true;
+        let hovered = tone(&app);
+        assert_ne!(idle, hovered, "hover must be visible");
+        assert_eq!(hovered.fg, Some(app.theme.fg));
+
+        // Clicking pins the well: 5/8 of the frame, past the auto cap.
+        let area = Rect::new(0, 0, 100, 40);
+        let auto = resolved_composer_height(area, &app);
+        app.composer_expanded = true;
+        let pinned = resolved_composer_height(area, &app);
+        assert_eq!(pinned, 25, "5/8 of a 40-row frame");
+        assert!(pinned > auto, "the click amplifies: {auto} → {pinned}");
     }
 
     /// The `↥` prompt-jump button rides the cap row right of the project path,

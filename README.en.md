@@ -183,7 +183,9 @@ reaches the label; a long path or a narrow terminal keeps the path alone.
 
 The `↥` right of the project path in that same row walks your prompts: each
 click jumps one prompt back (newest first, wrapping from the oldest), scrolls
-it to the top of the pane and highlights it for a few seconds.
+it to the top of the pane and highlights it for a few seconds. The `⛶` beside
+it is mouse-only too: one click pins the input well to the amplified height
+(about 5/8 of the frame), the next restores the automatic height.
 
 Mouse: wheel scrolls · click a tool card expands it · drag selects, release
 copies (native tool → tmux → OSC52) · inside the input box a click places the

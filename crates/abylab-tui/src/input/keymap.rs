@@ -884,6 +884,11 @@ pub const MOUSE_ROWS: &[MouseRow] = &[
         desc_zh: "跳到输入框上沿右端的 ↥ 处（你上一条输入）",
     },
     MouseRow {
+        chords: &["click ⛶"],
+        desc_en: "pin the input well to the amplified height · click again to restore",
+        desc_zh: "把输入框固定到放大高度 · 再点一下还原（无快捷键）",
+    },
+    MouseRow {
         chords: &["drag"],
         desc_en: "select text · copies on release (transcript and the input box)",
         desc_zh: "拖动选择文本，松开即复制（对话区和输入框都行）",
