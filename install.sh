@@ -8,6 +8,10 @@
 # verifies its SHA-256 sum and installs that one file. Everything else happens
 # inside a temporary directory that is removed on exit.
 #
+# A plain "latest" install first tries the mirror on https://abylab.ai/downloads
+# (GitHub Releases is slow or unreachable on some networks) and falls back to
+# GitHub Releases when it is missing or fails.
+#
 # Options:
 #   -v, --version <tag>   release to install (default: latest, e.g. v0.1.0)
 #       --bin-dir <dir>   where to put the binary (default: ~/.local/bin)
@@ -16,10 +20,13 @@
 #       --no-path         never touch a startup file; only print the line
 #       --force           reinstall even when this version is already present
 #       --no-verify       skip SHA-256 verification (not recommended)
+#       --mirror <url>    mirror base URL to download from first
+#       --no-mirror       skip the mirror and use GitHub Releases only
 #       --dry-run         print the plan, download nothing
 #   -h, --help            this text
 #
-# Environment: ABYLAB_VERSION, ABYLAB_BIN_DIR, ABYLAB_REPO
+# Environment: ABYLAB_VERSION, ABYLAB_BIN_DIR, ABYLAB_REPO, ABYLAB_MIRROR
+# (ABYLAB_MIRROR='' disables the mirror, like --no-mirror)
 #
 # Bash 3.2 compatible: no associative arrays, no ${var,,}, no mapfile.
 set -euo pipefail
@@ -28,6 +35,10 @@ REPO="${ABYLAB_REPO:-zhang0098/abylab}"
 BIN_NAME="abylab"
 VERSION="${ABYLAB_VERSION:-latest}"
 BIN_DIR="${ABYLAB_BIN_DIR:-${HOME:?HOME is not set}/.local/bin}"
+# `${VAR-default}`, not `${VAR:-default}`: an explicitly empty ABYLAB_MIRROR is
+# how a caller opts out of the mirror.
+MIRROR="${ABYLAB_MIRROR-https://abylab.ai/downloads}"
+MIRROR_ON=1
 MODIFY_PATH=1
 PATH_FILE=''
 PATH_WROTE=0
@@ -66,8 +77,9 @@ abylab installer
 
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/zhang0098/abylab/main/install.sh)"
 
-Downloads the prebuilt abylab binary for this machine from GitHub Releases,
-verifies its SHA-256 sum and installs that one file.
+Downloads the prebuilt abylab binary for this machine, verifies its SHA-256 sum
+and installs that one file. A plain "latest" install tries the mirror on
+abylab.ai first and falls back to GitHub Releases.
 
 Options:
   -v, --version <tag>   release to install (default: latest, e.g. v0.1.0)
@@ -77,13 +89,16 @@ Options:
       --no-path         never touch a startup file; only print the line
       --force           reinstall even when this version is already present
       --no-verify       skip SHA-256 verification (not recommended)
+      --mirror <url>    mirror base URL to download from first
+      --no-mirror       skip the mirror and use GitHub Releases only
       --dry-run         print the plan, download nothing
   -h, --help            this text
 
 Unless --no-path is given, that directory is also added to your shell startup
 file, marked with a comment so the line is easy to find and remove.
 
-Environment: ABYLAB_VERSION, ABYLAB_BIN_DIR, ABYLAB_REPO
+Environment: ABYLAB_VERSION, ABYLAB_BIN_DIR, ABYLAB_REPO, ABYLAB_MIRROR
+(ABYLAB_MIRROR='' disables the mirror, like --no-mirror)
 EOF
 }
 
@@ -116,6 +131,17 @@ while [ $# -gt 0 ]; do
             ;;
         --no-verify)
             VERIFY=0
+            shift
+            ;;
+        --mirror)
+            [ $# -ge 2 ] || die "--mirror needs a base URL, e.g. --mirror https://abylab.ai/downloads"
+            # Trailing slash would double up when the path is appended.
+            MIRROR="${2%/}"
+            MIRROR_ON=1
+            shift 2
+            ;;
+        --no-mirror)
+            MIRROR_ON=0
             shift
             ;;
         --dry-run)
@@ -223,6 +249,23 @@ resolve_tag() {
         sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
     [ -n "$tag" ] || return 1
     printf '%s\n' "$tag"
+}
+
+# The tag the mirror carries at downloads/latest/, or non-zero when the mirror
+# cannot serve this install. Only a plain "latest" can come from the mirror: it
+# holds a single version (a Pages deployment replaces the whole site), so an
+# explicit --version goes to GitHub Releases, which keeps every tag.
+mirror_tag() {
+    local tag
+    [ "$MIRROR_ON" = 1 ] || return 1
+    [ -n "$MIRROR" ] || return 1
+    [ "$VERSION" = "latest" ] || return 1
+    tag=$(http_get "$MIRROR/latest/VERSION" 2>/dev/null | tr -d '[:space:]') || return 1
+    case "$tag" in
+        '') return 1 ;;
+        v*) printf '%s\n' "$tag" ;;
+        *) printf 'v%s\n' "$tag" ;;
+    esac
 }
 
 # ------------------------------------------------------------- checksum ----
@@ -395,18 +438,30 @@ wire_path() { # dry_run
 # ---------------------------------------------------------------- main -----
 
 main() {
-    local target tag asset base tmp tarball sums bin current installed
+    local target tag asset base tmp tarball sums bin current installed dl_error mirrored
 
     target=$(detect_target)
-    tag=$(resolve_tag) || die "no release found for $REPO
+
+    # The mirror carries only the latest release; everything else — an explicit
+    # --version, --no-mirror, a mirror that is down or does not have the file —
+    # is served by GitHub Releases, which keeps every tag.
+    tag=''
+    mirrored=0
+    if tag=$(mirror_tag); then
+        mirrored=1
+        asset="${BIN_NAME}-latest-${target}.tar.gz"
+        base="$MIRROR/latest"
+    else
+        tag=$(resolve_tag) || die "no release found for $REPO
        Cut one first (see .github/workflows/release.yml) or build from source:
        cargo install --git https://github.com/${REPO} abylab-tui"
-
-    asset="${BIN_NAME}-${tag}-${target}.tar.gz"
-    base="https://github.com/${REPO}/releases/download/${tag}"
+        asset="${BIN_NAME}-${tag}-${target}.tar.gz"
+        base="https://github.com/${REPO}/releases/download/${tag}"
+    fi
 
     printf '%sabylab%s %s (%s)\n' "$BOLD" "$OFF" "$tag" "$target"
     note "asset    $asset"
+    note "source   $base"
     note "target   $BIN_DIR/$BIN_NAME"
 
     if [ "$FORCE" = 0 ] && [ -x "$BIN_DIR/$BIN_NAME" ]; then
@@ -435,7 +490,19 @@ main() {
     # Keep the downloader's own message (DNS failure, 404, …) and fold it into
     # our error instead of letting a bare "curl: (22)" escape.
     if ! dl_error=$(http_download "$base/$asset" "$tarball" 2>&1); then
-        die "download failed: $base/$asset
+        # A mirror that is down or has dropped the file must not cost the user
+        # the install: GitHub Releases is the source of record.
+        if [ "$mirrored" = 1 ]; then
+            note "mirror download failed — trying GitHub Releases"
+            rm -f "$tarball"
+            tag=$(resolve_tag) || die "mirror download failed: $MIRROR/latest/$asset
+       ${dl_error:-unknown download error}"
+            asset="${BIN_NAME}-${tag}-${target}.tar.gz"
+            base="https://github.com/${REPO}/releases/download/${tag}"
+            tarball="$tmp/$asset"
+            dl_error=$(http_download "$base/$asset" "$tarball" 2>&1) || true
+        fi
+        [ -s "$tarball" ] || die "download failed: $base/$asset
        ${dl_error:-unknown download error}
        Check that '$tag' has a build for $target:
        https://github.com/${REPO}/releases/tag/${tag}"

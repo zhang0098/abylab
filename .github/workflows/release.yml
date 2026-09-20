@@ -161,3 +161,94 @@ jobs:
             gh release create "$TAG" --title "$TAG" --generate-notes
           gh release upload "$TAG" --clobber dist/*
           gh release view "$TAG" --json url --jq .url
+
+  # Copy the tarballs onto the site, so abylab.ai/downloads/ serves installs for
+  # networks where GitHub Releases is slow or blocked. Same Pages project as
+  # site.yml; see SITE.md for the layout and the secrets.
+  mirror:
+    name: mirror to abylab.ai
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Check credentials
+        id: creds
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Mirror skipped"
+              echo "CLOUDFLARE_API_TOKEN is not set, so $TAG was not copied to"
+              echo "https://abylab.ai/downloads/. Add CLOUDFLARE_API_TOKEN and"
+              echo "CLOUDFLARE_ACCOUNT_ID (see SITE.md), then re-run this"
+              echo "workflow with tag=$TAG to backfill it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Is this the latest release?
+        id: latest
+        if: steps.creds.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The mirror keeps one version at downloads/latest/, and a Pages
+          # deployment replaces the whole site — so re-running this workflow
+          # for an older tag must not push its assets back over a newer
+          # release's.
+          newest=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          if [ "$newest" = "$TAG" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not the latest release ($newest) — nothing mirrored"
+          fi
+
+      - name: Stage site + latest assets
+        if: steps.latest.outputs.is_latest == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A Pages deployment is a full snapshot of the uploaded directory, so
+          # the site has to travel with the tarballs: staging gets a copy of
+          # site/ (`_headers` and `_redirects` included) plus downloads/.
+          mkdir -p staging downloads-src
+          cp -R site/. staging/
+          gh release download "$TAG" --pattern '*.tar.gz' -D downloads-src
+
+          mkdir -p staging/downloads/latest
+          printf '%s\n' "$TAG" > staging/downloads/latest/VERSION
+          for src in downloads-src/*.tar.gz; do
+            name=${src##*/}
+            # abylab-v0.1.2-x86_64-unknown-linux-gnu.tar.gz becomes
+            # abylab-latest-x86_64-unknown-linux-gnu.tar.gz — the stable name
+            # install.sh asks the mirror for.
+            stable=${name/abylab-${TAG}-/abylab-latest-}
+            cp "$src" "staging/downloads/latest/$stable"
+          done
+          cd staging/downloads/latest
+          # Sums for the names as mirrored (the release's own SHA256SUMS lists
+          # the versioned ones), so `sha256sum -c` works against this directory.
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Deploy site + downloads to Cloudflare Pages
+        if: steps.latest.outputs.is_latest == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # --branch main is required: a tag push is not a branch, and wrangler
+          # would otherwise publish a preview deployment, leaving abylab.ai on
+          # the previous build.
+          command: pages deploy staging --project-name=abylab --branch main

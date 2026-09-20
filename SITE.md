@@ -119,6 +119,45 @@ for f in index.html styles.css app.js vendor/pico.min.css; do
 done
 ```
 
+### 4. 安装包镜像（abylab.ai/downloads）
+
+`release.yml` 的 `mirror` job 在发布后把四个平台的 tarball 复制到站点上，给
+GitHub Releases 慢或被墙的网络留一条路：
+
+```
+/downloads/latest/VERSION                              v0.1.2
+/downloads/latest/abylab-latest-<target>.tar.gz        ×4
+/downloads/latest/SHA256SUMS                           对应上面的固定文件名
+```
+
+三个必须记住的点：
+
+- **一次推整站**：Pages 的部署是上传目录的完整快照，所以 job 先把 `site/`
+  复制进 staging，再放 `downloads/`。只推 `downloads/` 会把整站覆盖掉，
+  `_headers`、`_redirects` 也会一起消失。
+- **必须 `--branch main`**：tag 推送时 checkout 的不是分支，wrangler 会当成
+  预览部署，自定义域名不会更新。
+- **只留最新版**：快照语义决定老的 `downloads/v0.1.1/` 在下一次发布时就没了，
+  所以镜像只有 `latest`（job 里也会比对最新 release，避免回填旧 tag 时把新版
+  覆盖掉）。指定 `--version v0.1.1` 的安装仍然走 GitHub Releases。
+
+需要 `CLOUDFLARE_API_TOKEN`（Pages: Edit）和 `CLOUDFLARE_ACCOUNT_ID` 两个
+secret；没配时 job 跳过，并在 run summary 里写出补配方法。配好之后回填某次发布：
+
+```sh
+gh workflow run release.yml -f tag=v0.1.2
+```
+
+`install.sh` 对 `latest` 会**先试镜像再回退 GitHub**（镜像 404/超时/缺文件都
+不阻塞安装）：`--no-mirror` 或 `ABYLAB_MIRROR=''` 只走 GitHub，
+`--mirror <url>` 换一个镜像地址。检查：
+
+```sh
+curl -s https://abylab.ai/downloads/latest/VERSION
+curl -sO https://abylab.ai/downloads/latest/abylab-latest-x86_64-unknown-linux-gnu.tar.gz
+curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
+```
+
 ## 改内容
 
 - 文案只在两个 `index.html` 里，改中文别忘了 `en/index.html`；命令列表、按键、
