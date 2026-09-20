@@ -233,14 +233,14 @@ pub struct TurnLimits {
     /// Tool executions per run segment. [`TurnLimits::UNLIMITED`] removes the cap.
     pub max_tool_calls: usize,
     /// Extra run segments granted to an unfinished turn before the failure
-    /// surfaces: budget stops and transient request failures both resume the
+    /// surfaces: budget stops, timeouts and transient request failures resume the
     /// same open turn through the SDK's `continue_run` (harness's
     /// `dsh-llm-retry` re-runs a failed step in the same open turn). `0`
     /// disables it, so every failure ends the turn.
     pub continuations: usize,
     /// Whole-segment deadline. Harness has no turn deadline at all; this is
-    /// abylab's own bound, and it is the limit that actually binds once the
-    /// request/tool budgets are backstops.
+    /// abylab's own bound. Expiry can grant a fresh segment while continuation
+    /// headroom remains; it does not immediately end a long, unfinished turn.
     pub run_timeout: std::time::Duration,
     /// Per-tool deadline (a tool that ignores cancellation can exceed it).
     pub tool_timeout: std::time::Duration,
@@ -248,7 +248,7 @@ pub struct TurnLimits {
 
 impl TurnLimits {
     /// No cap: the turn runs until the model stops, the user interrupts, the
-    /// run deadline passes, or the context limit is reached.
+    /// timeout continuations are exhausted, or the context limit is reached.
     pub const UNLIMITED: usize = usize::MAX;
 
     /// The harness-style default: wide enough that a legitimate turn never

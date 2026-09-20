@@ -439,6 +439,7 @@ impl Run {
                     || event.starts_with("op-done:connection lost")
                     || event.starts_with("op-done:rate limited")
                     || event.starts_with("op-done:server error")
+                    || event.starts_with("op-done:timed out")
             })
             .collect()
     }

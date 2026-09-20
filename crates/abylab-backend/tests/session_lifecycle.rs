@@ -7,7 +7,10 @@ use abylab_backend::{Cmd, CtlEvent, DriverConfig, Event, TurnLimits, UiEvent};
 use common::{MockServer, Reply, single_call_reply, text_body};
 use std::{
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -21,12 +24,28 @@ impl Live {
         Self::start_with_setup(server, |_| {})
     }
     fn start_with_setup(server: &MockServer, setup: impl FnOnce(&std::path::Path)) -> Self {
+        Self::start_with_limits_and_setup(
+            server,
+            TurnLimits {
+                continuations: 1,
+                ..Default::default()
+            },
+            setup,
+        )
+    }
+    fn start_with_limits_and_setup(
+        server: &MockServer,
+        limits: TurnLimits,
+        setup: impl FnOnce(&std::path::Path),
+    ) -> Self {
+        static NEXT_WORKSPACE: AtomicUsize = AtomicUsize::new(0);
+        let serial = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let workspace = std::env::temp_dir().join(format!(
-            "aby-session-regression-{}-{unique}",
+            "aby-session-regression-{}-{unique}-{serial}",
             std::process::id()
         ));
         std::fs::create_dir_all(&workspace).unwrap();
@@ -45,10 +64,7 @@ impl Live {
                 max_tokens: None,
                 api_key: Some("fixture-key".into()),
                 base_url: Some(server.base_url.clone()),
-                limits: TurnLimits {
-                    continuations: 1,
-                    ..Default::default()
-                },
+                limits,
                 compaction: None,
             },
             move |event| {
@@ -382,4 +398,51 @@ fn manual_and_overflow_summaries_are_interruptible_and_keep_history() {
             "persist the interrupted request ledger too"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupting_timeout_backoff_saves_the_unverified_result_without_retrying() {
+    let server = MockServer::start(vec![Reply::sse(single_call_reply(
+        "slow-call",
+        "bash",
+        r#"{"command":"sleep 30","description":"Wait past the segment deadline"}"#,
+    ))]);
+    let live = Live::start_with_limits_and_setup(
+        &server,
+        TurnLimits {
+            run_timeout: Duration::from_secs(1),
+            continuations: 3,
+            ..Default::default()
+        },
+        |_| {},
+    );
+    live.send(Cmd::Prompt {
+        text: "run a slow tool".into(),
+    });
+    // The settlement event occurs after the deadline and before the retry
+    // delay. Synchronize on it instead of guessing when to press Esc.
+    live.wait(|event| {
+        matches!(event, Event::Ui(UiEvent::ToolResult { call_id, is_error: true, text, .. })
+            if call_id == "slow-call" && text.contains("unverified"))
+    });
+    let started = Instant::now();
+    live.handle.as_ref().unwrap().interrupt();
+    live.wait(
+        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "interrupted"),
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(server.bodies().len(), 1, "Esc prevents the next request");
+
+    let snapshot = live.snapshot();
+    assert!(snapshot.needs_response, "the user can resume later");
+    assert!(
+        snapshot.pending.is_empty(),
+        "the interrupted call was settled"
+    );
+    assert!(snapshot.items.iter().any(|item| {
+        matches!(item, abycore::Item::FunctionCallOutput { call_id, output, .. }
+            if call_id == "slow-call" && output.contains("unverified"))
+    }));
+    assert_eq!(snapshot.requests.len(), 1);
 }
