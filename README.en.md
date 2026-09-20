@@ -37,6 +37,16 @@ in your shell startup file (marked with a comment; `--no-path` only prints the
 line, `--path-file` picks the file). To build from source instead:
 `cargo build --release`.
 
+The Linux binaries are built on Debian 11 (bullseye), so they need glibc 2.31
+or newer — Ubuntu 20.04+, Debian 11+, RHEL 9 and Amazon Linux 2023 run them
+as-is. Anything older (RHEL 8, Amazon Linux 2) and musl distros (Alpine) need
+a source build, which wants a C compiler (`aws-lc-sys` builds its own
+BoringSSL):
+
+```sh
+cargo install --git https://github.com/zhang0098/abylab abylab-tui
+```
+
 Then store your key (from <https://platform.deepseek.com/> → API keys) by
 typing this into the composer — it takes effect without a restart:
 
