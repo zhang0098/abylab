@@ -142,6 +142,10 @@ GitHub Releases 慢或被墙的网络留一条路：
 - **一次推整站**：Pages 的部署是上传目录的完整快照，所以 job 先把 `site/`
   复制进 staging，再放 `downloads/`。只推 `downloads/` 会把整站覆盖掉，
   `_headers`、`_redirects` 也会一起消失。
+- **site/ 取默认分支，不取 tag**：站点不跟着版本走，所以 mirror job 的 checkout
+  用的是默认分支。回填旧 tag（`-f tag=v0.1.1`）时如果跟着 tag 取 `site/`，推上
+  去的就是那个 tag 当时的站点——没有 `site/install.sh`、`_redirects` 里还带着
+  跳 GitHub 的规则，正好把 #7 修掉的东西盖回去。
 - **必须 `--branch main`**：tag 推送时 checkout 的不是分支，wrangler 会当成
   预览部署，自定义域名不会更新。
 - **只留最新版**：快照语义决定老的 `downloads/v0.1.1/` 在下一次发布时就没了，
