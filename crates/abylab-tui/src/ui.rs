@@ -1756,7 +1756,6 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
     // borrows `app` (the ListView render needs a mutable picker).
     let current_model = app.cfg.model.clone();
     let current_provider = app.cfg.provider.clone();
-    let current_mode = app.current_mode();
     let current_palette = app.active_palette_id.clone();
     let current_permission = app.current_permission().to_string();
     let is_current = move |item: &crate::app::PickerItem| match kind {
@@ -1767,7 +1766,6 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
                     .as_deref()
                     .is_none_or(|provider| provider == current_provider)
         }
-        crate::app::PickerKind::Mode => item.id == current_mode,
         crate::app::PickerKind::Theme => item.id == current_palette,
         crate::app::PickerKind::Permission => item.id == current_permission,
         crate::app::PickerKind::Effort

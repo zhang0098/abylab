@@ -249,29 +249,6 @@ pub const MODEL_PRESETS: &[&str] = &["deepseek-flash", "deepseek-v4-pro"];
 
 /// Stock composition presets served by `FetchCatalog` until a host
 /// catalog replaces them.
-pub const AGENT_MODES: &[(&str, &str, &str)] = &[
-    (
-        "standard",
-        "Standard mode",
-        "full coding agent · files, shell, search, skills, subagents",
-    ),
-    (
-        "code",
-        "Code mode",
-        "standard tools driven from one TypeScript program",
-    ),
-    (
-        "minimal",
-        "Minimal mode",
-        "two tools · persistent bash + str_replace_editor",
-    ),
-    (
-        "cordis",
-        "Creator mode",
-        "standard + runtime inspection and preset authoring",
-    ),
-];
-
 /// The stock permission presets (id, one-line meaning) — the default table
 /// `@deepseek-ai/dsh-permission-presets` ships. Shift+Tab cycles them;
 /// `/permission <name>` passes any other id through for profiles with a
@@ -329,31 +306,6 @@ pub fn permission_label(id: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn permission_picker_items(
-    modes: &[crate::bus::CatalogPreset],
-    reported: Option<&str>,
-    current: &str,
-) -> Vec<PickerItem> {
-    modes
-        .iter()
-        .map(|p| {
-            let mark = if reported == Some(p.id.as_str()) {
-                " · current"
-            } else if reported.is_none() && p.id == current {
-                " · default"
-            } else {
-                ""
-            };
-            PickerItem {
-                id: p.id.clone(),
-                label: permission_label(&p.id),
-                meta: format!("{}{mark}", p.description),
-                provider: None,
-            }
-        })
-        .collect()
 }
 
 /// Map a file extension to the attachment media type the host accepts.
@@ -528,10 +480,6 @@ impl ChatView {
 pub enum PickerKind {
     Model,
     Effort,
-    // Mode pickers stay available for ACP `agent-preset` notifications,
-    // but no user entry point constructs them anymore (agent commands removed).
-    #[allow(dead_code)]
-    Mode,
     Theme,
     Permission,
     Session,
@@ -624,7 +572,6 @@ pub struct Modes {
     pub sandbox: Option<String>,
     pub approval: Option<String>,
     pub permission: Option<String>,
-    pub agent_preset: Option<String>,
     /// Reasoning effort as last requested from this client (`/effort`,
     /// the post-model-pick effort picker); the host doesn't echo one.
     pub effort: Option<String>,
@@ -714,11 +661,9 @@ pub struct App {
     /// the slash menu after the builtins.
     pub skills: Vec<crate::bus::SkillInfo>,
     /// Last advertised composition select (`/agent`).
-    last_presets: Vec<crate::bus::CatalogPreset>,
     /// Last advertised ACP model select (`/model`).
     last_models: Vec<crate::bus::CatalogModel>,
     /// Last advertised session modes (`/permission`, shift+tab).
-    permission_choices: Vec<crate::bus::CatalogPreset>,
     /// Last advertised effort catalog for the current model.
     effort_choices: Vec<String>,
     pub tip: Option<(String, Instant)>,
@@ -820,7 +765,6 @@ fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
         | UiEvent::SandboxMode { session, .. }
         | UiEvent::ApprovalPolicy { session, .. }
         | UiEvent::PermissionPreset { session, .. }
-        | UiEvent::AgentPreset { session, .. }
         | UiEvent::ApprovalAsked { session, .. }
         | UiEvent::ApprovalDecided { session, .. } => Some(session),
         UiEvent::SubagentStarted { .. } | UiEvent::SubagentFinished { .. } => None,
@@ -1104,9 +1048,7 @@ impl App {
             hover_att: None,
             modes,
             skills: Vec::new(),
-            last_presets: Vec::new(),
             last_models: Vec::new(),
-            permission_choices: Vec::new(),
             effort_choices: Vec::new(),
             tip: None,
             plan: None,
@@ -1518,17 +1460,6 @@ impl App {
                 plain("high", "high reasoning effort"),
                 plain("max", "maximum reasoning effort"),
             ],
-            "permission" if !self.permission_choices.is_empty() => self
-                .permission_choices
-                .iter()
-                .map(|preset| {
-                    (
-                        preset.id.clone(),
-                        preset.name.clone(),
-                        preset.description.clone(),
-                    )
-                })
-                .collect(),
             "permission" => PERMISSION_PRESETS
                 .iter()
                 .map(|(id, desc)| plain(id, desc))
@@ -1685,14 +1616,10 @@ impl App {
                     CtlEvent::Skills { skills } => {
                         self.skills = skills;
                     }
-                    CtlEvent::Catalog { models, presets } => {
-                        if !presets.is_empty() {
-                            self.last_presets = presets.clone();
-                        }
+                    CtlEvent::Catalog { models } => {
                         if !models.is_empty() {
                             self.last_models = models.clone();
                         }
-                        let mode_current = self.current_mode();
                         if let Some(picker) = &mut self.picker {
                             match picker.kind {
                                 PickerKind::Model if !models.is_empty() => {
@@ -1720,26 +1647,6 @@ impl App {
                                                 && i.provider.as_deref()
                                                     == Some(current_provider.as_str())
                                         })
-                                        .unwrap_or(0);
-                                }
-                                PickerKind::Mode if !presets.is_empty() => {
-                                    picker.items = presets
-                                        .into_iter()
-                                        .map(|p| PickerItem {
-                                            id: p.id.clone(),
-                                            label: p.name,
-                                            meta: if p.broken {
-                                                format!("⚠ broken · {}", p.description)
-                                            } else {
-                                                p.description
-                                            },
-                                            provider: None,
-                                        })
-                                        .collect();
-                                    picker.sel = picker
-                                        .items
-                                        .iter()
-                                        .position(|i| i.id == mode_current)
                                         .unwrap_or(0);
                                 }
                                 _ => {}
@@ -1888,10 +1795,6 @@ impl App {
             }
             E::PermissionPreset { session, preset } if *session == self.session_id => {
                 self.modes.permission = Some(preset.clone());
-                apply_to_transcript = false;
-            }
-            E::AgentPreset { session, preset } if *session == self.session_id => {
-                self.modes.agent_preset = Some(preset.clone());
                 apply_to_transcript = false;
             }
             E::SessionTitle { session, title } if *session == self.session_id => {
@@ -3447,7 +3350,6 @@ impl App {
                 self.picker = None;
                 match kind {
                     PickerKind::Model => self.select_model(item, ctl),
-                    PickerKind::Mode => self.set_mode(item.id, ctl),
                     PickerKind::Theme => self.select_palette(&item.id),
                     PickerKind::Permission => self.set_permission(item.id, ctl),
                     PickerKind::Session => self.load_acp_session(&item.id, ctl),
@@ -4004,41 +3906,6 @@ impl App {
     }
 
     /// The effective composition id: the advertised agent preset, else empty.
-    pub fn current_mode(&self) -> String {
-        self.modes.agent_preset.clone().unwrap_or_else(|| {
-            self.last_presets
-                .first()
-                .map(|p| p.id.clone())
-                .unwrap_or_default()
-        })
-    }
-
-    /// Resolve a preset id through the latest catalog; unknown ids stay as-is.
-    pub fn agent_label(&self, id: &str) -> String {
-        self.last_presets
-            .iter()
-            .find(|preset| preset.id == id)
-            .map(|preset| preset.name.clone())
-            .unwrap_or_else(|| id.to_string())
-    }
-
-    /// Pick the agent preset composed on this session's first prompt. The
-    /// host locks it once the session agent exists (`/new` for a fresh one).
-    fn set_mode(&mut self, preset: String, ctl: &Controller) {
-        let label = self.agent_label(&preset);
-        if self.modes.agent_preset.as_deref() == Some(preset.as_str()) {
-            self.show_tip(format!("agent already {label}"));
-            return;
-        }
-        ctl.send(Cmd::SetPreset {
-            session_id: self.session_id.clone(),
-            preset: preset.clone(),
-        });
-        // Preset scopes can mount their own skill registries.
-        ctl.send(Cmd::FetchSkills);
-        self.show_tip(format!("agent → {label} …"));
-    }
-
     fn select_model(&mut self, item: PickerItem, ctl: &Controller) {
         let model = item.id;
         let provider = item.provider;
@@ -4081,24 +3948,13 @@ impl App {
     /// grok: Shift+Tab cycles the permission preset.
     fn cycle_permission(&mut self, ctl: &Controller) {
         let current = self.current_permission().to_string();
-        let next = if self.permission_choices.len() >= 2 {
-            let idx = self
-                .permission_choices
-                .iter()
-                .position(|p| p.id == current)
-                .unwrap_or(0);
-            self.permission_choices[(idx + 1) % self.permission_choices.len()]
-                .id
-                .clone()
-        } else {
-            let idx = PERMISSION_PRESETS
-                .iter()
-                .position(|(p, _)| *p == current)
-                .unwrap_or(0);
-            PERMISSION_PRESETS[(idx + 1) % PERMISSION_PRESETS.len()]
-                .0
-                .to_string()
-        };
+        let idx = PERMISSION_PRESETS
+            .iter()
+            .position(|(p, _)| *p == current)
+            .unwrap_or(0);
+        let next = PERMISSION_PRESETS[(idx + 1) % PERMISSION_PRESETS.len()]
+            .0
+            .to_string();
         self.set_permission(next, ctl);
     }
 
@@ -4137,28 +3993,24 @@ impl App {
     fn open_permission_picker(&mut self) {
         let reported = self.modes.permission.clone();
         let current = self.current_permission().to_string();
-        let items = if self.permission_choices.is_empty() {
-            PERMISSION_PRESETS
-                .iter()
-                .map(|(id, desc)| {
-                    let mark = if reported.as_deref() == Some(*id) {
-                        " · current"
-                    } else if reported.is_none() && *id == current {
-                        " · default"
-                    } else {
-                        ""
-                    };
-                    PickerItem {
-                        id: id.to_string(),
-                        label: permission_label(id),
-                        meta: format!("{desc}{mark}"),
-                        provider: None,
-                    }
-                })
-                .collect()
-        } else {
-            permission_picker_items(&self.permission_choices, reported.as_deref(), &current)
-        };
+        let items: Vec<PickerItem> = PERMISSION_PRESETS
+            .iter()
+            .map(|(id, desc)| {
+                let mark = if reported.as_deref() == Some(*id) {
+                    " · current"
+                } else if reported.is_none() && *id == current {
+                    " · default"
+                } else {
+                    ""
+                };
+                PickerItem {
+                    id: id.to_string(),
+                    label: permission_label(id),
+                    meta: format!("{desc}{mark}"),
+                    provider: None,
+                }
+            })
+            .collect();
         let sel = items.iter().position(|i| i.id == current).unwrap_or(0);
         self.picker = Some(Picker {
             kind: PickerKind::Permission,
@@ -4653,17 +4505,10 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
         }
         text.push_str(&format!(
             "- model · {}{}\n\
-             - agent · {}{}\n\
              - permission · {}\n\
              - plan · {}",
             self.cfg.model,
             effort_line,
-            self.agent_label(&self.current_mode()),
-            if self.modes.agent_preset.is_none() {
-                " (default)"
-            } else {
-                ""
-            },
             perm_label,
             if self.modes.plan { "on" } else { "off" },
         ));
@@ -5748,7 +5593,6 @@ mod mode_tests {
         let cfg = test_cfg();
         let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
         let mut app = App::new(Theme::dark(), cfg.clone(), "s1".into());
-        app.modes.agent_preset = Some("code".into());
         app.modes.approval = Some("ask".into());
         app.modes.permission = Some("workspace-write".into());
         app.modes.effort = Some("max".into());
@@ -5758,7 +5602,6 @@ mod mode_tests {
         // A second instance in the same workspace boots with the cached
         // facts — except plan, which never carries over.
         let app2 = App::new(Theme::dark(), cfg.clone(), "s2".into());
-        assert_eq!(app2.modes.agent_preset.as_deref(), Some("code"));
         assert_eq!(app2.modes.approval.as_deref(), Some("ask"));
         assert_eq!(app2.modes.permission.as_deref(), Some("workspace-write"));
         assert_eq!(app2.modes.effort.as_deref(), Some("max"));
@@ -5768,7 +5611,7 @@ mod mode_tests {
         let mut other = cfg;
         other.workspace = "/elsewhere".into();
         let app3 = App::new(Theme::dark(), other, "s3".into());
-        assert!(app3.modes.agent_preset.is_none(), "cache is per workspace");
+        assert!(app3.modes.permission.is_none(), "cache is per workspace");
     }
 
     #[test]
@@ -6138,20 +5981,6 @@ mod mode_tests {
             &ctl,
         );
         assert_eq!(app.session_id, "acp-9");
-    }
-
-    #[test]
-    fn agent_preset_event_updates_chrome_without_adding_a_transcript_row() {
-        let (mut app, _ctl, _rx) = test_app();
-        let cells_before = app.transcript.cells.len();
-
-        app.apply_ui(crate::events::UiEvent::AgentPreset {
-            session: app.session_id.clone(),
-            preset: "cordis".into(),
-        });
-
-        assert_eq!(app.modes.agent_preset.as_deref(), Some("cordis"));
-        assert_eq!(app.transcript.cells.len(), cells_before);
     }
 
     #[test]

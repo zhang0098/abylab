@@ -4,7 +4,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc};
 
-use crate::bus::{AppEvent, CatalogPreset, Cmd, CtlEvent};
+use crate::bus::{AppEvent, Cmd, CtlEvent};
 use crate::runtime::RuntimeConfig;
 
 pub struct Controller {
@@ -136,14 +136,9 @@ fn aby_loop(
                 handle.send(abylab_backend::Cmd::SetModel { model, effort });
             }
             Cmd::FetchCatalog => {
-                // Seed the stock composition presets immediately, then ask
-                // the driver for the provider's live model listing. A failed
-                // or empty fetch keeps the picker on its stock presets
+                // Ask the driver for the provider's live model listing; a
+                // failed or empty fetch keeps the picker on its stock rows
                 // (`MODEL_PRESETS` + the configured model).
-                let _ = bus.send(AppEvent::Ctl(CtlEvent::Catalog {
-                    models: Vec::new(),
-                    presets: stock_presets(),
-                }));
                 handle.send(abylab_backend::Cmd::FetchCatalog);
             }
             Cmd::FetchSkills => {
@@ -170,11 +165,6 @@ fn aby_loop(
             }
             Cmd::SetApiKey { key } => {
                 handle.send(abylab_backend::Cmd::SetApiKey { key });
-            }
-            Cmd::SetPreset { .. } | Cmd::SetConfigOption { .. } => {
-                let _ = bus.send(AppEvent::Ctl(CtlEvent::TuiOpFailed(
-                    "not supported by the abycore driver yet".into(),
-                )));
             }
             Cmd::Compact => handle.send(abylab_backend::Cmd::Compact),
             Cmd::Goal { arg } => handle.send(abylab_backend::Cmd::Goal { arg }),
@@ -236,7 +226,6 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                         .collect(),
                     // The live listing replaces models only; stock composition
                     // presets were seeded when the picker opened.
-                    presets: Vec::new(),
                 },
                 abylab_backend::CtlEvent::SessionList { sessions, prefix } => {
                     CtlEvent::SessionList {
@@ -417,28 +406,9 @@ pub(crate) fn test_interruptible_controller() -> (Controller, Receiver<Cmd>) {
     (Controller { cmd_tx, aby: None }, cmd_rx)
 }
 
-fn stock_presets() -> Vec<CatalogPreset> {
-    crate::app::AGENT_MODES
-        .iter()
-        .map(|(id, name, desc)| CatalogPreset {
-            id: id.to_string(),
-            name: name.to_string(),
-            description: desc.to_string(),
-            broken: false,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stock_presets_cover_the_four_web_ui_modes() {
-        let presets = stock_presets();
-        let ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, ["standard", "code", "minimal", "cordis"]);
-    }
 
     /// The composer's todo line and its progress dialog are built from the
     /// plan's structured fields, so the backend→TUI translation must carry

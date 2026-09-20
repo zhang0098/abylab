@@ -729,9 +729,6 @@ impl Transcript {
             UiEvent::SandboxMode { .. }
             | UiEvent::ApprovalPolicy { .. }
             | UiEvent::PermissionPreset { .. } => {}
-            UiEvent::AgentPreset { preset, .. } => {
-                self.push_notice(NoticeLevel::Info, format!("⚙ agent preset · {preset}"));
-            }
             UiEvent::ApprovalAsked { tool, reason, .. } => {
                 let why = reason.map(|r| format!(" · {r}")).unwrap_or_default();
                 self.push_notice(

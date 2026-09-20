@@ -66,10 +66,7 @@ pub enum CtlEvent {
     /// Backchat `session.cancelled`: the prompt future settled after abort.
     Interrupted,
     /// Host model catalog + advertised composition select.
-    Catalog {
-        models: Vec<CatalogModel>,
-        presets: Vec<CatalogPreset>,
-    },
+    Catalog { models: Vec<CatalogModel> },
     /// Host skill catalog arrived (`available_commands_update`).
     Skills { skills: Vec<SkillInfo> },
     /// Selectable reasoning efforts for the current model.
@@ -116,16 +113,6 @@ pub struct CatalogModel {
 }
 
 /// One advertised composition choice (`agent` / `preset` / `agent-preset`,
-/// or the first extra uncategorized select). Demo seeds stock ids including
-/// `cordis`.
-#[derive(Debug, Clone)]
-pub struct CatalogPreset {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub broken: bool,
-}
-
 /// One user-invocable command from `available_commands_update`: typing
 /// `/name …` as a prompt makes the agent inject the skill body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,17 +193,6 @@ pub enum Cmd {
     /// `None` clears the live key (`/logout`).
     SetApiKey {
         key: Option<String>,
-    },
-    /// Pick the agent preset (mode) composed on the session's first prompt.
-    SetPreset {
-        session_id: String,
-        preset: String,
-    },
-    /// Agent-advertised command action (`_meta.commandAction`) mapped onto
-    /// standard ACP `session/set_config_option`.
-    SetConfigOption {
-        config_id: String,
-        value: String,
     },
     /// Live ACP `/new` → `session/new` (cwd = workspace).
     NewSession,
