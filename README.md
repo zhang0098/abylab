@@ -34,13 +34,17 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 `/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
 `/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
 `/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
-`/session` · `/lang [zh|en]` · `/quit`
+`/session` · `/status` · `/lang [zh|en]` · `/quit`
 
 `/theme` 用来挑调色板包：缺省是 one 的深色（`--theme dark` 只是换明暗，
 不动包）；另有内置的 DeepSeek 主题和七个主题（ayu · catppuccin · everforest ·
 iceberg · kanagawa · solarized · tomorrow）。
 选择器里 ↑/↓ 会就地预览高亮的那一款，`enter` 才应用、`esc` 还原；
 `ctrl+t` 在当前包里切换深色/浅色。
+
+`/status`（运行状态、模型、token/轮次/耗时统计）和 `/session`（会话 id、provider、
+工作区路径、凭据来源）都是弹窗：浮在对话上、esc 关闭、↑↓/滚轮滚动，
+不会写进对话记录 —— 和 `/help`、`/keys` 一样属于界面本身。
 
 ## 按键
 
@@ -55,7 +59,14 @@ Shift+Tab 循环切换预设。
 代理用 `todo_write` 维护任务清单时，输入框上沿的提示行会实时显示进行中的
 任务和完成进度（`任务 · 进行中: 修复登录 · 2/5 完成`）；操作反馈会短暂借用
 这一行，几秒后回到任务进度。点击进度部分（`2/5 完成`）弹出完整清单对话框，
-esc 关闭。
+esc 关闭。空闲时这一行留空。
+
+使用提示不常驻输入框：每次新会话（启动、`/new`）在对话区开头给出一条轮换的
+提示（esc 中断、ctrl+x steer、`/status` 里的 token 用量……），下一条会话换成
+下一条；完整清单见 `/help` 和 `/keys`。
+
+启动时对话区最上面是 ASCII wordmark 加项目地址 `https://abylab.ai`（居中），
+再往下才是那条提示；`/new` 只给提示，不再重复 logo。
 
 提示行右侧显示项目路径；工作区是个 Git 检出时，后面紧跟 `:分支`（冒号紧贴，
 如 `/work/acme/abylab:main`）。分支直接读 `.git/HEAD`，不启动 git 进程，每 5 秒

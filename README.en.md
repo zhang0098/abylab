@@ -121,7 +121,7 @@ run. Want a shorter answer? Just ask. A fresh session uses the SDK output cap
 `/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
 `/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
 `/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
-`/session` · `/lang [zh|en]` · `/quit`
+`/session` · `/status` · `/lang [zh|en]` · `/quit`
 
 `/theme` picks a palette pack — a fresh install starts on **one**, dark
 (`--theme dark` only moves between light and dark, it never changes the pack).
@@ -130,6 +130,11 @@ catppuccin · everforest · iceberg · kanagawa · solarized · tomorrow) are al
 embedded in the binary, no external files.
 Arrows in the picker preview the highlighted pack in place; `enter` applies it
 and `esc` reverts. `ctrl+t` toggles dark/light inside the active pack.
+
+`/status` (run state, model, token/turn/timing counters) and `/session`
+(session id, provider, workspace paths, credential source) both open a dialog:
+it floats over the conversation, esc closes it, ↑↓/wheel scroll, and nothing
+lands in the transcript — same chrome as `/help` and `/keys`.
 
 ## Keys
 
@@ -142,13 +147,23 @@ ctrl+z / ctrl+shift+z undo / redo · ctrl+p model · ctrl+t theme
 conversation history and applies to later file tools and Bash processes;
 Shift+Tab cycles the presets.
 
-While the agent keeps a checklist with `todo_write`, the tip row on the
+While the agent keeps a checklist with `todo_write`, the cap row on the
 composer's top border shows the task in progress and the completed/total
 progress (`Todo · now: fix login · 2/5 done`). Transient action feedback
 borrows that row for a few seconds, then the checklist returns. Clicking the
 progress chip (`2/5 done`) opens the full checklist in a dialog; esc closes it.
+With neither, the row stays blank.
 
-The tip row names the project path; when the workspace is a Git checkout the
+Usage hints no longer live in that row: a new session (launch, `/new`) opens
+the transcript with one rotating hint (esc interrupts, ctrl+x steers, the token
+counters in `/status`, …), and the next session moves on to the next one. The
+full list stays in `/help` and `/keys`.
+
+A launch opens the transcript with a centered ASCII wordmark over the project
+URL `https://abylab.ai`, then that hint; `/new` shows the hint alone and never
+repeats the mark.
+
+That row names the project path; when the workspace is a Git checkout the
 current branch rides along colon-tight (`/work/acme/abylab:main`). The branch
 is read straight from `.git/HEAD` (no git process) and re-checked on a 5 s
 tick, so a checkout made by the agent's shell tool or another terminal

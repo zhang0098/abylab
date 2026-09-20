@@ -44,6 +44,15 @@ pub(crate) const PROMPT_FLASH_TTL: Duration = Duration::from_secs(5);
 /// terminal while the session is open.
 const GIT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The startup wordmark: two half-block rows, painted verbatim by
+/// `Transcript`'s banner cell (spacing is part of the art). Uppercase-free
+/// lowercase shapes, small enough to survive an 80-col terminal with the
+/// splash margin intact.
+const LOGO_ART: [&str; 2] = ["▄▀█ █▄▄ █▄█ █   ▄▀█ █▄▄", "█▀█ █▄█  █  █▄▄ █▀█ █▄█"];
+
+/// Project URL under the startup wordmark.
+const SITE_URL: &str = "https://abylab.ai";
+
 /// Some terminal layers incorrectly wrap Kitty/CSI-u key reports in
 /// bracketed-paste markers. Crossterm then exposes the key bytes as a paste,
 /// so recover them only when the *entire* payload is made of CSI-u keys.
@@ -212,6 +221,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "session",
         usage: "/session",
         desc: "show session + runtime info",
+    },
+    SlashCommand {
+        name: "status",
+        usage: "/status",
+        desc: "run state, model and the live usage counters",
     },
     SlashCommand {
         name: "lang",
@@ -721,8 +735,10 @@ pub struct App {
     key_debug: bool,
     /// Optional vim modal editing for the composer (`/vim`).
     pub vim: crate::input::VimState,
-    pub ambient_tip_idx: usize,
-    pub ambient_tip_at: Instant,
+    /// Which usage hint the next new session opens with. The composer cap row
+    /// no longer rotates hints live; a session start shows one instead, so the
+    /// index advances per session and cycles the whole set over time.
+    session_tip_idx: usize,
     ctrl_c_armed: Option<CtrlCQuitChord>,
     pub session_id: String,
     pub cfg: RuntimeConfig,
@@ -1010,8 +1026,7 @@ impl App {
             prompt_flash_lines: None,
             key_debug: std::env::var("ABYLAB_KEYDEBUG").is_ok_and(|v| v == "1"),
             vim: crate::input::VimState::default(),
-            ambient_tip_idx: 0,
-            ambient_tip_at: Instant::now(),
+            session_tip_idx: 0,
             ctrl_c_armed: None,
             session_id,
             cfg,
@@ -1096,13 +1111,6 @@ impl App {
                 self.needs_redraw = true;
             }
         }
-        if self.ambient_tip_at.elapsed() > Duration::from_secs(14) {
-            self.ambient_tip_at = Instant::now();
-            self.ambient_tip_idx = (self.ambient_tip_idx + 1) % crate::locale::AMBIENT_TIP_COUNT;
-            if self.tip.is_none() {
-                self.needs_redraw = true;
-            }
-        }
         // disarm expired chords
         if let Some(chord) = self.ctrl_c_armed {
             if chord.started.elapsed() > CTRL_C_QUIT_WINDOW {
@@ -1114,6 +1122,31 @@ impl App {
     pub fn show_tip(&mut self, text: impl Into<String>) {
         self.tip = Some((text.into(), Instant::now()));
         self.needs_redraw = true;
+    }
+
+    /// Greet a new session with one usage hint.
+    ///
+    /// The hint rotation used to live in the composer cap row, competing with
+    /// the draft and the todo checklist for the same line; it lands in the
+    /// timeline once per session instead, and the index cycles so a user who
+    /// keeps starting sessions still walks the whole set.
+    pub fn push_session_tip(&mut self) {
+        let hint = self.locale.session_tip(self.session_tip_idx);
+        self.session_tip_idx = (self.session_tip_idx + 1) % crate::locale::TIP_COUNT;
+        let label = self.locale.tr("Tip", "提示");
+        self.transcript
+            .push_markdown(format!("- **{label}** · {hint}"));
+    }
+
+    /// The startup splash: the ASCII wordmark plus the project URL, painted
+    /// once per run at the top of the timeline (see `main`). `/new` keeps the
+    /// timeline to the usage hint — the mark belongs to the launch, not to
+    /// every session the client opens.
+    pub fn push_banner(&mut self) {
+        self.transcript.push_banner(
+            LOGO_ART.iter().map(|row| (*row).to_string()).collect(),
+            SITE_URL.to_string(),
+        );
     }
 
     fn activate_palette(&mut self, id: &str) {
@@ -3748,10 +3781,11 @@ impl App {
             "new" => {
                 self.reset_session_ui();
                 ctl.send(Cmd::NewSession);
+                self.push_session_tip();
                 self.show_tip("session/new …");
             }
-            "session" => self.push_session_info(),
-            "status" => self.push_status_info(),
+            "session" => self.open_session_dialog(),
+            "status" => self.open_status_dialog(),
             "resume" => {
                 if arg.is_empty() {
                     self.open_resume_picker(ctl);
@@ -3929,7 +3963,15 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
         });
     }
 
-    fn push_session_info(&mut self) {
+    /// `/session` as a local modal — the same card `/status` opens, with the
+    /// durable identity and runtime facts: session id/title, provider, agent,
+    /// workspace paths, the server banner and the credential source.
+    ///
+    /// The border names the card, so the body carries bullets only and the
+    /// timeline stays untouched. The live `/session` is also a Client Plugin
+    /// command in runs with a Client tree; this arm serves runs without one
+    /// (demo, standalone painter) and reads the local accumulator.
+    fn open_session_dialog(&mut self) {
         let creds = if self.cfg.has_credentials() {
             match self.cfg.credential_source() {
                 Some(src) => format!("api key present · {src}"),
@@ -3951,8 +3993,7 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             .map(|effort| format!("\n- effort · {effort}"))
             .unwrap_or_default();
         let mut text = format!(
-            "## session\n\n\
-             - session · {}{}\n\
+            "- session · {}{}\n\
              - provider · {} / {}{}\n\
              - agent · {}{}\n\
              - workspace · {}\n\
@@ -4002,19 +4043,28 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
                 u.output as f64 / (llm_millis as f64 / 1000.0)
             ));
         }
-        self.transcript.push_markdown(text);
+        self.view_overlay = Some(ViewOverlay {
+            title: self.locale.tr("Session", "会话").to_string(),
+            nodes: vec![crate::slots::TuiNode::Markdown {
+                text,
+                streaming: false,
+            }],
+            scroll: 0,
+        });
     }
 
-    /// Compact status fallback: the run state plus painter-owned ACP facts.
+    /// `/status` as a local modal: run state, painter-owned ACP facts and the
+    /// live counters the composer's stats dock used to carry. Like `/help` and
+    /// `/keys` it is chrome, not conversation — the card's border names it, so
+    /// the body carries bullets only and the timeline stays untouched.
     ///
-    /// The live `/status` is a Client Plugin command (`status-view`): it opens
-    /// the semantic overlay and takes every token/turn/step/timing figure from
-    /// the Client-side `acpSessionStats.current()` — the same snapshot
-    /// `stats-view` renders in the composer dock. This arm only serves runs
-    /// without a Client tree (demo, standalone painter) and deliberately
-    /// reads no `Transcript.usage`/`stats` accumulator, so the two surfaces
-    /// can never drift apart.
-    fn push_status_info(&mut self) {
+    /// The live `/status` is also a Client Plugin command (`status-view`): with
+    /// a Client tree the plugin's semantic overlay renders the same facts from
+    /// `acpSessionStats.current()`. This arm serves runs without one (demo,
+    /// standalone painter) and reads the local accumulator instead — the rows
+    /// it shows are the ones the dock used to paint, so nothing is lost when
+    /// the dock stays out of the frame.
+    fn open_status_dialog(&mut self) {
         let state = match self.state {
             RunState::Idle => self.locale.tr("idle", "空闲").to_string(),
             RunState::Starting => self.locale.tr("starting", "启动中").to_string(),
@@ -4043,7 +4093,7 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             .map(|effort| format!("\n- effort · {effort}"))
             .unwrap_or_default();
         // Connection facts + the server banner when the runtime reported it.
-        let mut text = format!("## status\n\n- state · {state}\n");
+        let mut text = format!("- state · {state}\n");
         text.push_str(&if self.session_bound {
             format!("- session · {}\n", self.session_id)
         } else {
@@ -4068,7 +4118,42 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             perm_label,
             if self.modes.plan { "on" } else { "off" },
         ));
-        self.transcript.push_markdown(text);
+        // The counter row the composer dock used to render, in the same
+        // bullet shape `/session` uses. `usage.input` is total input
+        // including cache reads, so the hit rate is a share of it.
+        let u = self.transcript.usage;
+        let s = self.transcript.stats;
+        let cache_pct = if u.input > 0 {
+            (u.cached as f64 / u.input as f64 * 100.0).round() as u64
+        } else {
+            0
+        };
+        text.push_str(&format!(
+            "\n- tokens · ↑{} ↓{} · cache {}%\n\
+             - turns · {} · steps · {}\n\
+             - LLM · {} · tool · {}",
+            fmt_tokens(u.input),
+            fmt_tokens(u.output),
+            cache_pct,
+            s.turns,
+            s.steps,
+            fmt_duration(s.turn_millis.saturating_sub(s.tool_millis)),
+            fmt_duration(s.tool_millis),
+        ));
+        if s.ttft_count > 0 {
+            text.push_str(&format!(
+                "\n- TTFT avg · {}",
+                fmt_duration(s.ttft_total_millis.checked_div(s.ttft_count).unwrap_or(0))
+            ));
+        }
+        self.view_overlay = Some(ViewOverlay {
+            title: self.locale.tr("Status", "状态").to_string(),
+            nodes: vec![crate::slots::TuiNode::Markdown {
+                text,
+                streaming: false,
+            }],
+            scroll: 0,
+        });
     }
 }
 
@@ -7099,10 +7184,12 @@ mod right_slot_tests {
     }
 
     #[test]
-    fn status_slash_fallback_shows_run_state_without_transcript_stats() {
+    fn status_slash_opens_a_modal_with_state_and_the_usage_counters() {
         let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::En;
         app.modes.effort = Some("high".into());
-        // Seed the transcript accumulators: the fallback must not render them.
+        // The counter rows the composer dock used to paint: the modal renders
+        // them from the transcript accumulator instead.
         app.transcript.usage.input = 1834;
         app.transcript.usage.output = 412;
         app.transcript.usage.cached = 1200;
@@ -7112,50 +7199,185 @@ mod right_slot_tests {
         app.transcript.stats.tool_millis = 8_000;
         app.transcript.stats.ttft_total_millis = 4_500;
         app.transcript.stats.ttft_count = 3;
+        let cells_before = app.transcript.cells.len();
 
         app.run_slash("status", "", &ctl);
 
-        let last = app.transcript.cells.last().expect("status cell");
-        let crate::transcript::CellKind::MarkdownNotice { text } = &last.kind else {
-            panic!("/status should be a markdown notice, got {:?}", last.kind);
+        assert_eq!(
+            app.transcript.cells.len(),
+            cells_before,
+            "/status is chrome and must not enter the conversation timeline"
+        );
+        let overlay = app
+            .view_overlay
+            .as_ref()
+            .expect("/status modal should open");
+        assert_eq!(overlay.title, "Status");
+        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
+            panic!("/status should render markdown, got {:?}", overlay.nodes[0]);
         };
-        assert!(text.contains("## status"), "{text}");
+        // The border names the card, so the body carries bullets only.
+        assert!(!text.contains("## status"), "{text}");
         assert!(text.contains("- state · "), "{text}");
         assert!(text.contains("- session · dsh-test"), "{text}");
         assert!(text.contains("- model · deepseek-v4-flash"), "{text}");
         assert!(text.contains("- effort · high"), "{text}");
         assert!(text.contains("- permission · "), "{text}");
         assert!(text.contains("- plan · "), "{text}");
-        // The fallback owns no transcript accumulators: token/turn/timing
-        // figures belong to the Client `acpSessionStats` snapshot that the
-        // status-view overlay renders in live runs.
-        assert!(!text.contains("- tokens ·"), "{text}");
-        assert!(!text.contains("- turns ·"), "{text}");
-        assert!(!text.contains("- LLM ·"), "{text}");
+        // Tokens, turns/steps, timing and TTFT ride the same card.
+        assert!(text.contains("- tokens · ↑1.8K ↓412 · cache 65%"), "{text}");
+        assert!(text.contains("- turns · 3 · steps · 47"), "{text}");
+        assert!(text.contains("- LLM · 2m7s · tool · 8.0s"), "{text}");
+        assert!(text.contains("- TTFT avg · 1.5s"), "{text}");
+
+        // The card is drawn over the chat and esc closes it.
+        let frame = crate::ui::dump_frame(&mut app, 100, 30);
+        assert!(
+            frame.contains("Status · ↑↓/wheel scroll"),
+            "modal:\n{frame}"
+        );
+        assert!(frame.contains("tokens · ↑1.8K ↓412"), "counters:\n{frame}");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.view_overlay.is_none(), "esc closes the modal");
+    }
+
+    /// A zero-data session still lists the counters as zeros (no dropped
+    /// row) while an unsampled TTFT stays out of the card — and the modal is
+    /// localized like the rest of the built-in chrome.
+    #[test]
+    fn status_slash_keeps_the_counter_row_for_a_fresh_session() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::Zh;
+
+        app.run_slash("status", "", &ctl);
+
+        let overlay = app
+            .view_overlay
+            .as_ref()
+            .expect("/status modal should open");
+        assert_eq!(overlay.title, "状态");
+        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
+            panic!("/status should render markdown, got {:?}", overlay.nodes[0]);
+        };
+        assert!(text.contains("- state · 空闲"), "{text}");
+        assert!(text.contains("- tokens · ↑0 ↓0 · cache 0%"), "{text}");
+        assert!(text.contains("- turns · 0 · steps · 0"), "{text}");
+        assert!(text.contains("- LLM · 0.0s · tool · 0.0s"), "{text}");
         assert!(!text.contains("- TTFT avg ·"), "{text}");
-        assert!(!text.contains("- rate ·"), "{text}");
+    }
+
+    /// The `/` menu lists `/status` (it was dispatch-only) with its localized
+    /// description.
+    #[test]
+    fn slash_menu_offers_the_status_dialog() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.input.set("/status".into());
+
+        let matches = app.slash_matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "status");
+        assert_eq!(matches[0].usage, "/status");
+        assert_eq!(
+            matches[0].desc,
+            "run state, model and the live usage counters"
+        );
+
+        app.locale = crate::locale::Locale::Zh;
+        assert_eq!(app.slash_matches()[0].desc, "状态、模型和实时用量统计");
+    }
+
+    /// A new session greets with one usage hint in the timeline — the line the
+    /// composer cap row used to rotate live — and the next `/new` walks on to
+    /// the following hint instead of repeating the first.
+    #[test]
+    fn new_session_greets_with_the_next_usage_hint() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::En;
+        app.transcript.push_user("a previous prompt".into(), false);
+        let greeting = |app: &App| -> String {
+            let first = app.transcript.cells.first().expect("greeting cell");
+            let crate::transcript::CellKind::MarkdownNotice { text } = &first.kind else {
+                panic!("the greeting should be markdown, got {:?}", first.kind);
+            };
+            text.clone()
+        };
+
+        app.run_slash("new", "", &ctl);
+        assert_eq!(
+            greeting(&app),
+            "- **Tip** · esc interrupts a running turn — your draft survives"
+        );
+
+        app.run_slash("new", "", &ctl);
+        assert_eq!(
+            greeting(&app),
+            "- **Tip** · enter queues a follow-up; ctrl+x steers the active turn now"
+        );
     }
 
     #[test]
-    fn session_slash_shows_effort_when_set() {
+    /// `/session` opens the same local modal as `/status` — chrome, not a
+    /// timeline entry — and its facts follow the live session state.
+    fn session_slash_opens_a_modal_with_the_runtime_facts() {
         let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::En;
         app.modes.effort = Some("max".into());
+        app.session_title = Some("fix the login flow".into());
+        let cells_before = app.transcript.cells.len();
 
         app.run_slash("session", "", &ctl);
 
-        let last = app.transcript.cells.last().expect("session cell");
-        let crate::transcript::CellKind::MarkdownNotice { text } = &last.kind else {
-            panic!("/session should be a markdown notice, got {:?}", last.kind);
+        assert_eq!(
+            app.transcript.cells.len(),
+            cells_before,
+            "/session is chrome and must not enter the conversation timeline"
+        );
+        let overlay = app
+            .view_overlay
+            .as_ref()
+            .expect("/session modal should open");
+        assert_eq!(overlay.title, "Session");
+        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
+            panic!(
+                "/session should render markdown, got {:?}",
+                overlay.nodes[0]
+            );
         };
-        assert!(text.contains("## session"), "{text}");
+        // The border names the card, so the body carries bullets only.
+        assert!(!text.contains("## session"), "{text}");
+        assert!(
+            text.contains("- session · dsh-test · fix the login flow"),
+            "{text}"
+        );
+        assert!(text.contains("- provider · deepseek"), "{text}");
+        assert!(text.contains("- agent · "), "{text}");
+        assert!(text.contains("- workspace · "), "{text}");
+        assert!(text.contains("- session store · "), "{text}");
+        assert!(text.contains("- server · "), "{text}");
+        assert!(text.contains("- credentials · "), "{text}");
+        assert!(text.contains("- tokens · "), "{text}");
         assert!(text.contains("- effort · max"), "{text}");
 
-        // Unset effort stays hidden.
+        let frame = crate::ui::dump_frame(&mut app, 100, 34);
+        assert!(
+            frame.contains("Session · ↑↓/wheel scroll"),
+            "modal:\n{frame}"
+        );
+        assert!(frame.contains("fix the login flow"), "facts:\n{frame}");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.view_overlay.is_none(), "esc closes the modal");
+
+        // Unset effort stays hidden; the title is localized.
         let (mut plain, ctl2, _rx2) = test_app();
+        plain.locale = Locale::Zh;
         plain.run_slash("session", "", &ctl2);
-        let last = plain.transcript.cells.last().expect("session cell");
-        let crate::transcript::CellKind::MarkdownNotice { text } = &last.kind else {
-            panic!("/session should be a markdown notice, got {:?}", last.kind);
+        let overlay = plain.view_overlay.as_ref().expect("/session modal");
+        assert_eq!(overlay.title, "会话");
+        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
+            panic!(
+                "/session should render markdown, got {:?}",
+                overlay.nodes[0]
+            );
         };
         assert!(!text.contains("- effort ·"), "{text}");
     }
