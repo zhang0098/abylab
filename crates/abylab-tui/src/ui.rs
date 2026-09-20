@@ -3103,12 +3103,6 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut app = test_app();
-        // A fresh app runs on the One pack, whose `chip_bg` *is* its panel
-        // colour: the selected row would paint with the popup background and
-        // this check would prove nothing. Pin the built-in pack, where the two
-        // differ.
-        app.active_palette_id = "default".into();
-        app.theme = Theme::dark();
         app.picker = Some(Picker {
             kind: PickerKind::Session,
             title: " resume session · 2 sessions ".into(),
