@@ -39,6 +39,11 @@ const TIP_TTL: Duration = Duration::from_secs(4);
 /// How long the `↥` jump flash keeps the jumped user prompt background-washed
 /// before it restores to normal (Martty's issue #103).
 pub(crate) const PROMPT_FLASH_TTL: Duration = Duration::from_secs(5);
+/// How often the composer cap re-checks the workspace git branch (tick
+/// cadence). Catches checkouts made by the agent's shell tool or in another
+/// terminal while the session is open.
+const GIT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Some terminal layers incorrectly wrap Kitty/CSI-u key reports in
 /// bracketed-paste markers. Crossterm then exposes the key bytes as a paste,
 /// so recover them only when the *entire* payload is made of CSI-u keys.
@@ -192,6 +197,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "clip",
         usage: "/clip [text]",
         desc: "attach the clipboard image (macOS/Linux)",
+    },
+    SlashCommand {
+        name: "vim",
+        usage: "/vim [on|off]",
+        desc: "toggle vim modal editing in the composer",
     },
     SlashCommand {
         name: "theme",
@@ -716,6 +726,12 @@ pub struct App {
     ctrl_c_armed: Option<CtrlCQuitChord>,
     pub session_id: String,
     pub cfg: RuntimeConfig,
+    /// Current branch of the workspace checkout, shown after the project path
+    /// in the composer cap (`path:branch`). `None` covers a non-repo
+    /// workspace, a detached HEAD, and a repo whose HEAD cannot be read.
+    pub git_branch: Option<String>,
+    /// Last time the workspace git branch was re-checked (tick throttle).
+    git_check_at: Instant,
     /// Model explicitly picked this session (`/model`); wins over
     /// `transcript.last_model` in the chip until a turn realizes it.
     pub selected_model: Option<String>,
@@ -935,6 +951,10 @@ impl App {
         if modes.permission.is_none() {
             modes.permission = settings.permission.clone();
         }
+        // ":branch" after the project path in the composer cap. Seeded once
+        // here; `tick` re-checks on a throttle so mid-session checkouts (the
+        // agent's shell tool, another terminal) stay in sync.
+        let git_branch = crate::ui::head_branch(&cfg.workspace);
         App {
             theme,
             locale,
@@ -994,6 +1014,8 @@ impl App {
             ctrl_c_armed: None,
             session_id,
             cfg,
+            git_branch,
+            git_check_at: Instant::now(),
             selected_model: None,
             session_bound: true,
             quit: false,
@@ -1030,7 +1052,25 @@ impl App {
         &mut self.transcript
     }
 
+    /// Re-detect the workspace git branch for the composer cap label. One
+    /// in-process read of `.git/HEAD` (no subprocess), at most every
+    /// `GIT_CHECK_INTERVAL`.
+    fn refresh_git_branch(&mut self) {
+        if self.git_check_at.elapsed() < GIT_CHECK_INTERVAL {
+            return;
+        }
+        self.git_check_at = Instant::now();
+        let branch = crate::ui::head_branch(&self.cfg.workspace);
+        if branch != self.git_branch {
+            self.git_branch = branch;
+            self.needs_redraw = true;
+        }
+    }
+
     pub fn tick(&mut self) {
+        // The cap's ":branch" label tracks mid-session checkouts on a
+        // throttled cadence.
+        self.refresh_git_branch();
         if self.state != RunState::Idle
             || self.transcript.streaming()
             || self
@@ -1246,6 +1286,13 @@ impl App {
             items,
         });
     }
+
+    /// The `/` command menu owns the band above the composer while it has
+    /// rows to show — the `@` browser never opens underneath it.
+    pub(crate) fn slash_completion_open(&self) -> bool {
+        !self.slash_matches().is_empty()
+    }
+
     pub fn slash_matches(&self) -> Vec<SlashEntry> {
         if !self.input.buf().starts_with('/') {
             return Vec::new();
@@ -2584,8 +2631,15 @@ impl App {
         // through `refresh_file_menu`). Enter settles, Tab drills into a
         // directory, → follows the explorer's enter semantics.
         if let Some(menu) = &mut self.file_menu {
+            use crate::file_ref::{navigate, ExplorerInput as XIn};
+            // ctrl+h toggles hidden files/dirs (the explorer's own binding
+            // for ToggleShowHidden); it stays modal while the browser is
+            // open, like the navigation keys.
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('h') {
+                navigate(menu, XIn::ToggleShowHidden);
+                return;
+            }
             if key.modifiers == KeyModifiers::NONE {
-                use crate::file_ref::{navigate, ExplorerInput as XIn};
                 match key.code {
                     KeyCode::Up => {
                         navigate(menu, XIn::Up);
@@ -2671,6 +2725,11 @@ impl App {
     fn refresh_file_menu(&mut self) {
         // Vim normal mode is command editing — no mention browser.
         if self.vim.is_active() && self.vim.mode == crate::input::VimMode::Normal {
+            self.file_menu = None;
+            return;
+        }
+        // The slash menu and the @ menu are mutually exclusive.
+        if self.slash_completion_open() {
             self.file_menu = None;
             return;
         }
@@ -3819,6 +3878,7 @@ impl App {
 - /login · 保存 API key 到 aby 主目录，不回显明文
 - /logout · 删除已保存的 API key
 - /effort · 推理强度 · /permission 权限预设 · /plan 计划模式
+- /vim · 切换 vim 模态编辑（/vim on|off，默认关闭）
 - /resume · 恢复持久会话并继续写入原日志
 - /image · 暂存本地图片：/image ./pic.png [说明]
 - /clip · 暂存剪贴板图片；ctrl+v 同样可用
@@ -3841,6 +3901,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - shift+tab · cycle permission (workspace-write ⇄ full access) · /permission opens the preset picker
 - ctrl+p · model picker → effort picker
 - /effort · reasoning effort · /permission preset · /plan plan mode
+- /vim · toggle vim modal editing (/vim on|off, off by default)
 - /login · store the API key in the aby home (never echoed in full)
 - /logout · remove the stored API key (a --api-key override keeps running)
 - /resume · pick up a durable session — transcript replays, log continues
@@ -4936,6 +4997,33 @@ mod mode_tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "lang");
         assert_eq!(matches[0].usage, "/lang [zh|en]");
+    }
+
+    /// `/vim` was dispatch-only — typing it worked, but the `/` menu never
+    /// listed it. Both halves are pinned here: the row exists (with its
+    /// localized description) and the bare command still toggles.
+    #[test]
+    fn slash_menu_offers_the_vim_toggle() {
+        let (mut app, ctl, _rx) = test_app();
+        app.input.set("/vim".into());
+
+        let matches = app.slash_matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "vim");
+        assert_eq!(matches[0].usage, "/vim [on|off]");
+        assert_eq!(matches[0].desc, "toggle vim modal editing in the composer");
+
+        app.locale = crate::locale::Locale::Zh;
+        assert_eq!(
+            app.slash_matches()[0].desc,
+            "切换 vim 模态编辑（默认关闭）",
+            "the menu uses the zh description"
+        );
+
+        app.run_slash("vim", "", &ctl);
+        assert!(app.vim.is_active(), "a bare /vim toggles it on");
+        app.run_slash("vim", "off", &ctl);
+        assert!(!app.vim.is_active(), "/vim off turns it off");
     }
 
     #[test]
@@ -7092,7 +7180,16 @@ mod at_menu_tests {
     }
 
     fn test_app() -> (App, Controller, Receiver<AppEvent>) {
-        let cfg = test_cfg();
+        test_app_in("/tmp")
+    }
+
+    /// Same app, but rooted at a fixture workspace (the browser lists real
+    /// directories, so the `@` tests need a real tree).
+    fn test_app_in(workspace: &str) -> (App, Controller, Receiver<AppEvent>) {
+        let cfg = RuntimeConfig {
+            workspace: workspace.into(),
+            ..test_cfg()
+        };
         let (_tx, rx) = std::sync::mpsc::channel::<AppEvent>();
         let (ctl, _commands) = crate::controller::test_controller();
         let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
@@ -7144,6 +7241,151 @@ mod at_menu_tests {
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &ctl);
         assert!(app.file_menu.is_none(), "whitespace ends the token");
         assert!(app.file_menu_dismissed.is_none());
+    }
+
+    /// A fixture workspace with a hidden `.env` the browser can reveal.
+    struct Workspace {
+        root: std::path::PathBuf,
+    }
+
+    impl Workspace {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "abylab-at-menu-ws-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("src/nested")).expect("create tree");
+            std::fs::write(root.join("src/main.rs"), "").expect("write");
+            std::fs::write(root.join("README.md"), "").expect("write");
+            std::fs::write(root.join("notes.txt"), "").expect("write");
+            Self { root }
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// ctrl+h is the explorer's own hidden-entries toggle, and it stays
+    /// modal while the browser is open (the draft keeps its text).
+    #[test]
+    fn ctrl_h_toggles_hidden_files_in_the_browser() {
+        let ws = Workspace::new();
+        std::fs::write(ws.root.join(".env"), "").expect("write");
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        fn hidden_state(app: &App) -> bool {
+            app.file_menu
+                .as_ref()
+                .expect("menu open")
+                .explorer()
+                .show_hidden()
+        }
+        fn has_env(app: &App) -> bool {
+            app.file_menu
+                .as_ref()
+                .expect("menu open")
+                .explorer()
+                .files()
+                .iter()
+                .any(|f| f.name == ".env")
+        }
+        assert!(!hidden_state(&app));
+        assert!(!has_env(&app), ".env hidden by default");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(hidden_state(&app), "ctrl+h reveals hidden entries");
+        assert!(has_env(&app), ".env listed while hidden shown");
+        assert_eq!(app.input.buf(), "@", "the toggle is modal, not typed");
+
+        // Toggling back hides them again and the browser still navigates.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(!hidden_state(&app));
+        assert!(!has_env(&app), ".env hidden again");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl); // src/
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl); // README.md
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "@README.md");
+    }
+
+    /// The `/` menu and the `@` browser are mutually exclusive: a banner
+    /// command draft never opens the mention browser under it.
+    #[test]
+    fn slash_draft_does_not_open_the_browser() {
+        let (mut app, ctl, _rx) = test_app();
+        for ch in "/th".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &ctl);
+        }
+        assert!(app.slash_completion_open(), "the / menu owns the band");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        assert!(
+            app.file_menu.is_none(),
+            "slash context never opens the @ menu"
+        );
+
+        // Drop the command prefix and the browser takes over.
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &ctl);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        assert!(app.file_menu.is_some(), "a plain @ opens the browser");
+    }
+
+    /// Send-now (ctrl+enter) clears the draft — the browser must not
+    /// survive the send and float over the busy transcript.
+    #[test]
+    fn send_now_closes_the_browser() {
+        let ws = Workspace::new();
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+        assert!(app.file_menu.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+        assert!(app.file_menu.is_none(), "the send closes the browser");
+    }
+
+    /// Typing narrows the listing itself (Martty's live filter), not just
+    /// the highlight: non-matching entries leave the popup.
+    #[test]
+    fn browser_filter_narrows_the_listing() {
+        let ws = Workspace::new();
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        for ch in "@read".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &ctl);
+        }
+
+        let frame = crate::ui::dump_frame(&mut app, 100, 24);
+        assert!(frame.contains("README.md"), "the match stays:\n{frame}");
+        assert!(
+            !frame.contains("notes.txt") && !frame.contains("src/"),
+            "non-matching entries leave the listing:\n{frame}"
+        );
+    }
+
+    /// The browser's hint row names the modal keys, ctrl+h included.
+    #[test]
+    fn browser_hint_names_the_hidden_toggle() {
+        let ws = Workspace::new();
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE), &ctl);
+
+        let frame = crate::ui::dump_frame(&mut app, 100, 24);
+        assert!(frame.contains("ctrl+h hidden"), "hint row:\n{frame}");
+        assert!(frame.contains("enter pick"), "hint row:\n{frame}");
     }
 }
 
@@ -7425,5 +7667,89 @@ mod resume_replay_tests {
             users.iter().any(|t| t.contains("hello persistence")),
             "replayed user line lands in the transcript: {users:?}"
         );
+    }
+}
+
+/// The composer cap's `:branch` suffix: seeded from the workspace once at
+/// startup, then re-checked on the tick throttle so a checkout made
+/// mid-session (the agent's shell tool, another terminal) reaches the label.
+#[cfg(test)]
+mod git_branch_tests {
+    use super::*;
+
+    fn fresh_root() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-tui-git-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// A workspace directory whose `.git/HEAD` points at `branch`.
+    fn repo(branch: &str) -> String {
+        let workspace = fresh_root();
+        std::fs::create_dir_all(std::path::Path::new(&workspace).join(".git")).unwrap();
+        std::fs::write(
+            std::path::Path::new(&workspace).join(".git/HEAD"),
+            format!("ref: refs/heads/{branch}\n"),
+        )
+        .unwrap();
+        workspace
+    }
+
+    fn test_app(workspace: &str) -> App {
+        let cfg = RuntimeConfig {
+            workspace: workspace.into(),
+            home: fresh_root(),
+            sessions_root: fresh_root(),
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            max_tokens: None,
+            base_url: None,
+            api_key: None,
+            key_origin: None,
+        };
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        App::new(crate::theme::Theme::dark(), cfg, "dsh-test".into())
+    }
+
+    #[test]
+    fn startup_seeds_the_branch_from_the_workspace_head() {
+        assert_eq!(test_app(&repo("main")).git_branch.as_deref(), Some("main"));
+        // A workspace that is not a checkout keeps the cap path-only.
+        assert_eq!(test_app("/work/acme/not-a-repo").git_branch, None);
+    }
+
+    #[test]
+    fn tick_picks_up_a_checkout_on_the_throttled_cadence() {
+        let workspace = repo("main");
+        let mut app = test_app(&workspace);
+        std::fs::write(
+            std::path::Path::new(&workspace).join(".git/HEAD"),
+            "ref: refs/heads/feature/next\n",
+        )
+        .unwrap();
+
+        // Inside the window: no re-read, and no repaint either.
+        app.git_check_at = Instant::now();
+        app.needs_redraw = false;
+        app.tick();
+        assert_eq!(
+            app.git_branch.as_deref(),
+            Some("main"),
+            "the throttled tick must not re-read HEAD"
+        );
+        assert!(!app.needs_redraw);
+
+        // Past it, the cap label follows the checkout.
+        app.git_check_at = Instant::now() - GIT_CHECK_INTERVAL;
+        app.needs_redraw = false;
+        app.tick();
+        assert_eq!(app.git_branch.as_deref(), Some("feature/next"));
+        assert!(app.needs_redraw, "a branch change repaints the cap");
     }
 }

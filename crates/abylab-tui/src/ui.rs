@@ -1142,6 +1142,35 @@ fn compact_workspace(path: &str, max_width: usize) -> String {
     format!("…{suffix}")
 }
 
+/// Parse the current branch from the workspace's `.git/HEAD` without
+/// spawning git (":branch" rides after the project path in the composer cap,
+/// colon-tight — Martty's cap label). `ref: refs/heads/<branch>` →
+/// Some(branch); a raw commit hash (detached HEAD), a missing `.git`, or a
+/// missing HEAD → None. Handles worktrees and submodules whose `.git` is a
+/// `gitdir:` pointer file; relative pointers resolve against the `.git`
+/// file's parent. Git itself is never invoked.
+pub fn head_branch(workspace: &str) -> Option<String> {
+    let dot_git = std::path::Path::new(workspace).join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let p = std::path::Path::new(pointer.strip_prefix("gitdir:")?.trim());
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dot_git.parent()?.join(p)
+        }
+    } else {
+        return None;
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    head.strip_prefix("ref: refs/heads/")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// The cap row's right side: the project path with the `:branch` suffix,
 /// plus the mouse-only `↥` user prompt jump glyph (Martty's issue #103
 /// button). The glyph keeps one cell of margin from the corner; hovering
@@ -1154,11 +1183,19 @@ fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
     } else {
         app.theme.caption
     };
+    let mut text = format!(" · {} ", compact_workspace(&app.cfg.workspace, path_width));
+    // The git branch follows the project path, colon-tight ("path:branch"),
+    // only while both still fit the cap budget — a narrow terminal (or a
+    // long path) keeps just the path.
+    if let Some(branch) = &app.git_branch {
+        let branch_tag = format!(":{branch} ");
+        if text.width() - 1 + branch_tag.width() <= title_width {
+            text.pop(); // drop the space between the path and the colon
+            text.push_str(&branch_tag);
+        }
+    }
     Line::from(vec![
-        Span::styled(
-            format!(" · {} ", compact_workspace(&app.cfg.workspace, path_width)),
-            Style::default().fg(app.theme.caption),
-        ),
+        Span::styled(text, Style::default().fg(app.theme.caption)),
         Span::raw(" "),
         Span::styled("↥", Style::default().fg(tone)),
         Span::raw(" "),
@@ -1549,15 +1586,11 @@ fn draw_file_menu(f: &mut Frame, app: &mut App, input: Rect, chat: Rect) {
     let Some(menu) = &mut app.file_menu else {
         return;
     };
-    if menu.explorer().files().is_empty() {
-        return;
-    }
     let theme = app.theme;
     let locale = app.locale;
-    menu.apply_chrome(&theme, locale, &app.cfg.workspace);
     let n = menu.explorer().files().len();
     let vis = FILE_MENU_ROWS
-        .min(n)
+        .min(n.max(1))
         .min(chat.height.saturating_sub(2) as usize);
     if vis == 0 {
         return;
@@ -1569,7 +1602,52 @@ fn draw_file_menu(f: &mut Frame, app: &mut App, input: Rect, chat: Rect) {
     let y = input.y.saturating_sub(h);
     let area = Rect::new(input.x + 2, y, w, h);
     f.render_widget(Clear, area);
+    if n == 0 {
+        // The live filter left nothing here (and the follow search found
+        // nothing): keep the frame up with a no-match hint instead of
+        // making the menu vanish mid-typing.
+        let title = menu.chrome_title(&app.cfg.workspace);
+        let hint = menu.chrome_hint(locale);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border))
+            .style(Style::default().bg(theme.panel))
+            .title(Span::styled(title, Style::default().fg(theme.caption)))
+            .title_bottom(Line::from(Span::styled(
+                hint,
+                Style::default().fg(theme.caption),
+            )));
+        f.render_widget(block, area);
+        force_full_rewrite(f, area);
+        return;
+    }
+    // Rebuild the explorer chrome from the app theme every frame: palette
+    // packs and locale can switch under us, and the title factories need
+    // the current cwd.
+    menu.apply_chrome(&theme, locale, &app.cfg.workspace);
     f.render_widget_ref(menu.explorer().widget(), area);
+    // Wide (CJK) names scroll through the explorer window and orphan
+    // trailing cells on the real screen; force a full rewrite so the diff
+    // never trusts a half-erased cell.
+    force_full_rewrite(f, area);
+}
+
+/// Mark every cell of `area` as always-dirty: overlay content that swaps
+/// between list and empty states (or scrolls wide glyphs) must not be
+/// diffed against the previous frame's half-erased cells.
+fn force_full_rewrite(f: &mut Frame, area: Rect) {
+    let buf = f.buffer_mut();
+    // Overlays compute their rect from screen math that can saturate at the
+    // top edge; never index a cell outside the buffer (widgets clip via
+    // `intersection`, direct indexing would panic).
+    let area = area.intersection(Rect::new(0, 0, buf.area.width, buf.area.height));
+    if area.is_empty() {
+        return;
+    }
+    for pos in area.positions() {
+        buf[pos].set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+    }
 }
 
 fn draw_slash_menu(f: &mut Frame, app: &App, input: Rect, chat: Rect) {
@@ -2068,6 +2146,107 @@ mod tests {
         assert!(
             cap.contains("· /work/acme/projects/deepseek-harness-tui-plan-view"),
             "{cap}"
+        );
+    }
+
+    /// The cap reads the branch straight out of `.git/HEAD` — no git process.
+    #[test]
+    fn head_branch_reads_the_ref_and_skips_non_branches() {
+        let root = fresh_root();
+        let workspace = std::path::Path::new(&root);
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        std::fs::write(workspace.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(head_branch(&root).as_deref(), Some("main"));
+
+        // A detached HEAD holds a raw commit hash, not a branch.
+        std::fs::write(workspace.join(".git/HEAD"), "0f1e2d3c4b5a6978\n").unwrap();
+        assert_eq!(head_branch(&root), None);
+        // An empty ref is not a branch either, and an unwritable/absent
+        // `.git` (a plain directory) reads as no repo at all.
+        std::fs::write(workspace.join(".git/HEAD"), "ref: refs/heads/\n").unwrap();
+        assert_eq!(head_branch(&root), None);
+        assert_eq!(head_branch("/work/acme/definitely-not-a-repo"), None);
+    }
+
+    /// Worktrees keep the real git dir elsewhere and leave a `gitdir:` pointer
+    /// file in place of `.git`; a relative pointer resolves against it.
+    #[test]
+    fn head_branch_follows_a_worktree_pointer() {
+        let root = fresh_root();
+        let workspace = std::path::Path::new(&root).join("checkout");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let git_dir = std::path::Path::new(&root).join("main.git/worktrees/checkout");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/wt/topic\n").unwrap();
+        std::fs::write(
+            workspace.join(".git"),
+            "gitdir: ../main.git/worktrees/checkout\n",
+        )
+        .unwrap();
+
+        let workspace = workspace.to_string_lossy().into_owned();
+        assert_eq!(head_branch(&workspace).as_deref(), Some("wt/topic"));
+
+        // A `.git` file without the `gitdir:` prefix is not a pointer.
+        std::fs::write(
+            std::path::Path::new(&workspace).join(".git"),
+            "../main.git\n",
+        )
+        .unwrap();
+        assert_eq!(head_branch(&workspace), None);
+    }
+
+    /// The cap label is `path:branch`, colon-tight (Martty's composer cap).
+    #[test]
+    fn composer_cap_appends_the_git_branch_colon_tight() {
+        let mut app = test_app();
+        let workspace = fresh_root();
+        std::fs::create_dir_all(std::path::Path::new(&workspace).join(".git")).unwrap();
+        std::fs::write(
+            std::path::Path::new(&workspace).join(".git/HEAD"),
+            "ref: refs/heads/feature/cap\n",
+        )
+        .unwrap();
+        app.cfg.workspace = workspace.clone();
+        app.git_branch = head_branch(&workspace);
+
+        let frame = dump_frame(&mut app, 120, 20);
+        let cap = frame
+            .lines()
+            .find(|line| line.contains("Tip"))
+            .expect("composer cap");
+
+        assert!(cap.contains(":feature/cap"), "{cap}");
+        // Colon-tight: no space between the project path and the branch.
+        let leaf = workspace.rsplit('/').next().expect("workspace leaf");
+        assert!(
+            cap.contains(&format!("{leaf}:feature/cap")),
+            "the path stays left of the colon: {cap}"
+        );
+        assert!(
+            cap.find('↥').unwrap() > cap.find(":feature/cap").unwrap(),
+            "the jump glyph stays right of the branch: {cap}"
+        );
+    }
+
+    /// A long path (or a narrow terminal) keeps the path alone: the branch
+    /// only rides along while both fit the cap budget.
+    #[test]
+    fn composer_cap_drops_the_branch_when_the_path_owns_the_budget() {
+        let mut app = test_app();
+        app.cfg.workspace = "/work/acme/very-long-directory-name/deepseek-harness".into();
+        app.git_branch = Some("feature/a-very-long-branch-name".into());
+
+        let frame = dump_frame(&mut app, 60, 20);
+        let cap = frame
+            .lines()
+            .find(|line| line.contains("Tip"))
+            .expect("composer cap");
+
+        assert!(cap.contains("· …/deepseek-harness"), "{cap}");
+        assert!(
+            !cap.contains(":feature"),
+            "the branch must not crowd out the path: {cap}"
         );
     }
 

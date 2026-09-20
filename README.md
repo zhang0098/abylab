@@ -33,7 +33,7 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 
 `/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
 `/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
-`/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
+`/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
 `/session` · `/lang [zh|en]` · `/quit`
 
 `/theme` 用来挑调色板包：内置的 DeepSeek 默认主题，外加八个主题（ayu ·
@@ -56,11 +56,21 @@ Shift+Tab 循环切换预设。
 这一行，几秒后回到任务进度。点击进度部分（`2/5 完成`）弹出完整清单对话框，
 esc 关闭。
 
+提示行右侧显示项目路径；工作区是个 Git 检出时，后面紧跟 `:分支`（冒号紧贴，
+如 `/work/acme/abylab:main`）。分支直接读 `.git/HEAD`，不启动 git 进程，每 5 秒
+在节拍里复查一次（代理的 shell 工具或另一个终端切了分支，标签会跟着变）；
+路径太长或终端太窄时只留路径。
+
 提示行右侧、项目路径后面的 `↥` 可以点击：每次点击往前跳一条你发过的
 输入（从最新开始，到最早后回到最新），跳到的输入会滚动到顶部并高亮几秒。
 
 鼠标：滚轮滚动 · 点击工具卡片展开 · 拖动选择，松开复制
 （原生工具 → tmux → OSC52）· `@` 打开文件浏览器。
+
+`@` 文件浏览器：输入即过滤（精确 > 前缀 > 包含 > 字母顺序模糊匹配），
+当前目录没有匹配就自动跳到子目录里最近的一条（跳过 `.git`、`node_modules`
+等重目录，最多三层）；↑↓ 移动 · ← 上级 · →/tab 进入目录 · enter 选择 ·
+`ctrl+h` 显示/隐藏点文件 · esc 关闭（同样的文字再打开）。
 
 ## 技术说明
 

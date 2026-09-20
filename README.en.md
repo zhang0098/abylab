@@ -113,7 +113,7 @@ run. Want a shorter answer? Just ask. A fresh session uses the SDK output cap
 
 `/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
 `/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
-`/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
+`/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
 `/session` · `/lang [zh|en]` · `/quit`
 
 `/theme` picks a palette pack: the built-in DeepSeek default plus the eight
@@ -139,12 +139,25 @@ progress (`Todo · now: fix login · 2/5 done`). Transient action feedback
 borrows that row for a few seconds, then the checklist returns. Clicking the
 progress chip (`2/5 done`) opens the full checklist in a dialog; esc closes it.
 
+The tip row names the project path; when the workspace is a Git checkout the
+current branch rides along colon-tight (`/work/acme/abylab:main`). The branch
+is read straight from `.git/HEAD` (no git process) and re-checked on a 5 s
+tick, so a checkout made by the agent's shell tool or another terminal
+reaches the label; a long path or a narrow terminal keeps the path alone.
+
 The `↥` right of the project path in that same row walks your prompts: each
 click jumps one prompt back (newest first, wrapping from the oldest), scrolls
 it to the top of the pane and highlights it for a few seconds.
 
 Mouse: wheel scrolls · click a tool card expands it · drag selects, release
 copies (native tool → tmux → OSC52) · `@` opens the file browser.
+
+The `@` browser filters as you type (exact > prefix > contains > fuzzy
+subsequence) and, when the current directory has no match, follows the query
+into the closest subdirectory (skipping heavyweight trees like `.git` and
+`node_modules`, three levels deep). ↑↓ move · ← parent · →/tab open a
+directory · enter pick · `ctrl+h` shows/hides dotfiles · esc closes it until
+the token text changes.
 
 ## Technical notes
 
