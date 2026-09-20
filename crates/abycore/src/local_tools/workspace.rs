@@ -429,12 +429,16 @@ pub(super) fn replace(
         .file_name()
         .ok_or_else(|| failed("file_path must name a file"))?;
     let stage_name = PathBuf::from(format!(".abycore-{:032x}.tmpdir", rand::random::<u128>()));
-    let mut builder = DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use cap_std::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
+    let builder = {
+        let mut builder = DirBuilder::new();
+        // 0700 is a unix mode; Windows inherits the parent directory's ACL.
+        #[cfg(unix)]
+        {
+            use cap_std::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+    };
     directory
         .create_dir_with(&stage_name, &builder)
         .map_err(|e| io_error("create staging directory", e))?;
