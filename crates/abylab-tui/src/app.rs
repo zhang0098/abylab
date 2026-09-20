@@ -931,12 +931,13 @@ impl App {
         let settings = Self::load_settings(&cfg);
         let locale = settings.language;
         // The persisted palette pack survives restarts; the appearance mode
-        // arrives already resolved (flag > persisted > dark).
+        // arrives already resolved (flag > persisted > dark). A fresh install
+        // opens on One, dark — the built-in DeepSeek pack stays selectable.
         let active_palette_id = settings
             .palette
             .clone()
             .filter(|id| palettes.iter().any(|pack| &pack.id == id))
-            .unwrap_or_else(|| "default".into());
+            .unwrap_or_else(|| crate::theme::DEFAULT_PACK.into());
         let theme = palettes
             .iter()
             .find(|pack| pack.id == active_palette_id)
@@ -6812,12 +6813,19 @@ mod palette_tests {
         (app, ctl, rx)
     }
 
+    /// A fresh install opens on One, dark. The built-in DeepSeek pack is not
+    /// gone — it is a row of the gallery, not the starting point.
     #[test]
-    fn starts_on_default_pack() {
+    fn starts_on_the_one_pack() {
         let (app, _ctl, _rx) = test_app();
-        assert_eq!(app.active_palette_id, "default");
-        assert_eq!(app.theme.brand, DEEPSEEK_450);
-        assert!(app.palettes.iter().any(|p| p.id == "default"));
+        assert_eq!(app.active_palette_id, "one");
+        assert_eq!(app.theme.mode, crate::theme::Mode::Dark);
+        assert_eq!(app.theme.brand, pack_brand(&app, "one"));
+        assert_eq!(
+            pack_brand(&app, "default"),
+            DEEPSEEK_450,
+            "the built-in pack still paints DeepSeek blue"
+        );
     }
 
     #[test]
@@ -6848,19 +6856,41 @@ mod palette_tests {
         );
     }
 
-    /// The dark-mode brand a gallery pack paints — the value live previews
-    /// and commits must land on.
-    fn pack_brand(app: &App, id: &str) -> Color {
+    /// The brand a gallery pack paints in `mode` — the value live previews and
+    /// commits must land on.
+    fn pack_brand_in(app: &App, id: &str, mode: crate::theme::Mode) -> Color {
         app.palettes
             .iter()
             .find(|pack| pack.id == id)
             .unwrap_or_else(|| panic!("pack {id}"))
-            .theme(crate::theme::Mode::Dark)
+            .theme(mode)
             .brand
+    }
+
+    fn pack_brand(app: &App, id: &str) -> Color {
+        pack_brand_in(app, id, crate::theme::Mode::Dark)
     }
 
     fn key(app: &mut App, ctl: &Controller, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), ctl);
+    }
+
+    /// Walk the open theme dialog's highlight onto `id`'s row, ↓ one row at a
+    /// time so the tests do not depend on where the gallery puts it.
+    fn highlight_pack(app: &mut App, ctl: &Controller, id: &str) {
+        let highlighted = |app: &App| {
+            app.picker
+                .as_ref()
+                .and_then(|picker| picker.items.get(picker.sel))
+                .map(|item| item.id.clone())
+        };
+        for _ in 0..app.palettes.len() {
+            if highlighted(app).as_deref() == Some(id) {
+                return;
+            }
+            key(app, ctl, KeyCode::Down);
+        }
+        panic!("the dialog never reached {id}");
     }
 
     fn wheel(app: &mut App, ctl: &Controller, kind: MouseEventKind) {
@@ -6876,37 +6906,41 @@ mod palette_tests {
     }
 
     /// The theme dialog lives on its highlight: arrows paint the row under it
-    /// immediately (`ayu` is the second row), but only Enter commits — the
-    /// committed pack and `settings.json` wait for the confirmation.
+    /// immediately, but only Enter commits — the committed pack and
+    /// `settings.json` wait for the confirmation.
     #[test]
     fn theme_dialog_arrows_preview_and_only_enter_commits() {
         let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
         let ayu = pack_brand(&app, "ayu");
-        assert_ne!(ayu, DEEPSEEK_450, "the test pack must differ from default");
+        assert_ne!(ayu, one, "the test pack must differ from the committed one");
         app.run_slash("theme", "", &ctl);
-        assert_eq!(
-            app.picker.as_ref().map(|p| p.sel),
-            Some(0),
-            "the committed row opens highlighted"
-        );
+        {
+            let picker = app.picker.as_ref().expect("the dialog opens");
+            assert_eq!(
+                picker.items[picker.sel].id, app.active_palette_id,
+                "the committed row opens highlighted"
+            );
+        }
 
-        // One ↓ lands on ayu: the painter follows right away, the committed
-        // pack does not.
-        key(&mut app, &ctl, KeyCode::Down);
+        // ↓ onto ayu: the painter follows right away, the committed pack does
+        // not.
+        highlight_pack(&mut app, &ctl, "ayu");
         assert_eq!(app.theme.brand, ayu);
-        assert_eq!(app.active_palette_id, "default", "arrows only preview");
+        assert_eq!(app.active_palette_id, "one", "arrows only preview");
         assert!(app.picker.is_some(), "preview must keep browsing open");
         assert_eq!(app.theme_preview.as_deref(), Some("ayu"));
 
-        // Home jumps back onto the committed row → the preview is gone.
-        key(&mut app, &ctl, KeyCode::Home);
-        assert_eq!(app.theme.brand, DEEPSEEK_450);
+        // Back onto the committed row → the preview is gone.
+        highlight_pack(&mut app, &ctl, "one");
+        assert_eq!(app.theme.brand, one);
         assert!(app.theme_preview.is_none());
 
-        // ↓ onto ayu, then Enter confirms: the dialog closes, ayu commits.
-        key(&mut app, &ctl, KeyCode::Down);
+        // Onto ayu once more, then Enter confirms: the dialog closes, ayu
+        // commits.
+        highlight_pack(&mut app, &ctl, "ayu");
         assert_eq!(app.theme.brand, ayu);
-        assert_eq!(app.active_palette_id, "default", "still only previewed");
+        assert_eq!(app.active_palette_id, "one", "still only previewed");
         key(&mut app, &ctl, KeyCode::Enter);
         assert!(app.picker.is_none());
         assert_eq!(app.active_palette_id, "ayu");
@@ -6919,22 +6953,23 @@ mod palette_tests {
     #[test]
     fn theme_dialog_esc_and_wheel_revert_to_the_committed_pack() {
         let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
         let ayu = pack_brand(&app, "ayu");
         app.run_slash("theme", "", &ctl);
 
         wheel(&mut app, &ctl, MouseEventKind::ScrollDown);
-        assert_eq!(app.theme.brand, ayu, "one notch previews one row");
+        assert_ne!(app.theme.brand, one, "one notch previews the next row");
         assert!(app.picker.is_some(), "the wheel keeps the dialog open");
         wheel(&mut app, &ctl, MouseEventKind::ScrollUp);
-        assert_eq!(app.theme.brand, DEEPSEEK_450, "back on the committed row");
+        assert_eq!(app.theme.brand, one, "back on the committed row");
 
-        key(&mut app, &ctl, KeyCode::Down);
+        highlight_pack(&mut app, &ctl, "ayu");
         assert_eq!(app.theme.brand, ayu);
         key(&mut app, &ctl, KeyCode::Esc);
         assert!(app.picker.is_none());
-        assert_eq!(app.active_palette_id, "default");
+        assert_eq!(app.active_palette_id, "one");
         assert_eq!(
-            app.theme.brand, DEEPSEEK_450,
+            app.theme.brand, one,
             "Esc must revert the preview — arrows never confirm"
         );
     }
@@ -6948,7 +6983,7 @@ mod palette_tests {
         let ayu = pack_brand(&app, "ayu");
         app.run_slash("theme", "", &ctl);
 
-        key(&mut app, &ctl, KeyCode::Down);
+        highlight_pack(&mut app, &ctl, "ayu");
         assert_eq!(app.theme.brand, ayu);
         let saved = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(
@@ -6969,17 +7004,12 @@ mod palette_tests {
     #[test]
     fn theme_dialog_ctrl_t_toggles_the_previewed_pack() {
         let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
         let ayu_dark = pack_brand(&app, "ayu");
-        let ayu_light = app
-            .palettes
-            .iter()
-            .find(|pack| pack.id == "ayu")
-            .unwrap()
-            .theme(crate::theme::Mode::Light)
-            .brand;
+        let ayu_light = pack_brand_in(&app, "ayu", crate::theme::Mode::Light);
         assert_ne!(ayu_dark, ayu_light, "the test pack must differ per mode");
         app.run_slash("theme", "", &ctl);
-        key(&mut app, &ctl, KeyCode::Down);
+        highlight_pack(&mut app, &ctl, "ayu");
 
         app.handle_key(
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
@@ -6987,7 +7017,7 @@ mod palette_tests {
         );
         assert_eq!(app.theme.mode, crate::theme::Mode::Light);
         assert_eq!(app.theme.brand, ayu_light, "the toggle stays in-pack");
-        assert_eq!(app.active_palette_id, "default", "still only previewed");
+        assert_eq!(app.active_palette_id, "one", "still only previewed");
         assert!(app.picker.is_some(), "ctrl+t must not close the dialog");
 
         // Esc drops the preview back to the committed pack — in the mode the
@@ -6996,9 +7026,10 @@ mod palette_tests {
         assert_eq!(app.theme.mode, crate::theme::Mode::Light);
         assert_eq!(
             app.theme.brand,
-            Theme::light().brand,
-            "default light, not ayu"
+            pack_brand_in(&app, "one", crate::theme::Mode::Light),
+            "One light, not ayu"
         );
+        assert_ne!(app.theme.brand, one, "…in the mode, not the old one");
     }
 
     /// The `/theme ` candidate popup previews the palette under its
@@ -7006,29 +7037,27 @@ mod palette_tests {
     #[test]
     fn slash_theme_popup_previews_and_reverts_without_enter() {
         let (mut app, ctl, _rx) = test_app();
+        let one = pack_brand(&app, "one");
         let ayu = pack_brand(&app, "ayu");
         app.input.set("/theme ".into());
 
         // Rows: dark · light · default · ayu …
         key(&mut app, &ctl, KeyCode::Down);
+        assert_eq!(app.theme.brand, one, "the `light` row previews nothing");
+        key(&mut app, &ctl, KeyCode::Down);
         assert_eq!(
             app.theme.brand, DEEPSEEK_450,
-            "the `light` row previews nothing"
+            "the `default` row previews the built-in pack"
         );
         key(&mut app, &ctl, KeyCode::Down);
-        assert_eq!(app.theme.brand, DEEPSEEK_450, "the committed row reverts");
-        key(&mut app, &ctl, KeyCode::Down);
         assert_eq!(app.theme.brand, ayu, "the ayu row previews it");
-        assert_eq!(app.active_palette_id, "default", "arrows only preview");
+        assert_eq!(app.active_palette_id, "one", "arrows only preview");
         assert_eq!(app.input.buf(), "/theme ", "the draft survives the preview");
 
         // Esc dismisses the popup and reverts with it.
         key(&mut app, &ctl, KeyCode::Esc);
         assert!(app.input.is_empty());
-        assert_eq!(
-            app.theme.brand, DEEPSEEK_450,
-            "Esc reverts the popup preview"
-        );
+        assert_eq!(app.theme.brand, one, "Esc reverts the popup preview");
     }
 
     /// Enter on the highlighted row is the confirmation there too.
@@ -7041,7 +7070,7 @@ mod palette_tests {
             key(&mut app, &ctl, KeyCode::Down);
         }
         assert_eq!(app.theme.brand, ayu);
-        assert_eq!(app.active_palette_id, "default");
+        assert_eq!(app.active_palette_id, "one");
 
         key(&mut app, &ctl, KeyCode::Enter);
         assert_eq!(app.active_palette_id, "ayu");

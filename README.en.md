@@ -116,9 +116,11 @@ run. Want a shorter answer? Just ask. A fresh session uses the SDK output cap
 `/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
 `/session` · `/lang [zh|en]` · `/quit`
 
-`/theme` picks a palette pack: the built-in DeepSeek default plus the eight
-gallery packs (ayu · catppuccin · everforest · iceberg · kanagawa · one ·
-solarized · tomorrow) — all embedded in the binary, no external files.
+`/theme` picks a palette pack — a fresh install starts on **one**, dark
+(`--theme dark` only moves between light and dark, it never changes the pack).
+The built-in DeepSeek pack and the other seven gallery packs (ayu ·
+catppuccin · everforest · iceberg · kanagawa · solarized · tomorrow) are all
+embedded in the binary, no external files.
 Arrows in the picker preview the highlighted pack in place; `enter` applies it
 and `esc` reverts. `ctrl+t` toggles dark/light inside the active pack.
 

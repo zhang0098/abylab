@@ -208,6 +208,10 @@ impl std::fmt::Display for PaletteError {
     }
 }
 
+/// Pack a fresh install opens on: One, dark. The built-in `default` pack —
+/// the DeepSeek tokens — stays in the gallery and selectable like the rest.
+pub const DEFAULT_PACK: &str = "one";
+
 /// A named dark/light token pack. Built-in `default` plus the Martty gallery.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PalettePack {
