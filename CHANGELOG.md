@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-20
+
 ### 新增
 
 - 启动画面在 ASCII wordmark 和项目地址下面多出四行启动信息：版本号、工作目录、
@@ -106,7 +108,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/zhang0098/abylab/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/zhang0098/abylab/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/zhang0098/abylab/compare/v0.1.1...v0.1.2
