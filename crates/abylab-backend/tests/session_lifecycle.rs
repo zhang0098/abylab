@@ -283,7 +283,11 @@ fn settings_changes_preserve_the_writer_and_child_control_identity() {
     live.send(Cmd::SetPermission {
         preset: "read-only".into(),
     });
-    live.done("permission → read-only");
+    // A switch reports its facts (and rebuilds the local tools) without an
+    // op-done echo, so the echoed preset is the barrier here.
+    live.wait(
+        |e| matches!(e, Event::Ui(UiEvent::PermissionPreset { preset, .. }) if preset == "read-only"),
+    );
     live.send(Cmd::SetApiKey {
         key: Some("rotated-fixture-key".into()),
     });

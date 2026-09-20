@@ -1767,14 +1767,21 @@ impl App {
                     self.modes.plan = *active;
                 }
             }
+            // The permission facts fold the meta row's chips and stop there: a
+            // switch is confirmed by the chip itself (the label brightens under
+            // full access), so echoing the same facts into the timeline would
+            // only repeat the composer chrome.
             E::SandboxMode { session, mode } if *session == self.session_id => {
                 self.modes.sandbox = Some(mode.clone());
+                apply_to_transcript = false;
             }
             E::ApprovalPolicy { session, policy } if *session == self.session_id => {
                 self.modes.approval = Some(policy.clone());
+                apply_to_transcript = false;
             }
             E::PermissionPreset { session, preset } if *session == self.session_id => {
                 self.modes.permission = Some(preset.clone());
+                apply_to_transcript = false;
             }
             E::AgentPreset { session, preset } if *session == self.session_id => {
                 self.modes.agent_preset = Some(preset.clone());
@@ -3534,9 +3541,11 @@ impl App {
     }
 
     /// Ask the host to switch this session's permission preset; the durable
-    /// `permission/preset` event echoes back and folds the ⛨ chip. Before
-    /// the first prompt the host stages the switch and applies it when the
-    /// session is created.
+    /// `permission/preset` event echoes back and folds the ⛨ chip, which is
+    /// the whole confirmation — the switch itself stays out of the timeline.
+    /// Before the first prompt the host stages the switch and applies it when
+    /// the session is created; until a session is bound the chips are hidden,
+    /// so a staged switch borrows the tip line to stay visible.
     fn set_permission(&mut self, preset: String, ctl: &Controller) {
         if self.modes.permission.as_deref() == Some(preset.as_str()) {
             self.show_tip(format!("permission already {preset}"));
@@ -3546,7 +3555,9 @@ impl App {
             session_id: self.session_id.clone(),
             preset: preset.clone(),
         });
-        self.show_tip(format!("permission → {preset} …"));
+        if !self.session_bound {
+            self.show_tip(format!("permission → {preset} …"));
+        }
     }
 
     /// `/permission` — the two stock presets with their meaning, the current
@@ -5530,6 +5541,49 @@ mod mode_tests {
             );
             assert_eq!(app.current_permission(), expected);
         }
+    }
+
+    #[test]
+    fn permission_facts_fold_the_chip_without_touching_the_timeline() {
+        let (mut app, ctl, _rx) = test_app();
+        let cells_before = app.transcript.cells.len();
+        for ui in [
+            crate::events::UiEvent::SandboxMode {
+                session: app.session_id.clone(),
+                mode: "read-only".into(),
+            },
+            crate::events::UiEvent::ApprovalPolicy {
+                session: app.session_id.clone(),
+                policy: "ask".into(),
+            },
+            crate::events::UiEvent::PermissionPreset {
+                session: app.session_id.clone(),
+                preset: "read-only".into(),
+            },
+        ] {
+            app.handle(AppEvent::Ui(ui), &ctl);
+        }
+        assert_eq!(app.modes.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(app.modes.approval.as_deref(), Some("ask"));
+        assert_eq!(app.modes.permission.as_deref(), Some("read-only"));
+        assert_eq!(
+            app.transcript.cells.len(),
+            cells_before,
+            "a switch is confirmed by the meta row's chips, not by timeline lines"
+        );
+    }
+
+    #[test]
+    fn a_switch_borrows_the_tip_only_while_the_chips_are_hidden() {
+        let (mut app, ctl, _rx) = test_app();
+        // A bound session shows the permission chip, so the switch is silent.
+        app.set_permission("read-only".into(), &ctl);
+        assert!(app.tip.is_none());
+        // A keyless boot has no session to chip: the staged switch keeps the
+        // tip line, which is the only place left to say it.
+        app.session_bound = false;
+        app.set_permission("workspace-write".into(), &ctl);
+        assert!(app.tip.is_some());
     }
 
     #[test]

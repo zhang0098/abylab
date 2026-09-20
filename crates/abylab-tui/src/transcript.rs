@@ -721,15 +721,14 @@ impl Transcript {
                     format!("⌁ plan mode {}", if active { "on" } else { "off" }),
                 );
             }
-            UiEvent::SandboxMode { mode, .. } => {
-                self.push_notice(NoticeLevel::Info, format!("⛨ file policy · {mode}"));
-            }
-            UiEvent::ApprovalPolicy { policy, .. } => {
-                self.push_notice(NoticeLevel::Info, format!("⚖ approval policy · {policy}"));
-            }
-            UiEvent::PermissionPreset { preset, .. } => {
-                self.push_notice(NoticeLevel::Info, format!("⛨ permission · {preset}"));
-            }
+            // Permission facts (`file policy` · `approval policy` ·
+            // `permission`) never print: the app folds them into the composer's
+            // meta-row chips and stops them there, so a switch is confirmed by
+            // the chip instead of echoing itself into the timeline. A granted
+            // or denied approval below still speaks for itself.
+            UiEvent::SandboxMode { .. }
+            | UiEvent::ApprovalPolicy { .. }
+            | UiEvent::PermissionPreset { .. } => {}
             UiEvent::AgentPreset { preset, .. } => {
                 self.push_notice(NoticeLevel::Info, format!("⚙ agent preset · {preset}"));
             }

@@ -936,11 +936,10 @@ async fn drive(
                     continue;
                 };
                 if next_mode == permission_mode {
+                    // Facts only, no op-done echo: a frontend confirms a mode
+                    // with its own chip, and the echo would land in the
+                    // transcript as a line of its own.
                     emit_permission_facts(&sink, &active_session, permission_mode);
-                    ctl(CtlEvent::TuiOpDone(format!(
-                        "permission → {}",
-                        permission_preset(permission_mode)
-                    )));
                     continue;
                 }
 
@@ -969,11 +968,9 @@ async fn drive(
                     old_local.shutdown().await;
                 }
                 permission_mode = next_mode;
+                // Silent success, same reason as the equal-preset branch above;
+                // a refused switch still lands as `TuiOpFailed`.
                 emit_permission_facts(&sink, &active_session, permission_mode);
-                ctl(CtlEvent::TuiOpDone(format!(
-                    "permission → {}",
-                    permission_preset(permission_mode)
-                )));
             }
             Cmd::SetApiKey { key } => {
                 api_key = key
@@ -2694,11 +2691,14 @@ mod tests {
             Event::Ui(UiEvent::PermissionPreset { preset, .. })
                 if preset == "danger-full-access"
         )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Ctl(CtlEvent::TuiOpDone(message))
-                if message == "permission → danger-full-access"
-        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Ctl(CtlEvent::TuiOpDone(message))
+                    if message.starts_with("permission →")
+            )),
+            "a successful switch reports facts only, never an op-done echo"
+        );
         drop(events);
         std::fs::remove_dir_all(&workspace).expect("remove test workspace");
     }
