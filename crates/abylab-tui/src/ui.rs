@@ -1,7 +1,9 @@
 //! Rendering: scrollback, tips row, status bar, prompt, hints, overlays.
 
+use std::time::Instant;
+
 use ratatui::layout::{Constraint, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, FrameExt, HighlightSpacing, Paragraph, Row, Scrollbar,
@@ -12,6 +14,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, RunState};
 use crate::theme::Theme;
+use crate::transcript::wrap;
+
+/// The `↥` prompt-jump glyph's hit width: the glyph cell plus the margin cell
+/// left of it (Martty's two-cell button).
+const PROMPT_JUMP_BTN_W: u16 = 2;
 
 /// Composer card height for a terminal `height` rows tall.
 /// Composer height: the input well plus one bottom meta row (state ·
@@ -50,6 +57,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // a painted caret (overlay owns input) leaves it `None` and `main`
     // parks the hidden hardware cursor nowhere.
     app.caret_cell = None;
+    // Same for the cap row's mouse-only hit targets: only a frame that draws
+    // them may leave a target behind.
+    app.plan_chip = None;
+    app.prompt_jump_btn = None;
     f.render_widget(
         Block::default().style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,
@@ -137,9 +148,52 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // composer (drawn last so it tops the menu-free chat area).
         draw_attachment_preview(f, app, composer, area);
     }
-    draw_model_picker(f, app, area);
-    draw_view_overlay(f, app, area);
-    draw_permission_ask(f, app, area);
+    // Every modal card (pickers, `/keys`, `/help`, the todo dialog, the ACP
+    // permission ask) floats over the *conversation*: the band stops at the
+    // composer's top row, so the tip line and the draft well always stay
+    // readable — a long card scrolls instead of covering them. The floor
+    // keeps a card on absurdly short terminals, where the composer leaves
+    // nothing.
+    let cards = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        composer_box
+            .y
+            .saturating_sub(area.y)
+            .max(DIALOG_MIN_H + DIALOG_MARGIN_Y * 2)
+            .min(area.height),
+    );
+    draw_model_picker(f, app, cards);
+    draw_view_overlay(f, app, cards);
+    draw_todo_dialog(f, app, cards);
+    draw_permission_ask(f, app, cards);
+}
+
+/// Outer breathing room for the modal cards (pickers, `/keys`, `/help`, the
+/// todo dialog, the permission ask): they float over the chat instead of
+/// kissing the screen edge. Margins give way first on tiny terminals — the
+/// card keeps its readable minimum, so the layout below never shrinks past
+/// it. `screen` is already the band above the composer (`draw`), so the
+/// bottom margin is measured from the composer's cap row.
+const DIALOG_MARGIN_X: u16 = 4;
+const DIALOG_MARGIN_Y: u16 = 2;
+/// The card's own minimum size (border included); the margins above never
+/// eat into it.
+const DIALOG_MIN_W: u16 = 24;
+const DIALOG_MIN_H: u16 = 4;
+
+/// The screen inset by [`DIALOG_MARGIN_X`] / [`DIALOG_MARGIN_Y`] — the box
+/// the modal review panes lay themselves out inside.
+fn dialog_area(screen: Rect) -> Rect {
+    let dx = DIALOG_MARGIN_X.min(screen.width.saturating_sub(DIALOG_MIN_W) / 2);
+    let dy = DIALOG_MARGIN_Y.min(screen.height.saturating_sub(DIALOG_MIN_H) / 2);
+    Rect::new(
+        screen.x + dx,
+        screen.y + dy,
+        screen.width.saturating_sub(dx * 2),
+        screen.height.saturating_sub(dy * 2),
+    )
 }
 
 fn draw_view_overlay(f: &mut Frame, app: &mut App, screen: Rect) {
@@ -147,6 +201,8 @@ fn draw_view_overlay(f: &mut Frame, app: &mut App, screen: Rect) {
     let Some(view) = app.view_overlay.as_mut() else {
         return;
     };
+    // Lay the card out inside the inset, keeping its own 2-column gutter.
+    let screen = dialog_area(screen);
     // A review pane, not a snackbar: wide terminals get up to 2/3 of the
     // screen (the old 84-column cap made long plans feel cramped).
     let width = screen
@@ -185,6 +241,149 @@ fn draw_view_overlay(f: &mut Frame, app: &mut App, screen: Rect) {
         ))
         .style(Style::default().bg(theme.panel).fg(theme.fg));
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), area);
+}
+
+/// The clickable todo dialog: the task in progress plus every checklist row,
+/// with the same scroll/esc affordances as the view overlay — and the same
+/// inset (`dialog_area`), so the two cards line up instead of one of them
+/// hugging the screen edge. Rendered from `App::plan` on every frame, so a
+/// live `todo_write` update refreshes an open dialog in place — and a cleared
+/// checklist (`App::plan == None`) draws nothing even if the dialog state
+/// lingers.
+fn draw_todo_dialog(f: &mut Frame, app: &mut App, screen: Rect) {
+    let theme = app.theme;
+    let Some(plan) = app.plan.clone() else {
+        return;
+    };
+    if app.todo_dialog.is_none() {
+        return;
+    }
+    let screen = dialog_area(screen);
+    let width = screen
+        .width
+        .saturating_sub(4)
+        .min((screen.width.saturating_mul(2) / 3).max(56))
+        .max(24);
+    let inner_width = width.saturating_sub(2) as usize;
+    let lines = todo_dialog_lines(&plan, &theme, inner_width, app.locale);
+    let height = (lines.len() as u16 + 2)
+        .min(screen.height.saturating_sub(4))
+        .max(4);
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    let max_scroll = lines
+        .len()
+        .saturating_sub(area.height.saturating_sub(2) as usize);
+    if let Some(dialog) = app.todo_dialog.as_mut() {
+        dialog.scroll = dialog.scroll.min(max_scroll);
+    }
+    let scroll = app.todo_dialog.as_ref().map_or(0, |d| d.scroll) as u16;
+    f.render_widget(Clear, area);
+    let title = format!(
+        " {} · {}/{} {} · {} ",
+        app.locale.tr("Todo progress", "任务进度"),
+        plan.completed,
+        plan.total,
+        app.locale.tr("done", "完成"),
+        app.locale
+            .tr("↑↓/wheel scroll · esc close", "↑↓/滚轮 滚动 · esc 关闭"),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.brand))
+        .title(Span::styled(title, Style::default().fg(theme.fg)))
+        .style(Style::default().bg(theme.panel).fg(theme.fg));
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), area);
+}
+
+/// The dialog body: the task in progress, then one line per checklist row —
+/// the `✓`/`▶`/`○` status glyphs carry the state without extra chrome. The
+/// title already reports completed/total.
+fn todo_dialog_lines(
+    plan: &crate::events::PlanProgress,
+    theme: &Theme,
+    width: usize,
+    locale: crate::locale::Locale,
+) -> Vec<Line<'static>> {
+    use crate::events::PlanStatus;
+
+    let mut lines = Vec::new();
+    if let Some(active) = &plan.active {
+        let extra = if plan.active_extra > 0 {
+            format!(" (+{})", plan.active_extra)
+        } else {
+            String::new()
+        };
+        lines.extend(indent_wrapped(
+            &format!("{active}{extra}"),
+            width,
+            locale.tr("now: ", "进行中: "),
+            Style::default().fg(theme.fg),
+            theme.brand,
+        ));
+    }
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+
+    for todo in &plan.todos {
+        let (icon, icon_color, text_style) = match todo.status {
+            PlanStatus::Completed => ("✓", theme.ok, Style::default().fg(theme.fg_tertiary)),
+            PlanStatus::InProgress => (
+                "▶",
+                theme.brand,
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
+            PlanStatus::Pending => ("○", theme.caption, Style::default().fg(theme.fg_secondary)),
+        };
+        for (i, row) in wrap(&todo.content, width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if i == 0 {
+                format!("{icon} ")
+            } else {
+                "  ".into()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(icon_color)),
+                Span::styled(row, text_style),
+            ]));
+        }
+    }
+    lines
+}
+
+/// One labeled, wrapped value in a dialog body (continuation rows align under
+/// the value, not under the label).
+fn indent_wrapped(
+    text: &str,
+    width: usize,
+    label: &str,
+    style: Style,
+    label_color: Color,
+) -> Vec<Line<'static>> {
+    let label_width = label.width();
+    wrap(text, width.saturating_sub(label_width))
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let prefix = if i == 0 {
+                label.to_string()
+            } else {
+                " ".repeat(label_width)
+            };
+            Line::from(vec![
+                Span::styled(prefix, Style::default().fg(label_color)),
+                Span::styled(row, style),
+            ])
+        })
+        .collect()
 }
 
 /// The bottom stats dock: one compact row under the composer box — token
@@ -354,26 +553,18 @@ fn draw_agent_rail(f: &mut Frame, app: &App, area: Rect) {
 
 /// The composer card fallback for short terminals (no cap row fits): a
 /// borderless tinted surface (panel bg) that owns the status row and the
-/// input well. A brand-blue edge bar glows while working. Tall enough
-/// terminals get `draw_composer_box` instead — the same surface wrapped
-/// in the rounded frame that also carries the cap row.
+/// input well. The amber prompt owns the working indicator (the old
+/// brand-blue edge bar is gone, issue #27). Tall enough terminals get
+/// `draw_composer_box` instead — the same surface wrapped in the rounded
+/// frame that also carries the cap row.
 fn draw_composer(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
-    let running = !matches!(app.state, RunState::Idle);
 
     // Surface fill: contrast against the chat bg does the framing.
     f.render_widget(
         Block::default().style(Style::default().bg(theme.panel)),
         area,
     );
-    // Left edge bar: the working "glow" (the old border used to do this).
-    if running {
-        let bar: Vec<Line> = (0..area.height).map(|_| Line::from("▎")).collect();
-        f.render_widget(
-            Paragraph::new(bar).style(Style::default().fg(theme.brand)),
-            Rect::new(area.x, area.y, 1, area.height),
-        );
-    }
 
     let inner = Rect::new(
         area.x + 1,
@@ -450,6 +641,12 @@ fn meta_line(app: &App, width: usize) -> Line<'static> {
 
 fn draw_meta_row(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(meta_line(app, area.width as usize)), area);
+}
+
+/// Whether `draw_chat` will append the live work row to the transcript this
+/// frame — the `↥` jump's scroll math must count exactly the lines it draws.
+pub(crate) fn state_line_shown(app: &App) -> bool {
+    state_line(app).is_some()
 }
 
 /// The active run-state line — rendered as the transcript's always-last line
@@ -668,6 +865,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
     let layout = app
         .displayed_transcript()
         .layout(&theme, inner.width, app.spinner(), thumbs);
+    let users = layout.users;
     let mut lines = layout.lines;
     owners.extend(layout.owners);
     // Active work rides as the transcript's last line — hugging the newest
@@ -703,6 +901,14 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
     app.chat_view.owners = owners[start..end].to_vec();
+    // The ↥ jump flash (issue #103): resolve the flashing transcript cell to
+    // its current line span every frame — streaming can move the prompt — and
+    // drop it once the few-second window expired.
+    app.prompt_flash_lines = app
+        .prompt_flash
+        .filter(|(_, until)| Instant::now() < *until)
+        .and_then(|(cell, _)| users.iter().find(|p| p.cell == cell))
+        .map(|prompt| (prompt.line, prompt.end));
 
     // Visible image thumbnails → screen rects (partially visible ones clip
     // to the pane).
@@ -728,7 +934,43 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     f.render_widget(Paragraph::new(visible), inner);
+    // The transient ↥ jump wash paints under an active copy-selection so the
+    // user's own highlight always wins.
+    draw_prompt_flash(f, app, inner, start);
     draw_selection_overlay(f, app, inner, start);
+}
+
+/// The transient `↥` jump highlight: right after a jump the jumped prompt's
+/// rows are washed with the chip background and the brand tone for a few
+/// seconds, then the ordinary bubble look returns (the expiry lives in
+/// `App::tick`, which clears the state and requests a repaint).
+fn draw_prompt_flash(f: &mut Frame, app: &App, inner: Rect, start: usize) {
+    let Some((s, e)) = app.prompt_flash_lines else {
+        return;
+    };
+    let theme = app.theme;
+    let buf = f.buffer_mut();
+    for r in 0..inner.height {
+        let li = start + r as usize;
+        if li < s || li >= e {
+            continue;
+        }
+        let Some(text) = app.chat_view.line_text(li) else {
+            continue;
+        };
+        let lw = text.trim_end().width();
+        if lw == 0 {
+            continue;
+        }
+        for c in 0..lw.min(inner.width as usize) {
+            if let Some(cell) = buf.cell_mut((inner.x + c as u16, inner.y + r)) {
+                let style = cell
+                    .style()
+                    .patch(Style::default().fg(theme.brand).bg(theme.chip_bg));
+                cell.set_style(style);
+            }
+        }
+    }
 }
 
 /// Paint the in-app mouse selection as reversed cells — the live highlight
@@ -764,35 +1006,111 @@ fn draw_selection_overlay(f: &mut Frame, app: &App, inner: Rect, start: usize) {
     }
 }
 
-fn tip_line(app: &App) -> Line<'static> {
-    let theme = app.theme;
-    let transient = app.tip.is_some();
-    let text = match &app.tip {
-        Some((t, _)) => t.clone(),
-        None => app.locale.ambient_tip(app.ambient_tip_idx).to_string(),
-    };
+/// The composer cap row as drawn, plus the cell range of its clickable chip
+/// (offset and width from the line's first cell; only the todo line has one).
+struct CapLine {
+    line: Line<'static>,
+    chip: Option<(u16, u16)>,
+}
 
-    let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    if transient {
+/// Priority: transient action feedback (a few seconds) → the live todo
+/// checklist → the rotating ambient hints. Only the todo line reports agent
+/// progress, so it holds the row between actions.
+fn cap_line(app: &App) -> CapLine {
+    let theme = app.theme;
+    if let Some((text, _)) = &app.tip {
         // Action feedback reads brighter than the rotating hints.
-        spans.push(Span::styled(text, Style::default().fg(theme.fg)));
-    } else {
-        spans.push(Span::styled(
-            app.locale.tr("Tip", "提示").to_string(),
+        return CapLine {
+            line: Line::from(vec![
+                Span::raw(" "),
+                Span::styled(text.clone(), Style::default().fg(theme.fg)),
+                Span::raw(" "),
+            ]),
+            chip: None,
+        };
+    }
+    if let Some(plan) = &app.plan {
+        return plan_line(app, plan);
+    }
+
+    CapLine {
+        line: Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                app.locale.tr("Tip", "提示").to_string(),
+                Style::default()
+                    .fg(theme.brand_soft)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            // Rotating hints read a tier below the chat body text above — the
+            // banner is furniture, not content. Gray-blue keeps it on-brand.
+            Span::styled(
+                format!(" · {}", app.locale.ambient_tip(app.ambient_tip_idx)),
+                Style::default().fg(theme.hint),
+            ),
+            Span::raw(" "),
+        ]),
+        chip: None,
+    }
+}
+
+/// The live todo checklist in the cap row: the task in progress (plus any
+/// concurrent ones) and the completed/total chip — the clickable button that
+/// opens the progress dialog. Wording follows the active locale; an empty
+/// checklist never reaches here (`App::plan` is cleared instead).
+fn plan_line(app: &App, plan: &crate::events::PlanProgress) -> CapLine {
+    let theme = app.theme;
+    let mut spans: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled(
+            app.locale.tr("Todo", "任务").to_string(),
             Style::default()
                 .fg(theme.brand_soft)
                 .add_modifier(Modifier::BOLD),
-        ));
-        // Rotating hints read a tier below the chat body text above — the
-        // banner is furniture, not content. Gray-blue keeps it on-brand.
+        ),
+    ];
+    if let Some(active) = &plan.active {
+        let extra = if plan.active_extra > 0 {
+            format!(" (+{})", plan.active_extra)
+        } else {
+            String::new()
+        };
         spans.push(Span::styled(
-            format!(" · {text}"),
-            Style::default().fg(theme.hint),
+            format!(" · {}{active}{extra}", app.locale.tr("now: ", "进行中: ")),
+            Style::default().fg(theme.fg),
         ));
     }
+    spans.push(Span::styled(
+        " · ".to_string(),
+        Style::default().fg(theme.hint),
+    ));
+    let chip_offset = span_widths(&spans) as u16;
+    // Hover is the only affordance a terminal has: the chip brightens to the
+    // brand accent while the pointer rests on it.
+    let chip_style = if app.hover_plan_chip {
+        Style::default()
+            .fg(theme.brand)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(theme.hint)
+    };
+    let chip = Span::styled(
+        format!(
+            "{}/{} {}",
+            plan.completed,
+            plan.total,
+            app.locale.tr("done", "完成")
+        ),
+        chip_style,
+    );
+    let chip_width = chip.content.width() as u16;
+    spans.push(chip);
     spans.push(Span::raw(" "));
 
-    Line::from(spans)
+    CapLine {
+        line: Line::from(spans),
+        chip: Some((chip_offset, chip_width)),
+    }
 }
 
 fn compact_workspace(path: &str, max_width: usize) -> String {
@@ -824,13 +1142,27 @@ fn compact_workspace(path: &str, max_width: usize) -> String {
     format!("…{suffix}")
 }
 
+/// The cap row's right side: the project path with the `:branch` suffix,
+/// plus the mouse-only `↥` user prompt jump glyph (Martty's issue #103
+/// button). The glyph keeps one cell of margin from the corner; hovering
+/// brightens it to the strongest foreground.
 fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
     let title_width = (area_width / 2).clamp(8, 64);
     let path_width = title_width.saturating_sub(4);
-    Line::from(Span::styled(
-        format!(" · {} ", compact_workspace(&app.cfg.workspace, path_width)),
-        Style::default().fg(app.theme.caption),
-    ))
+    let tone = if app.hover_prompt_jump_btn {
+        app.theme.fg
+    } else {
+        app.theme.caption
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(" · {} ", compact_workspace(&app.cfg.workspace, path_width)),
+            Style::default().fg(app.theme.caption),
+        ),
+        Span::raw(" "),
+        Span::styled("↥", Style::default().fg(tone)),
+        Span::raw(" "),
+    ])
     .right_aligned()
 }
 
@@ -867,18 +1199,35 @@ fn ellipsize_line(line: Line<'static>, max_width: usize, style: Style) -> Line<'
 /// The composer card as one rounded box: the cap row doubles as the top
 /// border (the tip line, plus the right-aligned · workspace title) and the
 /// meta row rides the bottom border — the input well owns every inner row.
-/// The brand glow replaces the left border while a turn runs.
+/// The amber prompt owns the working indicator (the old brand glow that
+/// replaced the left border is gone, issue #27).
 fn draw_composer_box(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
-    let running = !matches!(app.state, RunState::Idle);
     let workspace = workspace_cap_title(app, area.width as usize);
     let workspace_width = span_widths(&workspace.spans);
     let title_budget = (area.width as usize).saturating_sub(2 + workspace_width + 1);
-    let title = ellipsize_line(
-        tip_line(app),
-        title_budget,
-        Style::default().fg(theme.caption),
-    );
+    let cap = cap_line(app);
+    // The todo progress chip stays clickable as long as any of it survives
+    // the ellipsis; the block paints titles starting inside the left border.
+    app.plan_chip = cap.chip.and_then(|(offset, width)| {
+        let start = (offset as usize).min(title_budget);
+        let end = (offset as usize)
+            .saturating_add(width as usize)
+            .min(title_budget);
+        (end > start).then(|| Rect::new(area.x + 1 + start as u16, area.y, (end - start) as u16, 1))
+    });
+    let title = ellipsize_line(cap.line, title_budget, Style::default().fg(theme.caption));
+    // The `↥` glyph rides the right-aligned workspace title with a trailing
+    // space before the corner, so its cell is fixed; the hit target adds the
+    // margin cell on its left (Martty's two-cell button).
+    if area.width > PROMPT_JUMP_BTN_W + 3 {
+        app.prompt_jump_btn = Some(Rect::new(
+            area.x + area.width - PROMPT_JUMP_BTN_W - 2,
+            area.y,
+            PROMPT_JUMP_BTN_W,
+            1,
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -893,24 +1242,15 @@ fn draw_composer_box(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Running glow: the brand bar replaces the left border (corners and
-    // both title rows stay intact).
-    if running {
-        let bar: Vec<Line> = (0..inner.height).map(|_| Line::from("▎")).collect();
-        f.render_widget(
-            Paragraph::new(bar).style(Style::default().fg(theme.brand)),
-            Rect::new(area.x, area.y + 1, 1, inner.height),
-        );
-    }
-
-    let content = inner;
+    // Running state is painted by the prompt tint alone — no edge bar
+    // replaces the left border (issue #27).
 
     // Draft first: the well owns every inner row — the meta row lives on
     // the bottom border.
     app.att_chips.clear();
     app.att_thumbs.clear();
-    app.composer_wrap_width = content.width.saturating_sub("❯ ".width() as u16).max(1) as usize;
-    draw_input(f, app, content);
+    app.composer_wrap_width = inner.width.saturating_sub("❯ ".width() as u16).max(1) as usize;
+    draw_input(f, app, inner);
 }
 
 /// grok-style hover preview: when the pointer rests on an inline chip (or
@@ -1015,7 +1355,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let prompt = "❯ ";
     let pw = prompt.width();
-    // The prompt doubles as the working indicator that used to be the brand
+    // The prompt carries the working indicator that used to be the brand
     // glow bar: amber while working, brand blue when idle (issue #27).
     let working = !matches!(app.state, RunState::Idle);
     let prompt_style = Style::default()
@@ -1357,6 +1697,10 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
     let Some(picker) = &app.picker else {
         return;
     };
+    // Every `/model` · `/permission` · `/resume` · `/theme` popup lays itself
+    // out inside the same inset the review panes use, so no picker hugs the
+    // screen edge either.
+    let screen = dialog_area(screen);
     // The active model is identified by provider + id because multiple
     // coding plans can expose the same upstream model id.
     let kind = picker.kind;
@@ -1491,6 +1835,7 @@ fn draw_permission_ask(f: &mut Frame, app: &App, screen: Rect) {
         return;
     };
     let theme = app.theme;
+    let screen = dialog_area(screen);
     let h = (ask.options.len() as u16 + 2).min(screen.height.saturating_sub(2));
     let needed = ask
         .options
@@ -1660,6 +2005,55 @@ mod tests {
         assert_eq!(buf[(4, 9)].bg, theme.bg, "chat keeps the base background");
     }
 
+    /// Issue #27: the running state is the amber prompt alone — no brand
+    /// `▎` edge bar replaces the composer border.
+    #[test]
+    fn composer_glow_bar_is_gone_and_the_prompt_tints_while_working() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = test_app();
+        app.state = RunState::Idle;
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let theme = app.theme;
+
+        // Idle: brand-blue prompt on a plain rounded border.
+        terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
+        let buf = terminal.backend().buffer().clone();
+        let prompt = |buf: &ratatui::buffer::Buffer| {
+            buf.content
+                .iter()
+                .find(|cell| cell.symbol() == "❯")
+                .expect("composer prompt")
+                .clone()
+        };
+        assert_eq!(prompt(&buf).fg, theme.brand, "idle prompt stays brand blue");
+
+        // Running: the old glow bar must not paint over the left border,
+        // and the prompt carries the working state instead (amber).
+        app.state = RunState::Running;
+        terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            buf.content.iter().all(|cell| cell.symbol() != "▎"),
+            "no edge bar may render while running"
+        );
+        assert_eq!(
+            buf[(0, 16)].symbol(),
+            "│",
+            "the left border column stays a border"
+        );
+        assert_eq!(buf[(0, 16)].fg, theme.border);
+        assert_eq!(prompt(&buf).fg, theme.warn, "working prompt turns amber");
+
+        // Short terminals take the borderless fallback — the bar stayed out
+        // of that card too (cap_h is 0 below 16 rows).
+        assert!(
+            !dump_frame(&mut app, 80, 14).contains("▎"),
+            "the fallback card draws no edge bar either"
+        );
+    }
+
     #[test]
     fn composer_cap_persistently_shows_the_workspace() {
         let mut app = test_app();
@@ -1689,6 +2083,485 @@ mod tests {
             .expect("composer cap");
 
         assert!(cap.contains("· …/deepseek-harness"), "{cap}");
+    }
+
+    /// The `↥` prompt-jump button rides the cap row right of the project path,
+    /// and the recorded hit rect covers the glyph cell.
+    #[test]
+    fn composer_cap_puts_the_prompt_jump_glyph_after_the_path() {
+        let mut app = test_app();
+        app.cfg.workspace = "/work/acme/deepseek-harness".into();
+
+        let frame = dump_frame(&mut app, 100, 20);
+        let row = frame
+            .lines()
+            .position(|line| line.contains('↥'))
+            .expect("cap row with the ↥ glyph");
+        let cap = frame.lines().nth(row).unwrap();
+        assert!(cap.contains("deepseek-harness"), "{cap}");
+        assert!(
+            cap.find('↥').unwrap() > cap.find("deepseek-harness").unwrap(),
+            "the glyph follows the path: {cap}"
+        );
+
+        let btn = app.prompt_jump_btn.expect("jump button rect");
+        assert_eq!(btn.y as usize, row, "the hit rect rides the cap row");
+        let glyph = cap.chars().position(|c| c == '↥').unwrap() as u16;
+        assert!(
+            glyph >= btn.x && glyph < btn.x + btn.width,
+            "glyph at {glyph} inside {btn:?}"
+        );
+    }
+
+    /// Hover is the only affordance the glyph has: it brightens.
+    #[test]
+    fn prompt_jump_glyph_brightens_on_hover() {
+        let mut app = test_app();
+        let tone = |app: &App| -> Style {
+            workspace_cap_title(app, 100)
+                .spans
+                .iter()
+                .find(|span| span.content.contains('↥'))
+                .expect("glyph span")
+                .style
+        };
+        let idle = tone(&app);
+        app.hover_prompt_jump_btn = true;
+        let hovered = tone(&app);
+        assert_ne!(idle, hovered, "hover must be visible");
+        assert_eq!(hovered.fg, Some(app.theme.fg));
+    }
+
+    /// A `↥` jump washes the jumped prompt's bubble rows with the chip
+    /// background until the flash expires.
+    #[test]
+    fn prompt_jump_flash_washes_the_jumped_prompt() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::Duration;
+        let mut app = test_app();
+        app.transcript.push_user("first prompt".into(), false);
+        app.transcript.push_user("second prompt".into(), false);
+        let layout = app.transcript.layout(&app.theme, 78, app.spinner(), false);
+        let target = layout.users[0];
+        app.prompt_flash = Some((target.cell, Instant::now() + Duration::from_secs(5)));
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
+
+        assert_eq!(app.prompt_flash_lines, Some((target.line, target.end)));
+        let row = target.line - app.chat_view.top;
+        let text = app.chat_view.line_text(target.line).expect("visible row");
+        let col = text.find("first prompt").expect("prompt text on its row");
+        let buf = terminal.backend().buffer();
+        let cell = &buf[(
+            app.chat_view.area.x + col as u16,
+            app.chat_view.area.y + row as u16,
+        )];
+        assert_eq!(cell.bg, app.theme.chip_bg, "the jumped prompt is washed");
+        assert_eq!(cell.fg, app.theme.brand);
+    }
+
+    use crate::events::{PlanItem, PlanProgress, PlanStatus};
+
+    /// A checklist whose counts and active task are derived from its rows, the
+    /// way the driver derives them from abycore's `PlanView`.
+    fn plan(items: &[(&str, PlanStatus)]) -> PlanProgress {
+        let todos: Vec<PlanItem> = items
+            .iter()
+            .map(|(content, status)| PlanItem {
+                content: (*content).to_string(),
+                status: *status,
+            })
+            .collect();
+        let mut active = None;
+        let mut in_progress: usize = 0;
+        for todo in &todos {
+            if todo.status == PlanStatus::InProgress {
+                in_progress += 1;
+                if active.is_none() {
+                    active = Some(todo.content.clone());
+                }
+            }
+        }
+        PlanProgress {
+            completed: todos
+                .iter()
+                .filter(|todo| todo.status == PlanStatus::Completed)
+                .count(),
+            total: todos.len(),
+            active,
+            active_extra: in_progress.saturating_sub(1),
+            todos,
+        }
+    }
+
+    /// 2 of 5 done, one task in progress — the shape of a mid-turn checklist.
+    fn parser_plan() -> PlanProgress {
+        plan(&[
+            ("read the driver", PlanStatus::Completed),
+            ("patch the parser", PlanStatus::Completed),
+            ("wire the cap chip", PlanStatus::InProgress),
+            ("run the tests", PlanStatus::Pending),
+            ("update the docs", PlanStatus::Pending),
+        ])
+    }
+
+    /// A live todo checklist takes over the composer cap with the task in
+    /// progress plus completed/total, in place of the ambient tip rotation.
+    #[test]
+    fn composer_cap_shows_the_live_todo_checklist() {
+        let mut app = test_app();
+        app.plan = Some(parser_plan());
+
+        let frame = dump_frame(&mut app, 120, 20);
+        let cap = frame
+            .lines()
+            .find(|line| line.contains("Todo"))
+            .expect("todo cap line");
+
+        assert!(cap.contains("now: wire the cap chip"), "{cap}");
+        assert!(cap.contains("2/5 done"), "{cap}");
+        assert!(!cap.contains("Tip"), "{cap}");
+    }
+
+    /// Transient action feedback owns the cap row for its TTL, then the todo
+    /// checklist reclaims it; a cleared checklist restores the ambient tips.
+    #[test]
+    fn composer_cap_prefers_feedback_then_the_todo_checklist() {
+        let mut app = test_app();
+        app.plan = Some(plan(&[
+            ("patch the parser", PlanStatus::Completed),
+            ("wire the cap chip", PlanStatus::InProgress),
+            ("check the locale", PlanStatus::InProgress),
+        ]));
+        app.show_tip("copied 5 chars");
+
+        let frame = dump_frame(&mut app, 120, 20);
+        let cap = frame
+            .lines()
+            .find(|line| line.contains("copied 5 chars"))
+            .expect("feedback cap line");
+        assert!(!cap.contains("Todo"), "{cap}");
+        assert!(!cap.contains("Tip"), "{cap}");
+
+        app.tip = None;
+        let frame = dump_frame(&mut app, 120, 20);
+        let cap = frame
+            .lines()
+            .find(|line| line.contains("Todo"))
+            .expect("todo cap line");
+        assert!(cap.contains("wire the cap chip (+1)"), "{cap}");
+
+        app.plan = None;
+        let frame = dump_frame(&mut app, 120, 20);
+        assert!(
+            frame.lines().any(|line| line.contains("Tip")),
+            "an empty checklist falls back to the ambient hints:\n{frame}"
+        );
+    }
+
+    /// The cap row is localized like the rest of the built-in chrome.
+    #[test]
+    fn composer_cap_words_the_todo_checklist_in_the_active_locale() {
+        let flat = |cap: CapLine| -> String {
+            cap.line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let mut app = test_app();
+        app.locale = crate::locale::Locale::Zh;
+        assert_eq!(
+            flat(plan_line(
+                &app,
+                &plan(&[
+                    ("调研", PlanStatus::Completed),
+                    ("修复登录", PlanStatus::InProgress),
+                    ("测试", PlanStatus::Pending),
+                ])
+            )),
+            " 任务 · 进行中: 修复登录 · 1/3 完成 "
+        );
+        // Nothing in progress: the progress chip still reports the checklist.
+        assert_eq!(
+            flat(plan_line(
+                &app,
+                &plan(&[
+                    ("调研", PlanStatus::Completed),
+                    ("修复登录", PlanStatus::Completed),
+                ])
+            )),
+            " 任务 · 2/2 完成 "
+        );
+        app.locale = crate::locale::Locale::En;
+        assert_eq!(
+            flat(plan_line(
+                &app,
+                &plan(&[
+                    ("inspect", PlanStatus::Completed),
+                    ("fix login", PlanStatus::InProgress),
+                ])
+            )),
+            " Todo · now: fix login · 1/2 done "
+        );
+    }
+
+    /// The progress chip is a real button: the frame records its hit rect, and
+    /// clicking it opens the dialog while the rest of the cap row stays inert.
+    #[test]
+    fn todo_progress_chip_opens_the_dialog() {
+        use crate::controller::test_controller;
+        use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.plan = Some(parser_plan());
+        let (ctl, _commands) = test_controller();
+
+        let frame = dump_frame(&mut app, 120, 20);
+        let cap = frame
+            .lines()
+            .find(|line| line.contains("Todo"))
+            .expect("todo cap line");
+        let chip = app.plan_chip.expect("the cap row records its chip rect");
+        assert!(cap.contains("2/5 done"), "{cap}");
+
+        // The recorded rect sits on the cap row, inside the drawn title.
+        assert_eq!(
+            chip.y as usize,
+            frame.lines().position(|l| l.contains("Todo")).unwrap()
+        );
+        assert!(
+            chip.x >= 1 && chip.width >= "2/5 done".len() as u16,
+            "{chip:?}"
+        );
+
+        app.handle(
+            crate::bus::AppEvent::Term(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: chip.x + 1,
+                row: chip.y,
+                modifiers: KeyModifiers::NONE,
+            })),
+            &ctl,
+        );
+        assert!(app.todo_dialog.is_some(), "the chip opens the dialog");
+
+        app.todo_dialog = None;
+        app.handle(
+            crate::bus::AppEvent::Term(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: chip.y,
+                modifiers: KeyModifiers::NONE,
+            })),
+            &ctl,
+        );
+        assert!(
+            app.todo_dialog.is_none(),
+            "the left border is not part of the chip"
+        );
+
+        // Hover is the affordance: the chip brightens under the pointer.
+        let chip_style = |app: &App| -> Style {
+            plan_line(app, app.plan.as_ref().unwrap())
+                .line
+                .spans
+                .iter()
+                .find(|span| span.content.starts_with("2/5"))
+                .expect("progress chip span")
+                .style
+        };
+        let idle = chip_style(&app);
+        app.hover_plan_chip = true;
+        let hovered = chip_style(&app);
+        assert_ne!(idle, hovered, "hover must be visible");
+        assert!(hovered.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    /// The dialog lists every row with its status glyph (no progress bar: the
+    /// title carries the counts), and tracks live updates while it stays open.
+    #[test]
+    fn todo_dialog_shows_the_full_checklist() {
+        let mut app = test_app();
+        app.plan = Some(parser_plan());
+        app.todo_dialog = Some(crate::app::TodoDialog { scroll: 0 });
+
+        let frame = dump_frame(&mut app, 100, 24);
+        assert!(frame.contains("Todo progress · 2/5 done"), "{frame}");
+        assert!(frame.contains("✓ read the driver"), "{frame}");
+        assert!(frame.contains("▶ wire the cap chip"), "{frame}");
+        assert!(frame.contains("○ run the tests"), "{frame}");
+        assert!(frame.contains("now: wire the cap chip"), "{frame}");
+        assert!(
+            !frame.contains('█') && !frame.contains('░'),
+            "no progress bar in the dialog:\n{frame}"
+        );
+        assert!(!frame.contains("Tip"), "{frame}");
+
+        // A live todo_write commit repaints the open dialog in place.
+        app.plan = Some(plan(&[
+            ("read the driver", PlanStatus::Completed),
+            ("patch the parser", PlanStatus::Completed),
+            ("wire the cap chip", PlanStatus::Completed),
+        ]));
+        let frame = dump_frame(&mut app, 100, 24);
+        assert!(frame.contains("Todo progress · 3/3 done"), "{frame}");
+        assert!(frame.contains("✓ wire the cap chip"), "{frame}");
+        assert!(!frame.contains("○ run the tests"), "{frame}");
+    }
+
+    /// Both review cards float over the chat: `/keys` (the view overlay) and
+    /// the todo dialog keep `DIALOG_MARGIN_*` of chat around their border,
+    /// instead of one border kissing the screen edge. A short card and a long
+    /// one (which clamps to the inset) both hold the gap.
+    #[test]
+    fn review_panes_keep_their_border_margin() {
+        use crate::app::TodoDialog;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Corners of the one rounded card on screen: the dialog is drawn last
+        // and its chat background is empty here, so the topmost `╭` row is its
+        // top border and the first `╰` below is its bottom. Corner positions
+        // are display columns — box glyphs and titles are multi-byte.
+        fn card_bounds(frame: &str) -> (usize, usize, usize, usize) {
+            use unicode_width::UnicodeWidthStr;
+            let column = |line: &str, needle: char, last: bool| -> usize {
+                let byte = if last {
+                    line.rfind(needle).expect("corner")
+                } else {
+                    line.find(needle).expect("corner")
+                };
+                line[..byte].width()
+            };
+            let lines: Vec<&str> = frame.lines().collect();
+            let top = lines
+                .iter()
+                .position(|line| line.contains('╭'))
+                .expect("card top border");
+            let left = column(lines[top], '╭', false);
+            let right = column(lines[top], '╮', true);
+            let bottom = (top..lines.len())
+                .find(|&row| lines[row].contains('╰'))
+                .expect("card bottom border");
+            (top, left, right, bottom)
+        }
+
+        let assert_margin = |app: &mut App, long: bool| {
+            let (w, h) = (100u16, 30u16);
+            let theme = app.theme;
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+            terminal.draw(|f| draw(f, app)).expect("draw frame");
+            let buf = terminal.backend().buffer().clone();
+            let mut frame = String::new();
+            for row in 0..h {
+                for col in 0..w {
+                    frame.push_str(buf[(col, row)].symbol());
+                }
+                frame.push('\n');
+            }
+            let (top, left, right, bottom) = card_bounds(&frame);
+            assert!(
+                top >= DIALOG_MARGIN_Y as usize,
+                "top margin: card starts on row {top}:\n{frame}"
+            );
+            assert!(
+                left >= DIALOG_MARGIN_X as usize,
+                "left margin: card starts in column {left}:\n{frame}"
+            );
+            assert!(
+                right <= (w - 1 - DIALOG_MARGIN_X) as usize,
+                "right margin: card ends in column {right}:\n{frame}"
+            );
+            assert!(
+                bottom <= (h - 1 - DIALOG_MARGIN_Y) as usize,
+                "bottom margin: card ends on row {bottom}:\n{frame}"
+            );
+            // …and the card never covers the composer: its bottom border
+            // stays at least a row above the composer's cap line (the last
+            // rounded top border on screen — the card sits above it).
+            let cap = frame
+                .lines()
+                .collect::<Vec<_>>()
+                .iter()
+                .rposition(|line| line.contains('╭'))
+                .expect("composer cap row");
+            assert!(
+                bottom + 1 < cap,
+                "card ends on row {bottom}, the composer cap row is {cap}:\n{frame}"
+            );
+            // The ring around the border is still chat, not card surface — a
+            // "margin" painted panel bg would be no margin at all.
+            for col in 0..left as u16 {
+                assert_eq!(buf[(col, top as u16)].bg, theme.bg, "left of the card");
+            }
+            for row in 0..top as u16 {
+                assert_eq!(buf[(left as u16, row)].bg, theme.bg, "above the card");
+            }
+            if long {
+                assert!(
+                    bottom - top > 12,
+                    "the long card clamps to the inset, got {} rows",
+                    bottom - top
+                );
+            }
+        };
+
+        // `/keys`-style review pane, then the todo dialog — short and long.
+        let mut app = test_app();
+        app.view_overlay = Some(crate::app::ViewOverlay {
+            title: "Plan".into(),
+            nodes: vec![crate::slots::TuiNode::Markdown {
+                text: "## Plan\n\n- [x] Inspect\n- [ ] Implement".into(),
+                streaming: false,
+            }],
+            scroll: 0,
+        });
+        assert_margin(&mut app, false);
+
+        let mut app = test_app();
+        app.plan = Some(parser_plan());
+        app.todo_dialog = Some(TodoDialog { scroll: 0 });
+        assert_margin(&mut app, false);
+
+        // A 40-row checklist clamps to the inset — the card is as tall as the
+        // margin allows, never taller.
+        let mut app = test_app();
+        let todos: Vec<crate::events::PlanItem> = (0..40)
+            .map(|i| crate::events::PlanItem {
+                content: format!("step {i:02} with a reasonably long label"),
+                status: PlanStatus::Pending,
+            })
+            .collect();
+        app.plan = Some(crate::events::PlanProgress {
+            total: todos.len(),
+            todos,
+            active: None,
+            active_extra: 0,
+            completed: 0,
+        });
+        app.todo_dialog = Some(TodoDialog { scroll: 0 });
+        assert_margin(&mut app, true);
+
+        // The pickers (`/model`, `/permission`, `/resume`, `/theme`) float in
+        // the same inset: a 40-item list clamps to it too.
+        let mut app = test_app();
+        app.picker = Some(crate::app::Picker {
+            kind: crate::app::PickerKind::Session,
+            title: " resume session · 40 sessions · enter select · esc close ".into(),
+            sel: 0,
+            items: (0..40)
+                .map(|i| crate::app::PickerItem {
+                    id: format!("sess-{i:02}"),
+                    label: format!("session {i:02}"),
+                    meta: format!("meta {i:02}"),
+                    provider: None,
+                })
+                .collect(),
+        });
+        assert_margin(&mut app, true);
     }
 
     #[test]
@@ -2019,7 +2892,8 @@ mod tests {
             items,
         });
 
-        // 24-row terminal: the popup caps at 22 rows and must scroll.
+        // 24-row terminal: the popup caps at 12 rows (the inset band above
+        // the composer) and must scroll.
         let top = dump_frame(&mut app, 100, 24);
         assert!(top.contains("session 00"), "head row visible:\n{top}");
         assert!(!top.contains("session 39"), "tail not visible yet:\n{top}");
@@ -2041,7 +2915,7 @@ mod tests {
         assert!(!tail.contains("session 00"), "head scrolled away:\n{tail}");
         assert!(tail.contains("█"), "scrollbar thumb shown:\n{tail}");
         assert!(tail.contains("╰"), "bottom corners intact:\n{tail}");
-        assert_eq!(app.picker_page_rows, 20, "page size = visible rows");
+        assert_eq!(app.picker_page_rows, 10, "page size = visible rows");
     }
 
     #[test]

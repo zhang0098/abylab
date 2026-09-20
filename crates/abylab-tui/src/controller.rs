@@ -336,7 +336,37 @@ fn translate_ui(ui: abylab_backend::UiEvent) -> crate::events::UiEvent {
             text,
             error,
         },
-        abylab_backend::UiEvent::Plan { session, summary } => UiEvent::Plan { session, summary },
+        abylab_backend::UiEvent::Plan {
+            session,
+            summary,
+            todos,
+            active,
+            active_extra,
+            completed,
+            total,
+        } => UiEvent::Plan {
+            session,
+            summary,
+            todos: todos
+                .into_iter()
+                .map(|todo| crate::events::PlanItem {
+                    content: todo.content,
+                    status: match todo.status {
+                        abylab_backend::PlanStatus::Pending => crate::events::PlanStatus::Pending,
+                        abylab_backend::PlanStatus::InProgress => {
+                            crate::events::PlanStatus::InProgress
+                        }
+                        abylab_backend::PlanStatus::Completed => {
+                            crate::events::PlanStatus::Completed
+                        }
+                    },
+                })
+                .collect(),
+            active,
+            active_extra,
+            completed,
+            total,
+        },
         abylab_backend::UiEvent::SubagentStarted {
             parent,
             child,
@@ -408,6 +438,55 @@ mod tests {
         let presets = stock_presets();
         let ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["standard", "code", "minimal", "cordis"]);
+    }
+
+    /// The composer's todo line and its progress dialog are built from the
+    /// plan's structured fields, so the backend→TUI translation must carry
+    /// every one of them across unchanged.
+    #[test]
+    fn backend_plan_progress_reaches_the_tui() {
+        let events = translate_backend(abylab_backend::Event::Ui(abylab_backend::UiEvent::Plan {
+            session: "s1".into(),
+            summary: "1 of 3 done · now: patch · 1 pending".into(),
+            todos: vec![
+                abylab_backend::PlanItem {
+                    content: "inspect".into(),
+                    status: abylab_backend::PlanStatus::Completed,
+                },
+                abylab_backend::PlanItem {
+                    content: "patch".into(),
+                    status: abylab_backend::PlanStatus::InProgress,
+                },
+                abylab_backend::PlanItem {
+                    content: "test".into(),
+                    status: abylab_backend::PlanStatus::Pending,
+                },
+            ],
+            active: Some("patch".into()),
+            active_extra: 1,
+            completed: 1,
+            total: 3,
+        }));
+        let AppEvent::Ui(ui) = &events[0] else {
+            panic!("one ui event");
+        };
+        let progress = ui.plan_progress().expect("a checklist");
+        assert_eq!(progress.active.as_deref(), Some("patch"));
+        assert_eq!(progress.active_extra, 1);
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 3);
+        assert_eq!(
+            progress
+                .todos
+                .iter()
+                .map(|todo| (todo.content.as_str(), todo.status))
+                .collect::<Vec<_>>(),
+            [
+                ("inspect", crate::events::PlanStatus::Completed),
+                ("patch", crate::events::PlanStatus::InProgress),
+                ("test", crate::events::PlanStatus::Pending),
+            ]
+        );
     }
 
     #[test]

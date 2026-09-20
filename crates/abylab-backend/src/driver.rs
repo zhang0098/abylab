@@ -18,8 +18,8 @@ use abycore::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::contract::{
-    AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, TurnLimits,
-    UiEvent,
+    AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
+    PlanStatus, TurnLimits, UiEvent,
 };
 
 const SERVER_LABEL: &str = "abycore · deepseek-responses";
@@ -1470,12 +1470,10 @@ fn replay_events(session: &str, snapshot: &abycore::SessionSnapshot) -> Vec<UiEv
         }
     }
     // The snapshot carries the current turn's checklist; repainting it after
-    // the replayed history restores the transcript's plan cell in place.
+    // the replayed history restores the transcript's plan cell and the
+    // composer's todo line in place.
     if let Some(plan) = snapshot.plan_view() {
-        out.push(UiEvent::Plan {
-            session: session.to_string(),
-            summary: plan_summary(&plan),
-        });
+        out.push(plan_event(session, Some(&plan)));
     }
     out
 }
@@ -2164,17 +2162,44 @@ fn translate(session: &str, event: AgentEvent) -> Vec<UiEvent> {
             error: None,
         }],
         AgentEvent::PlanChanged { plan } => {
-            vec![UiEvent::Plan {
-                session,
-                summary: plan.as_ref().map(plan_summary).unwrap_or_default(),
-            }]
+            vec![plan_event(&session, plan.as_ref())]
         }
         AgentEvent::ViewChanged { .. } | AgentEvent::GoalChanged { .. } => Vec::new(),
         AgentEvent::Model(_) | AgentEvent::RunFinished { .. } => Vec::new(),
     }
 }
 
-/// One-line plan digest for the transcript's plan cell.
+/// One plan snapshot for every plan surface: the transcript's digest cell, the
+/// composer's live todo line, and the clickable progress dialog. An empty list
+/// is an explicit clear — abycore documents that no surface should show a task
+/// panel then — so it folds into the same blank event as `None`.
+fn plan_event(session: &str, plan: Option<&abycore::PlanView>) -> UiEvent {
+    let plan = plan.filter(|plan| plan.total > 0);
+    UiEvent::Plan {
+        session: session.to_string(),
+        summary: plan.map(plan_summary).unwrap_or_default(),
+        todos: plan.map_or_else(Vec::new, |plan| {
+            plan.todos
+                .iter()
+                .map(|todo| PlanItem {
+                    content: todo.content.clone(),
+                    status: match todo.status {
+                        abycore::TodoStatus::Pending => PlanStatus::Pending,
+                        abycore::TodoStatus::InProgress => PlanStatus::InProgress,
+                        abycore::TodoStatus::Completed => PlanStatus::Completed,
+                    },
+                })
+                .collect()
+        }),
+        active: plan.and_then(|plan| plan.active_content.clone()),
+        active_extra: plan.map_or(0, |plan| plan.active_extra),
+        completed: plan.map_or(0, |plan| plan.counts.completed),
+        total: plan.map_or(0, |plan| plan.total),
+    }
+}
+
+/// One-line plan digest for the transcript's plan cell. Only called with a
+/// non-empty list, so an all-zero digest never reaches a surface.
 fn plan_summary(plan: &abycore::PlanView) -> String {
     let mut parts = vec![format!("{} of {} done", plan.counts.completed, plan.total)];
     if let Some(active) = &plan.active_content {
@@ -2300,6 +2325,109 @@ mod tests {
                 name: "bash".into(),
             }]
         );
+    }
+
+    /// One committed `todo_write` reaches the UI as every plan surface at once:
+    /// the transcript digest, the counts behind the composer's todo line, and
+    /// the full checklist the progress dialog lists. A cleared list (`PlanView`
+    /// with no items) hides them all instead of painting an all-zero panel.
+    #[test]
+    fn plan_events_carry_the_digest_and_the_live_todo_counts() {
+        let plan = plan_view(&[
+            ("inspect", "completed"),
+            ("patch", "in_progress"),
+            ("test", "pending"),
+        ]);
+        assert_eq!(
+            translate("s", AgentEvent::PlanChanged { plan: Some(plan) }),
+            vec![UiEvent::Plan {
+                session: "s".into(),
+                summary: "1 of 3 done · now: patch · 1 pending".into(),
+                todos: vec![
+                    PlanItem {
+                        content: "inspect".into(),
+                        status: PlanStatus::Completed,
+                    },
+                    PlanItem {
+                        content: "patch".into(),
+                        status: PlanStatus::InProgress,
+                    },
+                    PlanItem {
+                        content: "test".into(),
+                        status: PlanStatus::Pending,
+                    },
+                ],
+                active: Some("patch".into()),
+                active_extra: 0,
+                completed: 1,
+                total: 3,
+            }]
+        );
+
+        // Concurrent work reports the first task plus the overflow count.
+        let parallel = plan_view(&[("a", "in_progress"), ("b", "in_progress")]);
+        let Some(UiEvent::Plan {
+            active,
+            active_extra,
+            total,
+            ..
+        }) = translate(
+            "s",
+            AgentEvent::PlanChanged {
+                plan: Some(parallel),
+            },
+        )
+        .pop()
+        else {
+            panic!("a plan event");
+        };
+        assert_eq!(active.as_deref(), Some("a"));
+        assert_eq!(active_extra, 1);
+        assert_eq!(total, 2);
+
+        // No list has been written in this turn.
+        assert_eq!(
+            translate("s", AgentEvent::PlanChanged { plan: None }),
+            vec![blank_plan()]
+        );
+        // An explicit clear is an empty list, not `None`.
+        let cleared = plan_view(&[]);
+        assert_eq!(cleared.total, 0);
+        assert_eq!(
+            translate(
+                "s",
+                AgentEvent::PlanChanged {
+                    plan: Some(cleared)
+                }
+            ),
+            vec![blank_plan()]
+        );
+    }
+
+    /// A `PlanView` for tests, built through abycore's public metadata path
+    /// (its constructor is crate-private).
+    fn plan_view(items: &[(&str, &str)]) -> abycore::PlanView {
+        let todos: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(content, status)| serde_json::json!({"content": content, "status": status}))
+            .collect();
+        let output = ToolOutput::text("updated")
+            .with_meta(serde_json::json!({"todo_write": {"todos": todos}}));
+        abycore::PlanView::from_tool_output(&output)
+            .expect("todo metadata parses")
+            .expect("a committed todo_write result yields a plan view")
+    }
+
+    fn blank_plan() -> UiEvent {
+        UiEvent::Plan {
+            session: "s".into(),
+            summary: String::new(),
+            todos: Vec::new(),
+            active: None,
+            active_extra: 0,
+            completed: 0,
+            total: 0,
+        }
     }
 
     fn hooks(mode: PermissionMode) -> UiHooks {

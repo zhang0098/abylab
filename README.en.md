@@ -1,4 +1,4 @@
-**English** · [中文](README.md)
+**English** · [中文](README.md) · [abylab.ai](https://abylab.ai/)
 
 # abylab
 
@@ -116,10 +116,11 @@ run. Want a shorter answer? Just ask. A fresh session uses the SDK output cap
 `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
 `/session` · `/lang [zh|en]` · `/quit`
 
-`/theme` picks a palette pack: the built-in DeepSeek default plus the nine
-gallery packs (ayu · catppuccin · ember · everforest · iceberg · kanagawa ·
-one · solarized · tomorrow) — all embedded in the binary, no external files.
-`ctrl+t` toggles dark/light inside the active pack.
+`/theme` picks a palette pack: the built-in DeepSeek default plus the eight
+gallery packs (ayu · catppuccin · everforest · iceberg · kanagawa · one ·
+solarized · tomorrow) — all embedded in the binary, no external files.
+Arrows in the picker preview the highlighted pack in place; `enter` applies it
+and `esc` reverts. `ctrl+t` toggles dark/light inside the active pack.
 
 ## Keys
 
@@ -131,6 +132,16 @@ ctrl+z / ctrl+shift+z undo / redo · ctrl+p model · ctrl+t theme
 `workspace-write`, and `danger-full-access` (default). The switch keeps the
 conversation history and applies to later file tools and Bash processes;
 Shift+Tab cycles the presets.
+
+While the agent keeps a checklist with `todo_write`, the tip row on the
+composer's top border shows the task in progress and the completed/total
+progress (`Todo · now: fix login · 2/5 done`). Transient action feedback
+borrows that row for a few seconds, then the checklist returns. Clicking the
+progress chip (`2/5 done`) opens the full checklist in a dialog; esc closes it.
+
+The `↥` right of the project path in that same row walks your prompts: each
+click jumps one prompt back (newest first, wrapping from the oldest), scrolls
+it to the top of the pane and highlights it for a few seconds.
 
 Mouse: wheel scrolls · click a tool card expands it · drag selects, release
 copies (native tool → tmux → OSC52) · `@` opens the file browser.

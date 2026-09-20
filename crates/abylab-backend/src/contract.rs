@@ -65,10 +65,21 @@ pub enum UiEvent {
         text: String,
         error: Option<String>,
     },
-    /// Todo-plan snapshot digest (empty summary clears the plan cell).
+    /// Todo-plan snapshot: `summary` is the transcript plan cell's digest,
+    /// while the structured fields let the TUI paint its own live todo line
+    /// and the clickable progress dialog. An empty `summary` (no list this
+    /// turn, or an explicit clear) hides every plan surface.
     Plan {
         session: String,
         summary: String,
+        /// The whole checklist, in list order — the dialog shows every row.
+        todos: Vec<PlanItem>,
+        /// First in-progress task, in list order.
+        active: Option<String>,
+        /// Additional concurrently in-progress tasks.
+        active_extra: usize,
+        completed: usize,
+        total: usize,
     },
     /// Subagent lifecycle under the parent's session id.
     SubagentStarted {
@@ -106,6 +117,21 @@ pub enum UiEvent {
         session: String,
         policy: String,
     },
+}
+
+/// One checklist row, in the order the agent wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanItem {
+    pub content: String,
+    pub status: PlanStatus,
+}
+
+/// Lifecycle of one [`PlanItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 /// Driver lifecycle facts, mirroring the TUI's `CtlEvent` subset.

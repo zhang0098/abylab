@@ -1,4 +1,4 @@
-**中文** · [English](README.en.md)
+**中文** · [English](README.en.md) · [abylab.ai](https://abylab.ai/)
 
 # abylab
 
@@ -36,10 +36,10 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
 `/session` · `/lang [zh|en]` · `/quit`
 
-`/theme` 用来挑调色板包：内置的 DeepSeek 默认主题，外加九个主题（ayu ·
-catppuccin · ember · everforest · iceberg · kanagawa · one · solarized ·
-tomorrow）。`ctrl+t` 在当前包里切换深色/
-浅色。
+`/theme` 用来挑调色板包：内置的 DeepSeek 默认主题，外加八个主题（ayu ·
+catppuccin · everforest · iceberg · kanagawa · one · solarized · tomorrow）。
+选择器里 ↑/↓ 会就地预览高亮的那一款，`enter` 才应用、`esc` 还原；
+`ctrl+t` 在当前包里切换深色/浅色。
 
 ## 按键
 
@@ -50,6 +50,14 @@ ctrl+z / ctrl+shift+z 撤销/重做 · ctrl+p 模型 · ctrl+t 主题
 `/permission` 在 `read-only`、`workspace-write`、`danger-full-access`（默认）
 之间切换实时会话。切换保留对话历史，并作用于后续的文件工具与 Bash 进程；
 Shift+Tab 循环切换预设。
+
+代理用 `todo_write` 维护任务清单时，输入框上沿的提示行会实时显示进行中的
+任务和完成进度（`任务 · 进行中: 修复登录 · 2/5 完成`）；操作反馈会短暂借用
+这一行，几秒后回到任务进度。点击进度部分（`2/5 完成`）弹出完整清单对话框，
+esc 关闭。
+
+提示行右侧、项目路径后面的 `↥` 可以点击：每次点击往前跳一条你发过的
+输入（从最新开始，到最早后回到最新），跳到的输入会滚动到顶部并高亮几秒。
 
 鼠标：滚轮滚动 · 点击工具卡片展开 · 拖动选择，松开复制
 （原生工具 → tmux → OSC52）· `@` 打开文件浏览器。
