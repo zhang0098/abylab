@@ -14,6 +14,7 @@ mod common;
 
 use abylab_backend::TurnLimits;
 use common::{Reply, drive_prompt, text_reply, tool_call_reply, two_tool_call_reply};
+use std::time::Duration;
 
 /// Request budget: the tool call forces a second reservation that trips the
 /// one-request segment budget; the continuation ships the follow-up request.
@@ -88,6 +89,7 @@ fn a_tool_budget_stop_settles_the_pending_batch_and_continues() {
         "the continuation resumes the same turn: {}",
         run.explain()
     );
+    assert!(run.requests[1].contains("did not execute"));
 }
 
 /// Transient failure, the harness's `dsh-llm-retry` case: every provider
@@ -127,15 +129,165 @@ fn a_transient_failure_retries_the_unfinished_step_in_the_same_turn() {
     );
 }
 
-/// The segment deadline is the limit that binds once the budgets are
-/// backstops: a provider that never answers ends the turn with a timeout the
-/// user can act on, instead of hanging.
+/// An expired segment must get the same continuation headroom as a budget
+/// stop, without adding another user prompt or ending the visible turn.
+#[test]
+fn a_run_deadline_continues_the_unfinished_turn() {
+    let run = drive_prompt(
+        "deadline-continue",
+        TurnLimits {
+            run_timeout: Duration::from_secs(1),
+            continuations: 1,
+            ..TurnLimits::default()
+        },
+        vec![
+            Reply::sse(text_reply()).delayed(Duration::from_millis(1200)),
+            Reply::sse(text_reply()),
+        ],
+    );
+
+    assert!(run.ended("completed"), "{}", run.explain());
+    assert!(run.is_clean(), "{}", run.explain());
+    assert_eq!(run.continuations().len(), 1, "{}", run.explain());
+    assert!(run.continuations()[0].contains("(1/1)"));
+    assert_eq!(run.count(), 2, "{}", run.explain());
+    assert_eq!(run.requests[0], run.requests[1], "retry the same input");
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|e| e.starts_with("turn-end:"))
+            .count(),
+        1,
+        "the segment timeout must not end the visible turn"
+    );
+}
+
+/// Completed tools remain in history when the follow-up model request times
+/// out. A continuation must not execute those calls a second time.
+#[test]
+fn a_run_deadline_preserves_completed_tool_results() {
+    let run = drive_prompt(
+        "deadline-after-tool",
+        TurnLimits {
+            run_timeout: Duration::from_secs(1),
+            continuations: 1,
+            ..TurnLimits::default()
+        },
+        vec![
+            Reply::sse(tool_call_reply("call-1")),
+            Reply::sse(text_reply()).delayed(Duration::from_millis(1200)),
+            Reply::sse(text_reply()),
+        ],
+    );
+
+    assert!(run.ended("completed"), "{}", run.explain());
+    assert!(run.is_clean(), "{}", run.explain());
+    assert_eq!(run.count(), 3, "{}", run.explain());
+    assert_eq!(run.requests[1], run.requests[2]);
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|e| *e == "tool-started:call-1")
+            .count(),
+        1,
+        "a completed call executes only once"
+    );
+}
+
+/// A tool may have changed the workspace before the run deadline fires. The
+/// next model request must say its result is unverified, never that it did
+/// not execute, and the driver must not replay the side effect.
+#[cfg(unix)]
+#[test]
+fn a_run_deadline_during_a_tool_requires_verification_before_repeating() {
+    let run = drive_prompt(
+        "deadline-during-tool",
+        TurnLimits {
+            run_timeout: Duration::from_secs(1),
+            continuations: 1,
+            ..TurnLimits::default()
+        },
+        vec![
+            Reply::sse(common::single_call_reply(
+                "slow-call",
+                "bash",
+                r#"{"command":"printf once >> deadline-marker; sleep 30","description":"Record a side effect before the deadline"}"#,
+            )),
+            Reply::sse(common::single_call_reply(
+                "verify-call",
+                "read",
+                r#"{"file_path":"deadline-marker"}"#,
+            )),
+            Reply::sse(text_reply()),
+        ],
+    );
+
+    assert!(run.ended("completed"), "{}", run.explain());
+    assert!(run.is_clean(), "{}", run.explain());
+    assert_eq!(run.continuations().len(), 1, "{}", run.explain());
+    assert_eq!(run.count(), 3, "{}", run.explain());
+    let continued: serde_json::Value = serde_json::from_str(&run.requests[1]).unwrap();
+    let result = &continued["messages"].as_array().unwrap().last().unwrap()["content"][0];
+    assert_eq!(result["type"], "tool_result");
+    assert_eq!(result["tool_use_id"], "slow-call");
+    assert_eq!(result["is_error"], true);
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("tool result text");
+    assert!(text.contains("unverified"), "{text}");
+    assert!(text.contains("check before repeating"), "{text}");
+    assert!(!text.contains("did not execute"), "{text}");
+    let verified: serde_json::Value = serde_json::from_str(&run.requests[2]).unwrap();
+    let result = &verified["messages"].as_array().unwrap().last().unwrap()["content"][0];
+    assert_eq!(result["tool_use_id"], "verify-call");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("once"), "{text}");
+    assert!(!text.contains("onceonce"), "{text}");
+    assert!(run.events.iter().any(|e| e == "tool-result:slow-call"));
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|e| *e == "tool-started:slow-call")
+            .count(),
+        1
+    );
+}
+
+/// A persistently hung provider still stops once the configured continuation
+/// headroom is spent; timeouts must not start an unlimited retry loop.
+#[test]
+fn repeated_run_deadlines_exhaust_the_continuation_limit() {
+    let run = drive_prompt(
+        "deadline-exhausted",
+        TurnLimits {
+            run_timeout: Duration::from_secs(1),
+            continuations: 1,
+            ..TurnLimits::default()
+        },
+        (0..2)
+            .map(|_| Reply::sse(text_reply()).delayed(Duration::from_millis(1200)))
+            .collect(),
+    );
+
+    assert!(run.ended("error"), "{}", run.explain());
+    assert_eq!(run.continuations().len(), 1, "{}", run.explain());
+    assert_eq!(run.count(), 2, "{}", run.explain());
+    let error = run.events.iter().find(|e| e.starts_with("error:")).unwrap();
+    assert!(error.contains("ABY_TURN_TIMEOUT=1"), "{error}");
+    assert!(error.contains("ABY_TOOL_TIMEOUT=60"), "{error}");
+    assert!(error.contains("ABY_AUTO_CONTINUE=1"), "{error}");
+    assert!(error.contains("继续输入"), "{error}");
+}
+
+/// Turning off automatic continuation keeps a deadline terminal and leaves
+/// the session resumable by the user.
 #[test]
 fn the_run_deadline_ends_a_hung_segment() {
     let run = drive_prompt(
         "deadline",
         TurnLimits {
             run_timeout: std::time::Duration::from_secs(1),
+            continuations: 0,
             ..TurnLimits::default()
         },
         vec![Reply::sse(text_reply()).delayed(std::time::Duration::from_secs(3))],
@@ -155,6 +307,8 @@ fn the_run_deadline_ends_a_hung_segment() {
         error.contains("timed out") && error.contains("继续输入"),
         "the timeout text says the turn is ours to continue: {error}"
     );
+    assert!(run.continuations().is_empty(), "{}", run.explain());
+    assert_eq!(run.count(), 1);
 }
 
 /// Exhausted headroom: the budget error must still end the turn cleanly (no
