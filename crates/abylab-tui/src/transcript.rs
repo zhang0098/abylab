@@ -150,7 +150,7 @@ pub struct UsageTotals {
 }
 
 /// Native transcript timing/step facts used by session state and tests. The
-/// LLM usage/timing details surface through `/session` and `/status` (plus the
+/// LLM usage/timing details surface through `/status` (plus the
 /// Client-side `acpSessionStats` service for plugins) — never in a persistent
 /// row of its own: the composer frame ends at the input box.
 #[derive(Default, Clone, Copy)]

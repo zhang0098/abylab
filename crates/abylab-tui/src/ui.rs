@@ -714,8 +714,8 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
 }
 
 /// Meta row, right side: contextual shortcut hints, the model id and the
-/// requested reasoning effort — plain chrome tones, no accent. Token flow
-/// lives in `/status`; the session id lives in `/session`.
+/// requested reasoning effort — plain chrome tones, no accent. Token flow and
+/// the session identity live in `/status`.
 fn status_right(app: &App) -> Vec<Span<'static>> {
     let theme = app.theme;
     let mut spans: Vec<Span> = vec![Span::raw(" ")];

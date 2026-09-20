@@ -218,11 +218,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "toggle mode or switch palette pack",
     },
     SlashCommand {
-        name: "session",
-        usage: "/session",
-        desc: "show session + runtime info",
-    },
-    SlashCommand {
         name: "status",
         usage: "/status",
         desc: "run state, model and the live usage counters",
@@ -3795,7 +3790,6 @@ impl App {
                 self.push_session_tip();
                 self.show_tip("session/new …");
             }
-            "session" => self.open_session_dialog(),
             "status" => self.open_status_dialog(),
             "resume" => {
                 if arg.is_empty() {
@@ -3871,7 +3865,7 @@ impl App {
    /login sk-xxxxxxxx
 
 3. key 保存在 `~/.abylab/.credentials.yaml`（0600，仅本用户可读）；
-   `/session` 查看凭据来源 · `/logout` 删除已保存的 key
+   `/status` 查看凭据来源 · `/logout` 删除已保存的 key
 
 本次运行也可以用 `--api-key <key>` 临时覆盖（不落盘）。"
                 .to_string()
@@ -3885,7 +3879,7 @@ impl App {
    /login sk-xxxxxxxx
 
 3. The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only);
-   `/session` shows its source · `/logout` removes the stored key
+   `/status` shows its source · `/logout` removes the stored key
 
 `--api-key <key>` can override for this run only (never persisted)."
                 .to_string()
@@ -3974,94 +3968,16 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
         });
     }
 
-    /// `/session` as a local modal — the same card `/status` opens, with the
-    /// durable identity and runtime facts: session id/title, provider, agent,
-    /// workspace paths, the server banner and the credential source.
-    ///
-    /// The border names the card, so the body carries bullets only and the
-    /// timeline stays untouched. The live `/session` is also a Client Plugin
-    /// command in runs with a Client tree; this arm serves runs without one
-    /// (demo, standalone painter) and reads the local accumulator.
-    fn open_session_dialog(&mut self) {
-        let creds = if self.cfg.has_credentials() {
-            match self.cfg.credential_source() {
-                Some(src) => format!("api key present · {src}"),
-                None => "api key present".to_string(),
-            }
-        } else {
-            "no api key — /login <apikey> stores one".to_string()
-        };
-        let u = self.transcript.usage;
-        let total = u.input + u.output + u.cached + u.reasoning;
-        let s = self.transcript.stats;
-        let llm_millis = s.turn_millis.saturating_sub(s.tool_millis);
-        // The same facts the Client-side `acpSessionStats` service folds —
-        // rendered here from the transcript's own accumulator.
-        let effort_line = self
-            .modes
-            .effort
-            .as_deref()
-            .map(|effort| format!("\n- effort · {effort}"))
-            .unwrap_or_default();
-        let mut text = format!(
-            "- session · {}{}\n\
-             - provider · {} / {}{}\n\
-             - agent · {}{}\n\
-             - workspace · {}\n\
-             - session store · {}\n\
-             - server · {}\n\
-             - credentials · {}\n\
-             - tokens · ↑{} ↓{} (cached {} · reasoning {}) · Σ {}\n\
-             - turns · {} · steps · {}\n\
-             - LLM · {} · tool · {}",
-            self.session_id,
-            self.session_title
-                .as_deref()
-                .map(|t| format!(" · {t}"))
-                .unwrap_or_default(),
-            self.cfg.provider,
-            self.cfg.model,
-            effort_line,
-            self.agent_label(&self.current_mode()),
-            if self.modes.agent_preset.is_none() {
-                " (default)"
-            } else {
-                ""
-            },
-            self.cfg.workspace,
-            self.cfg.sessions_root,
-            self.server_info.as_deref().unwrap_or("not started"),
-            creds,
-            fmt_tokens(u.input),
-            fmt_tokens(u.output),
-            fmt_tokens(u.cached),
-            fmt_tokens(u.reasoning),
-            fmt_tokens(total),
-            s.turns,
-            s.steps,
-            fmt_duration(llm_millis),
-            fmt_duration(s.tool_millis),
-        );
-        if s.ttft_count > 0 {
-            text.push_str(&format!(
-                "\n- TTFT avg · {}",
-                fmt_duration(s.ttft_total_millis.checked_div(s.ttft_count).unwrap_or(0))
-            ));
+    /// Where the running client's API key comes from: an explicit `/login`,
+    /// the environment, or nothing. `/help` points the `/login` docs here.
+    fn credential_line(&self) -> String {
+        if !self.cfg.has_credentials() {
+            return "no api key — /login <apikey> stores one".to_string();
         }
-        if llm_millis > 0 && u.output > 0 {
-            text.push_str(&format!(
-                "\n- rate · {:.1} tok/s",
-                u.output as f64 / (llm_millis as f64 / 1000.0)
-            ));
+        match self.cfg.credential_source() {
+            Some(src) => format!("api key present · {src}"),
+            None => "api key present".to_string(),
         }
-        self.view_overlay = Some(ViewOverlay {
-            title: self.locale.tr("Session", "会话").to_string(),
-            nodes: vec![crate::slots::TuiNode::Markdown {
-                text,
-                streaming: false,
-            }],
-            scroll: 0,
-        });
     }
 
     /// `/status` as a local modal: run state, painter-owned ACP facts and the
@@ -4105,11 +4021,21 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             .unwrap_or_default();
         // Connection facts + the server banner when the runtime reported it.
         let mut text = format!("- state · {state}\n");
+        // The live title rides the session row — it used to headline the
+        // retired session card, and `/resume` lists the stored ones.
+        let title = self
+            .session_title
+            .as_deref()
+            .map(|title| format!(" · {title}"))
+            .unwrap_or_default();
         text.push_str(&if self.session_bound {
-            format!("- session · {}\n", self.session_id)
+            format!("- session · {}{title}\n", self.session_id)
         } else {
             "- session · unbound\n".to_string()
         });
+        // The credential source rides here since the session card folded into
+        // this one: `/help` still sends the `/login` reader to it.
+        text.push_str(&format!("- credentials · {}\n", self.credential_line()));
         if let Some(server) = &self.server_info {
             text.push_str(&format!("- server · {server}\n"));
         }
@@ -4129,8 +4055,8 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             perm_label,
             if self.modes.plan { "on" } else { "off" },
         ));
-        // The counter row the composer dock used to render, in the same
-        // bullet shape `/session` uses. `usage.input` is total input
+        // The counter rows the composer dock used to render, in the same
+        // bullet shape the other cards use. `usage.input` is total input
         // including cache reads, so the hit rate is a share of it.
         let u = self.transcript.usage;
         let s = self.transcript.stats;
@@ -7242,6 +7168,7 @@ mod right_slot_tests {
         let (mut app, ctl, _rx) = test_app();
         app.locale = Locale::En;
         app.modes.effort = Some("high".into());
+        app.session_title = Some("fix the login flow".into());
         // The counter rows the composer dock used to paint: the modal renders
         // them from the transcript accumulator instead.
         app.transcript.usage.input = 1834;
@@ -7273,7 +7200,16 @@ mod right_slot_tests {
         // The border names the card, so the body carries bullets only.
         assert!(!text.contains("## status"), "{text}");
         assert!(text.contains("- state · "), "{text}");
-        assert!(text.contains("- session · dsh-test"), "{text}");
+        // The session row carries the live title, and the credential source
+        // (env vs stored vs none) landed here when `/session` retired.
+        assert!(
+            text.contains("- session · dsh-test · fix the login flow"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- credentials · no api key — /login <apikey> stores one"),
+            "{text}"
+        );
         assert!(text.contains("- model · deepseek-v4-flash"), "{text}");
         assert!(text.contains("- effort · high"), "{text}");
         assert!(text.contains("- permission · "), "{text}");
@@ -7367,73 +7303,6 @@ mod right_slot_tests {
             greeting(&app),
             "- **Tip** · enter queues a follow-up; ctrl+x steers the active turn now"
         );
-    }
-
-    #[test]
-    /// `/session` opens the same local modal as `/status` — chrome, not a
-    /// timeline entry — and its facts follow the live session state.
-    fn session_slash_opens_a_modal_with_the_runtime_facts() {
-        let (mut app, ctl, _rx) = test_app();
-        app.locale = Locale::En;
-        app.modes.effort = Some("max".into());
-        app.session_title = Some("fix the login flow".into());
-        let cells_before = app.transcript.cells.len();
-
-        app.run_slash("session", "", &ctl);
-
-        assert_eq!(
-            app.transcript.cells.len(),
-            cells_before,
-            "/session is chrome and must not enter the conversation timeline"
-        );
-        let overlay = app
-            .view_overlay
-            .as_ref()
-            .expect("/session modal should open");
-        assert_eq!(overlay.title, "Session");
-        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
-            panic!(
-                "/session should render markdown, got {:?}",
-                overlay.nodes[0]
-            );
-        };
-        // The border names the card, so the body carries bullets only.
-        assert!(!text.contains("## session"), "{text}");
-        assert!(
-            text.contains("- session · dsh-test · fix the login flow"),
-            "{text}"
-        );
-        assert!(text.contains("- provider · deepseek"), "{text}");
-        assert!(text.contains("- agent · "), "{text}");
-        assert!(text.contains("- workspace · "), "{text}");
-        assert!(text.contains("- session store · "), "{text}");
-        assert!(text.contains("- server · "), "{text}");
-        assert!(text.contains("- credentials · "), "{text}");
-        assert!(text.contains("- tokens · "), "{text}");
-        assert!(text.contains("- effort · max"), "{text}");
-
-        let frame = crate::ui::dump_frame(&mut app, 100, 34);
-        assert!(
-            frame.contains("Session · ↑↓/wheel scroll"),
-            "modal:\n{frame}"
-        );
-        assert!(frame.contains("fix the login flow"), "facts:\n{frame}");
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
-        assert!(app.view_overlay.is_none(), "esc closes the modal");
-
-        // Unset effort stays hidden; the title is localized.
-        let (mut plain, ctl2, _rx2) = test_app();
-        plain.locale = Locale::Zh;
-        plain.run_slash("session", "", &ctl2);
-        let overlay = plain.view_overlay.as_ref().expect("/session modal");
-        assert_eq!(overlay.title, "会话");
-        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
-            panic!(
-                "/session should render markdown, got {:?}",
-                overlay.nodes[0]
-            );
-        };
-        assert!(!text.contains("- effort ·"), "{text}");
     }
 }
 

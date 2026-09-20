@@ -43,7 +43,7 @@ cargo install --git https://github.com/zhang0098/abylab abylab-tui
 `/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
 `/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
 `/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
-`/session` · `/status` · `/lang [zh|en]` · `/quit`
+`/status` · `/lang [zh|en]` · `/quit`
 
 `/theme` 用来挑调色板包：缺省是 one 的深色（`--theme dark` 只是换明暗，
 不动包）；另有内置的 DeepSeek 主题和七个主题（ayu · catppuccin · everforest ·
@@ -51,8 +51,8 @@ iceberg · kanagawa · solarized · tomorrow）。
 选择器里 ↑/↓ 会就地预览高亮的那一款，`enter` 才应用、`esc` 还原；
 `ctrl+t` 在当前包里切换深色/浅色。
 
-`/status`（运行状态、模型、token/轮次/耗时统计）和 `/session`（会话 id、provider、
-工作区路径、凭据来源）都是弹窗：浮在对话上、esc 关闭、↑↓/滚轮滚动，
+`/status`（运行状态、模型、token/轮次/耗时统计，以及会话 id/标题和
+凭据来源）是弹窗：浮在对话上、esc 关闭、↑↓/滚轮滚动，
 不会写进对话记录 —— 和 `/help`、`/keys` 一样属于界面本身。
 
 ## 按键

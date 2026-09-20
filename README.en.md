@@ -133,7 +133,7 @@ run. Want a shorter answer? Just ask. A fresh session uses the SDK output cap
 `/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
 `/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
 `/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
-`/session` · `/status` · `/lang [zh|en]` · `/quit`
+`/status` · `/lang [zh|en]` · `/quit`
 
 `/theme` picks a palette pack — a fresh install starts on **one**, dark
 (`--theme dark` only moves between light and dark, it never changes the pack).
@@ -143,8 +143,8 @@ embedded in the binary, no external files.
 Arrows in the picker preview the highlighted pack in place; `enter` applies it
 and `esc` reverts. `ctrl+t` toggles dark/light inside the active pack.
 
-`/status` (run state, model, token/turn/timing counters) and `/session`
-(session id, provider, workspace paths, credential source) both open a dialog:
+`/status` (run state, model, token/turn/timing counters, plus the session
+id/title and the credential source) opens a dialog:
 it floats over the conversation, esc closes it, ↑↓/wheel scroll, and nothing
 lands in the transcript — same chrome as `/help` and `/keys`.
 
