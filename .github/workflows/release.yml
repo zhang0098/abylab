@@ -141,19 +141,16 @@ jobs:
 
   # musl static builds, published next to the glibc pair while the switch is
   # being validated; the plan is to ship these two assets and retire the gnu
-  # ones. See the note in ci.yml and scripts/check-glibc-floor.sh --static.
+  # ones. See the note on `docker run` vs `container:` in ci.yml, and
+  # scripts/check-glibc-floor.sh --static for what "static" has to mean here.
   #
-  # Alpine's own libc is musl, so each runner builds its architecture natively:
-  # no cross toolchain, no zig, nothing to pin beyond the image tag.
+  # The build happens inside Alpine, whose own libc is musl: the image is the
+  # whole toolchain, each runner builds its architecture natively, and there is
+  # no glibc floor to build down to and no cross toolchain to keep working.
   build-linux-musl:
     name: build ${{ matrix.target }}
     needs: check
     runs-on: ${{ matrix.os }}
-    container: rust:alpine
-    # The container's default shell is sh; the steps below are bash.
-    defaults:
-      run:
-        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -163,25 +160,36 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
     steps:
-      # bash for the run steps, git for actions/checkout: neither is in the
-      # image. `shell: sh` because this is the step that creates bash.
-      - name: bash + git
-        shell: sh
-        run: apk add --no-cache bash git
-
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      # `cache-bin: false` keeps rust-cache from pruning the image's shims in
-      # /usr/local/cargo/bin.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          cache-bin: false
 
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p abylab-tui
+      # The image carries rust, musl-gcc and the musl libc; nothing is
+      # cross-compiled and no extra package is needed. `RUSTFLAGS` and `TARGET`
+      # are the only things passed in with the workspace.
+      - name: Build in Alpine
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$PWD:$PWD" --workdir "$PWD" \
+            --env CARGO_TARGET_DIR="$PWD/target" \
+            --env RUSTFLAGS \
+            --env TARGET \
+            rust:alpine \
+            sh -euc '
+              cargo build --release --locked --target "$TARGET" -p abylab-tui
+              # The image is the musl system the asset is for: run it here.
+              "./target/$TARGET/release/abylab" --version
+            '
+          # The container is root; hand the artifacts to the runner user so the
+          # cache save and the steps below can read and write them.
+          sudo chown -R "$(id -u):$(id -g)" target
 
       - name: static link
         run: scripts/check-glibc-floor.sh --static "target/${{ matrix.target }}/release/abylab"
@@ -197,8 +205,8 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
-      # Runs on the musl system the binary was built for — the asset's real
-      # platform — so this is a native smoke test, not just a self-check.
+      # The Alpine smoke test ran above; this one runs the asset on the glibc
+      # runner, which is the other half of the promise.
       - name: Smoke test
         run: |
           set -euo pipefail

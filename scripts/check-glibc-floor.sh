@@ -12,10 +12,16 @@
 #       `/lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found`.
 #
 #   scripts/check-glibc-floor.sh --static <binary>
-#       musl build: the binary must be a static ELF — no dynamic section, no
-#       PT_INTERP, no GLIBC_ symbol. That is what lets the one Linux asset run
-#       on glibc and musl hosts alike. Linux releases are built this way (see
-#       the Alpine container in .github/workflows/release.yml).
+#       musl build: nothing may be loaded from the host at run time — no
+#       interpreter to find (PT_INTERP), no shared library to link against
+#       (NEEDED), and no GLIBC_ symbol. That is what lets the one Linux asset
+#       run on glibc and musl hosts alike; Linux releases are built this way
+#       (see the Alpine container in .github/workflows/release.yml).
+#
+#       rustc links musl's crt-static builds as static-PIE on this target, so
+#       the binary keeps a dynamic section holding its own self-relocations.
+#       That is the same shape ripgrep and cargo-dist ship for
+#       *-unknown-linux-musl, and it is reported rather than rejected.
 #
 # usage: scripts/check-glibc-floor.sh [--static] <binary> [floor]
 set -euo pipefail
@@ -63,20 +69,25 @@ glibc_symbols() {
 }
 
 if [ "$MODE" = static ]; then
-    # readelf sees the section headers and the program headers, which is where
-    # "static" is decided; objdump -p is the fallback for a binutils without
-    # readelf. One of the two has to be there: without them a passing check
-    # would mean nothing.
+    # readelf sees the program headers, which is where "does the host have to
+    # provide anything at run time" is decided; objdump -p is the fallback for
+    # a binutils without readelf. One of the two has to be there — without them
+    # a passing check would mean nothing.
+    flavor=static
     if command -v readelf >/dev/null 2>&1; then
-        if readelf -d "$bin" 2>/dev/null | grep -q 'Dynamic section'; then
-            fail "has a dynamic section — this is not a static build"
-        fi
         if readelf -l "$bin" 2>/dev/null | grep -q 'Requesting program interpreter'; then
-            fail "has a PT_INTERP header — the runtime loader would have to exist on the host"
+            fail "has a PT_INTERP header — the host's loader would have to exist"
+        fi
+        if readelf -d "$bin" 2>/dev/null | grep -q 'NEEDED'; then
+            fail "links a shared library (NEEDED) — this is not a static build"
+        fi
+        # Only for the message: a static-PIE keeps the dynamic section.
+        if readelf -d "$bin" 2>/dev/null | grep -q 'Dynamic section'; then
+            flavor=static-PIE
         fi
     elif command -v objdump >/dev/null 2>&1; then
         if objdump -p "$bin" 2>/dev/null | grep -q 'NEEDED'; then
-            fail "links a shared library (NEEDED entry) — this is not a static build"
+            fail "links a shared library (NEEDED) — this is not a static build"
         fi
     else
         die "neither readelf nor objdump is installed — cannot tell a static build from a dynamic one"
@@ -88,7 +99,8 @@ if [ "$MODE" = static ]; then
         fail "asks for GLIBC_ symbols — this is not the musl build"
     fi
 
-    printf 'static link ok: %s has no dynamic section and no GLIBC_ symbols\n' "$bin"
+    printf 'static link ok: %s is a %s binary — no interpreter, no shared libraries, no GLIBC_ symbols\n' \
+        "$bin" "$flavor"
     exit 0
 fi
 
