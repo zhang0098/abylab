@@ -205,6 +205,7 @@ fn every_action_has_exactly_one_documented_row_except_typing_insert() {
         Action::ToggleTheme,
         Action::ToggleExpandAll,
         Action::SendNow,
+        Action::EditQueuedPrompt,
         Action::AttachClipboard,
         Action::ModelPicker,
         Action::CyclePermission,

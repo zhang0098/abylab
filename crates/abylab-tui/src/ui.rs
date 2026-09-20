@@ -19,6 +19,9 @@ use crate::transcript::wrap;
 /// The `↥` prompt-jump glyph's hit width: the glyph cell plus the margin cell
 /// left of it (Martty's two-cell button).
 const PROMPT_JUMP_BTN_W: u16 = 2;
+/// The `⛶` expand glyph's hit width: a margin, the glyph, and one more cell so
+/// the corner `╮` keeps its room (Martty's issue #92 button).
+const EXPAND_BTN_W: u16 = 3;
 
 /// Composer card height for a terminal `height` rows tall.
 /// Composer height: the input well plus one bottom meta row (state ·
@@ -37,18 +40,30 @@ fn composer_height(height: u16) -> u16 {
 
 /// Grow with hard/soft-wrapped draft rows, while leaving at least half of a
 /// normal terminal to the conversation. Beyond the cap, `draw_input` keeps a
-/// cursor-following viewport inside the composer.
+/// cursor-following viewport inside the composer. The mouse-only expand button
+/// (`⛶`) pins the well to the amplified height instead.
 fn resolved_composer_height(area: Rect, app: &App) -> u16 {
     let minimum = composer_height(area.height);
     let inner_width = area.width.saturating_sub(2);
     let prompt_width = "❯ ".width() as u16;
     let wrap_width = inner_width.saturating_sub(prompt_width).max(1) as usize;
-    let maximum = (area.height / 2).max(minimum).min(14);
-    let desired = app
-        .input
-        .visual_row_count(wrap_width)
-        .saturating_add(1)
-        .min(maximum as usize) as u16;
+    // Expanded: up to 5/8 of the frame and no compact cap — the conversation
+    // keeps the rest. Auto: half the screen, ≤ 14.
+    let maximum = if app.composer_expanded {
+        (area.height * 5 / 8)
+            .max(minimum)
+            .min(area.height.saturating_sub(4).max(minimum))
+    } else {
+        (area.height / 2).max(minimum).min(14)
+    };
+    let desired = if app.composer_expanded {
+        maximum
+    } else {
+        app.input
+            .visual_row_count(wrap_width)
+            .saturating_add(1)
+            .min(maximum as usize) as u16
+    };
     desired.max(minimum).min(maximum)
 }
 
@@ -63,14 +78,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // them may leave a target behind.
     app.plan_chip = None;
     app.prompt_jump_btn = None;
+    app.expand_btn = None;
+    app.scroll_btn = None;
+    // …and the well's own hit targets: a frame that draws no composer (a
+    // child view, or a terminal too small for one) must not leave the last
+    // frame's well, chip rects or thumbnails behind for the mouse to hit.
+    app.composer_area = Rect::default();
+    app.att_chips.clear();
+    app.att_thumbs.clear();
     f.render_widget(
         Block::default().style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,
     );
     if area.height < 6 || area.width < 24 {
         f.render_widget(
-            Paragraph::new("terminal too small — need ≥ 24x6")
-                .style(Style::default().fg(theme.warn)),
+            Paragraph::new(app.locale.tr(
+                "terminal too small — need ≥ 24x6",
+                "终端太小 —— 至少需要 24x6",
+            ))
+            .style(Style::default().fg(theme.warn)),
             area,
         );
         return;
@@ -382,15 +408,18 @@ fn draw_child_navigation(f: &mut Frame, app: &App, area: Rect) {
         .as_deref()
         .and_then(|id| app.subagents.iter().find(|view| view.id == id))
         .map(|view| view.label.as_str())
-        .unwrap_or("subagent");
+        .unwrap_or_else(|| app.locale.tr("subagent", "子代理"));
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                format!(" {label} · read-only"),
+                format!(" {label} · {}", app.locale.tr("read-only", "只读")),
                 Style::default().fg(theme.fg_secondary),
             ),
             Span::styled(
-                "   esc back · ↓ switch agents",
+                app.locale.tr(
+                    "   esc back · ↓ switch agents",
+                    "   esc 返回 · ↓ 切换 Agent",
+                ),
                 Style::default().fg(theme.caption),
             ),
         ]))
@@ -401,13 +430,18 @@ fn draw_child_navigation(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_agent_rail(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
+    let main = app.locale.tr("main", "主会话");
     let mut spans = vec![Span::styled(
-        " agents  ",
+        app.locale.tr(" agents  ", " Agent  "),
         Style::default().fg(theme.caption),
     )];
     let main_active = app.active_subagent.is_none();
     spans.push(Span::styled(
-        if main_active { "▸ main" } else { "  main" },
+        if main_active {
+            format!("▸ {main}")
+        } else {
+            format!("  {main}")
+        },
         Style::default()
             .fg(if main_active {
                 theme.brand
@@ -439,7 +473,7 @@ fn draw_agent_rail(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     spans.push(Span::styled(
-        "  ↓ switch",
+        app.locale.tr("  ↓ switch", "  ↓ 切换"),
         Style::default().fg(theme.caption),
     ));
     f.render_widget(
@@ -508,9 +542,14 @@ fn meta_line(app: &App, width: usize) -> Line<'static> {
             .unwrap_or_else(|| app.cfg.model.clone());
         let mut compact = Vec::new();
         if app.scroll_up > 0 {
+            let tone = if app.hover_scroll_btn {
+                theme.fg
+            } else {
+                theme.caption
+            };
             compact.push(Span::styled(
-                format!("▲{} · ", app.scroll_up),
-                Style::default().fg(theme.caption),
+                format!("↓ {} · ", app.scroll_up),
+                Style::default().fg(tone),
             ));
         }
         compact.push(Span::styled(
@@ -536,8 +575,30 @@ fn meta_line(app: &App, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_meta_row(f: &mut Frame, app: &App, area: Rect) {
-    f.render_widget(Paragraph::new(meta_line(app, area.width as usize)), area);
+fn draw_meta_row(f: &mut Frame, app: &mut App, area: Rect) {
+    let line = meta_line(app, area.width as usize);
+    app.scroll_btn = scroll_chip_rect(&line, area);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Where the meta row's `↓ N` chip landed, so the mouse can hit it: the row is
+/// left-aligned and padded, so the chip's offset is the width of everything
+/// before it. `None` when the row shows no chip (the tail is on screen).
+fn scroll_chip_rect(line: &Line<'static>, row: Rect) -> Option<Rect> {
+    let mut offset = 0u16;
+    for span in &line.spans {
+        let width = span.content.width() as u16;
+        if span.content.starts_with('↓') {
+            return Some(Rect::new(
+                row.x.saturating_add(offset),
+                row.y,
+                width,
+                row.height.min(1),
+            ));
+        }
+        offset = offset.saturating_add(width);
+    }
+    None
 }
 
 /// Whether `draw_chat` will append the live work row to the transcript this
@@ -655,7 +716,7 @@ fn status_title(app: &App) -> Line<'static> {
     }
     if app.modes.plan {
         spans.push(Span::styled(
-            " · plan".to_string(),
+            format!(" · {}", app.locale.tr("plan", "计划")),
             Style::default().fg(theme.brand_soft),
         ));
     }
@@ -673,12 +734,18 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
     let lbl = Style::default().fg(theme.caption);
     let running = !matches!(app.state, RunState::Idle);
     let pairs: Vec<(&str, &str)> = match (running, app.input.is_empty()) {
-        // Working, nothing typed: the only move is stopping it.
+        // Working, nothing typed: stop it — or, with a queue waiting, ship
+        // its head now (plain enter promotes the FIFO head).
+        (true, true) if app.queued > 0 => vec![
+            ("⏎", app.locale.tr("send queue head", "发送队首")),
+            ("esc", app.locale.tr("interrupt", "中断")),
+        ],
         (true, true) => vec![("esc", app.locale.tr("interrupt", "中断"))],
-        // Working with a draft: enter queues; ^x steers without cancellation.
+        // Working with a draft: enter queues; ctrl+⏎ steers without
+        // cancellation (ctrl+x cuts the selection instead).
         (true, false) => vec![
             ("⏎", app.locale.tr("queue", "排队")),
-            ("^x", "steer"),
+            ("ctrl+⏎", "steer"),
             ("esc", app.locale.tr("interrupt", "中断")),
         ],
         // Idle, empty: nothing to hint at. The `^K keys` discovery chip that
@@ -713,16 +780,35 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
-/// Meta row, right side: contextual shortcut hints, the model id and the
-/// requested reasoning effort — plain chrome tones, no accent. Token flow
-/// lives in `/status`; the session id lives in `/session`.
+/// Meta row, right side: contextual shortcut hints, the vim mode chip, the
+/// model id and the requested reasoning effort — plain chrome tones, no accent.
+/// Token flow and the session identity live in `/status`.
 fn status_right(app: &App) -> Vec<Span<'static>> {
     let theme = app.theme;
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    if app.scroll_up > 0 {
+    // `/vim` is modal, so the row has to say which mode the keys are in:
+    // normal mode swallows the letters a reader would expect to type.
+    if app.vim.is_active() {
+        let (label, color) = match app.vim.mode {
+            crate::input::VimMode::Insert => ("-- INSERT --", theme.caption),
+            _ => ("-- NORMAL --", theme.brand),
+        };
         spans.push(Span::styled(
-            format!("▲{} · ", app.scroll_up),
-            Style::default().fg(theme.caption),
+            format!("{label} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.scroll_up > 0 {
+        // The chip is a button: the meta row's `↓ N` jumps back to the tail,
+        // so the pointer resting on it brightens it like `↥` and `⛶`.
+        let tone = if app.hover_scroll_btn {
+            theme.fg
+        } else {
+            theme.caption
+        };
+        spans.push(Span::styled(
+            format!("↓ {} · ", app.scroll_up),
+            Style::default().fg(tone),
         ));
     }
     spans.extend(context_hints(app));
@@ -1059,14 +1145,20 @@ pub fn head_branch(workspace: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The cap row's right side: the project path with the `:branch` suffix,
-/// plus the mouse-only `↥` user prompt jump glyph (Martty's issue #103
-/// button). The glyph keeps one cell of margin from the corner; hovering
-/// brightens it to the strongest foreground.
+/// The cap row's right side: the project path with the `:branch` suffix, plus
+/// the mouse-only `⛶` expand button (Martty's issue #92) and, one cell left of
+/// it, the `↥` user prompt jump glyph (issue #103). Both keep one cell of
+/// margin from the corner; hovering brightens them to the strongest
+/// foreground.
 fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
     let title_width = (area_width / 2).clamp(8, 64);
     let path_width = title_width.saturating_sub(4);
     let tone = if app.hover_prompt_jump_btn {
+        app.theme.fg
+    } else {
+        app.theme.caption
+    };
+    let expand_tone = if app.hover_expand_btn {
         app.theme.fg
     } else {
         app.theme.caption
@@ -1086,6 +1178,8 @@ fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
         Span::styled(text, Style::default().fg(app.theme.caption)),
         Span::raw(" "),
         Span::styled("↥", Style::default().fg(tone)),
+        Span::raw(" "),
+        Span::styled("⛶", Style::default().fg(expand_tone)),
         Span::raw(" "),
     ])
     .right_aligned()
@@ -1142,12 +1236,31 @@ fn draw_composer_box(f: &mut Frame, app: &mut App, area: Rect) {
         (end > start).then(|| Rect::new(area.x + 1 + start as u16, area.y, (end - start) as u16, 1))
     });
     let title = ellipsize_line(cap.line, title_budget, Style::default().fg(theme.caption));
-    // The `↥` glyph rides the right-aligned workspace title with a trailing
-    // space before the corner, so its cell is fixed; the hit target adds the
-    // margin cell on its left (Martty's two-cell button).
-    if area.width > PROMPT_JUMP_BTN_W + 3 {
+    // The meta row rides the bottom border: same origin rule as the cap row
+    // (titles start inside the left border).
+    let meta = meta_line(app, area.width.saturating_sub(2) as usize);
+    app.scroll_btn = scroll_chip_rect(
+        &meta,
+        Rect::new(
+            area.x + 1,
+            area.y + area.height.saturating_sub(1),
+            area.width.saturating_sub(2),
+            1,
+        ),
+    );
+    // Both cap-row glyphs ride the right-aligned workspace title with a
+    // trailing space before the corner, so their cells are fixed: `⛶` two
+    // cells left of the corner, `↥` two cells left of that. Each hit target
+    // adds the margin cell on its left (Martty's two-cell buttons).
+    if area.width > EXPAND_BTN_W + PROMPT_JUMP_BTN_W + 4 {
+        app.expand_btn = Some(Rect::new(
+            area.x + area.width - EXPAND_BTN_W - 1,
+            area.y,
+            EXPAND_BTN_W,
+            1,
+        ));
         app.prompt_jump_btn = Some(Rect::new(
-            area.x + area.width - PROMPT_JUMP_BTN_W - 2,
+            area.x + area.width - EXPAND_BTN_W - PROMPT_JUMP_BTN_W - 1,
             area.y,
             PROMPT_JUMP_BTN_W,
             1,
@@ -1159,7 +1272,7 @@ fn draw_composer_box(f: &mut Frame, app: &mut App, area: Rect) {
         .border_style(Style::default().fg(theme.border))
         .title(title)
         .title(workspace)
-        .title_bottom(meta_line(app, area.width.saturating_sub(2) as usize))
+        .title_bottom(meta)
         .style(Style::default().bg(theme.panel));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1219,7 +1332,7 @@ fn draw_attachment_preview(f: &mut Frame, app: &mut App, composer: Rect, screen:
     )));
     let dims_txt = dims
         .map(|(iw, ih)| format!("{iw}×{ih} px"))
-        .unwrap_or_else(|| "unknown size".into());
+        .unwrap_or_else(|| app.locale.tr("unknown size", "尺寸未知").into());
     let kb = att.data.len() as f64 / 1024.0;
     let size_txt = if kb >= 1024.0 {
         format!("{:.1} MB", kb / 1024.0)
@@ -1231,7 +1344,12 @@ fn draw_attachment_preview(f: &mut Frame, app: &mut App, composer: Rect, screen:
         Style::default().fg(theme.caption),
     )));
     lines.push(Line::from(Span::styled(
-        "⌫ on the chip removes · enter sends".to_string(),
+        app.locale
+            .tr(
+                "⌫ on the chip removes · enter sends",
+                "⌫ 删除筹码 · enter 发送",
+            )
+            .to_string(),
         Style::default().fg(theme.caption),
     )));
 
@@ -1275,6 +1393,9 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     // Overlays that own input never paint the composer caret.
     let composer_owns_cursor = true;
+    // The well's rect is the seam mouse hit-testing reads between frames
+    // (placed before the early return: an empty draft is still clickable).
+    app.composer_area = area;
     if area.width < 4 || area.height == 0 {
         return;
     }
@@ -1296,8 +1417,8 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
             _ => app
                 .locale
                 .tr(
-                    "queue a follow-up — ctrl+x steers now",
-                    "输入后续消息 — ctrl+x 立即 steer",
+                    "queue a follow-up — ctrl+enter steers now",
+                    "输入后续消息 — ctrl+enter 立即 steer",
                 )
                 .to_string(),
         };
@@ -1414,6 +1535,27 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                     Rect::new(text_area.x + c0 as u16, y, (c1 - c0) as u16, 1),
                     idx,
                 ));
+            }
+        }
+        // Drag selection: reversed cells over the covered graphemes — the same
+        // treatment as the chat pane's highlight. Drawn after the chips so a
+        // drag across an inline `[image n]` reads as one selection.
+        if let Some((a, b)) = app.input_selection_range() {
+            let layout = app.input.layout(avail);
+            for (row, r) in layout.rows.iter().enumerate() {
+                if row < top || row >= top + h {
+                    continue;
+                }
+                let y = area.y + (row - top) as u16;
+                for g in &r.graphemes {
+                    if g.start_char < b && g.end_char > a {
+                        for c in g.start_col..g.start_col + g.width {
+                            if let Some(cell) = buf.cell_mut((text_area.x + c as u16, y)) {
+                                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1677,7 +1819,6 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
     // borrows `app` (the ListView render needs a mutable picker).
     let current_model = app.cfg.model.clone();
     let current_provider = app.cfg.provider.clone();
-    let current_mode = app.current_mode();
     let current_palette = app.active_palette_id.clone();
     let current_permission = app.current_permission().to_string();
     let is_current = move |item: &crate::app::PickerItem| match kind {
@@ -1688,12 +1829,12 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
                     .as_deref()
                     .is_none_or(|provider| provider == current_provider)
         }
-        crate::app::PickerKind::Mode => item.id == current_mode,
         crate::app::PickerKind::Theme => item.id == current_palette,
         crate::app::PickerKind::Permission => item.id == current_permission,
         crate::app::PickerKind::Effort
         | crate::app::PickerKind::Session
-        | crate::app::PickerKind::Subagent => false,
+        | crate::app::PickerKind::Subagent
+        | crate::app::PickerKind::Queue => false,
     };
     // The popup caps at the screen; `ListView` scrolls the overflow instead
     // of clipping it out of reach.
@@ -1835,7 +1976,13 @@ fn draw_permission_ask(f: &mut Frame, app: &App, screen: Rect) {
             Span::styled(opt.kind.clone(), Style::default().fg(theme.caption)),
         ]));
     }
-    let title = format!(" approval · {} · enter select · esc cancel ", ask.title);
+    let title = format!(
+        "{} · {} · {} ",
+        app.locale.tr(" approval ", " 审批 "),
+        ask.title,
+        app.locale
+            .tr("enter select · esc cancel", "enter 选择 · esc 取消")
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2154,6 +2301,62 @@ mod tests {
         let cap = cap_row(&frame);
 
         assert!(cap.contains("· …/deepseek-harness"), "{cap}");
+    }
+
+    /// The `⛶` expand glyph sits right of the `↥` jump glyph on the cap row
+    /// (two cells left of the corner), its hit rect covers it, and a click
+    /// pins the well to the amplified height until the next one.
+    #[test]
+    fn the_expand_glyph_rides_the_cap_row_and_pins_the_well() {
+        let mut app = test_app();
+        app.cfg.workspace = "/work/acme/deepseek-harness".into();
+
+        let frame = dump_frame(&mut app, 100, 20);
+        let row = frame
+            .lines()
+            .position(|line| line.contains('⛶'))
+            .expect("cap row with the ⛶ glyph");
+        let cap = frame.lines().nth(row).unwrap();
+        assert!(
+            cap.find('⛶').unwrap() > cap.find('↥').unwrap(),
+            "⛶ follows ↥: {cap}"
+        );
+        assert!(
+            cap.find('↥').unwrap() > cap.find("deepseek-harness").unwrap(),
+            "both glyphs follow the path: {cap}"
+        );
+
+        let btn = app.expand_btn.expect("expand button rect");
+        assert_eq!(btn.y as usize, row, "the hit rect rides the cap row");
+        assert_eq!(btn.right(), 99, "it ends one cell short of the corner");
+        let glyph = cap.chars().position(|c| c == '⛶').unwrap() as u16;
+        assert!(
+            glyph >= btn.x && glyph < btn.x + btn.width,
+            "glyph at {glyph} inside {btn:?}"
+        );
+
+        // Hover is the only affordance: it brightens, like `↥`.
+        let tone = |app: &App| -> Style {
+            workspace_cap_title(app, 100)
+                .spans
+                .iter()
+                .find(|span| span.content.contains('⛶'))
+                .expect("glyph span")
+                .style
+        };
+        let idle = tone(&app);
+        app.hover_expand_btn = true;
+        let hovered = tone(&app);
+        assert_ne!(idle, hovered, "hover must be visible");
+        assert_eq!(hovered.fg, Some(app.theme.fg));
+
+        // Clicking pins the well: 5/8 of the frame, past the auto cap.
+        let area = Rect::new(0, 0, 100, 40);
+        let auto = resolved_composer_height(area, &app);
+        app.composer_expanded = true;
+        let pinned = resolved_composer_height(area, &app);
+        assert_eq!(pinned, 25, "5/8 of a 40-row frame");
+        assert!(pinned > auto, "the click amplifies: {auto} → {pinned}");
     }
 
     /// The `↥` prompt-jump button rides the cap row right of the project path,
@@ -2703,6 +2906,79 @@ mod tests {
         assert!(bound_right.contains("high"), "{bound_right}");
     }
 
+    /// `/vim` is modal: the meta row names the mode while vim editing is on
+    /// (normal mode swallows the letters a reader would expect to type), and
+    /// says nothing once it is off again.
+    #[test]
+    fn the_meta_row_names_the_vim_mode_while_it_is_on() {
+        let flat = |spans: Vec<Span>| -> String {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let mut app = test_app();
+
+        assert!(!flat(status_right(&app)).contains("INSERT"));
+
+        app.vim.set(true);
+        let insert = flat(status_right(&app));
+        assert!(insert.contains("-- INSERT --"), "{insert}");
+
+        app.vim.mode = crate::input::VimMode::Normal;
+        let normal = flat(status_right(&app));
+        assert!(normal.contains("-- NORMAL --"), "{normal}");
+        assert!(!normal.contains("INSERT"), "{normal}");
+
+        app.vim.set(false);
+        let off = flat(status_right(&app));
+        assert!(!off.contains("NORMAL") && !off.contains("INSERT"), "{off}");
+    }
+
+    /// A composer drag-selection paints reversed cells over the covered
+    /// graphemes — the same treatment as the chat pane's highlight.
+    #[test]
+    fn a_composer_drag_selection_paints_reversed_cells() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        let (w, h) = (80u16, 20u16);
+        let mut app = live_test_app();
+        app.input.set("hello world".into());
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
+
+        // The first frame records the well; the drag covers chars 1..=4
+        // ("ello") in well-local cells `(row 0, col 1..=4)`.
+        let area = app.composer_area;
+        assert!(area.height > 0 && area.width > 8, "well: {area:?}");
+        app.input_sel = Some(crate::app::InputSel {
+            anchor: (0, 1),
+            head: (0, 4),
+        });
+        terminal.draw(|f| draw(f, &mut app)).expect("draw frame");
+
+        let buf = terminal.backend().buffer().clone();
+        let x = area.x + 2; // the "❯ " prompt column
+        for col in 1..=4u16 {
+            let cell = &buf[(x + col, area.y)];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "cell {col} must be highlighted: {:?}",
+                cell.symbol()
+            );
+        }
+        for col in [0u16, 5, 10] {
+            let cell = &buf[(x + col, area.y)];
+            assert!(
+                !cell.modifier.contains(Modifier::REVERSED),
+                "cell {col} stays plain: {:?}",
+                cell.symbol()
+            );
+        }
+    }
+
     /// The mode label stands alone: the `shift+tab` key that used to follow it
     /// is gone from the meta row (the binding still works, and `/help` and
     /// `/permission` still document it), leaving one plain chrome tone.
@@ -2808,7 +3084,7 @@ mod tests {
         app.input.set("follow-up".into());
         let s = flat(context_hints(&app));
         assert!(
-            s.contains("⏎ queue") && s.contains("^x steer") && s.contains("esc interrupt"),
+            s.contains("⏎ queue") && s.contains("ctrl+⏎ steer") && s.contains("esc interrupt"),
             "{s}"
         );
     }
@@ -3160,6 +3436,55 @@ mod tests {
         );
     }
 
+    /// The `↓ N` chip is a button: the frame that draws it records where it
+    /// landed, so a click on the arrow follows the tail again.
+    #[test]
+    fn the_scroll_chip_records_the_cell_it_is_drawn_on() {
+        let mut app = test_app();
+        for i in 0..40 {
+            app.transcript.push_user(format!("line {i}"), false);
+        }
+        let _ = dump_frame(&mut app, 100, 14);
+        assert!(
+            app.scroll_btn.is_none(),
+            "no chip while the tail is visible"
+        );
+
+        app.scroll_by(20);
+        let frame = dump_frame(&mut app, 100, 14);
+        let chip = app.scroll_btn.expect("the scrolled frame records a chip");
+        let row: Vec<char> = frame
+            .lines()
+            .nth(chip.y as usize)
+            .expect("chip row")
+            .chars()
+            .collect();
+        assert_eq!(
+            row[chip.x as usize], '↓',
+            "the rect sits on the arrow:\n{frame}"
+        );
+        assert!(chip.width > 1, "the count rides the same target");
+
+        // A narrow terminal may drop the chip from the meta row entirely; the
+        // target then goes with it instead of staying behind for the mouse.
+        app.scroll_by(20);
+        let frame = dump_frame(&mut app, 34, 12);
+        let drawn = frame.lines().skip(1).any(|row| row.contains('↓'));
+        match app.scroll_btn {
+            Some(chip) => {
+                assert!(drawn, "a recorded chip must be on screen:\n{frame}");
+                let row: Vec<char> = frame
+                    .lines()
+                    .nth(chip.y as usize)
+                    .expect("chip row")
+                    .chars()
+                    .collect();
+                assert_eq!(row[chip.x as usize], '↓', "compact rect too:\n{frame}");
+            }
+            None => assert!(!drawn, "the chip is drawn but not clickable:\n{frame}"),
+        }
+    }
+
     #[test]
     fn scroll_up_survives_draw_and_shows_indicator() {
         let mut app = test_app();
@@ -3169,7 +3494,7 @@ mod tests {
         app.scroll_by(20);
         let frame = dump_frame(&mut app, 100, 14);
         assert!(app.scroll_up > 0, "scroll_up clamped to zero");
-        assert!(frame.contains("▲"), "scroll indicator missing:\n{frame}");
+        assert!(frame.contains('↓'), "scroll indicator missing:\n{frame}");
     }
 
     #[test]

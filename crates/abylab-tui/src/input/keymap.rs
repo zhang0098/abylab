@@ -21,6 +21,8 @@ pub enum Action {
     ToggleTheme,
     ToggleExpandAll,
     SendNow,
+    /// `⌥↑`: pick one queued follow-up to edit in the composer.
+    EditQueuedPrompt,
     AttachClipboard,
     ModelPicker,
     CyclePermission,
@@ -146,6 +148,10 @@ pub fn classify(key: &KeyEvent, ctx: KeyCtx) -> Option<Action> {
         // esc-b/esc-f: ⌥←/⌥→ in most macOS terminals (option-as-meta).
         KeyCode::Char('b') if alt => WordLeft,
         KeyCode::Char('f') if alt => WordRight,
+
+        // ⌥↑ edits a queued follow-up (Martty's EditQueuedPrompt). Plain ↑
+        // keeps browsing history, so the modified chord is what claims it.
+        KeyCode::Up if alt => EditQueuedPrompt,
 
         // --- scrolling ----------------------------------------------------
         KeyCode::PageUp => PageUp,
@@ -363,6 +369,16 @@ pub const KEY_ROWS: &[KeyRow] = &[
             p(KeyCode::Enter, CTRL, false),
             p(KeyCode::Enter, SUPER, false),
         ],
+    },
+    KeyRow {
+        action: EditQueuedPrompt,
+        group: KeyGroup::Send,
+        chords_mac: &["⌥↑"],
+        chords_other: &["alt+↑"],
+        ctx: CtxNote::Always,
+        desc_en: "choose a queued follow-up to edit",
+        desc_zh: "选择一条排队消息编辑",
+        probes: &[p(KeyCode::Up, ALT, true)],
     },
     KeyRow {
         action: Esc,
@@ -869,19 +885,29 @@ pub const KEY_ROWS: &[KeyRow] = &[
 
 pub const MOUSE_ROWS: &[MouseRow] = &[
     MouseRow {
-        chords: &["click tab"],
-        desc_en: "switch session tab (strip shows 2+ sessions) · /session prev · /session next · /new · /resume · /close",
-        desc_zh: "点击标签页切换会话（≥2 个会话时显示）· /session prev · /session next · /new · /resume · /close",
+        chords: &["click"],
+        desc_en: "expand/collapse a tool · wheel scrolls · in the input box it places the caret",
+        desc_zh: "点击展开/折叠工具 · 滚轮滚动 · 在输入框里点击定位光标",
     },
     MouseRow {
-        chords: &["click"],
-        desc_en: "expand/collapse a tool · wheel scrolls",
-        desc_zh: "点击展开/折叠工具 · 滚轮滚动",
+        chords: &["click 2/5"],
+        desc_en: "open the todo checklist behind the composer cap chip",
+        desc_zh: "打开输入框上沿进度芯片（2/5）的完整清单",
+    },
+    MouseRow {
+        chords: &["click ↥"],
+        desc_en: "jump to your prompt on the composer cap's right end",
+        desc_zh: "跳到输入框上沿右端的 ↥ 处（你上一条输入）",
+    },
+    MouseRow {
+        chords: &["click ⛶"],
+        desc_en: "pin the input well to the amplified height · click again to restore",
+        desc_zh: "把输入框固定到放大高度 · 再点一下还原（无快捷键）",
     },
     MouseRow {
         chords: &["drag"],
-        desc_en: "select text · copies on release",
-        desc_zh: "拖动选择文本，松开即复制",
+        desc_en: "select text · copies on release (transcript and the input box)",
+        desc_zh: "拖动选择文本，松开即复制（对话区和输入框都行）",
     },
     MouseRow {
         chords: &["2×click"],
@@ -938,11 +964,11 @@ pub fn keys_markdown(zh: bool, mac: bool) -> String {
     }
     out.push('\n');
     out.push_str(if zh {
-        "### vim 模式（`/vim` 开启 · 默认关闭）\n\n\
+        "### vim 模式（`/vim` 开启 · 默认关闭 · 输入框 meta 行显示 `-- INSERT --` / `-- NORMAL --`）\n\n\
          - normal：`h/j/k/l` 移动 · `w/b/e` 词跳 · `0/$` 行首尾 · `x/X` 删除 · `dd` 删行 · `u` 撤销 · `p` 粘贴 · `gg/G` 文档首尾 · `i/a/A` 插入 · `o/O` 新行 · `esc` 返回 normal\n\
          - Ctrl/⌘ · 组合键始终保留（steer、undo 等）。\n"
     } else {
-        "### vim mode (`/vim` toggles · off by default)\n\n\
+        "### vim mode (`/vim` toggles · off by default · the meta row shows `-- INSERT --` / `-- NORMAL --`)\n\n\
          - normal: `h/j/k/l` move · `w/b/e` word · `0/$` line head/tail · `x/X` delete · `dd` kill line · `u` undo · `p` paste · `gg/G` document head/tail · `i/a/A` insert · `o/O` new line · `esc` back\n\
          - Ctrl/⌘ · chords stay with the app (steer, undo, …).\n"
     });

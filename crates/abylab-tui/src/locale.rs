@@ -57,7 +57,6 @@ impl Locale {
             "clip" => "附加剪贴板图片（macOS/Linux）",
             "theme" => "切换明暗模式或主题包",
             "vim" => "切换 vim 模态编辑（默认关闭）",
-            "session" => "显示会话和运行时信息",
             "status" => "状态、模型和实时用量统计",
             "lang" => "切换界面语言",
             "login" => "保存 API key 到 aby 主目录",
@@ -72,18 +71,18 @@ impl Locale {
     pub fn session_tip(self, index: usize) -> &'static str {
         const EN: [&str; 7] = [
             "esc interrupts a running turn — your draft survives",
-            "enter queues a follow-up; ctrl+x steers the active turn now",
+            "enter queues a follow-up; ctrl+enter steers the active turn now",
             "click a tool to expand it · wheel always scrolls the conversation",
-            "token usage + cache hit rate live in /status · /session has the details",
+            "token usage + cache hit rate live in /status · it also names the session",
             "answers render markdown: headings, code, links, and images",
             "@ mentions a workspace file · the file browser filters as you type",
             "/new starts a fresh session · /theme switches packs · ctrl+t toggles dark/light",
         ];
         const ZH: [&str; 7] = [
             "esc 可中断当前轮次，草稿会保留",
-            "enter 会排队后续消息；ctrl+x 立即 steer 当前轮次",
+            "enter 会排队后续消息；ctrl+enter 立即 steer 当前轮次",
             "点击工具可展开 · 滚轮始终滚动对话",
-            "token 用量和缓存命中率见 /status · 详情见 /session",
+            "token 用量和缓存命中率见 /status · 会话身份也在那里",
             "回答支持 Markdown：标题、代码、链接和图片",
             "@ 可引用工作区文件 · 输入时文件浏览器实时过滤",
             "/new 新建会话 · /theme 切换主题包 · ctrl+t 切换明暗模式",

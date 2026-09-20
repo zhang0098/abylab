@@ -71,9 +71,18 @@ measurement when there is one, otherwise estimated at 3 bytes per token. A view
 change invalidates the old measurement; restoring an already-compacted session
 conservatively waits for a new one.
 
-Where abylab is stricter than harness, and the limits that bind in practice:
-abycore's 10-minute run deadline per segment and its 4 MiB serialized input cap.
-The byte estimate is not a guaranteed upper bound.
+Where abylab is stricter than harness: each segment runs under a 10-minute
+deadline by default (`ABY_TURN_TIMEOUT=600`) and each tool call under 60 seconds
+(`ABY_TOOL_TIMEOUT=60`). A timeout waits one second and continues the same open
+turn, sharing the `ABY_AUTO_CONTINUE` allowance with budget stops and transient
+failures (default 3; `0` stops on the first failure). Completed tool results
+survive; a tool truncated mid-execution is marked "unverified — check before
+repeating" and never replayed. Only once that allowance is spent does the error
+surface, listing the current limits; another message continues the session, and
+Esc interrupts both execution and the wait between segments. (The README's
+[Turn budgets](README.en.md#turn-budgets) covers the same ground from the user's
+side.) Serialized input has its own 4 MiB cap. The byte estimate is not a
+guaranteed upper bound.
 
 ## Session persistence
 
@@ -90,7 +99,11 @@ workspace slug:
 - `--session-id <id>` replays the stored history, and your next message continues
   an unfinished turn. Pending tool calls are settled as unverified errors before
   that message goes out; they are not replayed.
-- `/resume` lists the workspace store (newest first).
+- `/resume` lists the workspace store (newest first). The listing is a pure
+  read and rides the driver's query channel, so the picker opens while a turn
+  is still running; the load itself (`session/load`) waits for that turn to
+  end. `/model`'s live catalog (the `/models` request) takes the same channel,
+  so it fills the picker mid-turn too.
 - A non-blocking `flock` on `session.lock` keeps it to a single writer.
 
 Changing permissions or the API key at runtime keeps the parent's runtime

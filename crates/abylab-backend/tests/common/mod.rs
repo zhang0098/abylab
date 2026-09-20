@@ -224,8 +224,10 @@ impl Reply {
         ))
     }
 
-    fn body(mut self, body: String) -> Self {
-        self.body = body;
+    /// Replace the response body — a fixture that answers a non-SSE endpoint
+    /// (the `/models` listing, say) spells the JSON here.
+    pub fn body(mut self, body: impl Into<String>) -> Self {
+        self.body = body.into();
         self
     }
 

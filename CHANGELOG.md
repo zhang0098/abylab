@@ -1,0 +1,108 @@
+**中文** · [English](CHANGELOG.en.md)
+
+# 更新日志
+
+这个文件记录 abylab 每一次发布里值得用户知道的变更。格式参考
+[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
+[语义化版本](https://semver.org/lang/zh-CN/)。
+内部细节（工作区指令、上下文压缩、会话持久化、目标轮次）写在
+[TECH.md](TECH.md)；日常用法看 [README.md](README.md)。
+
+## [Unreleased]
+
+### 新增
+
+- 启动画面在 ASCII wordmark 和项目地址下面多出四行启动信息：版本号、工作目录、
+  权限预设、模型（设了 effort 就带在模型那行后面）。标签跟随界面语言，值不变。
+- 底栏的 `↓ N`（N = 离底部多少行）现在是按钮：点一下翻回最新的行、重新跟随尾部；
+  指针停上去会变亮。往上翻过对话时它才出现。
+- `/resume` 在任务运行中也立刻列出会话：这条列举是纯读操作，走驱动的查询侧通道，
+  不再排在正在跑的回合后面；选中后真正载入仍等这一轮结束，提示里会写明
+  （「（本轮结束后）」）。`/model` 的实时模型列表走同一条通道，回合中也能立刻
+  补全（`/login` 换过 key 也照样用新 key）。
+
+### 修复
+
+- 任务进行中执行 `/resume` 会一直等待：会话列表原先排在驱动那条单队列里，
+  一个回合跑完才轮到它，选择器因此不弹出。同一队列也让 `/model` 的实时模型
+  列表等到回合结束才到。
+
+### 变更
+
+- 补齐中英文对照：中文 README 补上英文版已有的 crate 表、极简/单文件/快、
+  快速开始的平台与 `SHA256SUMS`/`--mirror`/`--version <tag>`、选项表、环境变量、
+  `settings.json`，以及整节「轮次预算」；英文 README 补上「可以让 AI 帮你安装」和
+  `--mirror`；英文 TECH 补上只有中文版才有的时限段。站点两版页面核对为同构。
+- 界面文案（客户端自有 chrome）全部跟 `/lang` 走：时间线通知与工具卡尾注、
+  子代理与 Agent 侧栏、计划 chip、权限预设的含义与 `· 当前`/`· 默认` 标记、
+  斜杠参数提示、命令反馈与状态行、附件预览浮层、审批弹窗标题、终端过小提示。
+
+## [0.1.4] - 2026-09-20
+
+### 变更
+
+- Linux 只发一种包：每个架构一个 musl 静态二进制，不再有 glibc 版本，
+  没有 glibc 下限要长期维护；二进制在 Alpine 容器里按架构原生构建。
+- 输入框多两行、底栏更安静：随时读得清模式和模型，又不会挤掉草稿。
+
+### 修复
+
+- `scripts/check-glibc-floor.sh` 的 objdump 兜底分支会如实回答解释器问题，
+  静态产物不再被误判。
+
+## [0.1.3] - 2026-09-20
+
+### 新增
+
+- 启动画面（ASCII wordmark + 项目地址）。
+- `/status`、`/help`、`/keys` 是浮在对话上的弹窗，不写进会话记录。
+
+### 变更
+
+- 输入框周围的框架更安静：模式、模型和状态不再抢草稿的注意力。
+- Linux 二进制改在 bullseye 上构建，并用 `scripts/check-glibc-floor.sh`
+  断言 glibc 下限；发布流水线把 tarball 镜像到 abylab.ai/downloads，
+  安装脚本优先走镜像。
+- `https://abylab.ai/install.sh` 直接由站点提供（不再跳到 GitHub）。
+
+## [0.1.2] - 2026-09-20
+
+### 新增
+
+- `@` 文件浏览器：Tab 落在目录上会进去，输入即过滤，跳过 `.git`、`node_modules`
+  等重目录。
+- 输入框上沿的 `todo_write` 任务清单与进度 chip，点击打开完整清单。
+- 提示行里的项目路径带上 `:分支`（直接读 `.git/HEAD`，不启动 git 进程）。
+- 站点 abylab.ai 上线（Pico CSS + Cloudflare Pages），文档拆成 README 与 TECH
+  的中英两版。
+
+### 变更
+
+- 全新安装默认落在 One 主题包的深色外观。
+- 安装脚本把安装目录写进 shell 启动文件（`--no-path` 只打印），并引导用户用
+  `/login` 存 key。
+
+### 修复
+
+- 因超时中断的回合可以续跑：未结算的工具调用标记为「未核实」，下一条消息接着跑
+  同一个回合。
+
+## [0.1.1] - 2026-09-19
+
+### 修复
+
+- 发布任务的 checkout 缺失导致 publish 从未真正执行。
+- README 的措辞与排版。
+
+## [0.1.0] - 2026-09-19
+
+首个版本：abycore agent SDK、abylab-backend 驱动、abylab-tui 画布（composer
+卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
+release 流水线。
+
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/zhang0098/abylab/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/zhang0098/abylab/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/zhang0098/abylab/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/zhang0098/abylab/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/zhang0098/abylab/releases/tag/v0.1.0

@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use unicode_width::UnicodeWidthChar;
+use ratatui::layout::Rect;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::bus::{
     permission_ask_default_sel, AppEvent, Cmd, CtlEvent, PermissionAskOption, PermissionAskReply,
@@ -52,6 +53,9 @@ const LOGO_ART: [&str; 2] = ["▄▀█ █▄▄ █▄█ █   ▄▀█ █�
 
 /// Project URL under the startup wordmark.
 const SITE_URL: &str = "https://abylab.ai";
+
+/// Build version the startup splash reports (`-V` prints the same number).
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Some terminal layers incorrectly wrap Kitty/CSI-u key reports in
 /// bracketed-paste markers. Crossterm then exposes the key bytes as a paste,
@@ -218,11 +222,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "toggle mode or switch palette pack",
     },
     SlashCommand {
-        name: "session",
-        usage: "/session",
-        desc: "show session + runtime info",
-    },
-    SlashCommand {
         name: "status",
         usage: "/status",
         desc: "run state, model and the live usage counters",
@@ -253,29 +252,6 @@ pub const MODEL_PRESETS: &[&str] = &["deepseek-flash", "deepseek-v4-pro"];
 
 /// Stock composition presets served by `FetchCatalog` until a host
 /// catalog replaces them.
-pub const AGENT_MODES: &[(&str, &str, &str)] = &[
-    (
-        "standard",
-        "Standard mode",
-        "full coding agent · files, shell, search, skills, subagents",
-    ),
-    (
-        "code",
-        "Code mode",
-        "standard tools driven from one TypeScript program",
-    ),
-    (
-        "minimal",
-        "Minimal mode",
-        "two tools · persistent bash + str_replace_editor",
-    ),
-    (
-        "cordis",
-        "Creator mode",
-        "standard + runtime inspection and preset authoring",
-    ),
-];
-
 /// The stock permission presets (id, one-line meaning) — the default table
 /// `@deepseek-ai/dsh-permission-presets` ships. Shift+Tab cycles them;
 /// `/permission <name>` passes any other id through for profiles with a
@@ -335,29 +311,23 @@ pub fn permission_label(id: &str) -> String {
         .join(" ")
 }
 
-fn permission_picker_items(
-    modes: &[crate::bus::CatalogPreset],
-    reported: Option<&str>,
-    current: &str,
-) -> Vec<PickerItem> {
-    modes
+/// One-line meaning of a stock permission preset in the interface language.
+/// Only the three stock ids carry a translation; a custom preset the host
+/// reports falls back to the English table (and then to nothing), so the
+/// picker never invents a meaning the host didn't list.
+pub fn permission_desc(locale: Locale, id: &str) -> Option<&'static str> {
+    if locale == Locale::Zh {
+        match id {
+            "read-only" => return Some("只读 —— 不写文件"),
+            "workspace-write" => return Some("只写工作区 · 更大的动作会先征求同意"),
+            "danger-full-access" => return Some("完全文件访问 · 关闭审批 —— 仅限信任目录"),
+            _ => {}
+        }
+    }
+    PERMISSION_PRESETS
         .iter()
-        .map(|p| {
-            let mark = if reported == Some(p.id.as_str()) {
-                " · current"
-            } else if reported.is_none() && p.id == current {
-                " · default"
-            } else {
-                ""
-            };
-            PickerItem {
-                id: p.id.clone(),
-                label: permission_label(&p.id),
-                meta: format!("{}{mark}", p.description),
-                provider: None,
-            }
-        })
-        .collect()
+        .find(|(preset, _)| *preset == id)
+        .map(|(_, desc)| *desc)
 }
 
 /// Map a file extension to the attachment media type the host accepts.
@@ -468,6 +438,18 @@ impl Selection {
     }
 }
 
+/// Composer drag-selection (the same gesture as the chat pane): both
+/// endpoints are cells in the input well's text-area coordinates — `(row,
+/// col)`, where the drag began and where the pointer is now. The covered char
+/// range comes from [`App::input_selection_range`], which treats both endpoint
+/// cells as inclusive, so a drag in either direction covers exactly the cells
+/// the pointer crossed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InputSel {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
 /// Snapshot of the chat pane layout from the last draw — the seam that
 /// mouse hit-testing and copy extraction read (grok-build's resolved
 /// selection model, scaled way down): pane rect, index of the first
@@ -520,14 +502,12 @@ impl ChatView {
 pub enum PickerKind {
     Model,
     Effort,
-    // Mode pickers stay available for ACP `agent-preset` notifications,
-    // but no user entry point constructs them anymore (agent commands removed).
-    #[allow(dead_code)]
-    Mode,
     Theme,
     Permission,
     Session,
     Subagent,
+    /// `⌥↑`: pick one client-queued prompt to edit in the composer.
+    Queue,
 }
 
 #[derive(Clone)]
@@ -614,7 +594,6 @@ pub struct Modes {
     pub sandbox: Option<String>,
     pub approval: Option<String>,
     pub permission: Option<String>,
-    pub agent_preset: Option<String>,
     /// Reasoning effort as last requested from this client (`/effort`,
     /// the post-model-pick effort picker); the host doesn't echo one.
     pub effort: Option<String>,
@@ -637,6 +616,14 @@ pub struct App {
     pub input: ComposerEditor,
     /// Display-cell width of the composer text well from the latest frame.
     pub(crate) composer_wrap_width: usize,
+    /// The composer well's screen rect from the latest frame (prompt column
+    /// included) — the seam mouse hit-testing reads between frames.
+    pub(crate) composer_area: Rect,
+    /// Composer drag-selection highlight. Cleared by a click, Esc, and every
+    /// text edit (`App::dispatch`).
+    pub(crate) input_sel: Option<InputSel>,
+    /// A left-button drag that began inside the well is in progress.
+    input_selecting: bool,
     /// First text row shown inside the well (the viewport scroll from
     /// `ui::draw_input`), mirrored from the editor's own scroll offset.
     pub(crate) input_top: usize,
@@ -696,11 +683,9 @@ pub struct App {
     /// the slash menu after the builtins.
     pub skills: Vec<crate::bus::SkillInfo>,
     /// Last advertised composition select (`/agent`).
-    last_presets: Vec<crate::bus::CatalogPreset>,
     /// Last advertised ACP model select (`/model`).
     last_models: Vec<crate::bus::CatalogModel>,
     /// Last advertised session modes (`/permission`, shift+tab).
-    permission_choices: Vec<crate::bus::CatalogPreset>,
     /// Last advertised effort catalog for the current model.
     effort_choices: Vec<String>,
     pub tip: Option<(String, Instant)>,
@@ -720,6 +705,19 @@ pub struct App {
     pub(crate) prompt_jump_btn: Option<ratatui::layout::Rect>,
     /// The pointer rests on the `↥` glyph: brighten it.
     pub(crate) hover_prompt_jump_btn: bool,
+    /// Screen rect of the cap row's mouse-only `⛶` expand glyph, recorded by
+    /// `ui::draw_composer_box` every frame.
+    pub(crate) expand_btn: Option<ratatui::layout::Rect>,
+    /// The pointer rests on the `⛶` glyph: brighten it.
+    pub(crate) hover_expand_btn: bool,
+    /// Screen rect of the meta row's `↓ N` scroll chip, recorded by the frame
+    /// that draws it. `None` while the transcript follows the tail (no chip).
+    pub(crate) scroll_btn: Option<ratatui::layout::Rect>,
+    /// The pointer rests on the `↓ N` chip: brighten it.
+    pub(crate) hover_scroll_btn: bool,
+    /// The `⛶` click pins the well to the amplified height (issue #92) until
+    /// the next click; the auto layout returns.
+    pub(crate) composer_expanded: bool,
     /// Transcript cell of the user prompt the last `↥` click jumped to; the
     /// next click walks one prompt further back (the oldest wraps around).
     /// In-memory only, and it rides across clicks so jumping resumes where the
@@ -757,9 +755,13 @@ pub struct App {
     pub quit: bool,
     pub queued: usize,
     /// Transcript cells grouped by the client FIFO prompt that owns them.
-    queued_cells: VecDeque<Vec<usize>>,
-    /// Send Now bubbles awaiting the concurrent ACP request result.
-    pending_steer_cells: HashMap<u64, Vec<usize>>,
+    /// Client-owned FIFO of prompts waiting for the active turn to end; `queued`
+    /// mirrors its length, and the queue is what `⌥↑` edits.
+    prompt_queue: VecDeque<QueuedPrompt>,
+    /// The queued prompt loaded back into the composer for editing (`⌥↑`).
+    queue_edit: Option<QueueEditState>,
+    /// Send Now bubbles awaiting the driver's settlement.
+    pending_steer_cells: HashMap<u64, PendingSteer>,
     next_prompt_id: u64,
     /// A first prompt was handed to the controller but has not reached the
     /// ACP request task yet. Runtime startup alone does not make a turn busy.
@@ -790,7 +792,6 @@ fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
         | UiEvent::SandboxMode { session, .. }
         | UiEvent::ApprovalPolicy { session, .. }
         | UiEvent::PermissionPreset { session, .. }
-        | UiEvent::AgentPreset { session, .. }
         | UiEvent::ApprovalAsked { session, .. }
         | UiEvent::ApprovalDecided { session, .. } => Some(session),
         UiEvent::SubagentStarted { .. } | UiEvent::SubagentFinished { .. } => None,
@@ -801,6 +802,35 @@ fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
 enum StagedBlock {
     Text(String),
     Image(crate::attachments::Attachment),
+}
+
+/// One client-owned queued prompt: the blocks (text and/or staged images)
+/// waiting for the active turn to end, plus the transcript cells echoing them
+/// (marked queued until the prompt is actually sent).
+///
+/// The queue lives here rather than in the driver's command channel so a
+/// queued prompt stays addressable: `⌥↑` lists it, Enter loads it back into
+/// the composer for editing, and an empty-draft Enter promotes the head into
+/// the active turn (Martty's client-owned FIFO).
+pub(crate) struct QueuedPrompt {
+    id: u64,
+    blocks: Vec<StagedBlock>,
+    cells: Vec<usize>,
+}
+
+/// A Send Now bubble awaiting settlement: the echo cells to re-tint (or to
+/// hand back to the queue) plus the blocks themselves, so a deferred steer
+/// requeues as the very prompt the user sent — images included.
+struct PendingSteer {
+    cells: Vec<usize>,
+    blocks: Vec<StagedBlock>,
+}
+
+/// The queued prompt currently loaded into the composer for editing.
+pub(crate) struct QueueEditState {
+    prompt_id: u64,
+    /// `ctrl+d` arms before it deletes: the first press asks, the second does.
+    delete_confirm: bool,
 }
 
 fn token_spans_in(
@@ -852,22 +882,33 @@ fn session_picker_row(id: &str, title: Option<&str>, updated_at: Option<&str>) -
     }
 }
 
-fn unique_session_list_match(sessions: &[SessionListItem], prefix: &str) -> Result<String, String> {
+fn unique_session_list_match(
+    locale: Locale,
+    sessions: &[SessionListItem],
+    prefix: &str,
+) -> Result<String, String> {
     let matches: Vec<&SessionListItem> = sessions
         .iter()
         .filter(|s| s.id.starts_with(prefix))
         .collect();
+    let list_hint = locale.tr("/resume lists them", "/resume 可以看到它们");
     match matches.as_slice() {
         [one] => Ok(one.id.clone()),
-        [] => Err(format!(
-            "no session matches “{prefix}” — /resume lists them"
-        )),
+        [] => Err(if locale == Locale::Zh {
+            format!("没有会话匹配 “{prefix}” —— {list_hint}")
+        } else {
+            format!("no session matches “{prefix}” — {list_hint}")
+        }),
         many => match many.iter().find(|s| s.id == prefix) {
             Some(one) => Ok(one.id.clone()),
-            None => Err(format!(
-                "“{prefix}” is ambiguous ({} matches) — /resume lists them",
-                many.len()
-            )),
+            None => Err(if locale == Locale::Zh {
+                format!("“{prefix}” 有歧义（{} 个匹配）—— {list_hint}", many.len())
+            } else {
+                format!(
+                    "“{prefix}” is ambiguous ({} matches) — {list_hint}",
+                    many.len()
+                )
+            }),
         },
     }
 }
@@ -930,12 +971,44 @@ fn image_part_from(att: &crate::attachments::Attachment) -> crate::bus::ImagePar
     }
 }
 
-fn prompt_blocks_from_staged(staged: Vec<StagedBlock>) -> Vec<crate::bus::PromptBlock> {
+/// One-line label for a queued prompt: its first non-blank text line plus a
+/// count of the images riding along (Martty's queue rows).
+fn queue_prompt_summary(blocks: &[StagedBlock]) -> String {
+    let mut text = String::new();
+    let mut images = 0usize;
+    for block in blocks {
+        match block {
+            StagedBlock::Text(part) => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(part);
+            }
+            StagedBlock::Image(_) => images += 1,
+        }
+    }
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut label = clamp_str(line, 48).to_string();
+    match (images, label.is_empty()) {
+        (0, _) => label,
+        (n, true) => format!("[{n} image]"),
+        (n, false) => {
+            label.push_str(&format!(" [+{n} image]"));
+            label
+        }
+    }
+}
+
+fn prompt_blocks_from_staged(staged: &[StagedBlock]) -> Vec<crate::bus::PromptBlock> {
     staged
-        .into_iter()
+        .iter()
         .map(|block| match block {
-            StagedBlock::Text(text) => crate::bus::PromptBlock::Text(text),
-            StagedBlock::Image(att) => crate::bus::PromptBlock::Image(image_part_from(&att)),
+            StagedBlock::Text(text) => crate::bus::PromptBlock::Text(text.clone()),
+            StagedBlock::Image(att) => crate::bus::PromptBlock::Image(image_part_from(att)),
         })
         .collect()
 }
@@ -978,11 +1051,18 @@ impl App {
             palettes,
             active_palette_id,
             theme_preview: None,
-            transcript: Transcript::new(session_id.clone()),
+            transcript: {
+                let mut transcript = Transcript::new(session_id.clone());
+                transcript.set_locale(locale);
+                transcript
+            },
             subagents: Vec::new(),
             active_subagent: None,
             input: ComposerEditor::new(),
             composer_wrap_width: 80,
+            composer_area: Rect::default(),
+            input_sel: None,
+            input_selecting: false,
             input_top: 0,
             caret_cell: None,
             state: RunState::Idle,
@@ -1010,9 +1090,7 @@ impl App {
             hover_att: None,
             modes,
             skills: Vec::new(),
-            last_presets: Vec::new(),
             last_models: Vec::new(),
-            permission_choices: Vec::new(),
             effort_choices: Vec::new(),
             tip: None,
             plan: None,
@@ -1021,6 +1099,11 @@ impl App {
             hover_plan_chip: false,
             prompt_jump_btn: None,
             hover_prompt_jump_btn: false,
+            expand_btn: None,
+            hover_expand_btn: false,
+            scroll_btn: None,
+            hover_scroll_btn: false,
+            composer_expanded: false,
             prompt_jump_cell: None,
             prompt_flash: None,
             prompt_flash_lines: None,
@@ -1036,7 +1119,8 @@ impl App {
             session_bound: true,
             quit: false,
             queued: 0,
-            queued_cells: VecDeque::new(),
+            prompt_queue: VecDeque::new(),
+            queue_edit: None,
             pending_steer_cells: HashMap::new(),
             next_prompt_id: 1,
             prompt_pending: false,
@@ -1138,15 +1222,48 @@ impl App {
             .push_markdown(format!("- **{label}** · {hint}"));
     }
 
-    /// The startup splash: the ASCII wordmark plus the project URL, painted
-    /// once per run at the top of the timeline (see `main`). `/new` keeps the
-    /// timeline to the usage hint — the mark belongs to the launch, not to
-    /// every session the client opens.
+    /// The startup splash: the ASCII wordmark, the project URL and the launch
+    /// facts — build version, working directory, permission preset and model —
+    /// painted once per run at the top of the timeline (see `main`). `/new`
+    /// keeps the timeline to the usage hint: the mark (and the facts it
+    /// reports) belongs to the launch, not to every session the client opens.
     pub fn push_banner(&mut self) {
+        let facts = vec![
+            (
+                self.locale.tr("version", "版本").to_string(),
+                VERSION.to_string(),
+            ),
+            (
+                self.locale.tr("cwd", "工作目录").to_string(),
+                self.cfg.workspace.clone(),
+            ),
+            (
+                self.locale.tr("permission", "权限").to_string(),
+                self.current_permission().to_string(),
+            ),
+            (
+                self.locale.tr("model", "模型").to_string(),
+                self.model_fact(),
+            ),
+        ];
         self.transcript.push_banner(
             LOGO_ART.iter().map(|row| (*row).to_string()).collect(),
             SITE_URL.to_string(),
+            facts,
         );
+    }
+
+    /// The splash's model value: the model id, with the requested reasoning
+    /// effort riding along when the session has one.
+    fn model_fact(&self) -> String {
+        match self.modes.effort.as_deref().filter(|e| !e.is_empty()) {
+            Some(effort) => format!(
+                "{} · {} {effort}",
+                self.cfg.model,
+                self.locale.tr("effort", "推理强度")
+            ),
+            None => self.cfg.model.clone(),
+        }
     }
 
     fn activate_palette(&mut self, id: &str) {
@@ -1160,7 +1277,8 @@ impl App {
         self.sync_theme_from_active();
         self.save_settings();
         self.show_tip(format!(
-            "theme: {} {}",
+            "{}: {} {}",
+            self.locale.tr("theme", "主题"),
             self.active_palette_id,
             self.theme.mode.as_str()
         ));
@@ -1273,20 +1391,29 @@ impl App {
             "dark" => {
                 self.theme = self.theme.with_mode(crate::theme::Mode::Dark);
                 self.save_settings();
-                self.show_tip(format!("theme: {} dark", self.active_palette_id));
+                self.show_tip(format!(
+                    "{}: {} dark",
+                    self.locale.tr("theme", "主题"),
+                    self.active_palette_id
+                ));
             }
             "light" => {
                 self.theme = self.theme.with_mode(crate::theme::Mode::Light);
                 self.save_settings();
-                self.show_tip(format!("theme: {} light", self.active_palette_id));
+                self.show_tip(format!(
+                    "{}: {} light",
+                    self.locale.tr("theme", "主题"),
+                    self.active_palette_id
+                ));
             }
             id => {
                 if self.palettes.iter().any(|p| p.id == id) {
                     self.select_palette(id);
                 } else {
-                    self.show_tip(format!("unknown palette: {id}"));
+                    let unknown = self.locale.tr("unknown palette", "未知主题包");
+                    self.show_tip(format!("{unknown}: {id}"));
                     self.transcript
-                        .push_notice(NoticeLevel::Warn, format!("unknown palette `{id}`"));
+                        .push_notice(NoticeLevel::Warn, format!("{unknown} `{id}`"));
                 }
             }
         }
@@ -1416,39 +1543,37 @@ impl App {
                 .map(|effort| (effort.clone(), effort.clone(), String::new()))
                 .collect(),
             "effort" => vec![
-                plain("off", "disable extended reasoning"),
-                plain("high", "high reasoning effort"),
-                plain("max", "maximum reasoning effort"),
+                plain(
+                    "off",
+                    self.locale.tr("disable extended reasoning", "关闭扩展推理"),
+                ),
+                plain(
+                    "high",
+                    self.locale.tr("high reasoning effort", "高推理强度"),
+                ),
+                plain(
+                    "max",
+                    self.locale.tr("maximum reasoning effort", "最高推理强度"),
+                ),
             ],
-            "permission" if !self.permission_choices.is_empty() => self
-                .permission_choices
-                .iter()
-                .map(|preset| {
-                    (
-                        preset.id.clone(),
-                        preset.name.clone(),
-                        preset.description.clone(),
-                    )
-                })
-                .collect(),
             "permission" => PERMISSION_PRESETS
                 .iter()
-                .map(|(id, desc)| plain(id, desc))
+                .map(|(id, _)| plain(id, permission_desc(self.locale, id).unwrap_or_default()))
                 .collect(),
             "plan" => vec![
-                plain("on", "enable plan mode"),
-                plain("off", "disable plan mode"),
+                plain("on", self.locale.tr("enable plan mode", "打开计划模式")),
+                plain("off", self.locale.tr("disable plan mode", "关闭计划模式")),
             ],
             "theme" => {
                 let mut choices = vec![
-                    plain("dark", "dark appearance"),
-                    plain("light", "light appearance"),
+                    plain("dark", self.locale.tr("dark appearance", "深色外观")),
+                    plain("light", self.locale.tr("light appearance", "浅色外观")),
                 ];
                 choices.extend(self.palettes.iter().map(|palette| {
                     (
                         palette.id.clone(),
                         palette.label.clone(),
-                        "palette pack".to_string(),
+                        self.locale.tr("palette pack", "主题包").to_string(),
                     )
                 }));
                 choices
@@ -1489,14 +1614,28 @@ impl App {
                 self.quit = true;
             }
             AppEvent::Term(term) => self.handle_term(term, ctl),
-            AppEvent::Ui(ui) => self.apply_ui(ui),
+            AppEvent::Ui(ui) => {
+                // The turn that a queued prompt waited behind has ended: hand
+                // the FIFO head to the driver. Read the fact before `apply_ui`
+                // folds it (the fold clears the run state).
+                let idle = matches!(
+                    &ui,
+                    crate::events::UiEvent::SessionStatus { session, running: false }
+                        if *session == self.session_id
+                );
+                self.apply_ui(ui);
+                if idle {
+                    self.dispatch_next_queued(ctl);
+                }
+            }
             AppEvent::RuntimeStderr(_line) => {
                 // kept in proto's tail buffer for diagnostics; stay quiet here
             }
             AppEvent::RuntimeExited(code) => {
                 self.prompt_pending = false;
                 self.queued = 0;
-                self.queued_cells.clear();
+                self.prompt_queue.clear();
+                self.queue_edit = None;
                 self.pending_steer_cells.clear();
                 if self.state != RunState::Idle {
                     self.state = RunState::Idle;
@@ -1506,7 +1645,13 @@ impl App {
                     if c != 0 {
                         self.transcript.push_notice(
                             NoticeLevel::Warn,
-                            format!("runtime exited with code {c} — next prompt restarts it"),
+                            format!(
+                                "{} ({c}) — {}",
+                                self.locale
+                                    .tr("runtime exited with code", "运行时退出，代码"),
+                                self.locale
+                                    .tr("the next prompt restarts it", "下一条消息会重新拉起")
+                            ),
                         );
                     }
                 }
@@ -1517,7 +1662,8 @@ impl App {
                     CtlEvent::Starting { .. } => {
                         self.state = RunState::Starting;
                         self.run_started = Some(Instant::now());
-                        self.state_note = "starting runtime".into();
+                        self.state_note =
+                            self.locale.tr("starting runtime", "正在启动运行时").into();
                     }
                     CtlEvent::Ready { server } => {
                         self.server_info = Some(server.clone());
@@ -1528,31 +1674,27 @@ impl App {
                         }
                     }
                     CtlEvent::PromptQueued { .. } => {
-                        let started_queued_prompt = !self.prompt_pending && self.queued > 0;
+                        // The driver picked a prompt up: the turn is running.
+                        // Queued items in the client's FIFO are dispatched on
+                        // the idle status, not here.
                         self.prompt_pending = false;
                         if self.state == RunState::Starting {
                             self.state = RunState::Running;
                         }
                         self.state_note.clear();
-                        if started_queued_prompt {
-                            self.queued = self.queued.saturating_sub(1);
-                            if let Some(cells) = self.queued_cells.pop_front() {
-                                self.transcript.mark_prompt_delivered(&cells);
-                            }
-                        }
                     }
                     CtlEvent::SteerSettled {
                         message_id,
                         deferred,
                     } => {
-                        if let Some(cells) = self.pending_steer_cells.remove(&message_id) {
+                        if let Some(pending) = self.pending_steer_cells.remove(&message_id) {
                             if deferred {
-                                self.transcript.mark_prompt_queued(&cells);
-                                self.queued += 1;
-                                self.queued_cells.push_back(cells);
-                                self.show_tip(
+                                self.transcript.mark_prompt_queued(&pending.cells);
+                                self.enqueue_prompt(pending.blocks, pending.cells);
+                                self.show_tip(self.locale.tr(
                                     "agent deferred Send Now — queued after the active turn",
-                                );
+                                    "Agent 推迟了立即发送 —— 已排到本轮之后",
+                                ));
                             }
                         }
                     }
@@ -1563,7 +1705,7 @@ impl App {
                         self.transcript.push_notice(NoticeLevel::Error, err);
                     }
                     CtlEvent::CancelRequested => {
-                        self.state_note = "cancelling".into();
+                        self.state_note = self.locale.tr("cancelling", "正在取消").into();
                         self.transcript.cancel_open_work();
                     }
                     CtlEvent::Interrupted => {
@@ -1572,20 +1714,20 @@ impl App {
                         self.run_started = None;
                         self.state_note.clear();
                         self.transcript.cancel_open_work();
-                        self.transcript
-                            .push_notice(NoticeLevel::Warn, "interrupted — turn cancelled".into());
+                        self.transcript.push_notice(
+                            NoticeLevel::Warn,
+                            self.locale
+                                .tr("interrupted — turn cancelled", "已中断 —— 本轮已取消")
+                                .into(),
+                        );
                     }
                     CtlEvent::Skills { skills } => {
                         self.skills = skills;
                     }
-                    CtlEvent::Catalog { models, presets } => {
-                        if !presets.is_empty() {
-                            self.last_presets = presets.clone();
-                        }
+                    CtlEvent::Catalog { models } => {
                         if !models.is_empty() {
                             self.last_models = models.clone();
                         }
-                        let mode_current = self.current_mode();
                         if let Some(picker) = &mut self.picker {
                             match picker.kind {
                                 PickerKind::Model if !models.is_empty() => {
@@ -1613,26 +1755,6 @@ impl App {
                                                 && i.provider.as_deref()
                                                     == Some(current_provider.as_str())
                                         })
-                                        .unwrap_or(0);
-                                }
-                                PickerKind::Mode if !presets.is_empty() => {
-                                    picker.items = presets
-                                        .into_iter()
-                                        .map(|p| PickerItem {
-                                            id: p.id.clone(),
-                                            label: p.name,
-                                            meta: if p.broken {
-                                                format!("⚠ broken · {}", p.description)
-                                            } else {
-                                                p.description
-                                            },
-                                            provider: None,
-                                        })
-                                        .collect();
-                                    picker.sel = picker
-                                        .items
-                                        .iter()
-                                        .position(|i| i.id == mode_current)
                                         .unwrap_or(0);
                                 }
                                 _ => {}
@@ -1710,13 +1832,19 @@ impl App {
         } = &ui
         {
             if !self.subagents.iter().any(|view| view.id == *child) {
-                let fallback = format!("subagent {}", self.subagents.len() + 1);
+                let fallback = format!(
+                    "{} {}",
+                    self.locale.tr("subagent", "子代理"),
+                    self.subagents.len() + 1
+                );
+                let mut transcript = Transcript::new(child.clone());
+                transcript.set_locale(self.locale);
                 self.subagents.push(SubagentView {
                     id: child.clone(),
                     parent: parent.clone(),
                     label: label.clone().unwrap_or(fallback),
                     running: true,
-                    transcript: Transcript::new(child.clone()),
+                    transcript,
                 });
             }
             if parent == &self.session_id {
@@ -1767,17 +1895,20 @@ impl App {
                     self.modes.plan = *active;
                 }
             }
+            // The permission facts fold the meta row's chips and stop there: a
+            // switch is confirmed by the chip itself (the label brightens under
+            // full access), so echoing the same facts into the timeline would
+            // only repeat the composer chrome.
             E::SandboxMode { session, mode } if *session == self.session_id => {
                 self.modes.sandbox = Some(mode.clone());
+                apply_to_transcript = false;
             }
             E::ApprovalPolicy { session, policy } if *session == self.session_id => {
                 self.modes.approval = Some(policy.clone());
+                apply_to_transcript = false;
             }
             E::PermissionPreset { session, preset } if *session == self.session_id => {
                 self.modes.permission = Some(preset.clone());
-            }
-            E::AgentPreset { session, preset } if *session == self.session_id => {
-                self.modes.agent_preset = Some(preset.clone());
                 apply_to_transcript = false;
             }
             E::SessionTitle { session, title } if *session == self.session_id => {
@@ -1837,7 +1968,12 @@ impl App {
                     }
                     return;
                 }
-                self.input.insert_str(&text.replace('\n', " "));
+                // The composer is multi-line (soft wrap, ctrl+j), so a paste
+                // keeps its line structure instead of being flattened to
+                // spaces. `insert_str` understands `\n`; normalize the stray
+                // CR-only endings some terminals (iTerm2 et al.) send.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.input.insert_str(&text);
                 self.reconcile_attachments();
                 self.needs_redraw = true;
             }
@@ -1878,12 +2014,16 @@ impl App {
                 // The cap row's progress chip opens the todo dialog. No other
                 // modal may be up: the chip sits under an open dialog.
                 if self.plan_chip_at(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
                     self.open_todo_dialog();
                     return;
                 }
                 // The `↥` glyph right of the project path walks the session's
                 // user prompts (newest first, then back, then wrapping).
                 if self.prompt_jump_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
                     self.jump_to_user_prompt();
                     return;
                 }
@@ -1893,15 +2033,58 @@ impl App {
                     self.sel = None;
                     self.selecting = false;
                     self.last_click = None;
+                    self.input_selecting = false;
                     self.toggle_tool(ci);
+                    return;
+                }
+                // The mouse-only `⛶` glyph (issue #92) pins the well to the
+                // amplified height and restores it on the next click.
+                if self.expand_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
+                    self.composer_expanded = !self.composer_expanded;
+                    self.needs_redraw = true;
+                    return;
+                }
+                // The `↓ N` chip in the meta row is the way back down: one
+                // click drops the scroll and follows the tail again.
+                if self.scroll_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
+                    self.input_sel = None;
+                    self.input_selecting = false;
+                    self.scroll_up = 0;
+                    self.needs_redraw = true;
+                    return;
+                }
+                // A click inside the composer well places the caret at the
+                // clicked char and arms a drag-selection; the chat highlight is
+                // dismissed first, like any click outside that pane.
+                if !self.modal_open() && self.input_hit(mouse.column, mouse.row) {
+                    self.sel = None;
+                    self.selecting = false;
+                    self.last_click = None;
+                    let cell = self.input_cell_at(mouse.column, mouse.row);
+                    let offset =
+                        self.input
+                            .screen_to_char(self.composer_wrap_width, cell.0, cell.1);
+                    self.input.set_cursor_char(offset);
+                    self.input_sel = Some(InputSel {
+                        anchor: cell,
+                        head: cell,
+                    });
+                    self.input_selecting = true;
+                    self.refresh_file_menu();
                     return;
                 }
                 let Some(p) = self.chat_hit(mouse.column, mouse.row) else {
                     // Click outside the chat pane dismisses the highlight.
                     self.sel = None;
                     self.selecting = false;
+                    self.input_sel = None;
+                    self.input_selecting = false;
                     return;
                 };
+                self.input_sel = None;
+                self.input_selecting = false;
                 let double = self.last_click.take().is_some_and(|(at, x, y)| {
                     at.elapsed() < DOUBLE_CLICK_WINDOW
                         && x.abs_diff(mouse.column) <= 1
@@ -1934,6 +2117,19 @@ impl App {
                 self.selecting = false;
                 self.finish_selection();
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.input_selecting => {
+                // The head snaps to the well's edges: a drag above the well
+                // selects to its top visible row, below it to the bottom row.
+                let head = self.input_cell_at(mouse.column, mouse.row);
+                if let Some(sel) = &mut self.input_sel {
+                    sel.head = head;
+                }
+                self.needs_redraw = true;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.input_selecting => {
+                self.input_selecting = false;
+                self.finish_input_selection();
+            }
             MouseEventKind::Moved => {
                 // grok-style hover: track which inline chip the pointer is
                 // over; redraw only on changes (mouse moves are a firehose).
@@ -1954,6 +2150,20 @@ impl App {
                     self.prompt_jump_btn_hit(mouse.column, mouse.row) && !self.modal_open();
                 if jump_hover != self.hover_prompt_jump_btn {
                     self.hover_prompt_jump_btn = jump_hover;
+                    self.needs_redraw = true;
+                }
+                // …and for the `⛶` expand glyph beside it.
+                let expand_hover =
+                    self.expand_btn_hit(mouse.column, mouse.row) && !self.modal_open();
+                if expand_hover != self.hover_expand_btn {
+                    self.hover_expand_btn = expand_hover;
+                    self.needs_redraw = true;
+                }
+                // …and for the meta row's `↓ N` scroll chip.
+                let scroll_hover =
+                    self.scroll_btn_hit(mouse.column, mouse.row) && !self.modal_open();
+                if scroll_hover != self.hover_scroll_btn {
+                    self.hover_scroll_btn = scroll_hover;
                     self.needs_redraw = true;
                 }
             }
@@ -1997,7 +2207,11 @@ impl App {
         };
         self.input.delete_char_range(start, end);
         if let Some(att) = self.pending_images.remove(idx) {
-            self.show_tip(format!("removed {}", att.name));
+            self.show_tip(
+                self.locale
+                    .tr("removed {n}", "已移除 {n}")
+                    .replace("{n}", &att.name),
+            );
         }
         true
     }
@@ -2059,6 +2273,28 @@ impl App {
     /// drawn this frame.
     fn prompt_jump_btn_hit(&self, col: u16, row: u16) -> bool {
         self.prompt_jump_btn.is_some_and(|r| {
+            col >= r.x
+                && col < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        })
+    }
+
+    /// Hit-test a screen cell against the cap row's `⛶` expand glyph drawn
+    /// this frame.
+    fn expand_btn_hit(&self, col: u16, row: u16) -> bool {
+        self.expand_btn.is_some_and(|r| {
+            col >= r.x
+                && col < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        })
+    }
+
+    /// Hit-test a screen cell against the meta row's `↓ N` scroll chip drawn
+    /// this frame (absent while the tail is already on screen).
+    fn scroll_btn_hit(&self, col: u16, row: u16) -> bool {
+        self.scroll_btn.is_some_and(|r| {
             col >= r.x
                 && col < r.x.saturating_add(r.width)
                 && row >= r.y
@@ -2210,18 +2446,22 @@ impl App {
 
     /// Toggle a tool between its collapsed viewport and full expansion.
     fn toggle_tool(&mut self, ci: usize) {
-        let label = {
+        let expanded = {
             let Some(cell) = self.displayed_transcript_mut().cells.get_mut(ci) else {
                 return;
             };
             cell.expanded = !cell.expanded;
-            if cell.expanded {
-                "expanded"
-            } else {
-                "collapsed"
-            }
+            cell.expanded
         };
-        self.show_tip(format!("{label} tool output · click toggles"));
+        let label = self.locale.tr(
+            if expanded { "expanded" } else { "collapsed" },
+            if expanded { "已展开" } else { "已折叠" },
+        );
+        self.show_tip(format!(
+            "{label} {}",
+            self.locale
+                .tr("tool output · click toggles", "工具输出 · 点击切换")
+        ));
         self.needs_redraw = true;
     }
 
@@ -2246,10 +2486,89 @@ impl App {
     fn copy_text(&mut self, text: &str) {
         let chars = text.chars().count();
         if crate::clipboard::copy(text) {
-            self.show_tip(format!("✓ copied {chars} chars — esc clears the highlight"));
+            self.show_tip(
+                self.locale
+                    .tr(
+                        "✓ copied {n} chars — esc clears the highlight",
+                        "✓ 已复制 {n} 个字符 —— esc 清除高亮",
+                    )
+                    .replace("{n}", &chars.to_string()),
+            );
         } else {
-            self.show_tip("copy failed — hold shift and drag for the terminal's native selection");
+            self.show_tip(self.locale.tr(
+                "copy failed — hold shift and drag for the terminal's native selection",
+                "复制失败 —— 按住 shift 拖动可用终端自带的选择",
+            ));
         }
+    }
+
+    /// The composer well's text width — the same wrap width the widget was
+    /// laid out with this frame (`ui::draw_input`).
+    fn input_avail(&self) -> usize {
+        self.composer_wrap_width.max(1)
+    }
+
+    /// Is this screen cell inside the composer well?
+    fn input_hit(&self, col: u16, row: u16) -> bool {
+        let a = self.composer_area;
+        a.width > 0
+            && a.height > 0
+            && col >= a.x
+            && col < a.right()
+            && row >= a.y
+            && row < a.bottom()
+    }
+
+    /// Map a screen cell to a well-local `(row, col)` in the same coordinates
+    /// as [`ComposerEditor::screen_to_char`] (prompt column and the well's
+    /// viewport scroll applied), clamped into the visible text area.
+    fn input_cell_at(&self, col: u16, row: u16) -> (usize, usize) {
+        let a = self.composer_area;
+        let prompt = "❯ ".width() as u16;
+        let rel_row = (row.saturating_sub(a.y) as usize)
+            .min(a.height.saturating_sub(1) as usize)
+            .saturating_add(self.input_top);
+        let rel_col = (col.saturating_sub(a.x.saturating_add(prompt)) as usize)
+            .min(self.input_avail().saturating_sub(1));
+        (rel_row, rel_col)
+    }
+
+    /// Ordered char boundaries covered by the composer drag-selection — both
+    /// endpoint cells inclusive, so either drag direction covers exactly the
+    /// cells the pointer crossed. `None` without a selection.
+    pub(crate) fn input_selection_range(&mut self) -> Option<(usize, usize)> {
+        let sel = self.input_sel?;
+        let (s, e) = if sel.anchor <= sel.head {
+            (sel.anchor, sel.head)
+        } else {
+            (sel.head, sel.anchor)
+        };
+        let avail = self.input_avail();
+        let start = self.input.screen_to_char(avail, s.0, s.1);
+        let end = self.input.screen_to_char_end(avail, e.0, e.1);
+        (start < end).then_some((start, end))
+    }
+
+    /// Copy the dragged composer selection; the highlight persists until the
+    /// next click or Esc, mirroring the chat pane. A plain click (a caret)
+    /// just clears the highlight.
+    fn finish_input_selection(&mut self) {
+        self.needs_redraw = true;
+        let Some(sel) = self.input_sel else { return };
+        if sel.anchor == sel.head {
+            self.input_sel = None;
+            return;
+        }
+        let Some((a, b)) = self.input_selection_range() else {
+            self.input_sel = None;
+            return;
+        };
+        let text = self.input.chars_between(a, b);
+        if text.trim().is_empty() {
+            self.input_sel = None;
+            return;
+        }
+        self.copy_text(&text);
     }
 
     /// Extract the selected text from the layout snapshot: cell-range slices
@@ -2478,6 +2797,10 @@ impl App {
             return;
         };
         self.locale = next;
+        self.transcript.set_locale(next);
+        for view in &mut self.subagents {
+            view.transcript.set_locale(next);
+        }
         self.save_settings();
         self.show_tip(match next {
             Locale::En => "Language switched to English",
@@ -2740,9 +3063,22 @@ impl App {
             }
         }
 
+        // The queue editor owns ctrl+d while an item is loaded (the keymap
+        // would read it as delete-forward): first press arms, second deletes.
+        if self.queue_edit.is_some()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('d')
+        {
+            self.delete_queue_edit(ctl);
+            return;
+        }
+
         let ctx = crate::input::KeyCtx {
             input_empty: self.input.is_empty(),
-            history_active: false,
+            // While a history entry is on screen, ↑/↓ keep browsing it instead
+            // of moving inside the recalled draft; any edit clears `hist_pos`
+            // in the editor and hands the arrows back to cursor motion.
+            history_active: self.input.hist_pos.is_some(),
         };
         if let Some(action) = crate::input::classify(&key, ctx) {
             self.dispatch(action, ctl);
@@ -2871,6 +3207,32 @@ impl App {
     /// Apply one classified [`Action`] — the only place key semantics touch
     /// app state, so `input::keymap` stays a pure table.
     fn dispatch(&mut self, action: Action, ctl: &Controller) {
+        if matches!(
+            action,
+            Action::Insert(_)
+                | Action::Newline
+                | Action::Backspace
+                | Action::DeleteForward
+                | Action::DeleteWordBack
+                | Action::KillToEnd
+                | Action::KillToStart
+                | Action::KillLine
+                | Action::Undo
+                | Action::Redo
+                | Action::YankPaste
+                | Action::SelectLeft
+                | Action::SelectRight
+                | Action::SelectUp
+                | Action::SelectDown
+                | Action::SelectWordLeft
+                | Action::SelectWordRight
+                | Action::SelectLineStart
+                | Action::SelectLineEnd
+        ) {
+            // Text edits invalidate the drag-selection highlight: the cells it
+            // covered no longer describe the same text.
+            self.input_sel = None;
+        }
         match action {
             Action::Insert(ch) => {
                 self.input.insert_char(ch);
@@ -2878,6 +3240,20 @@ impl App {
             }
             Action::Newline => self.input.insert_newline(),
             Action::Enter => {
+                // The queue editor owns enter: it saves the edited item
+                // instead of sending it.
+                if self.queue_edit.is_some() {
+                    self.save_queue_edit(ctl);
+                    return;
+                }
+                // An empty draft promotes the FIFO head into the active turn.
+                if self.input.is_empty()
+                    && self.pending_images.is_empty()
+                    && !self.prompt_queue.is_empty()
+                {
+                    self.send_queue_head_now(ctl);
+                    return;
+                }
                 let menu = self.slash_matches();
                 if !menu.is_empty() {
                     let entry = menu[self.slash_sel.min(menu.len() - 1)].clone();
@@ -2904,14 +3280,17 @@ impl App {
             Action::ClearScrollback => {
                 self.transcript.clear();
                 self.sel = None;
-                self.transcript
-                    .push_notice(NoticeLevel::Info, "scrollback cleared".into());
+                self.transcript.push_notice(
+                    NoticeLevel::Info,
+                    self.locale.tr("scrollback cleared", "滚动区已清空").into(),
+                );
             }
             Action::ToggleTheme => {
                 self.theme = self.theme.toggled();
                 self.save_settings();
                 self.show_tip(format!(
-                    "theme: {} {}",
+                    "{}: {} {}",
+                    self.locale.tr("theme", "主题"),
                     self.active_palette_id,
                     self.theme.mode.as_str()
                 ));
@@ -2919,12 +3298,19 @@ impl App {
             Action::ToggleExpandAll => {
                 self.transcript.expand_all = !self.transcript.expand_all;
                 self.show_tip(if self.transcript.expand_all {
-                    "expanded all thoughts and tool results"
+                    self.locale.tr(
+                        "expanded all thoughts and tool results",
+                        "已展开全部思考与工具结果",
+                    )
                 } else {
-                    "collapsed all thoughts and tool results"
+                    self.locale.tr(
+                        "collapsed all thoughts and tool results",
+                        "已折叠全部思考与工具结果",
+                    )
                 });
             }
             Action::SendNow => self.send_now(ctl),
+            Action::EditQueuedPrompt => self.open_queue_selector(),
             Action::AttachClipboard => self.clip_image("", ctl),
             Action::ModelPicker => self.open_model_picker(ctl),
             Action::CyclePermission => self.cycle_permission(ctl),
@@ -2938,7 +3324,15 @@ impl App {
             Action::JumpTail => self.scroll_up = 0,
             Action::CursorLeft => self.input.move_left(),
             Action::CursorRight => self.input.move_right(),
-            Action::CursorUp => self.input.move_up(),
+            Action::CursorUp => {
+                // ↑ at the draft's first visual row recalls the input history
+                // (the editor stashes the draft first, so ↓ restores it).
+                let before = self.input.cursor_char();
+                self.input.move_up();
+                if self.input.cursor_char() == before {
+                    self.history_prev_from_draft();
+                }
+            }
             Action::CursorDown => self.input.move_down(),
             Action::WordLeft => self.input.word_left(),
             Action::WordRight => self.input.word_right(),
@@ -2978,25 +3372,43 @@ impl App {
             Action::SelectLineStart => self.input.select_line_start(),
             Action::SelectLineEnd => self.input.select_line_end(),
             Action::CopySelection => {
-                // The composer's keyboard selection, then the chat drag.
+                // The composer's keyboard selection, then its mouse drag.
                 if let Some(text) = self.input.selection_text() {
                     if !text.trim().is_empty() {
                         self.input.copy_selection_to_yank();
                         self.copy_text(&text);
                     }
+                } else if let Some((a, b)) = self.input_selection_range() {
+                    let text = self.input.chars_between(a, b);
+                    if !text.trim().is_empty() {
+                        self.copy_text(&text);
+                    }
                 }
             }
             Action::CutSelection => {
+                let nothing = self.locale.tr(
+                    "nothing to cut — select with shift+arrows, or drag in the box",
+                    "无可剪切 —— 用 shift+方向键或直接在输入框里拖选",
+                );
+                // The composer's keyboard selection, then its mouse drag.
                 if let Some(text) = self.input.selection_text() {
                     if !text.trim().is_empty() {
                         self.input.cut_selection_to_yank();
                         self.copy_text(&text);
                     } else {
-                        self.show_tip(self.locale.tr(
-                            "nothing to cut — select with shift+arrows",
-                            "无可剪切 —— 用 shift+方向键先选中文本",
-                        ));
+                        self.show_tip(nothing);
                     }
+                } else if let Some((a, b)) = self.input_selection_range() {
+                    let text = self.input.chars_between(a, b);
+                    if !text.trim().is_empty() {
+                        self.input.delete_char_range(a, b);
+                        self.input_sel = None;
+                        self.copy_text(&text);
+                    } else {
+                        self.show_tip(nothing);
+                    }
+                } else {
+                    self.show_tip(nothing);
                 }
             }
         }
@@ -3075,7 +3487,7 @@ impl App {
                     &key,
                     crate::input::KeyCtx {
                         input_empty: self.input.is_empty(),
-                        history_active: false,
+                        history_active: self.input.hist_pos.is_some(),
                     },
                 ),
                 Some(Action::ToggleTheme)
@@ -3110,10 +3522,10 @@ impl App {
                 self.picker = None;
                 match kind {
                     PickerKind::Model => self.select_model(item, ctl),
-                    PickerKind::Mode => self.set_mode(item.id, ctl),
                     PickerKind::Theme => self.select_palette(&item.id),
                     PickerKind::Permission => self.set_permission(item.id, ctl),
                     PickerKind::Session => self.load_acp_session(&item.id, ctl),
+                    PickerKind::Queue => self.begin_queue_edit(&item.id, ctl),
                     PickerKind::Subagent => {
                         self.active_subagent = if item.id == self.session_id {
                             None
@@ -3139,8 +3551,13 @@ impl App {
                             model: None,
                             effort: Some(effort.clone()),
                         });
-                        self.transcript
-                            .push_notice(NoticeLevel::Info, format!("reasoning effort → {effort}"));
+                        self.transcript.push_notice(
+                            NoticeLevel::Info,
+                            format!(
+                                "{} → {effort}",
+                                self.locale.tr("reasoning effort", "推理强度")
+                            ),
+                        );
                     }
                 }
             }
@@ -3234,6 +3651,254 @@ impl App {
         });
     }
 
+    /// `⌥↑` — pick one queued prompt to edit (Martty's queue selector). The
+    /// composer must be free: the chosen item is loaded into it.
+    fn open_queue_selector(&mut self) {
+        if self.prompt_queue.is_empty() {
+            self.show_tip(
+                self.locale
+                    .tr("no queued prompt to edit", "没有可编辑的排队消息"),
+            );
+            return;
+        }
+        if !self.input.is_empty() || !self.pending_images.is_empty() {
+            self.show_tip(self.locale.tr(
+                "send or clear the current draft before editing the queue",
+                "编辑队列前请先发送或清空当前草稿",
+            ));
+            return;
+        }
+        let editing = self.queue_edit.as_ref().map(|edit| edit.prompt_id);
+        let items: Vec<PickerItem> = self
+            .prompt_queue
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| PickerItem {
+                id: prompt.id.to_string(),
+                label: queue_prompt_summary(&prompt.blocks),
+                meta: format!(
+                    "#{} · {}",
+                    index + 1,
+                    if editing == Some(prompt.id) {
+                        self.locale.tr("editing", "编辑中")
+                    } else {
+                        self.locale.tr("queued", "排队中")
+                    }
+                ),
+                provider: None,
+            })
+            .collect();
+        let sel = editing
+            .and_then(|id| items.iter().position(|item| item.id == id.to_string()))
+            .unwrap_or(0);
+        self.picker = Some(Picker {
+            kind: PickerKind::Queue,
+            title: self
+                .locale
+                .tr(
+                    " queued prompts · ↑/↓ select · enter edit · esc close ",
+                    " 排队消息 · ↑/↓ 选择 · enter 编辑 · esc 关闭 ",
+                )
+                .into(),
+            sel,
+            items,
+        });
+    }
+
+    /// Load one queued prompt back into the composer. The item keeps its FIFO
+    /// slot (marked "editing") together with its original blocks: save
+    /// replaces them, delete drops them, cancel leaves them alone — nothing
+    /// can be sent twice.
+    fn begin_queue_edit(&mut self, id: &str, _ctl: &Controller) {
+        /// What the rebuild needs from one queued block: attachments cannot be
+        /// cloned (only their payloads are cheap `Arc`s), and `stage_image`
+        /// wants `&mut self`, so the item is read out before the borrow ends.
+        enum Piece {
+            Text(String),
+            Image(String, String, String, Vec<u8>),
+        }
+        let Some((prompt_id, pieces)) = self
+            .prompt_queue
+            .iter()
+            .find(|prompt| prompt.id.to_string() == id)
+            .map(|prompt| {
+                let pieces: Vec<Piece> = prompt
+                    .blocks
+                    .iter()
+                    .map(|block| match block {
+                        StagedBlock::Text(text) => Piece::Text(text.clone()),
+                        StagedBlock::Image(att) => Piece::Image(
+                            att.name.clone(),
+                            att.path.clone(),
+                            att.media_type.clone(),
+                            att.data.to_vec(),
+                        ),
+                    })
+                    .collect();
+                (prompt.id, pieces)
+            })
+        else {
+            self.show_tip(
+                self.locale
+                    .tr("queued prompt already left the queue", "这条消息已离开队列"),
+            );
+            return;
+        };
+        // Rebuild the draft from the item's blocks. Images are staged afresh
+        // (their tokens and the tray entries behind them are new), so the edit
+        // owns its attachments outright and cancel can leave the queue alone.
+        self.input.clear();
+        for piece in pieces {
+            match piece {
+                Piece::Text(text) => self.input.insert_str(&text),
+                Piece::Image(name, path, media_type, data) => {
+                    self.stage_image(name, path, media_type, data, String::new())
+                }
+            }
+        }
+        self.queue_edit = Some(QueueEditState {
+            prompt_id,
+            delete_confirm: false,
+        });
+        self.reconcile_attachments();
+        self.show_tip(self.locale.tr(
+            "editing queued prompt · enter save · ctrl+d delete · esc cancel",
+            "编辑排队消息 · enter 保存 · ctrl+d 删除 · esc 取消",
+        ));
+    }
+
+    /// Enter while editing: replace the queued item with the edited draft.
+    fn save_queue_edit(&mut self, ctl: &Controller) {
+        let Some(edit) = self.queue_edit.as_ref() else {
+            return;
+        };
+        let prompt_id = edit.prompt_id;
+        if edit.delete_confirm {
+            self.delete_queue_edit(ctl);
+            return;
+        }
+        let raw = self.input.buf().trim().to_string();
+        if raw.is_empty() && self.pending_images.is_empty() {
+            self.show_tip(self.locale.tr(
+                "queued prompt cannot be empty · ctrl+d deletes it",
+                "排队消息不能为空 · ctrl+d 可删除",
+            ));
+            return;
+        }
+        let blocks = if self.pending_images.is_empty() {
+            vec![StagedBlock::Text(raw)]
+        } else {
+            self.take_staged_blocks()
+        };
+        let Some(index) = self
+            .prompt_queue
+            .iter()
+            .position(|prompt| prompt.id == prompt_id)
+        else {
+            self.finish_queue_edit();
+            self.show_tip(
+                self.locale
+                    .tr("queued prompt already left the queue", "这条消息已离开队列"),
+            );
+            return;
+        };
+        self.prompt_queue[index].blocks = blocks;
+        self.finish_queue_edit();
+        self.show_tip(
+            self.locale
+                .tr("queued prompt #{n} updated", "排队消息 #{n} 已更新")
+                .replace("{n}", &(index + 1).to_string()),
+        );
+        if self.state == RunState::Idle {
+            self.dispatch_next_queued(ctl);
+        }
+    }
+
+    /// `ctrl+d` while editing: the first press arms, the second deletes.
+    fn delete_queue_edit(&mut self, ctl: &Controller) {
+        let Some(edit) = self.queue_edit.as_mut() else {
+            return;
+        };
+        if !edit.delete_confirm {
+            edit.delete_confirm = true;
+            self.show_tip(self.locale.tr(
+                "ctrl+d again deletes this queued prompt · esc cancels",
+                "再按一次 ctrl+d 删除这条排队消息 · esc 取消",
+            ));
+            return;
+        }
+        let prompt_id = edit.prompt_id;
+        let Some(index) = self
+            .prompt_queue
+            .iter()
+            .position(|prompt| prompt.id == prompt_id)
+        else {
+            self.finish_queue_edit();
+            return;
+        };
+        self.prompt_queue.remove(index);
+        self.queued = self.prompt_queue.len();
+        self.finish_queue_edit();
+        self.show_tip(
+            self.locale
+                .tr("queued prompt #{n} deleted", "排队消息 #{n} 已删除")
+                .replace("{n}", &(index + 1).to_string()),
+        );
+        if self.state == RunState::Idle {
+            self.dispatch_next_queued(ctl);
+        }
+    }
+
+    /// Leave edit mode: the draft (and the tray it resolved into) is dropped;
+    /// the queued item keeps whatever it already had.
+    fn finish_queue_edit(&mut self) {
+        self.queue_edit = None;
+        self.input.clear();
+        self.pending_images.clear();
+        self.reconcile_attachments();
+    }
+
+    /// Empty-draft Enter: promote the FIFO head into the active turn. While a
+    /// turn runs this is the same steer the composer's ctrl+enter takes
+    /// (interrupt + resend); idle it simply goes out now.
+    fn send_queue_head_now(&mut self, ctl: &Controller) {
+        if self.queue_edit.is_some() {
+            return;
+        }
+        let running = self.turn_busy();
+        let Some(prompt) = self.prompt_queue.pop_front() else {
+            return;
+        };
+        self.queued = self.prompt_queue.len();
+        self.scroll_up = 0;
+        let message_id = prompt.id;
+        let wire = prompt_blocks_from_staged(&prompt.blocks);
+        if running {
+            self.pending_steer_cells.insert(
+                message_id,
+                PendingSteer {
+                    cells: prompt.cells,
+                    blocks: prompt.blocks,
+                },
+            );
+            self.show_tip(self.locale.tr(
+                "queue head sent now — lands at the next agent step",
+                "队首已立即发送 —— 在下一步 Agent 处生效",
+            ));
+            self.send_wire_prompt(wire, Some(message_id), ctl);
+            return;
+        }
+        self.transcript.mark_prompt_delivered(&prompt.cells);
+        self.prompt_pending = true;
+        self.state = RunState::Starting;
+        self.run_started = Some(Instant::now());
+        self.state_note = self
+            .locale
+            .tr("sending queued followup", "正在发送排队消息")
+            .into();
+        self.send_wire_prompt(wire, None, ctl);
+    }
+
     fn open_model_picker(&mut self, ctl: &Controller) {
         // Ask the driver for its catalog; seed the picker with the
         // stock presets meanwhile.
@@ -3322,7 +3987,7 @@ impl App {
     /// The abycore driver owns the workspace snapshot store.
     fn open_resume_picker(&mut self, ctl: &Controller) {
         ctl.send(Cmd::ListSessions { prefix: None });
-        self.show_tip("listing sessions…");
+        self.show_tip(self.locale.tr("listing sessions…", "正在列出会话…"));
     }
 
     /// Resume a durable session: replay its JSONL into the scrollback and
@@ -3343,7 +4008,8 @@ impl App {
         self.selected_model = None;
         self.session_title = None;
         self.queued = 0;
-        self.queued_cells.clear();
+        self.prompt_queue.clear();
+        self.queue_edit = None;
         self.pending_steer_cells.clear();
         self.prompt_pending = false;
         self.sel = None;
@@ -3365,13 +4031,30 @@ impl App {
     }
 
     fn load_acp_session(&mut self, id: &str, ctl: &Controller) {
+        // A load is a driver mutation, so a turn in flight holds it back until
+        // that turn ends. Read the flag first: the reset below puts the
+        // composer back to idle whatever the driver is still doing.
+        let after_turn = self.turn_busy();
         self.reset_session_ui();
         self.session_id = id.to_string();
         self.transcript.set_root_session(id.to_string());
         ctl.send(Cmd::LoadSession {
             session_id: id.to_string(),
         });
-        self.show_tip(format!("session/load {id} …"));
+        // The listing answers mid-turn (the driver serves store queries off
+        // its turn loop), but a load needs that loop: say the turn has to end
+        // instead of letting the tip imply the load is already running.
+        let suffix = if after_turn {
+            self.locale.tr(" (after this turn)", "（本轮结束后）")
+        } else {
+            ""
+        };
+        self.show_tip(format!(
+            "{}{suffix}",
+            self.locale
+                .tr("session/load {n} …", "正在加载会话 {n} …")
+                .replace("{n}", id)
+        ));
         self.needs_redraw = true;
     }
 
@@ -3385,7 +4068,7 @@ impl App {
         let sessions: Vec<SessionListItem> =
             sessions.into_iter().filter(|s| s.id != skip).collect();
         if let Some(prefix) = prefix.as_deref().filter(|p| !p.is_empty()) {
-            match unique_session_list_match(&sessions, prefix) {
+            match unique_session_list_match(self.locale, &sessions, prefix) {
                 Ok(id) => {
                     self.load_acp_session(&id, ctl);
                     return;
@@ -3401,7 +4084,11 @@ impl App {
         if sessions.is_empty() {
             self.transcript.push_notice(
                 NoticeLevel::Info,
-                "no durable sessions for this workspace yet — finish a turn and /resume finds it"
+                self.locale
+                    .tr(
+                        "no durable sessions for this workspace yet — finish a turn and /resume finds it",
+                        "这个工作区还没有持久会话 —— 先跑完一轮，/resume 就能看到",
+                    )
                     .into(),
             );
             return;
@@ -3425,41 +4112,6 @@ impl App {
     }
 
     /// The effective composition id: the advertised agent preset, else empty.
-    pub fn current_mode(&self) -> String {
-        self.modes.agent_preset.clone().unwrap_or_else(|| {
-            self.last_presets
-                .first()
-                .map(|p| p.id.clone())
-                .unwrap_or_default()
-        })
-    }
-
-    /// Resolve a preset id through the latest catalog; unknown ids stay as-is.
-    pub fn agent_label(&self, id: &str) -> String {
-        self.last_presets
-            .iter()
-            .find(|preset| preset.id == id)
-            .map(|preset| preset.name.clone())
-            .unwrap_or_else(|| id.to_string())
-    }
-
-    /// Pick the agent preset composed on this session's first prompt. The
-    /// host locks it once the session agent exists (`/new` for a fresh one).
-    fn set_mode(&mut self, preset: String, ctl: &Controller) {
-        let label = self.agent_label(&preset);
-        if self.modes.agent_preset.as_deref() == Some(preset.as_str()) {
-            self.show_tip(format!("agent already {label}"));
-            return;
-        }
-        ctl.send(Cmd::SetPreset {
-            session_id: self.session_id.clone(),
-            preset: preset.clone(),
-        });
-        // Preset scopes can mount their own skill registries.
-        ctl.send(Cmd::FetchSkills);
-        self.show_tip(format!("agent → {label} …"));
-    }
-
     fn select_model(&mut self, item: PickerItem, ctl: &Controller) {
         let model = item.id;
         let provider = item.provider;
@@ -3502,24 +4154,13 @@ impl App {
     /// grok: Shift+Tab cycles the permission preset.
     fn cycle_permission(&mut self, ctl: &Controller) {
         let current = self.current_permission().to_string();
-        let next = if self.permission_choices.len() >= 2 {
-            let idx = self
-                .permission_choices
-                .iter()
-                .position(|p| p.id == current)
-                .unwrap_or(0);
-            self.permission_choices[(idx + 1) % self.permission_choices.len()]
-                .id
-                .clone()
-        } else {
-            let idx = PERMISSION_PRESETS
-                .iter()
-                .position(|(p, _)| *p == current)
-                .unwrap_or(0);
-            PERMISSION_PRESETS[(idx + 1) % PERMISSION_PRESETS.len()]
-                .0
-                .to_string()
-        };
+        let idx = PERMISSION_PRESETS
+            .iter()
+            .position(|(p, _)| *p == current)
+            .unwrap_or(0);
+        let next = PERMISSION_PRESETS[(idx + 1) % PERMISSION_PRESETS.len()]
+            .0
+            .to_string();
         self.set_permission(next, ctl);
     }
 
@@ -3534,19 +4175,31 @@ impl App {
     }
 
     /// Ask the host to switch this session's permission preset; the durable
-    /// `permission/preset` event echoes back and folds the ⛨ chip. Before
-    /// the first prompt the host stages the switch and applies it when the
-    /// session is created.
+    /// `permission/preset` event echoes back and folds the ⛨ chip, which is
+    /// the whole confirmation — the switch itself stays out of the timeline.
+    /// Before the first prompt the host stages the switch and applies it when
+    /// the session is created; until a session is bound the chips are hidden,
+    /// so a staged switch borrows the tip line to stay visible.
     fn set_permission(&mut self, preset: String, ctl: &Controller) {
         if self.modes.permission.as_deref() == Some(preset.as_str()) {
-            self.show_tip(format!("permission already {preset}"));
+            self.show_tip(
+                self.locale
+                    .tr("permission already {n}", "权限已经是 {n}")
+                    .replace("{n}", &preset),
+            );
             return;
         }
         ctl.send(Cmd::SetPermission {
             session_id: self.session_id.clone(),
             preset: preset.clone(),
         });
-        self.show_tip(format!("permission → {preset} …"));
+        if !self.session_bound {
+            self.show_tip(
+                self.locale
+                    .tr("permission → {n} …", "权限 → {n} …")
+                    .replace("{n}", &preset),
+            );
+        }
     }
 
     /// `/permission` — the two stock presets with their meaning, the current
@@ -3554,28 +4207,27 @@ impl App {
     fn open_permission_picker(&mut self) {
         let reported = self.modes.permission.clone();
         let current = self.current_permission().to_string();
-        let items = if self.permission_choices.is_empty() {
-            PERMISSION_PRESETS
-                .iter()
-                .map(|(id, desc)| {
-                    let mark = if reported.as_deref() == Some(*id) {
-                        " · current"
-                    } else if reported.is_none() && *id == current {
-                        " · default"
-                    } else {
-                        ""
-                    };
-                    PickerItem {
-                        id: id.to_string(),
-                        label: permission_label(id),
-                        meta: format!("{desc}{mark}"),
-                        provider: None,
-                    }
-                })
-                .collect()
-        } else {
-            permission_picker_items(&self.permission_choices, reported.as_deref(), &current)
-        };
+        let items: Vec<PickerItem> = PERMISSION_PRESETS
+            .iter()
+            .map(|(id, _)| {
+                let mark = if reported.as_deref() == Some(*id) {
+                    format!(" · {}", self.locale.tr("current", "当前"))
+                } else if reported.is_none() && *id == current {
+                    format!(" · {}", self.locale.tr("default", "默认"))
+                } else {
+                    String::new()
+                };
+                PickerItem {
+                    id: id.to_string(),
+                    label: permission_label(id),
+                    meta: format!(
+                        "{}{mark}",
+                        permission_desc(self.locale, id).unwrap_or_default()
+                    ),
+                    provider: None,
+                }
+            })
+            .collect();
         let sel = items.iter().position(|i| i.id == current).unwrap_or(0);
         self.picker = Some(Picker {
             kind: PickerKind::Permission,
@@ -3606,9 +4258,20 @@ impl App {
             self.needs_redraw = true;
             return;
         }
+        // A queued prompt loaded for editing leaves the item untouched.
+        if self.queue_edit.is_some() {
+            self.finish_queue_edit();
+            self.show_tip(
+                self.locale
+                    .tr("queued prompt edit cancelled", "已取消编辑排队消息"),
+            );
+            return;
+        }
         // A lingering copy highlight is dismissed first (idle only — while
-        // running, esc keeps its interrupt meaning and clears it in passing).
-        if self.sel.take().is_some() && matches!(self.state, RunState::Idle) {
+        // running, esc keeps its interrupt meaning and clears it in passing);
+        // the composer's drag highlight follows the same rule.
+        let had_input_sel = self.input_sel.take().is_some();
+        if (self.sel.take().is_some() || had_input_sel) && matches!(self.state, RunState::Idle) {
             self.needs_redraw = true;
             return;
         }
@@ -3623,7 +4286,7 @@ impl App {
                 ctl.send(Cmd::Interrupt {
                     session_id: self.session_id.clone(),
                 });
-                self.state_note = "cancelling".into();
+                self.state_note = self.locale.tr("cancelling", "正在取消").into();
             }
             RunState::Idle => {
                 // Esc clears the draft — inline [image n] chips live in it,
@@ -3632,10 +4295,16 @@ impl App {
                     self.input.history.push(self.input.buf().clone());
                     self.input.clear();
                     self.reconcile_attachments();
-                    self.show_tip("draft cleared — ↑ recalls it");
+                    self.show_tip(
+                        self.locale
+                            .tr("draft cleared — ↑ recalls it", "草稿已清空 —— ↑ 可召回"),
+                    );
                     return;
                 }
-                self.show_tip("esc — idle · a running turn is interrupted with esc");
+                self.show_tip(self.locale.tr(
+                    "esc — idle · a running turn is interrupted with esc",
+                    "esc —— 空闲；运行中按 esc 会中断本轮",
+                ));
             }
         }
     }
@@ -3648,7 +4317,10 @@ impl App {
             self.input.history.push(self.input.buf().clone());
             self.input.clear();
             self.reconcile_attachments();
-            self.show_tip("draft cleared — ↑ recalls it");
+            self.show_tip(
+                self.locale
+                    .tr("draft cleared — ↑ recalls it", "草稿已清空 —— ↑ 可召回"),
+            );
             return;
         }
         let required = 2;
@@ -3665,9 +4337,16 @@ impl App {
         let remaining = chord.required - chord.presses;
         self.ctrl_c_armed = Some(chord);
         self.show_tip(if remaining == 1 {
-            "press ctrl+c again to exit".into()
+            self.locale
+                .tr("press ctrl+c again to exit", "再按一次 ctrl+c 退出")
+                .to_string()
         } else {
-            format!("press ctrl+c {remaining} more times to exit while the agent is running")
+            self.locale
+                .tr(
+                    "press ctrl+c {n} more times to exit while the agent is running",
+                    "Agent 运行中：再按 {n} 次 ctrl+c 退出",
+                )
+                .replace("{n}", &remaining.to_string())
         });
     }
 
@@ -3683,6 +4362,26 @@ impl App {
                 self.input.stash = self.input.buf().clone();
                 self.input.history.len() - 1
             }
+            Some(0) => 0,
+            Some(p) => p - 1,
+        };
+        self.input.hist_pos = Some(pos);
+        self.input.set(self.input.history[pos].clone());
+    }
+
+    /// Recall history from a *non-empty* draft — ↑ at the draft's first visual
+    /// row, or on a dismissed `/` line. Unlike [`Self::history_prev`] this one
+    /// opens the history even while the draft holds text: the editor's stash
+    /// keeps that draft, and `↓` past the newest entry restores it.
+    fn history_prev_from_draft(&mut self) {
+        if self.input.history.is_empty() {
+            return;
+        }
+        if self.input.hist_pos.is_none() {
+            self.input.stash = self.input.buf().clone();
+        }
+        let pos = match self.input.hist_pos {
+            None => self.input.history.len() - 1,
             Some(0) => 0,
             Some(p) => p - 1,
         };
@@ -3782,9 +4481,8 @@ impl App {
                 self.reset_session_ui();
                 ctl.send(Cmd::NewSession);
                 self.push_session_tip();
-                self.show_tip("session/new …");
+                self.show_tip(self.locale.tr("session/new …", "正在新建会话…"));
             }
-            "session" => self.open_session_dialog(),
             "status" => self.open_status_dialog(),
             "resume" => {
                 if arg.is_empty() {
@@ -3793,7 +4491,7 @@ impl App {
                     ctl.send(Cmd::ListSessions {
                         prefix: Some(arg.to_string()),
                     });
-                    self.show_tip("listing sessions…");
+                    self.show_tip(self.locale.tr("listing sessions…", "正在列出会话…"));
                 }
             }
             "effort" => {
@@ -3860,7 +4558,7 @@ impl App {
    /login sk-xxxxxxxx
 
 3. key 保存在 `~/.abylab/.credentials.yaml`（0600，仅本用户可读）；
-   `/session` 查看凭据来源 · `/logout` 删除已保存的 key
+   `/status` 查看凭据来源 · `/logout` 删除已保存的 key
 
 本次运行也可以用 `--api-key <key>` 临时覆盖（不落盘）。"
                 .to_string()
@@ -3874,7 +4572,7 @@ impl App {
    /login sk-xxxxxxxx
 
 3. The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only);
-   `/session` shows its source · `/logout` removes the stored key
+   `/status` shows its source · `/logout` removes the stored key
 
 `--api-key <key>` can override for this run only (never persisted)."
                 .to_string()
@@ -3888,8 +4586,10 @@ impl App {
         // the body is the list itself — the same surface `/keys` uses.
         let text = if self.locale == Locale::Zh {
             "\
-- enter · 发送；当前轮次运行时将后续消息排队
-- ctrl+x · 立即 steer 当前轮次
+- enter · 发送；当前轮次运行时将后续消息排队（草稿为空时立即发送队首）
+- ctrl+enter · 立即 steer 当前轮次（老终端会退化成普通 enter）
+- ⌥↑ · 编辑排队的后续消息（enter 保存 · ctrl+d 删除 · esc 取消）
+- ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 中断（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
 - shift+tab · 轮换权限预设 · /permission 打开选择器
@@ -3914,8 +4614,10 @@ impl App {
 token 用量（含缓存命中）以及轮次结束原因。"
         } else {
             "\
-- enter · send · queues a follow-up while a turn runs
-- ctrl+x · steer the active turn immediately
+- enter · send · queues a follow-up while a turn runs (an empty draft sends the queue head now)
+- ctrl+enter · steer the active turn immediately (legacy terminals fall back to plain enter)
+- ⌥↑ · edit a queued follow-up (enter save · ctrl+d delete · esc cancel)
+- ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · interrupt (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
 - shift+tab · cycle permission (workspace-write ⇄ full access) · /permission opens the preset picker
@@ -3963,94 +4665,16 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
         });
     }
 
-    /// `/session` as a local modal — the same card `/status` opens, with the
-    /// durable identity and runtime facts: session id/title, provider, agent,
-    /// workspace paths, the server banner and the credential source.
-    ///
-    /// The border names the card, so the body carries bullets only and the
-    /// timeline stays untouched. The live `/session` is also a Client Plugin
-    /// command in runs with a Client tree; this arm serves runs without one
-    /// (demo, standalone painter) and reads the local accumulator.
-    fn open_session_dialog(&mut self) {
-        let creds = if self.cfg.has_credentials() {
-            match self.cfg.credential_source() {
-                Some(src) => format!("api key present · {src}"),
-                None => "api key present".to_string(),
-            }
-        } else {
-            "no api key — /login <apikey> stores one".to_string()
-        };
-        let u = self.transcript.usage;
-        let total = u.input + u.output + u.cached + u.reasoning;
-        let s = self.transcript.stats;
-        let llm_millis = s.turn_millis.saturating_sub(s.tool_millis);
-        // The same facts the Client-side `acpSessionStats` service folds —
-        // rendered here from the transcript's own accumulator.
-        let effort_line = self
-            .modes
-            .effort
-            .as_deref()
-            .map(|effort| format!("\n- effort · {effort}"))
-            .unwrap_or_default();
-        let mut text = format!(
-            "- session · {}{}\n\
-             - provider · {} / {}{}\n\
-             - agent · {}{}\n\
-             - workspace · {}\n\
-             - session store · {}\n\
-             - server · {}\n\
-             - credentials · {}\n\
-             - tokens · ↑{} ↓{} (cached {} · reasoning {}) · Σ {}\n\
-             - turns · {} · steps · {}\n\
-             - LLM · {} · tool · {}",
-            self.session_id,
-            self.session_title
-                .as_deref()
-                .map(|t| format!(" · {t}"))
-                .unwrap_or_default(),
-            self.cfg.provider,
-            self.cfg.model,
-            effort_line,
-            self.agent_label(&self.current_mode()),
-            if self.modes.agent_preset.is_none() {
-                " (default)"
-            } else {
-                ""
-            },
-            self.cfg.workspace,
-            self.cfg.sessions_root,
-            self.server_info.as_deref().unwrap_or("not started"),
-            creds,
-            fmt_tokens(u.input),
-            fmt_tokens(u.output),
-            fmt_tokens(u.cached),
-            fmt_tokens(u.reasoning),
-            fmt_tokens(total),
-            s.turns,
-            s.steps,
-            fmt_duration(llm_millis),
-            fmt_duration(s.tool_millis),
-        );
-        if s.ttft_count > 0 {
-            text.push_str(&format!(
-                "\n- TTFT avg · {}",
-                fmt_duration(s.ttft_total_millis.checked_div(s.ttft_count).unwrap_or(0))
-            ));
+    /// Where the running client's API key comes from: an explicit `/login`,
+    /// the environment, or nothing. `/help` points the `/login` docs here.
+    fn credential_line(&self) -> String {
+        if !self.cfg.has_credentials() {
+            return "no api key — /login <apikey> stores one".to_string();
         }
-        if llm_millis > 0 && u.output > 0 {
-            text.push_str(&format!(
-                "\n- rate · {:.1} tok/s",
-                u.output as f64 / (llm_millis as f64 / 1000.0)
-            ));
+        match self.cfg.credential_source() {
+            Some(src) => format!("api key present · {src}"),
+            None => "api key present".to_string(),
         }
-        self.view_overlay = Some(ViewOverlay {
-            title: self.locale.tr("Session", "会话").to_string(),
-            nodes: vec![crate::slots::TuiNode::Markdown {
-                text,
-                streaming: false,
-            }],
-            scroll: 0,
-        });
     }
 
     /// `/status` as a local modal: run state, painter-owned ACP facts and the
@@ -4094,32 +4718,35 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             .unwrap_or_default();
         // Connection facts + the server banner when the runtime reported it.
         let mut text = format!("- state · {state}\n");
+        // The live title rides the session row — it used to headline the
+        // retired session card, and `/resume` lists the stored ones.
+        let title = self
+            .session_title
+            .as_deref()
+            .map(|title| format!(" · {title}"))
+            .unwrap_or_default();
         text.push_str(&if self.session_bound {
-            format!("- session · {}\n", self.session_id)
+            format!("- session · {}{title}\n", self.session_id)
         } else {
             "- session · unbound\n".to_string()
         });
+        // The credential source rides here since the session card folded into
+        // this one: `/help` still sends the `/login` reader to it.
+        text.push_str(&format!("- credentials · {}\n", self.credential_line()));
         if let Some(server) = &self.server_info {
             text.push_str(&format!("- server · {server}\n"));
         }
         text.push_str(&format!(
             "- model · {}{}\n\
-             - agent · {}{}\n\
              - permission · {}\n\
              - plan · {}",
             self.cfg.model,
             effort_line,
-            self.agent_label(&self.current_mode()),
-            if self.modes.agent_preset.is_none() {
-                " (default)"
-            } else {
-                ""
-            },
             perm_label,
             if self.modes.plan { "on" } else { "off" },
         ));
-        // The counter row the composer dock used to render, in the same
-        // bullet shape `/session` uses. `usage.input` is total input
+        // The counter rows the composer dock used to render, in the same
+        // bullet shape the other cards use. `usage.input` is total input
         // including cache reads, so the hit rate is a share of it.
         let u = self.transcript.usage;
         let s = self.transcript.stats;
@@ -4183,7 +4810,10 @@ impl App {
         // Client namespaces don't take images — keep the chips editable
         // instead of silently dropping them.
         if !self.pending_images.is_empty() && text.starts_with('/') {
-            self.show_tip("send or delete the [image] chips first — /commands don't take images");
+            self.show_tip(self.locale.tr(
+                "send or delete the [image] chips first — /commands don't take images",
+                "先发送或删除草稿里的 [image] 图片 —— / 命令不接收图片",
+            ));
             return;
         }
         if let Some(cmdline) = text.strip_prefix('/') {
@@ -4224,25 +4854,114 @@ impl App {
     }
 
     /// Send raw text as an agent prompt (shared by submit and command
-    /// passthroughs like /plan).
+    /// passthroughs like /plan). While a turn runs the text joins the client's
+    /// FIFO instead of the driver's channel, so `⌥↑` can still edit it.
     fn send_agent_text(&mut self, text: String, ctl: &Controller) {
-        let running = self.state == RunState::Running || self.prompt_pending || self.queued > 0;
+        let running = self.turn_busy();
         let cell = self.transcript.cells.len();
         self.transcript.push_user(text.clone(), running);
         if running {
-            self.queued += 1;
-            self.queued_cells.push_back(vec![cell]);
-            self.show_tip("queued — lands after this turn · ctrl+x would send now");
-        } else {
-            self.prompt_pending = true;
-            self.state = RunState::Starting;
-            self.run_started = Some(Instant::now());
-            self.state_note = "contacting runtime".into();
+            self.enqueue_prompt(vec![StagedBlock::Text(text)], vec![cell]);
+            self.show_tip(
+                self.locale
+                    .tr(
+                        "queued ({n} waiting) — lands after this turn · ⌥↑ edits · ctrl+enter sends now",
+                        "已排队（{n} 条等待）—— 本轮结束后送出 · ⌥↑ 编辑 · ctrl+enter 立即发送",
+                    )
+                    .replace("{n}", &self.queued.to_string()),
+            );
+            self.scroll_up = 0;
+            return;
         }
+        self.prompt_pending = true;
+        self.state = RunState::Starting;
+        self.run_started = Some(Instant::now());
+        self.state_note = self
+            .locale
+            .tr("contacting runtime", "正在连接运行时")
+            .into();
         self.scroll_up = 0;
         ctl.send(Cmd::Prompt {
             session_id: self.session_id.clone(),
             text,
+        });
+    }
+
+    /// Is a turn in flight (or a prompt already handed over)? A runtime that is
+    /// still *starting* with nothing in flight takes a prompt immediately —
+    /// otherwise a first prompt could wait for an idle status that never comes.
+    fn turn_busy(&self) -> bool {
+        matches!(self.state, RunState::Running)
+            || self.prompt_pending
+            || !self.prompt_queue.is_empty()
+    }
+
+    /// Queue one prompt behind the active turn and mark its echo cells.
+    fn enqueue_prompt(&mut self, blocks: Vec<StagedBlock>, cells: Vec<usize>) {
+        let id = self.next_prompt_id();
+        self.prompt_queue
+            .push_back(QueuedPrompt { id, blocks, cells });
+        self.queued = self.prompt_queue.len();
+    }
+
+    /// Send the FIFO head — the turn it waited behind has ended. The echo
+    /// bubbles lose their queued tint (they were painted when queued), and the
+    /// item leaves the queue before the driver sees it, so a `/clear` or a
+    /// session switch can never double-send it.
+    fn dispatch_next_queued(&mut self, ctl: &Controller) {
+        if self.queue_edit.is_some() {
+            // The item under edit keeps its slot and its pre-edit wording.
+            self.state_note = self
+                .locale
+                .tr("queue paused for edit", "队列已暂停 · 正在编辑")
+                .into();
+            return;
+        }
+        let Some(prompt) = self.prompt_queue.pop_front() else {
+            return;
+        };
+        self.queued = self.prompt_queue.len();
+        self.transcript.mark_prompt_delivered(&prompt.cells);
+        self.prompt_pending = true;
+        self.state = RunState::Starting;
+        self.run_started = Some(Instant::now());
+        self.state_note = self
+            .locale
+            .tr("sending queued followup", "正在发送排队消息")
+            .into();
+        self.scroll_up = 0;
+        let wire = prompt_blocks_from_staged(&prompt.blocks);
+        self.send_wire_prompt(wire, None, ctl);
+    }
+
+    /// Fire one prompt at the driver: a lone text block takes the plain
+    /// `Cmd::Prompt` (so a `/`-prefixed line still reaches the skill path),
+    /// anything carrying images rides the image variants, and a steer carries
+    /// its pending-bubble id.
+    fn send_wire_prompt(
+        &self,
+        blocks: Vec<crate::bus::PromptBlock>,
+        steer: Option<u64>,
+        ctl: &Controller,
+    ) {
+        let text = match blocks.as_slice() {
+            [crate::bus::PromptBlock::Text(text)] => Some(text.clone()),
+            _ => None,
+        };
+        let session_id = self.session_id.clone();
+        ctl.send(match (steer, text) {
+            (Some(message_id), Some(text)) => Cmd::Steer {
+                session_id,
+                message_id,
+                text,
+            },
+            (Some(message_id), None) => Cmd::SteerImages {
+                session_id,
+                message_id,
+                blocks,
+            },
+            (None, Some(text)) => Cmd::Prompt { session_id, text },
+            (None, None) => Cmd::PromptImages { session_id, blocks },
         });
     }
 
@@ -4254,17 +4973,26 @@ impl App {
             None => (arg, String::new()),
         };
         if path.is_empty() {
-            self.show_tip("/image needs a path — /image ./pic.png [caption]");
+            self.show_tip(self.locale.tr(
+                "/image needs a path — /image ./pic.png [caption]",
+                "/image 需要路径 —— /image ./pic.png [说明]",
+            ));
             return;
         }
         let Some(media_type) = media_type_for(path) else {
-            self.show_tip("unsupported image — use .png .jpg .jpeg .webp .gif");
+            self.show_tip(self.locale.tr(
+                "unsupported image — use .png .jpg .jpeg .webp .gif",
+                "不支持的图片格式 —— 请用 .png .jpg .jpeg .webp .gif",
+            ));
             return;
         };
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(err) => {
-                self.show_tip(format!("cannot read {path}: {err}"));
+                self.show_tip(format!(
+                    "{} {path}: {err}",
+                    self.locale.tr("cannot read", "无法读取")
+                ));
                 return;
             }
         };
@@ -4287,7 +5015,10 @@ impl App {
                 bytes,
                 caption.to_string(),
             ),
-            None => self.show_tip("clipboard has no image, or this platform isn't supported"),
+            None => self.show_tip(self.locale.tr(
+                "clipboard has no image, or this platform isn't supported",
+                "剪贴板里没有图片，或当前平台不支持",
+            )),
         }
     }
 
@@ -4301,7 +5032,10 @@ impl App {
         data: Vec<u8>,
         caption: String,
     ) {
-        let token = match self.pending_images.add(name, path, media_type, data) {
+        let token = match self
+            .pending_images
+            .add(self.locale, name, path, media_type, data)
+        {
             Ok(att) => att.token.clone(),
             Err(full) => {
                 self.show_tip(full);
@@ -4322,7 +5056,10 @@ impl App {
             self.input.insert_char(' ');
         }
         self.input.insert_str(&token);
-        self.show_tip("image staged — ⌫ deletes its chip · hover it to preview");
+        self.show_tip(self.locale.tr(
+            "image staged — ⌫ deletes its chip · hover it to preview",
+            "图片已暂存 —— ⌫ 删除它的筹码 · 悬停可预览",
+        ));
         self.needs_redraw = true;
     }
 
@@ -4361,30 +5098,26 @@ impl App {
                 ),
             }
         }
+        let cells: Vec<usize> = (first_cell..self.transcript.cells.len()).collect();
+        self.scroll_up = 0;
         if queued {
-            self.queued_cells
-                .push_back((first_cell..self.transcript.cells.len()).collect());
+            self.enqueue_prompt(staged, cells);
+            return;
         }
+        // The wire form borrows the staged blocks (image payloads are `Arc`
+        // clones), so a steer can hand the very same blocks to the pending
+        // record for a deferred requeue.
+        let wire = prompt_blocks_from_staged(&staged);
         if let Some(message_id) = steer_message_id {
             self.pending_steer_cells.insert(
                 message_id,
-                (first_cell..self.transcript.cells.len()).collect(),
+                PendingSteer {
+                    cells,
+                    blocks: staged,
+                },
             );
         }
-        self.scroll_up = 0;
-        let blocks = prompt_blocks_from_staged(staged);
-        ctl.send(if let Some(message_id) = steer_message_id {
-            Cmd::SteerImages {
-                session_id: self.session_id.clone(),
-                message_id,
-                blocks,
-            }
-        } else {
-            Cmd::PromptImages {
-                session_id: self.session_id.clone(),
-                blocks,
-            }
-        });
+        self.send_wire_prompt(wire, steer_message_id, ctl);
     }
 
     /// Submit path for the staged tray: set run state / queue bookkeeping,
@@ -4397,22 +5130,33 @@ impl App {
             .iter()
             .filter(|b| matches!(b, StagedBlock::Image(_)))
             .count();
-        let running = self.state == RunState::Running || self.prompt_pending || self.queued > 0;
+        let running = self.turn_busy();
         if running {
-            self.queued += 1;
             self.show_tip(if n <= 1 {
-                "image queued — lands after this turn".to_string()
+                self.locale
+                    .tr(
+                        "image queued ({n} waiting) — lands after this turn",
+                        "图片已排队（{n} 条等待）—— 本轮结束后送出",
+                    )
+                    .replace("{n}", &(self.queued + 1).to_string())
             } else {
-                format!("{n} images queued — land after this turn")
+                self.locale
+                    .tr(
+                        "{n} images queued — land after this turn",
+                        "已排队 {n} 张图片 —— 本轮结束后送出",
+                    )
+                    .replace("{n}", &n.to_string())
             });
         } else {
             self.prompt_pending = true;
             self.state = RunState::Starting;
             self.run_started = Some(Instant::now());
             self.state_note = if n <= 1 {
-                "sending image".into()
+                self.locale.tr("sending image", "正在发送图片").into()
             } else {
-                format!("sending {n} images")
+                self.locale
+                    .tr("sending {n} images", "正在发送 {n} 张图片")
+                    .replace("{n}", &n.to_string())
             };
         }
         self.emit_staged_prompt(staged, running, None, ctl);
@@ -4423,7 +5167,10 @@ impl App {
     fn send_now(&mut self, ctl: &Controller) {
         let raw = self.input.buf().trim().to_string();
         if !self.pending_images.is_empty() && raw.starts_with('/') {
-            self.show_tip("send or delete the [image] chips first — /commands don't take images");
+            self.show_tip(self.locale.tr(
+                "send or delete the [image] chips first — /commands don't take images",
+                "先发送或删除草稿里的 [image] 图片 —— / 命令不接收图片",
+            ));
             return;
         }
         let staged = if self.pending_images.is_empty() {
@@ -4448,15 +5195,20 @@ impl App {
                 .filter(|b| matches!(b, StagedBlock::Image(_)))
                 .count();
             if running {
-                self.show_tip("steered with image — lands at the next agent step");
+                self.show_tip(self.locale.tr(
+                    "steered with image — lands at the next agent step",
+                    "已 steer（带图片）—— 在 Agent 下一步生效",
+                ));
             } else {
                 self.prompt_pending = true;
                 self.state = RunState::Starting;
                 self.run_started = Some(Instant::now());
                 self.state_note = if n == 1 {
-                    "sending image".into()
+                    self.locale.tr("sending image", "正在发送图片").into()
                 } else {
-                    format!("sending {n} images")
+                    self.locale
+                        .tr("sending {n} images", "正在发送 {n} 张图片")
+                        .replace("{n}", &n.to_string())
                 };
             }
             let steer_message_id = running.then(|| self.next_prompt_id());
@@ -4469,27 +5221,30 @@ impl App {
             let cell = self.transcript.cells.len();
             self.transcript.push_user(text.clone(), queued);
             if running {
-                self.show_tip("steered — lands at the next agent step");
+                self.show_tip(self.locale.tr(
+                    "steered — lands at the next agent step",
+                    "已 steer —— 在 Agent 下一步生效",
+                ));
             } else {
                 self.prompt_pending = true;
                 self.state = RunState::Starting;
                 self.run_started = Some(Instant::now());
             }
             self.scroll_up = 0;
-            ctl.send(if running {
+            let message_id = if running {
                 let message_id = self.next_prompt_id();
-                self.pending_steer_cells.insert(message_id, vec![cell]);
-                Cmd::Steer {
-                    session_id: self.session_id.clone(),
+                self.pending_steer_cells.insert(
                     message_id,
-                    text,
-                }
+                    PendingSteer {
+                        cells: vec![cell],
+                        blocks: vec![StagedBlock::Text(text.clone())],
+                    },
+                );
+                Some(message_id)
             } else {
-                Cmd::Prompt {
-                    session_id: self.session_id.clone(),
-                    text,
-                }
-            });
+                None
+            };
+            self.send_wire_prompt(vec![crate::bus::PromptBlock::Text(text)], message_id, ctl);
         }
     }
 
@@ -4651,9 +5406,10 @@ mod resume_tests {
         );
         let overlay = app.view_overlay.as_ref().expect("/help modal should open");
         assert_eq!(overlay.title, "Help");
-        let frame = crate::ui::dump_frame(&mut app, 100, 34);
+        // 40 rows: the card is scrollable, and the body has to reach `!cmd`.
+        let frame = crate::ui::dump_frame(&mut app, 100, 40);
         assert!(frame.contains("Help · ↑↓/wheel scroll"), "modal:\n{frame}");
-        assert!(frame.contains("ctrl+x"), "binding missing:\n{frame}");
+        assert!(frame.contains("ctrl+enter"), "binding missing:\n{frame}");
         assert!(frame.contains("!cmd"), "shell hint missing:\n{frame}");
         assert!(
             !frame.contains("## help"),
@@ -4870,6 +5626,104 @@ mod selection_tests {
         assert_eq!(fwd, rev);
     }
 
+    /// A click in the well places the caret at the clicked char; a drag arms
+    /// the composer highlight, and releasing copies the covered text.
+    #[test]
+    fn clicking_and_dragging_in_the_well_places_the_caret_and_selects() {
+        let mut app = test_app();
+        app.input.set("hello world".into());
+        // The well: rows 10..13, prompt "❯ " in columns 0..2.
+        app.composer_area = Rect::new(0, 10, 40, 3);
+        app.composer_wrap_width = 38;
+
+        // Click on the 4th text column → char 3 (right of "hel").
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.input.cursor_char(), 3, "the caret follows the click");
+        assert!(app.input_selecting, "the click arms a drag");
+
+        // Drag right to the 10th text column (cell 11 - prompt 2), inclusive.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 11,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        let (a, b) = app.input_selection_range().expect("a drag covers text");
+        assert_eq!(
+            app.input.chars_between(a, b),
+            "lo worl",
+            "cells inclusive, either direction"
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 11,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.input_selecting);
+        assert!(
+            app.input_sel.is_some(),
+            "the highlight survives the release (esc clears it)"
+        );
+
+        // Ctrl+X cuts the dragged range: the highlight goes with it.
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert_eq!(app.input.buf(), "held", "the selection was cut");
+        assert!(app.input_sel.is_none(), "cut clears the highlight");
+    }
+
+    /// A click that never moves is a caret placement, not a selection, and a
+    /// click outside the well dismisses a lingering highlight.
+    #[test]
+    fn a_caret_click_clears_the_highlight_and_outside_clicks_dismiss_it() {
+        let mut app = test_app();
+        app.input.set("hello".into());
+        app.composer_area = Rect::new(0, 10, 40, 3);
+        app.composer_wrap_width = 38;
+
+        app.input_sel = Some(InputSel {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.input_sel.is_none(), "a plain click is just a caret");
+        assert_eq!(app.input.cursor_char(), 1);
+
+        app.input_sel = Some(InputSel {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 39,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.input_sel.is_none(), "outside the well dismisses it");
+        assert!(!app.input_selecting);
+    }
+
     #[test]
     fn chat_hit_maps_screen_cells_to_layout_lines() {
         let mut app = test_app();
@@ -5020,7 +5874,6 @@ mod mode_tests {
         let cfg = test_cfg();
         let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
         let mut app = App::new(Theme::dark(), cfg.clone(), "s1".into());
-        app.modes.agent_preset = Some("code".into());
         app.modes.approval = Some("ask".into());
         app.modes.permission = Some("workspace-write".into());
         app.modes.effort = Some("max".into());
@@ -5030,7 +5883,6 @@ mod mode_tests {
         // A second instance in the same workspace boots with the cached
         // facts — except plan, which never carries over.
         let app2 = App::new(Theme::dark(), cfg.clone(), "s2".into());
-        assert_eq!(app2.modes.agent_preset.as_deref(), Some("code"));
         assert_eq!(app2.modes.approval.as_deref(), Some("ask"));
         assert_eq!(app2.modes.permission.as_deref(), Some("workspace-write"));
         assert_eq!(app2.modes.effort.as_deref(), Some("max"));
@@ -5040,7 +5892,246 @@ mod mode_tests {
         let mut other = cfg;
         other.workspace = "/elsewhere".into();
         let app3 = App::new(Theme::dark(), other, "s3".into());
-        assert!(app3.modes.agent_preset.is_none(), "cache is per workspace");
+        assert!(app3.modes.permission.is_none(), "cache is per workspace");
+    }
+
+    /// The launch splash reports the four facts a user wants before the first
+    /// prompt: build version, working directory, permission preset, model.
+    /// A preset cached from an earlier run is what the splash names.
+    #[test]
+    fn splash_reports_version_cwd_permission_and_model() {
+        let cfg = test_cfg();
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let mut app = App::new(Theme::dark(), cfg, "s1".into());
+        app.locale = crate::locale::Locale::En;
+        app.modes.permission = Some("workspace-write".into());
+        app.modes.effort = Some("max".into());
+        app.push_banner();
+
+        assert_eq!(
+            banner_facts(&app),
+            vec![
+                ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+                ("cwd".to_string(), "/tmp".to_string()),
+                ("permission".to_string(), "workspace-write".to_string()),
+                (
+                    "model".to_string(),
+                    "deepseek-v4-flash · effort max".to_string()
+                ),
+            ]
+        );
+
+        // The labels follow the interface language; the values do not — the
+        // one exception is the effort word, which is a label of its own.
+        let mut zh = test_app().0;
+        zh.locale = crate::locale::Locale::Zh;
+        zh.modes.effort = Some("max".into());
+        zh.push_banner();
+        let facts = banner_facts(&zh);
+        let labels: Vec<String> = facts.iter().map(|(l, _)| l.clone()).collect();
+        assert_eq!(labels, ["版本", "工作目录", "权限", "模型"]);
+        assert_eq!(
+            facts[3].1, "deepseek-v4-flash · 推理强度 max",
+            "zh names the effort"
+        );
+    }
+
+    /// `/resume` mid-turn: the picker opens as soon as the driver's listing
+    /// lands (the driver answers store queries off its turn loop), while the
+    /// load itself waits for the turn and says so.
+    #[test]
+    fn resume_mid_turn_lists_now_and_says_when_the_load_lands() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::Zh;
+        app.state = RunState::Running;
+        app.run_started = Some(std::time::Instant::now());
+        assert!(app.turn_busy());
+
+        app.run_slash("resume", "", &ctl);
+        assert_eq!(
+            app.tip.as_ref().map(|(text, _)| text.as_str()),
+            Some("正在列出会话…")
+        );
+        assert!(app.picker.is_none(), "the picker waits for the listing");
+
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionList {
+                sessions: vec![crate::bus::SessionListItem {
+                    id: "aby-1".into(),
+                    title: Some("修复登录".into()),
+                    updated_at: None,
+                }],
+                prefix: None,
+            }),
+            &ctl,
+        );
+        let picker = app.picker.as_ref().expect("the listing opens the picker");
+        assert!(matches!(picker.kind, PickerKind::Session));
+        assert_eq!(picker.items[0].id, "aby-1");
+
+        // Picking one hands it to the driver, which is busy: the tip names the
+        // wait instead of pretending the load already started.
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        let tip = app
+            .tip
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        assert!(tip.starts_with("正在加载会话 aby-1 …"), "{tip}");
+        assert!(tip.ends_with("（本轮结束后）"), "{tip}");
+    }
+
+    /// `/lang` retells every timeline the app paints — the root one and each
+    /// subagent's — so the next notice already speaks the new language, and a
+    /// subagent that starts later is born in it.
+    #[test]
+    fn lang_switch_retells_the_timelines() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::En;
+        app.transcript.set_locale(Locale::En);
+        app.apply_ui(crate::events::UiEvent::SubagentStarted {
+            parent: "dsh-test".into(),
+            child: "child-1".into(),
+            label: None,
+        });
+
+        app.run_slash("lang", "zh", &ctl);
+        assert_eq!(app.locale, Locale::Zh);
+
+        app.apply_ui(crate::events::UiEvent::SessionTitle {
+            session: "dsh-test".into(),
+            title: "修复登录".into(),
+        });
+        app.apply_ui(crate::events::UiEvent::SessionTitle {
+            session: "child-1".into(),
+            title: "子会话".into(),
+        });
+        let notices = |tr: &crate::transcript::Transcript| -> Vec<String> {
+            tr.cells
+                .iter()
+                .filter_map(|cell| match &cell.kind {
+                    crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            notices(&app.transcript).contains(&"会话 · 修复登录".to_string()),
+            "{:?}",
+            notices(&app.transcript)
+        );
+        let child = app
+            .subagents
+            .iter()
+            .find(|view| view.id == "child-1")
+            .expect("subagent view");
+        assert!(
+            notices(&child.transcript).contains(&"会话 · 子会话".to_string()),
+            "{:?}",
+            notices(&child.transcript)
+        );
+
+        // A subagent that starts after the switch is born in the new language.
+        app.apply_ui(crate::events::UiEvent::SubagentStarted {
+            parent: "dsh-test".into(),
+            child: "child-2".into(),
+            label: None,
+        });
+        app.apply_ui(crate::events::UiEvent::SessionTitle {
+            session: "child-2".into(),
+            title: "第二个".into(),
+        });
+        let fresh = app
+            .subagents
+            .iter()
+            .find(|view| view.id == "child-2")
+            .expect("second subagent view");
+        assert!(
+            notices(&fresh.transcript).contains(&"会话 · 第二个".to_string()),
+            "the new timeline follows /lang: {:?}",
+            notices(&fresh.transcript)
+        );
+    }
+
+    /// Client-side command feedback speaks the interface language: the same
+    /// commands an English session answers in English answer a Chinese one in
+    /// Chinese (the values they carry stay identifiers).
+    #[test]
+    fn command_feedback_follows_the_interface_language() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::Zh;
+        let tip = |app: &App| app.tip.as_ref().map(|(text, _)| text.clone());
+
+        app.run_slash("image", "", &ctl);
+        assert_eq!(
+            tip(&app).as_deref(),
+            Some("/image 需要路径 —— /image ./pic.png [说明]")
+        );
+
+        app.run_slash("image", "./missing.mp3", &ctl);
+        assert_eq!(
+            tip(&app).as_deref(),
+            Some("不支持的图片格式 —— 请用 .png .jpg .jpeg .webp .gif")
+        );
+
+        app.run_slash("theme", "nope", &ctl);
+        assert_eq!(tip(&app).as_deref(), Some("未知主题包: nope"));
+        let notices: Vec<String> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.contains(&"未知主题包 `nope`".to_string()),
+            "{notices:?}"
+        );
+
+        app.run_slash("clear", "", &ctl);
+        assert!(notices_tail(&app).contains(&"滚动区已清空".to_string()));
+
+        // An empty store notices instead of opening a picker, in zh too.
+        app.run_slash("resume", "", &ctl);
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionList {
+                sessions: vec![],
+                prefix: None,
+            }),
+            &ctl,
+        );
+        assert!(
+            notices_tail(&app)
+                .contains(&"这个工作区还没有持久会话 —— 先跑完一轮，/resume 就能看到".to_string()),
+            "{:?}",
+            notices_tail(&app)
+        );
+    }
+
+    /// The notices currently in the timeline, newest last.
+    fn notices_tail(app: &App) -> Vec<String> {
+        app.transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The facts the splash cell carries, in paint order.
+    fn banner_facts(app: &App) -> Vec<(String, String)> {
+        app.transcript
+            .cells
+            .iter()
+            .find_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Banner { facts, .. } => Some(facts.clone()),
+                _ => None,
+            })
+            .expect("splash banner")
     }
 
     #[test]
@@ -5257,6 +6348,45 @@ mod mode_tests {
         );
     }
 
+    /// A child view replaces the composer, so a frame without a well must
+    /// clear the mouse seam: a click where the parent's well used to be can
+    /// neither move the main draft's caret nor arm a drag.
+    #[test]
+    fn a_child_view_frame_clears_the_well_hit_target() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.input.set("parent draft".into());
+        let _ = crate::ui::dump_frame(&mut app, 100, 24);
+        let well = app.composer_area;
+        assert!(
+            well.height > 0,
+            "the parent frame records the well: {well:?}"
+        );
+
+        app.apply_ui(crate::events::UiEvent::SubagentStarted {
+            parent: "dsh-test".into(),
+            child: "child-1".into(),
+            label: None,
+        });
+        // The switcher's ↓ only opens on an empty draft, so take the view the
+        // way it lands it and keep the parent draft in place.
+        app.active_subagent = Some("child-1".into());
+        assert_eq!(app.active_subagent.as_deref(), Some("child-1"));
+
+        let _ = crate::ui::dump_frame(&mut app, 100, 24);
+        assert_eq!(app.composer_area, Rect::default(), "the well is gone");
+
+        let caret = app.input.cursor_char();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: well.x + 4,
+            row: well.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.input_selecting, "no composer drag in a child view");
+        assert!(app.input_sel.is_none());
+        assert_eq!(app.input.cursor_char(), caret, "the draft caret stays put");
+    }
+
     #[test]
     fn down_from_a_child_view_preselects_the_next_agent() {
         let (mut app, ctl, _rx) = test_app();
@@ -5374,20 +6504,6 @@ mod mode_tests {
     }
 
     #[test]
-    fn agent_preset_event_updates_chrome_without_adding_a_transcript_row() {
-        let (mut app, _ctl, _rx) = test_app();
-        let cells_before = app.transcript.cells.len();
-
-        app.apply_ui(crate::events::UiEvent::AgentPreset {
-            session: app.session_id.clone(),
-            preset: "cordis".into(),
-        });
-
-        assert_eq!(app.modes.agent_preset.as_deref(), Some("cordis"));
-        assert_eq!(app.transcript.cells.len(), cells_before);
-    }
-
-    #[test]
     fn acp_session_list_opens_picker_and_prefix_loads() {
         let (mut app, ctl, _rx) = test_app();
         app.load_session = true;
@@ -5465,6 +6581,75 @@ mod mode_tests {
         assert!(picker.items[2].meta.contains("current"));
     }
 
+    /// The picker's meanings and markers follow the interface language; the
+    /// preset ids never do.
+    #[test]
+    fn permission_picker_rows_speak_the_interface_language() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = Locale::Zh;
+        app.run_slash("permission", "", &ctl);
+        let picker = app.picker.as_ref().expect("permission picker opens");
+        assert_eq!(picker.sel, 2, "danger-full-access is the default");
+        assert!(
+            picker.items[0].meta.contains("只读"),
+            "{}",
+            picker.items[0].meta
+        );
+        assert!(
+            picker.items[2].meta.contains("完全文件访问") && picker.items[2].meta.contains("默认"),
+            "zh meaning + marker: {}",
+            picker.items[2].meta
+        );
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            ["read-only", "workspace-write", "danger-full-access"],
+            "ids stay the ids /permission takes"
+        );
+        assert_eq!(
+            permission_desc(Locale::Zh, "danger-full-access"),
+            Some("完全文件访问 · 关闭审批 —— 仅限信任目录")
+        );
+        assert_eq!(
+            permission_desc(Locale::En, "read-only"),
+            Some("read only — no file writes")
+        );
+        // A preset outside the stock table carries no invented meaning.
+        assert_eq!(permission_desc(Locale::Zh, "custom-preset"), None);
+
+        app.modes.permission = Some("read-only".into());
+        app.run_slash("permission", "", &ctl);
+        let picker = app.picker.as_ref().expect("picker reopens");
+        assert!(
+            picker.items[0].meta.contains("当前"),
+            "{}",
+            picker.items[0].meta
+        );
+    }
+
+    /// The slash menu's argument hints are chrome, so they translate too.
+    #[test]
+    fn slash_argument_hints_follow_the_interface_language() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.input.set("/effort ".into());
+        let en: Vec<String> = app.slash_matches().into_iter().map(|e| e.desc).collect();
+        assert!(en[0].contains("disable extended reasoning"), "{en:?}");
+
+        app.locale = Locale::Zh;
+        app.input.set("/effort ".into());
+        let zh: Vec<String> = app.slash_matches().into_iter().map(|e| e.desc).collect();
+        assert_eq!(zh, ["关闭扩展推理", "高推理强度", "最高推理强度"]);
+
+        app.input.set("/theme ".into());
+        let zh: Vec<String> = app.slash_matches().into_iter().map(|e| e.desc).collect();
+        assert_eq!(zh[0], "深色外观");
+        assert_eq!(zh[1], "浅色外观");
+        assert!(zh[2..].iter().all(|desc| desc == "主题包"), "{zh:?}");
+    }
+
     #[test]
     fn permission_aliases_normalize() {
         assert_eq!(normalize_permission("full"), Some("danger-full-access"));
@@ -5530,6 +6715,49 @@ mod mode_tests {
             );
             assert_eq!(app.current_permission(), expected);
         }
+    }
+
+    #[test]
+    fn permission_facts_fold_the_chip_without_touching_the_timeline() {
+        let (mut app, ctl, _rx) = test_app();
+        let cells_before = app.transcript.cells.len();
+        for ui in [
+            crate::events::UiEvent::SandboxMode {
+                session: app.session_id.clone(),
+                mode: "read-only".into(),
+            },
+            crate::events::UiEvent::ApprovalPolicy {
+                session: app.session_id.clone(),
+                policy: "ask".into(),
+            },
+            crate::events::UiEvent::PermissionPreset {
+                session: app.session_id.clone(),
+                preset: "read-only".into(),
+            },
+        ] {
+            app.handle(AppEvent::Ui(ui), &ctl);
+        }
+        assert_eq!(app.modes.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(app.modes.approval.as_deref(), Some("ask"));
+        assert_eq!(app.modes.permission.as_deref(), Some("read-only"));
+        assert_eq!(
+            app.transcript.cells.len(),
+            cells_before,
+            "a switch is confirmed by the meta row's chips, not by timeline lines"
+        );
+    }
+
+    #[test]
+    fn a_switch_borrows_the_tip_only_while_the_chips_are_hidden() {
+        let (mut app, ctl, _rx) = test_app();
+        // A bound session shows the permission chip, so the switch is silent.
+        app.set_permission("read-only".into(), &ctl);
+        assert!(app.tip.is_none());
+        // A keyless boot has no session to chip: the staged switch keeps the
+        // tip line, which is the only place left to say it.
+        app.session_bound = false;
+        app.set_permission("workspace-write".into(), &ctl);
+        assert!(app.tip.is_some());
     }
 
     #[test]
@@ -5864,8 +7092,65 @@ mod mode_tests {
             &ctl,
         );
 
-        assert_eq!(app.input.buf(), "hello world literal \u{1b}[99;5u");
+        // The composer is multi-line, so the pasted break survives (a CRLF or
+        // a bare CR from iTerm2-style terminals lands as a plain `\n`).
+        assert_eq!(
+            app.input.buf(),
+            "hello\nworld literal \u{1b}[99;5u",
+            "a paste keeps its line structure"
+        );
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn a_pasted_crlf_lands_as_one_newline_and_never_sends() {
+        let (mut app, ctl, _rx) = test_app();
+
+        app.handle(
+            AppEvent::Term(Event::Paste("fn main() {\r\n    run();\r\n}\r".to_string())),
+            &ctl,
+        );
+
+        assert_eq!(
+            app.input.buf(),
+            "fn main() {\n    run();\n}\n",
+            "CRLF and a trailing CR normalize to `\\n`"
+        );
+        assert!(
+            app.transcript.cells.is_empty(),
+            "a multi-line paste must not submit the draft"
+        );
+    }
+
+    /// ↑ recalls the input history from a *non-empty* draft once the caret is
+    /// already on the first visual row, and ↓ past the newest entry puts the
+    /// stashed draft back.
+    #[test]
+    fn up_at_the_first_row_recalls_history_and_down_restores_the_draft() {
+        let (mut app, ctl, _rx) = test_app();
+        app.input.history.push("first prompt".into());
+        app.input.history.push("second prompt".into());
+
+        app.input.set("half-typed".into());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "second prompt");
+        assert_eq!(app.input.hist_pos, Some(1));
+
+        // While browsing, ↑/↓ keep walking the history (no caret motion).
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "first prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "half-typed", "the draft was stashed");
+        assert_eq!(app.input.hist_pos, None);
+
+        // A multi-line draft moves the caret first; only the top row recalls.
+        app.input.set("one\ntwo".into());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "one\ntwo", "the caret stayed in the draft");
+        assert_eq!(app.input.hist_pos, None, "no recall while the caret moves");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "second prompt");
     }
 
     #[test]
@@ -5909,7 +7194,7 @@ mod mode_tests {
 
         assert!(app.pending_steer_cells.is_empty());
         assert_eq!(app.queued, 0, "late settlement cannot taint a new session");
-        assert!(app.queued_cells.is_empty());
+        assert!(app.prompt_queue.is_empty());
     }
 
     #[test]
@@ -5925,7 +7210,7 @@ mod mode_tests {
         app.handle(AppEvent::RuntimeExited(Some(1)), &ctl);
 
         assert_eq!(app.queued, 0);
-        assert!(app.queued_cells.is_empty());
+        assert!(app.prompt_queue.is_empty());
         assert!(app.pending_steer_cells.is_empty());
     }
 
@@ -5997,7 +7282,7 @@ mod mode_tests {
         );
 
         assert_eq!(app.queued, 2);
-        assert_eq!(app.queued_cells.len(), 2);
+        assert_eq!(app.prompt_queue.len(), 2);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::Image { queued: true, .. })
@@ -6025,11 +7310,103 @@ mod mode_tests {
         ));
     }
 
+    /// `⌥↑` lists the queued follow-ups; entering one loads it into the
+    /// composer, and enter saves the edit back into the same FIFO slot.
     #[test]
-    fn agent_idle_status_does_not_discard_the_client_owned_fifo() {
-        let (mut app, ctl, _rx) = test_app();
+    fn alt_up_edits_a_queued_prompt_in_place() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
         app.state = RunState::Running;
-        app.send_agent_text("followup".into(), &ctl);
+        app.send_agent_text("first followup".into(), &ctl);
+        app.send_agent_text("second followup".into(), &ctl);
+        let kept_id = app.prompt_queue[1].id;
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &ctl);
+        let picker = app.picker.as_ref().expect("queue picker");
+        assert!(matches!(picker.kind, PickerKind::Queue));
+        assert_eq!(picker.items.len(), 2);
+        assert_eq!(picker.items[1].label, "second followup");
+        assert!(
+            picker.items[1].meta.contains("#2"),
+            "{}",
+            picker.items[1].meta
+        );
+
+        // ↓ then enter opens the second item for editing.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(app.picker.is_none(), "the picker closed on enter");
+        assert_eq!(app.input.buf(), "second followup");
+        assert!(app.queue_edit.is_some());
+        assert_eq!(app.prompt_queue.len(), 2, "the item keeps its slot");
+
+        // Enter saves: the item is replaced in place and nothing was sent.
+        app.input.set("second followup, revised".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(app.queue_edit.is_none());
+        assert!(app.input.is_empty());
+        assert_eq!(app.queued, 2);
+        assert_eq!(app.prompt_queue[1].id, kept_id, "the slot is unchanged");
+        assert!(
+            matches!(&app.prompt_queue[1].blocks[..], [StagedBlock::Text(text)] if text == "second followup, revised"),
+            "the edit replaced the blocks"
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "editing a queued prompt never sends anything"
+        );
+    }
+
+    /// Esc cancels an edit and leaves the item alone; ctrl+d arms and then
+    /// deletes it. Neither path sends anything.
+    #[test]
+    fn queue_edit_cancels_or_deletes_without_sending() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("keep me".into(), &ctl);
+        let id = app.prompt_queue[0].id;
+        app.begin_queue_edit(&id.to_string(), &ctl);
+        app.input.set("changed my mind".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.queue_edit.is_none(), "esc cancelled the edit");
+        assert!(app.input.is_empty(), "the draft is dropped");
+        assert!(
+            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "keep me"),
+            "the queued item is untouched"
+        );
+        assert_eq!(app.queued, 1);
+
+        // ctrl+d asks once, then deletes.
+        app.begin_queue_edit(&id.to_string(), &ctl);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(app.queue_edit.is_some(), "the first press only arms");
+        assert_eq!(app.prompt_queue.len(), 1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(app.queue_edit.is_none());
+        assert!(app.prompt_queue.is_empty(), "the second press deleted it");
+        assert_eq!(app.queued, 0);
+        assert!(commands.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// While an item is loaded for editing the FIFO holds: a turn end must not
+    /// ship the head out from under the editor.
+    #[test]
+    fn the_queue_pauses_dispatch_while_an_item_is_edited() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("head".into(), &ctl);
+        app.send_agent_text("tail".into(), &ctl);
+        let head = app.prompt_queue[0].id;
+        app.begin_queue_edit(&head.to_string(), &ctl);
 
         app.handle(
             AppEvent::Ui(crate::events::UiEvent::SessionStatus {
@@ -6039,16 +7416,92 @@ mod mode_tests {
             &ctl,
         );
 
+        assert_eq!(app.queued, 2, "the queue held");
+        assert!(commands.try_recv().is_err(), "nothing went out");
+        assert!(app.state_note.contains("paused"), "{}", app.state_note);
+
+        // Closing the editor lets the next idle status ship the head.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
         assert_eq!(app.queued, 1);
-        assert_eq!(app.queued_cells.len(), 1);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Prompt { text, .. }) if text == "head"
+        ));
+    }
+
+    /// An empty draft's enter promotes the FIFO head: a steer while the turn
+    /// runs, and it waits for the idle status like any other send otherwise.
+    #[test]
+    fn empty_enter_sends_the_queue_head_now() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("head".into(), &ctl);
+        app.send_agent_text("tail".into(), &ctl);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Steer { text, .. }) if text == "head"
+        ));
+        assert_eq!(app.queued, 1, "the tail stays queued");
+        assert_eq!(app.prompt_queue.len(), 1);
+        assert!(
+            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "tail")
+        );
+        assert_eq!(
+            app.pending_steer_cells.len(),
+            1,
+            "the steer awaits settlement"
+        );
+    }
+
+    /// The idle status is what hands the FIFO head to the driver: it is not
+    /// merely kept (that was the driver-channel queue's job), it goes out —
+    /// exactly one item, whose echo loses the queued tint.
+    #[test]
+    fn an_idle_status_dispatches_the_client_owned_fifo_head() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("followup".into(), &ctl);
+        assert_eq!(app.queued, 1);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::User { queued: true, .. })
         ));
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
+
+        assert_eq!(app.queued, 0);
+        assert!(app.prompt_queue.is_empty(), "the head left the queue");
+        assert!(matches!(
+            app.transcript.cells.last().map(|cell| &cell.kind),
+            Some(crate::transcript::CellKind::User { queued: false, .. })
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Prompt { text, .. }) if text == "followup"
+        ));
+        assert!(app.prompt_pending, "the dispatched turn is armed");
     }
 
     #[test]
-    fn actor_prompt_acceptance_delivers_only_the_first_queued_prompt_group() {
+    fn an_idle_status_delivers_exactly_one_queued_prompt_group() {
         let (mut app, ctl, _rx) = test_app();
         app.state = RunState::Running;
         app.send_staged(
@@ -6067,25 +7520,24 @@ mod mode_tests {
         );
         app.send_agent_text("after".into(), &ctl);
 
+        assert_eq!(app.queued, 2);
+
         app.handle(
-            AppEvent::Ui(crate::events::UiEvent::TurnStart {
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
                 session: "dsh-test".into(),
-                turn: 2,
+                running: false,
             }),
             &ctl,
         );
+        assert_eq!(app.queued, 1, "only the head went out");
 
-        assert_eq!(
-            app.queued, 2,
-            "TurnStart also fires for the active prompt and cannot identify FIFO delivery"
-        );
+        // The driver's own acceptance of a prompt never moves the queue.
         app.handle(
             AppEvent::Ctl(CtlEvent::PromptQueued {
                 message_id: "dsh-test".into(),
             }),
             &ctl,
         );
-
         assert_eq!(app.queued, 1);
         let queued = app
             .transcript
@@ -6266,12 +7718,19 @@ mod mode_tests {
         assert_eq!(app.transcript.cells.len(), cells_before);
     }
 
+    /// The direct turn facts still drive the client lifecycle — the queue
+    /// itself is only moved by the idle status now.
     #[test]
     fn direct_ui_turn_facts_update_client_lifecycle() {
         let (mut app, ctl, _rx) = test_app();
         app.state = RunState::Running;
         app.run_started = Some(Instant::now());
         app.state_note = "working".into();
+        app.prompt_queue.push_back(QueuedPrompt {
+            id: 1,
+            blocks: vec![StagedBlock::Text("followup".into())],
+            cells: vec![],
+        });
         app.queued = 1;
 
         app.handle(
@@ -6281,15 +7740,34 @@ mod mode_tests {
             }),
             &ctl,
         );
-        assert_eq!(app.queued, 1);
+        assert_eq!(app.queued, 1, "a turn start never moves the queue");
         app.handle(
             AppEvent::Ctl(CtlEvent::PromptQueued {
                 message_id: "dsh-test".into(),
             }),
             &ctl,
         );
-        assert_eq!(app.queued, 0);
+        assert_eq!(app.queued, 1, "acceptance never moves the queue either");
 
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.queued, 0, "the idle status dispatched the queued head");
+        assert!(matches!(app.state, RunState::Starting));
+        assert!(app.run_started.is_some(), "the dispatched turn is timed");
+        assert!(app.state_note.contains("queued"), "{}", app.state_note);
+
+        // The next turn end has an empty queue and settles back to idle.
+        app.handle(
+            AppEvent::Ctl(CtlEvent::PromptQueued {
+                message_id: "dsh-test".into(),
+            }),
+            &ctl,
+        );
         app.handle(
             AppEvent::Ui(crate::events::UiEvent::SessionStatus {
                 session: "dsh-test".into(),
@@ -6687,6 +8165,7 @@ mod mode_tests {
         let mut staged = crate::attachments::Staged::default();
         staged
             .add(
+                crate::locale::Locale::En,
                 "a.png".into(),
                 "/tmp/a.png".into(),
                 "image/png".into(),
@@ -6695,6 +8174,7 @@ mod mode_tests {
             .unwrap();
         staged
             .add(
+                crate::locale::Locale::En,
                 "b.png".into(),
                 "/tmp/b.png".into(),
                 "image/png".into(),
@@ -6709,7 +8189,7 @@ mod mode_tests {
         assert!(matches!(&blocks[2], StagedBlock::Text(t) if t == " then "));
         assert!(matches!(&blocks[3], StagedBlock::Image(a) if a.name == "b.png"));
         assert!(matches!(&blocks[4], StagedBlock::Text(t) if t == "done"));
-        let prompt = prompt_blocks_from_staged(blocks);
+        let prompt = prompt_blocks_from_staged(&blocks);
         assert!(matches!(&prompt[0], crate::bus::PromptBlock::Text(t) if t == "see"));
         assert!(matches!(&prompt[1], crate::bus::PromptBlock::Image(a) if a.path == "/tmp/a.png"));
         assert!(matches!(&prompt[2], crate::bus::PromptBlock::Text(t) if t == " then "));
@@ -6722,6 +8202,7 @@ mod mode_tests {
         let mut staged = crate::attachments::Staged::default();
         staged
             .add(
+                crate::locale::Locale::En,
                 "kept.png".into(),
                 "/tmp/kept.png".into(),
                 "image/png".into(),
@@ -6730,6 +8211,7 @@ mod mode_tests {
             .unwrap();
         staged
             .add(
+                crate::locale::Locale::En,
                 "orphan.png".into(),
                 "/tmp/orphan.png".into(),
                 "image/png".into(),
@@ -7188,6 +8670,7 @@ mod right_slot_tests {
         let (mut app, ctl, _rx) = test_app();
         app.locale = Locale::En;
         app.modes.effort = Some("high".into());
+        app.session_title = Some("fix the login flow".into());
         // The counter rows the composer dock used to paint: the modal renders
         // them from the transcript accumulator instead.
         app.transcript.usage.input = 1834;
@@ -7219,7 +8702,16 @@ mod right_slot_tests {
         // The border names the card, so the body carries bullets only.
         assert!(!text.contains("## status"), "{text}");
         assert!(text.contains("- state · "), "{text}");
-        assert!(text.contains("- session · dsh-test"), "{text}");
+        // The session row carries the live title, and the credential source
+        // (env vs stored vs none) landed here when `/session` retired.
+        assert!(
+            text.contains("- session · dsh-test · fix the login flow"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- credentials · no api key — /login <apikey> stores one"),
+            "{text}"
+        );
         assert!(text.contains("- model · deepseek-v4-flash"), "{text}");
         assert!(text.contains("- effort · high"), "{text}");
         assert!(text.contains("- permission · "), "{text}");
@@ -7311,75 +8803,8 @@ mod right_slot_tests {
         app.run_slash("new", "", &ctl);
         assert_eq!(
             greeting(&app),
-            "- **Tip** · enter queues a follow-up; ctrl+x steers the active turn now"
+            "- **Tip** · enter queues a follow-up; ctrl+enter steers the active turn now"
         );
-    }
-
-    #[test]
-    /// `/session` opens the same local modal as `/status` — chrome, not a
-    /// timeline entry — and its facts follow the live session state.
-    fn session_slash_opens_a_modal_with_the_runtime_facts() {
-        let (mut app, ctl, _rx) = test_app();
-        app.locale = Locale::En;
-        app.modes.effort = Some("max".into());
-        app.session_title = Some("fix the login flow".into());
-        let cells_before = app.transcript.cells.len();
-
-        app.run_slash("session", "", &ctl);
-
-        assert_eq!(
-            app.transcript.cells.len(),
-            cells_before,
-            "/session is chrome and must not enter the conversation timeline"
-        );
-        let overlay = app
-            .view_overlay
-            .as_ref()
-            .expect("/session modal should open");
-        assert_eq!(overlay.title, "Session");
-        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
-            panic!(
-                "/session should render markdown, got {:?}",
-                overlay.nodes[0]
-            );
-        };
-        // The border names the card, so the body carries bullets only.
-        assert!(!text.contains("## session"), "{text}");
-        assert!(
-            text.contains("- session · dsh-test · fix the login flow"),
-            "{text}"
-        );
-        assert!(text.contains("- provider · deepseek"), "{text}");
-        assert!(text.contains("- agent · "), "{text}");
-        assert!(text.contains("- workspace · "), "{text}");
-        assert!(text.contains("- session store · "), "{text}");
-        assert!(text.contains("- server · "), "{text}");
-        assert!(text.contains("- credentials · "), "{text}");
-        assert!(text.contains("- tokens · "), "{text}");
-        assert!(text.contains("- effort · max"), "{text}");
-
-        let frame = crate::ui::dump_frame(&mut app, 100, 34);
-        assert!(
-            frame.contains("Session · ↑↓/wheel scroll"),
-            "modal:\n{frame}"
-        );
-        assert!(frame.contains("fix the login flow"), "facts:\n{frame}");
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
-        assert!(app.view_overlay.is_none(), "esc closes the modal");
-
-        // Unset effort stays hidden; the title is localized.
-        let (mut plain, ctl2, _rx2) = test_app();
-        plain.locale = Locale::Zh;
-        plain.run_slash("session", "", &ctl2);
-        let overlay = plain.view_overlay.as_ref().expect("/session modal");
-        assert_eq!(overlay.title, "会话");
-        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
-            panic!(
-                "/session should render markdown, got {:?}",
-                overlay.nodes[0]
-            );
-        };
-        assert!(!text.contains("- effort ·"), "{text}");
     }
 }
 
@@ -7845,6 +9270,175 @@ mod resume_replay_tests {
         );
         app.reset_session_ui();
         assert_eq!(app.plan, None);
+    }
+
+    /// The cap row's `⛶` glyph is a mouse-only toggle: each click pins the
+    /// well to the amplified height or hands it back to the auto layout.
+    #[test]
+    fn the_expand_glyph_pins_and_restores_the_well_height() {
+        let (mut app, _ctl, _rx) = test_app();
+        // The frame that draws the glyph records its hit target.
+        app.expand_btn = Some(ratatui::layout::Rect::new(80, 4, 3, 1));
+
+        for expected in [true, false] {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 81,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.composer_expanded, expected, "click {expected}");
+        }
+
+        // A click that misses the glyph leaves the height alone.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.composer_expanded);
+    }
+
+    /// The driver's live catalog fills an open `/model` picker (a query it now
+    /// answers mid-turn), keeps the configured model selected when the
+    /// provider lists it, and is remembered for the next picker opening.
+    #[test]
+    fn the_catalog_fills_the_open_model_picker_and_is_remembered() {
+        let (mut app, ctl, _rx) = test_app();
+        app.cfg.model = "deepseek-v4-flash".into();
+        app.cfg.provider = "deepseek-official".into();
+        app.open_model_picker(&ctl);
+        assert!(matches!(
+            app.picker.as_ref().expect("picker opens").kind,
+            PickerKind::Model
+        ));
+        let stock = app.picker.as_ref().expect("picker").items.len();
+        assert!(stock > 1, "the picker opens on its stock rows");
+
+        app.handle(
+            AppEvent::Ctl(CtlEvent::Catalog {
+                models: vec![
+                    crate::bus::CatalogModel {
+                        provider: "coding-plan-b".into(),
+                        id: "deepseek-v4-pro".into(),
+                        name: "DeepSeek V4 Pro".into(),
+                        vision: false,
+                    },
+                    crate::bus::CatalogModel {
+                        provider: "deepseek-official".into(),
+                        id: "deepseek-v4-flash".into(),
+                        name: "DeepSeek V4 Flash".into(),
+                        vision: true,
+                    },
+                ],
+            }),
+            &ctl,
+        );
+        let picker = app.picker.as_ref().expect("picker stays open");
+        let ids: Vec<&str> = picker.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["deepseek-v4-pro", "deepseek-v4-flash"]);
+        assert_eq!(
+            picker.sel, 1,
+            "the configured model keeps the selection (provider included)"
+        );
+        assert_eq!(
+            picker.items[1].meta, "deepseek-official · DeepSeek V4 Flash · vision",
+            "the meta row names the provider, the label and vision"
+        );
+
+        // A reopened popup seeds the stock rows again (the driver re-fetches),
+        // while the cached listing is what the `/model ` candidates offer.
+        app.picker = None;
+        app.open_model_picker(&ctl);
+        assert_eq!(
+            app.picker.as_ref().expect("picker reopens").items.len(),
+            3,
+            "stock presets + the configured model"
+        );
+        app.input.set("/model ".into());
+        let candidates = app.slash_matches();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|e| e.desc.as_str())
+                .collect::<Vec<_>>(),
+            ["coding-plan-b", "deepseek-official"],
+            "the provider rides the meta"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter_map(|e| e.completion.as_deref())
+                .collect::<Vec<_>>(),
+            ["/model deepseek-v4-pro", "/model deepseek-v4-flash"],
+            "the completion inserts the id"
+        );
+    }
+
+    /// The meta row's `↓ N` chip is the way back down: clicking it drops the
+    /// scroll and follows the newest line again. The frame that draws the chip
+    /// records the cell, hover brightens it, and an open modal swallows the
+    /// click like it does for the other glyph buttons.
+    #[test]
+    fn clicking_the_scroll_chip_follows_the_tail_again() {
+        let (mut app, ctl, _rx) = test_app();
+        for i in 0..40 {
+            app.transcript.push_user(format!("line {i}"), false);
+        }
+        app.scroll_by(20);
+        let _ = crate::ui::dump_frame(&mut app, 100, 14);
+        let chip = app.scroll_btn.expect("the scrolled frame records the chip");
+        assert!(app.scroll_up > 0);
+
+        // Hover: the chip brightens (the pointer rests on it).
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: chip.x + 1,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.hover_scroll_btn, "hover lands on the chip");
+
+        // A modal owns the screen: the click is not the chip's while one is up.
+        app.view_overlay = Some(crate::app::ViewOverlay {
+            title: "status".into(),
+            nodes: Vec::new(),
+            scroll: 0,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.scroll_up > 0, "a modal swallows the click");
+        app.view_overlay = None;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll_up, 0, "the click follows the tail");
+        assert!(app.needs_redraw);
+
+        // A click that misses the chip leaves the scroll where it was.
+        app.scroll_by(20);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x.saturating_sub(6),
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.scroll_up > 0, "a miss keeps the scroll");
+
+        // With the tail on screen the chip is gone, so nothing is clickable.
+        app.scroll_up = 0;
+        let _ = crate::ui::dump_frame(&mut app, 100, 14);
+        assert!(app.scroll_btn.is_none());
+        let _ = ctl;
     }
 
     /// The cap row's progress chip opens the checklist dialog; esc closes it,

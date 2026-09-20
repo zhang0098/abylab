@@ -1,4 +1,4 @@
-**English** · [中文](README.md) · [abylab.ai](https://abylab.ai/)
+**English** · [中文](README.md) · [Changelog](CHANGELOG.en.md) · [abylab.ai](https://abylab.ai/)
 
 # abylab
 
@@ -32,7 +32,8 @@ abylab
 Prebuilt binaries cover Linux (x86_64, aarch64) and macOS (Intel, Apple
 Silicon). The script installs `~/.local/bin/abylab` and checks the download
 against the release's `SHA256SUMS`; `--bin-dir` moves it, `--version <tag>`
-pins a release, `--help` lists the rest. It also puts that directory on PATH
+pins a release, `--mirror <url>` switches the download source, `--help` lists
+the rest. It also puts that directory on PATH
 in your shell startup file (marked with a comment; `--no-path` only prints the
 line, `--path-file` picks the file). To build from source instead:
 `cargo build --release`.
@@ -48,6 +49,8 @@ builds its own BoringSSL):
 ```sh
 cargo install --git https://github.com/zhang0098/abylab abylab-tui
 ```
+
+You can also just ask your AI to install it.
 
 Then store your key (from <https://platform.deepseek.com/> → API keys) by
 typing this into the composer — it takes effect without a restart:
@@ -133,7 +136,7 @@ run. Want a shorter answer? Just ask. A fresh session uses the SDK output cap
 `/help` · `/keys` · `/new` · `/resume [id]` · `/compact` · `/goal` · `/clear` · `/model [id]` ·
 `/effort [off|low|high|max]` · `/permission [preset]` · `/plan [on|off]` ·
 `/vim [on|off]` · `/image <path> [text]` · `/clip [text]` · `/theme [dark|light|pack]` ·
-`/session` · `/status` · `/lang [zh|en]` · `/quit`
+`/status` · `/lang [zh|en]` · `/quit`
 
 `/theme` picks a palette pack — a fresh install starts on **one**, dark
 (`--theme dark` only moves between light and dark, it never changes the pack).
@@ -143,21 +146,29 @@ embedded in the binary, no external files.
 Arrows in the picker preview the highlighted pack in place; `enter` applies it
 and `esc` reverts. `ctrl+t` toggles dark/light inside the active pack.
 
-`/status` (run state, model, token/turn/timing counters) and `/session`
-(session id, provider, workspace paths, credential source) both open a dialog:
+`/status` (run state, model, token/turn/timing counters, plus the session
+id/title and the credential source) opens a dialog:
 it floats over the conversation, esc closes it, ↑↓/wheel scroll, and nothing
 lands in the transcript — same chrome as `/help` and `/keys`.
 
 ## Keys
 
-enter send/queue · ctrl+x send-now · esc interrupt / 2×clear draft ·
-ctrl+c clear/quit · ↑ history · `/` commands · `@` file mention ·
+enter send/queue · ctrl+enter send-now · esc interrupt (clears the draft when idle) ·
+ctrl+c clear/quit · ↑ history (empty draft, or from the draft's first row) ·
+`/` commands · `@` file mention ·
 ctrl+z / ctrl+shift+z undo / redo · ctrl+p model · ctrl+t theme
 
 `/permission` switches the live abycore session between `read-only`,
 `workspace-write`, and `danger-full-access` (default). The switch keeps the
 conversation history and applies to later file tools and Bash processes;
 Shift+Tab cycles the presets.
+
+Follow-ups typed while a turn runs wait in a client-owned queue, not in the
+driver's channel: `⌥↑` picks one to edit — enter saves it back into its slot,
+ctrl+d deletes it (twice), esc cancels, and none of the three sends anything.
+The queue pauses while an item is open, so a turn end cannot ship it out from
+under the editor. Enter on an empty draft promotes the head into the active
+turn (the same steer ctrl+enter takes for that item).
 
 While the agent keeps a checklist with `todo_write`, the cap row on the
 composer's top border shows the task in progress and the completed/total
@@ -167,13 +178,14 @@ progress chip (`2/5 done`) opens the full checklist in a dialog; esc closes it.
 With neither, the row stays blank.
 
 Usage hints no longer live in that row: a new session (launch, `/new`) opens
-the transcript with one rotating hint (esc interrupts, ctrl+x steers, the token
+the transcript with one rotating hint (esc interrupts, ctrl+enter steers, the token
 counters in `/status`, …), and the next session moves on to the next one. The
 full list stays in `/help` and `/keys`.
 
 A launch opens the transcript with a centered ASCII wordmark over the project
-URL `https://abylab.ai`, then that hint; `/new` shows the hint alone and never
-repeats the mark.
+URL `https://abylab.ai`, then four launch facts — version, working directory,
+permission preset, model (with its effort when one is set) — then that hint;
+`/new` shows the hint alone and never repeats the mark.
 
 That row names the project path; when the workspace is a Git checkout the
 current branch rides along colon-tight (`/work/acme/abylab:main`). The branch
@@ -183,10 +195,16 @@ reaches the label; a long path or a narrow terminal keeps the path alone.
 
 The `↥` right of the project path in that same row walks your prompts: each
 click jumps one prompt back (newest first, wrapping from the oldest), scrolls
-it to the top of the pane and highlights it for a few seconds.
+it to the top of the pane and highlights it for a few seconds. The `⛶` beside
+it is mouse-only too: one click pins the input well to the amplified height
+(about 5/8 of the frame), the next restores the automatic height. Once you
+have scrolled up, the `↓ N` on the meta row (N = lines above the bottom) is a
+button as well: one click returns to the newest line and follows the tail
+again, and the pointer resting on it brightens it.
 
 Mouse: wheel scrolls · click a tool card expands it · drag selects, release
-copies (native tool → tmux → OSC52) · `@` opens the file browser.
+copies (native tool → tmux → OSC52) · inside the input box a click places the
+caret and a drag selects (`ctrl+x` cuts it) · `@` opens the file browser.
 
 The `@` browser filters as you type (exact > prefix > contains > fuzzy
 subsequence) and, when the current directory has no match, follows the query

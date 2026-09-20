@@ -127,13 +127,6 @@ pub enum UiEvent {
         session: String,
         preset: String,
     },
-    /// `agent-preset/selected` — agent composition preset (standard/code/…);
-    /// awaiting a direct driver producer.
-    #[allow(dead_code)]
-    AgentPreset {
-        session: String,
-        preset: String,
-    },
     /// `approval/asked` — one pending approval request; awaiting a direct
     /// driver producer (the driver's permission ask uses the overlay).
     #[allow(dead_code)]
