@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-20
+
 ### Added
 
 - The launch splash now carries four facts under the ASCII wordmark and the
@@ -124,7 +126,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/zhang0098/abylab/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/zhang0098/abylab/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/zhang0098/abylab/compare/v0.1.1...v0.1.2
