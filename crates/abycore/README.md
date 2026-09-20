@@ -58,6 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   （只留当前回合）并重试同一回合。
 - **目标** — 每会话一个持久完成目标（`get_goal`/`create_goal`/`update_goal`），
   带版本号校验的完成协议；轮次由宿主驱动。
+- **技能** — `SkillCatalog::discover` 读用户写的 `SKILL.md`（工作区的
+  `.agents/skills/`，可选 frontmatter 写名字、描述、参数提示；正文上限 64 KiB，
+  超出按字符边界截断并留标记），`expand` 把
+  `/名字 [参数]` 渲染成注入正文的用户消息，`index_block` 给出可放进
+  `AgentHooks::request_context` 的技能索引，`SkillTool` 让模型按需自己读正文。
+  SDK 只读文本，不执行任何东西。
 - **结构化事件** — `AgentEvent`/`StreamEvent` 把模型视图、计划视图、工具结果
   与用量记录分开，任何 UI 都能直接消费。
 

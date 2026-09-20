@@ -142,7 +142,10 @@ fn aby_loop(
                 handle.send(abylab_backend::Cmd::FetchCatalog);
             }
             Cmd::FetchSkills => {
-                let _ = bus.send(AppEvent::Ctl(CtlEvent::Skills { skills: Vec::new() }));
+                // The driver discovered the session's skills at launch; a
+                // failed or empty answer just leaves the `/` menu without
+                // skill rows (`/skill` with no argument says where to put them).
+                handle.send(abylab_backend::Cmd::FetchSkills);
             }
             Cmd::FetchEfforts { .. } => {
                 let _ = bus.send(AppEvent::Ctl(CtlEvent::Efforts {
@@ -240,6 +243,17 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                         prefix,
                     }
                 }
+                abylab_backend::CtlEvent::Skills { skills } => CtlEvent::Skills {
+                    skills: skills
+                        .into_iter()
+                        .map(|skill| crate::bus::SkillInfo {
+                            name: skill.name,
+                            description: skill.description,
+                            input_hint: skill.input_hint,
+                            source: Some(skill.path),
+                        })
+                        .collect(),
+                },
                 // Handled above (emits Ready + AgentCaps together).
                 abylab_backend::CtlEvent::Ready { .. } => unreachable!(),
             })]

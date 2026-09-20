@@ -112,14 +112,15 @@ pub struct CatalogModel {
     pub vision: bool,
 }
 
-/// One advertised composition choice (`agent` / `preset` / `agent-preset`,
-/// One user-invocable command from `available_commands_update`: typing
-/// `/name …` as a prompt makes the agent inject the skill body.
+/// One user-invocable skill: typing `/name …` as a prompt makes the agent
+/// inject the skill's body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
     pub input_hint: Option<String>,
+    /// The skill file this came from — `/skill`'s listing shows which one won.
+    pub source: Option<String>,
 }
 /// One staged image on its way to the host (base64 payload).
 #[derive(Debug, Clone)]

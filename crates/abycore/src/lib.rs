@@ -17,6 +17,7 @@ mod hooks;
 mod local_tools;
 mod persist;
 mod session;
+mod skills;
 mod subagent;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -52,6 +53,9 @@ pub use local_tools::{
 };
 pub use persist::{SessionStore, SessionSummary, SessionWriter};
 pub use session::{PendingCall, PendingState, SessionSnapshot};
+pub use skills::{
+    MAX_SKILL_BYTES, SKILL_FILENAME, SKILLS_DIR, Skill, SkillCatalog, SkillInvocation, SkillTool,
+};
 pub use subagent::{
     SubagentConfig, SubagentEvent, SubagentHookFactory, SubagentInfo, SubagentMode,
     SubagentRequest, SubagentResult, SubagentStatus, Subagents,
