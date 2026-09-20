@@ -637,12 +637,36 @@ pub fn drive(scenario: Scenario) -> Run {
                 });
             }
             Step::Goal(arg) => {
+                let start = events.lock().expect("event lock").len();
                 handle.send(Cmd::Goal { arg: arg.clone() });
-                // The driver settles every round before it reads the next
-                // command, so quiescence means the whole run is done — a
-                // predicate cannot tell an intermediate round notice from the
-                // last one.
-                wait_quiet(&events, deadline, &format!("goal {arg:?}"));
+                let what = format!("goal {arg:?}");
+                // Rounds end with exactly one settle notice; wait for it
+                // explicitly. Quiescence alone is not a completion signal: a
+                // slow round leaves a quiet gap while its request is in
+                // flight, and the next step would then race the still-running
+                // round (the harness's final shutdown interrupts it, so the
+                // settle shows `active` instead of the state the test wants).
+                // Commands that never drive a round just need their own notice.
+                let runs_rounds = !matches!(
+                    arg.trim(),
+                    "" | "status" | "rounds" | "pause" | "complete" | "clear"
+                );
+                if runs_rounds {
+                    wait_for(&events, deadline, &what, |events| {
+                        events.len() > start
+                            && events[start..]
+                                .iter()
+                                .any(|event| event.starts_with("op-done:goal settled"))
+                    });
+                } else {
+                    wait_for(&events, deadline, &what, |events| {
+                        events.len() > start
+                            && events[start..].iter().any(|event| {
+                                event.starts_with("op-done:") || event.starts_with("op-failed:")
+                            })
+                    });
+                }
+                wait_quiet(&events, deadline, &what);
             }
         }
     }
