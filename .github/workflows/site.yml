@@ -47,7 +47,26 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Deploy site/ to Cloudflare Pages
+      - name: Stage site + the latest release's downloads
+        id: stage
+        if: steps.creds.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A Pages deployment is a full snapshot, so this deploy has to carry
+          # /downloads/ too or it deletes the mirror that release.yml put there.
+          # scripts/stage-site.sh is the same staging the mirror job uses.
+          tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' || true)
+          if [ -n "$tag" ]; then
+            scripts/stage-site.sh staging "$tag"
+          else
+            echo "::warning::no release yet — deploying the site alone"
+            scripts/stage-site.sh staging
+          fi
+
+      - name: Deploy to Cloudflare Pages
         if: steps.creds.outputs.ready == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
@@ -55,4 +74,4 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # wrangler reads the branch from the checkout, so pushes to main land
           # as production and other branches as preview deployments.
-          command: pages deploy site --project-name=abylab
+          command: pages deploy staging --project-name=abylab
