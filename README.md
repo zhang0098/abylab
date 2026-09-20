@@ -17,10 +17,10 @@ abylab 是个极简主义的 DeepSeek harness：装完就是一个可执行文�
 标记, 想撤销就删那一行); `--no-path` 只打印命令不落盘, `--path-file` 指定写到
 哪个文件, `--bin-dir` 换安装目录, `--help` 看全部选项.
 
-预编译的 Linux 二进制在 Debian 11(bullseye) 里构建, 所以要求 glibc ≥ 2.31:
-Ubuntu 20.04+、Debian 11+、RHEL 9、Amazon Linux 2023 都能直接跑. 更老的系统
-(RHEL 8、Amazon Linux 2)和 musl 发行版(Alpine)请从源码构建, 需要一个 C 编译器
-(依赖里的 aws-lc-sys 会自己编译 BoringSSL):
+预编译的 Linux 二进制用 musl 静态链接, 就是一个不依赖宿主 libc 的文件: RHEL 7+、
+Amazon Linux 2/2023、Debian/Ubuntu 全系、Alpine 都能直接跑, 不用管宿主的 glibc
+版本. 静态不等于自包含 —— TLS 证书和 DNS 仍然读宿主的配置(见 [TECH.md](TECH.md)).
+想自己编译需要一个 C 编译器(依赖里的 aws-lc-sys 会自己编译 BoringSSL):
 
 ```sh
 cargo install --git https://github.com/zhang0098/abylab abylab-tui

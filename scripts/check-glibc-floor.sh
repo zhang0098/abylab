@@ -10,13 +10,15 @@
 #       raises it — a binary built on Ubuntu 24.04 links
 #       `__isoc23_*@GLIBC_2.38+`, and the user on an older distro only sees
 #       `/lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found`.
+#       Nothing builds a glibc asset any more (see below); this mode is what
+#       such a build would have to pass, and it is one command either way.
 #
 #   scripts/check-glibc-floor.sh --static <binary>
 #       musl build: nothing may be loaded from the host at run time — no
 #       interpreter to find (PT_INTERP), no shared library to link against
 #       (NEEDED), and no GLIBC_ symbol. That is what lets the one Linux asset
-#       run on glibc and musl hosts alike; Linux releases are built this way
-#       (see the Alpine container in .github/workflows/release.yml).
+#       run on glibc and musl hosts alike, and it is what the Linux jobs in
+#       .github/workflows/release.yml assert after building in Alpine.
 #
 #       rustc links musl's crt-static builds as static-PIE on this target, so
 #       the binary keeps a dynamic section holding its own self-relocations.
@@ -113,7 +115,7 @@ highest=$(printf '%s\n' "$versions" | tail -n 1)
 # max(floor, highest) == floor exactly when highest <= floor.
 if [ "$(printf '%s\n%s\n' "$FLOOR" "$highest" | sort -V | tail -n 1)" != "$FLOOR" ]; then
     printf 'requested:%s\n' "$(printf ' %s' $versions)" >&2
-    fail "needs GLIBC_$highest, above the $FLOOR floor — build in the older container (see .github/workflows/release.yml)"
+    fail "needs GLIBC_$highest, above the $FLOOR floor — build it against the oldest glibc you promise"
 fi
 
 printf 'glibc floor ok: %s needs %s, floor %s\n' "$bin" "$highest" "$FLOOR"

@@ -37,11 +37,13 @@ in your shell startup file (marked with a comment; `--no-path` only prints the
 line, `--path-file` picks the file). To build from source instead:
 `cargo build --release`.
 
-The Linux binaries are built on Debian 11 (bullseye), so they need glibc 2.31
-or newer — Ubuntu 20.04+, Debian 11+, RHEL 9 and Amazon Linux 2023 run them
-as-is. Anything older (RHEL 8, Amazon Linux 2) and musl distros (Alpine) need
-a source build, which wants a C compiler (`aws-lc-sys` builds its own
-BoringSSL):
+The Linux binaries are statically linked against musl: one file per
+architecture that needs no libc from the host, so RHEL 7+, Amazon Linux 2 and
+2023, every Debian and Ubuntu, and Alpine all run the same download — there is
+no glibc version to match. Static is not self-contained, though: TLS
+certificates and DNS still come from the host (see
+[TECH.en.md](TECH.en.md)). A source build wants a C compiler (`aws-lc-sys`
+builds its own BoringSSL):
 
 ```sh
 cargo install --git https://github.com/zhang0098/abylab abylab-tui

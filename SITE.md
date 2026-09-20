@@ -174,7 +174,7 @@ gh workflow run release.yml -f tag=v0.1.2
 
 ```sh
 curl -s https://abylab.ai/downloads/latest/VERSION
-curl -sO https://abylab.ai/downloads/latest/abylab-latest-x86_64-unknown-linux-gnu.tar.gz
+curl -sO https://abylab.ai/downloads/latest/abylab-latest-x86_64-unknown-linux-musl.tar.gz
 curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
 ```
 
