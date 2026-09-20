@@ -2816,26 +2816,11 @@ impl App {
             (mention, menu.row(), menu.start(), menu.end())
         };
         crate::file_ref::replace_span(&mut self.input, row, start, end, &mention);
-        let end = start + mention.chars().count();
-        let query = mention
-            .strip_prefix("@\"")
-            .unwrap_or(&mention)
-            .strip_suffix('"')
-            .unwrap_or(&mention)
-            .to_string();
-        let quoted = mention.starts_with("@\"");
-        if let Some(menu) = &mut self.file_menu {
-            menu.retoken(
-                row,
-                &crate::file_ref::AtToken {
-                    start,
-                    end,
-                    query: query.clone(),
-                    quoted,
-                },
-            );
-            menu.apply_query(&query);
-        }
+        // Re-derive the token from the edited line instead of parsing the
+        // mention text by hand: the caret-token grammar owns the `@`/quote
+        // stripping, and `refresh_file_menu` re-anchors the menu's span and
+        // drives the browser to the new query (`@src/` descends into `src/`).
+        self.refresh_file_menu();
     }
 
     /// Esc: close the browser and remember the token so it stays closed
@@ -7415,6 +7400,113 @@ mod at_menu_tests {
         let frame = crate::ui::dump_frame(&mut app, 100, 24);
         assert!(frame.contains("ctrl+h hidden"), "hint row:\n{frame}");
         assert!(frame.contains("enter pick"), "hint row:\n{frame}");
+    }
+
+    /// Tab / → on a directory rewrites the token to `@dir/` *and* takes the
+    /// browser inside: the listing must be the child's. The drill used to
+    /// hand the browser a query that still carried the `@` (`@src/`), so the
+    /// filter matched nothing, the popup emptied down to `../` and the cwd
+    /// never moved.
+    #[test]
+    fn tab_and_right_drill_into_the_selected_directory() {
+        fn names(app: &App) -> Vec<String> {
+            app.file_menu
+                .as_ref()
+                .expect("browser open")
+                .explorer()
+                .files()
+                .iter()
+                .map(|f| f.name.clone())
+                .collect()
+        }
+        for key in [KeyCode::Tab, KeyCode::Right] {
+            let ws = Workspace::new();
+            let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+            for ch in "@src".chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &ctl);
+            }
+            assert_eq!(
+                app.file_menu
+                    .as_ref()
+                    .expect("browser open")
+                    .explorer()
+                    .current()
+                    .name,
+                "src/",
+                "the query preselected the directory"
+            );
+
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &ctl);
+
+            assert_eq!(app.input.buf(), "@src/", "{key:?} keeps drilling open");
+            let menu = app.file_menu.as_ref().expect("browser stays open");
+            assert_eq!(
+                menu.explorer().cwd(),
+                &ws.root.join("src"),
+                "{key:?} enters src/"
+            );
+            assert_eq!(names(&app), ["../", "nested/", "main.rs"], "{key:?}");
+            let frame = crate::ui::dump_frame(&mut app, 100, 24);
+            assert!(
+                frame.contains("nested/") && !frame.contains("README.md"),
+                "{key:?} paints the child listing:\n{frame}"
+            );
+
+            // Enter settles the drilled dir into a mention from the child.
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+            assert_eq!(app.input.buf(), "@src/nested/", "{key:?}");
+        }
+    }
+
+    /// A quoted token keeps its quote open across the drill (`@"dir with
+    /// space/`), and the browser lands inside it.
+    #[test]
+    fn tab_drills_into_a_quoted_directory() {
+        let ws = Workspace::new();
+        std::fs::create_dir_all(ws.root.join("with space")).expect("create dir");
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        for ch in "@with".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &ctl);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctl);
+
+        assert_eq!(app.input.buf(), "@\"with space/");
+        let menu = app.file_menu.as_ref().expect("browser stays open");
+        assert_eq!(menu.explorer().cwd(), &ws.root.join("with space"));
+        assert!(menu.quoted(), "the quoted form survives the drill");
+    }
+
+    /// The follow search (`@nested` with no `nested*` in the root hops the
+    /// browser into `src/`) plus the drill: the token jumps to the full
+    /// workspace-relative path and the listing is the nested directory's.
+    #[test]
+    fn tab_drills_after_the_follow_search() {
+        let ws = Workspace::new();
+        let (mut app, ctl, _rx) = test_app_in(&ws.root.to_string_lossy());
+        for ch in "@nested".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &ctl);
+        }
+        assert_eq!(
+            app.file_menu
+                .as_ref()
+                .expect("browser open")
+                .explorer()
+                .cwd(),
+            &ws.root.join("src"),
+            "the follow search landed in src/"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "@src/nested/");
+        assert_eq!(
+            app.file_menu
+                .as_ref()
+                .expect("browser stays open")
+                .explorer()
+                .cwd(),
+            &ws.root.join("src/nested")
+        );
     }
 }
 
