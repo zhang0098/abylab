@@ -1,4 +1,4 @@
-**English** · [中文](README.md) · [abylab.ai](https://abylab.ai/)
+**English** · [中文](README.md) · [Changelog](CHANGELOG.en.md) · [abylab.ai](https://abylab.ai/)
 
 # abylab
 
@@ -32,7 +32,8 @@ abylab
 Prebuilt binaries cover Linux (x86_64, aarch64) and macOS (Intel, Apple
 Silicon). The script installs `~/.local/bin/abylab` and checks the download
 against the release's `SHA256SUMS`; `--bin-dir` moves it, `--version <tag>`
-pins a release, `--help` lists the rest. It also puts that directory on PATH
+pins a release, `--mirror <url>` switches the download source, `--help` lists
+the rest. It also puts that directory on PATH
 in your shell startup file (marked with a comment; `--no-path` only prints the
 line, `--path-file` picks the file). To build from source instead:
 `cargo build --release`.
@@ -48,6 +49,8 @@ builds its own BoringSSL):
 ```sh
 cargo install --git https://github.com/zhang0098/abylab abylab-tui
 ```
+
+You can also just ask your AI to install it.
 
 Then store your key (from <https://platform.deepseek.com/> → API keys) by
 typing this into the composer — it takes effect without a restart:
@@ -180,8 +183,9 @@ counters in `/status`, …), and the next session moves on to the next one. The
 full list stays in `/help` and `/keys`.
 
 A launch opens the transcript with a centered ASCII wordmark over the project
-URL `https://abylab.ai`, then that hint; `/new` shows the hint alone and never
-repeats the mark.
+URL `https://abylab.ai`, then four launch facts — version, working directory,
+permission preset, model (with its effort when one is set) — then that hint;
+`/new` shows the hint alone and never repeats the mark.
 
 That row names the project path; when the workspace is a Git checkout the
 current branch rides along colon-tight (`/work/acme/abylab:main`). The branch
@@ -193,7 +197,10 @@ The `↥` right of the project path in that same row walks your prompts: each
 click jumps one prompt back (newest first, wrapping from the oldest), scrolls
 it to the top of the pane and highlights it for a few seconds. The `⛶` beside
 it is mouse-only too: one click pins the input well to the amplified height
-(about 5/8 of the frame), the next restores the automatic height.
+(about 5/8 of the frame), the next restores the automatic height. Once you
+have scrolled up, the `↓ N` on the meta row (N = lines above the bottom) is a
+button as well: one click returns to the newest line and follows the tail
+again, and the pointer resting on it brightens it.
 
 Mouse: wheel scrolls · click a tool card expands it · drag selects, release
 copies (native tool → tmux → OSC52) · inside the input box a click places the
