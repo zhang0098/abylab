@@ -1,17 +1,17 @@
 name: Site
 
-# abylab.ai is served by Cloudflare Pages. Two ways to deploy it — pick one:
+# The site was pushed to Pages with `wrangler pages deploy` (see site/README.md).
+# Three ways to keep it up to date — pick one:
 #
-#  1. Git integration (recommended, no secrets): connect this repo once in the
-#     Cloudflare dashboard with an empty build command and `site` as the output
-#     directory. Cloudflare then deploys on every push by itself, and this
-#     workflow is redundant.
-#  2. This workflow (Direct Upload): add CLOUDFLARE_API_TOKEN (Pages: Edit) and
+#  1. The manual command from site/README.md, run on the box you are working on.
+#  2. Git integration: connect this repo once in the Cloudflare dashboard with
+#     an empty build command and `site` as the output directory. Cloudflare then
+#     deploys on every push by itself, and this workflow is redundant.
+#  3. This workflow: add CLOUDFLARE_API_TOKEN (Pages: Edit) and
 #     CLOUDFLARE_ACCOUNT_ID as repository secrets and pushes touching site/
 #     ship through wrangler instead.
 #
-# When the secrets are absent the job skips instead of failing, so the file is
-# safe to keep around under option 1.
+# Under 1 or 2 the secrets are absent, so the job skips instead of failing.
 on:
   push:
     branches: [main, master]

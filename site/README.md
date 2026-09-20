@@ -33,9 +33,23 @@ python3 -m http.server 8000 --directory site
 
 ## 部署到 Cloudflare Pages
 
-### 1. 建项目（二选一）
+现状：项目 `abylab` 已经建好（Production branch = `main`），站点已经部署上去，
+生产地址 <https://abylab.pages.dev> 就是 `site/` 的内容（逐字节一致）。自定义
+域名 `abylab.ai` 已挂到项目上，卡在 **等待一条 DNS 记录**——见下面第 2 步。
 
-**Git 集成（推荐，不需要任何密钥）**
+### 1. 部署
+
+**Direct Upload（现在用的这条）**
+
+```sh
+npx wrangler pages deploy site --project-name abylab --branch main
+```
+
+`--branch main` 是必须的：本地在 `dev` 上开发，而 `main` 是项目的生产分支，随便
+推一个分支只会得到预览部署，自定义域名不会跟着更新。工作区有未提交改动时
+wrangler 会拦一下，加 `--commit-dirty=true` 跳过。
+
+**Git 集成（想改成推仓库自动部署）**
 Workers & Pages → Create → Pages → Connect to Git → 选本仓库，然后：
 
 | 设置 | 值 |
@@ -44,27 +58,28 @@ Workers & Pages → Create → Pages → Connect to Git → 选本仓库，然�
 | Build command | 留空 |
 | Build output directory | `site` |
 
-保存后每次推送自动部署，非生产分支会拿到预览域名。
-
-**Direct Upload**
-
-```sh
-npx wrangler pages deploy site --project-name abylab
-```
+保存后每次推送自动部署，非生产分支会拿到预览域名；`dev` 的推送正好用来看排版。
 
 **CI 里推（可选）**：给仓库加两个 secret —— `CLOUDFLARE_API_TOKEN`
 （权限 Pages: Edit）和 `CLOUDFLARE_ACCOUNT_ID`，`.github/workflows/site.yml`
 就会在 `site/**` 有改动时用 wrangler 部署；没配 secret 时它自己跳过。
-Git 集成已经在部署的话，把那个 workflow 删掉即可，别让两条路同时上线。
-
-> 生产分支按仓库的实际流向选：站点改动在 `dev` 上写，随 `dev → main` 的发布
-> 合并一起上线，所以 Pages 的 Production branch 填 `main`；`dev` 的推送会落到
-> 预览域名，正好用来看排版。
 
 ### 2. 绑定域名
 
-1. Pages 项目 → **Custom domains** → 添加 `abylab.ai`。域名 DNS 本来就在
-   Cloudflare 的话，记录会自动建好，证书也会自动签发。
+1. 自定义域名已经添加。剩下一条 DNS 记录：**DNS → Records → 添加**
+
+   | Type | Name | Target | Proxy |
+   | --- | --- | --- | --- |
+   | CNAME | `@`（即 `abylab.ai`） | `abylab.pages.dev` | **Proxied** |
+
+   apex 上用 CNAME 是可以的，Cloudflare 会做 flattening。记录一出现，Pages
+   那边的校验（`CNAME record not set`）就会通过并自动签发证书，不用再做别的。
+
+   注意：在 dashboard 里点 "Add custom domain" 时 Cloudflare 会顺手把这条记录
+   建好；通过 API 挂域名时它**不会**——所以要么在面板里加，要么用带
+   *Zone → DNS → Edit* 权限的 token 调
+   `POST /zones/{zone_id}/dns_records`。
+
 2. `www` 跳 apex（可选）：Cloudflare 官方做法是
    DNS 加一条 `A www → 192.0.2.1`（**Proxied**），再建一个
    **Bulk Redirect** 列表：`www.abylab.ai` → `https://abylab.ai`，状态 301，
@@ -75,9 +90,10 @@ Git 集成已经在部署的话，把那个 workflow 删掉即可，别让两条
 ### 3. 检查
 
 ```sh
-curl -sI https://abylab.ai/ | head -12        # CSP 等头部、200
-curl -sI https://www.abylab.ai/ | head -3     # 301 → https://abylab.ai/
-curl -s https://abylab.ai/install.sh | head -3   # 跟仓库里的脚本一致
+curl -sI https://abylab.pages.dev/ | head -12     # CSP 等头部、200
+curl -sI https://abylab.ai/ | head -3             # 域名生效后：200
+curl -sI https://www.abylab.ai/ | head -3         # 301 → https://abylab.ai/
+curl -s https://abylab.ai/install.sh | head -3    # 跟仓库里的脚本一致
 ```
 
 ## 改内容
