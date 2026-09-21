@@ -43,8 +43,7 @@ impl Discovery {
         match event {
             Event::Title { title, .. } => self.title = Some(title.clone()),
             Event::Snapshot { snapshot, .. } => self.observe(snapshot),
-            // The anchor's observe already carries the session preview; a delta
-            // never introduces the session's first user prompt.
+            // scan observes the resulting snapshot after folding this delta.
             Event::Delta { .. } => self.has_snapshot = true,
         }
     }
@@ -193,6 +192,10 @@ pub(super) fn scan(mut reader: impl BufRead, id: &str) -> Result<Scanned> {
                     snapshot.compactions = compactions;
                     snapshot.prune = prune;
                     snapshot.goal = goal;
+                    // Each committed record must stand on its own; a later
+                    // delta or anchor must never hide earlier corruption.
+                    snapshot.validate()?;
+                    scanned.discovery.observe(snapshot);
                     scanned.deltas_since_anchor += 1;
                 }
             }
@@ -206,7 +209,9 @@ pub(super) fn scan(mut reader: impl BufRead, id: &str) -> Result<Scanned> {
 /// beyond the folded length is a gap between records: the log is corrupt.
 fn fold_span<T: Clone>(items: &mut Vec<T>, span: &Span<T>) -> Result<()> {
     if span.from > items.len() {
-        return Err(invalid("session delta replaces past the committed transcript"));
+        return Err(invalid(
+            "session delta replaces past the committed transcript",
+        ));
     }
     items.truncate(span.from);
     items.extend(span.added.iter().cloned());

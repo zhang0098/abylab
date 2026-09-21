@@ -762,6 +762,8 @@ pub struct App {
     /// A real `session/new` or `session/load` has supplied this session id.
     /// Cached session options stay hidden until this becomes true.
     pub session_bound: bool,
+    /// Keep the old view until the driver commits a switch. Only one is in flight.
+    session_switch: Option<SessionSwitch>,
     pub quit: bool,
     pub queued: usize,
     /// Transcript cells grouped by the client FIFO prompt that owns them.
@@ -778,6 +780,11 @@ pub struct App {
     prompt_pending: bool,
     pub server_info: Option<String>,
     pub needs_redraw: bool,
+}
+
+enum SessionSwitch {
+    New,
+    Resume(String),
 }
 
 fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
@@ -1127,6 +1134,7 @@ impl App {
             git_check_at: Instant::now(),
             selected_model: None,
             session_bound: true,
+            session_switch: None,
             quit: false,
             queued: 0,
             prompt_queue: VecDeque::new(),
@@ -1657,6 +1665,7 @@ impl App {
                 // kept in proto's tail buffer for diagnostics; stay quiet here
             }
             AppEvent::RuntimeExited(code) => {
+                self.session_switch = None;
                 self.prompt_pending = false;
                 self.queued = 0;
                 self.prompt_queue.clear();
@@ -1798,6 +1807,13 @@ impl App {
                     CtlEvent::TuiOpFailed(desc) => {
                         self.transcript.push_notice(NoticeLevel::Warn, desc);
                     }
+                    CtlEvent::SessionSwitchFailed(desc) => {
+                        self.session_switch = None;
+                        self.transcript.push_notice(NoticeLevel::Warn, desc);
+                        if self.state == RunState::Idle && !self.prompt_pending {
+                            self.dispatch_next_queued(ctl);
+                        }
+                    }
                     CtlEvent::AgentCaps { load_session } => {
                         self.load_session = load_session;
                     }
@@ -1807,12 +1823,26 @@ impl App {
                         model,
                         effort,
                     } => {
-                        if self.session_id != session_id {
+                        let switched = match &self.session_switch {
+                            Some(SessionSwitch::New) => self.session_id != session_id,
+                            Some(SessionSwitch::Resume(target)) => *target == session_id,
+                            None => false,
+                        };
+                        let fresh =
+                            switched && matches!(self.session_switch, Some(SessionSwitch::New));
+                        if switched || (self.session_bound && self.session_id != session_id) {
+                            self.session_switch = None;
+                            self.reset_session_ui();
+                        } else if self.session_id != session_id {
+                            // Initial binding keeps already reported mode facts.
                             self.reset_subagent_views();
                         }
                         self.session_id = session_id.clone();
                         self.transcript.set_root_session(session_id);
                         self.session_bound = true;
+                        if fresh {
+                            self.push_session_tip();
+                        }
                         // The driver is the source of truth for the bound
                         // session's model: a resumed session keeps its stored
                         // model, and a rejected /model never moves this row.
@@ -4019,6 +4049,7 @@ impl App {
     /// point the next prompt at the same id — the runtime (or host dsh)
     /// keeps appending to the same log.
     fn reset_session_ui(&mut self) {
+        self.session_switch = None;
         self.vim.reset_pending();
         self.reset_subagent_views();
         self.transcript.clear();
@@ -4056,13 +4087,12 @@ impl App {
     }
 
     fn load_acp_session(&mut self, id: &str, ctl: &Controller) {
-        // A load is a driver mutation, so a turn in flight holds it back until
-        // that turn ends. Read the flag first: the reset below puts the
-        // composer back to idle whatever the driver is still doing.
+        if self.session_switch.is_some() || id == self.session_id {
+            return;
+        }
+        // The old view and queue remain owned by the old session until ack.
         let after_turn = self.turn_busy();
-        self.reset_session_ui();
-        self.session_id = id.to_string();
-        self.transcript.set_root_session(id.to_string());
+        self.session_switch = Some(SessionSwitch::Resume(id.into()));
         ctl.send(Cmd::LoadSession {
             session_id: id.to_string(),
         });
@@ -4498,9 +4528,11 @@ impl App {
                 }
             }
             "new" => {
-                self.reset_session_ui();
+                if self.session_switch.is_some() {
+                    return;
+                }
+                self.session_switch = Some(SessionSwitch::New);
                 ctl.send(Cmd::NewSession);
-                self.push_session_tip();
                 self.show_tip(self.locale.tr("session/new …", "正在新建会话…"));
             }
             "status" => self.open_status_dialog(),
@@ -4910,6 +4942,9 @@ pub(crate) fn fmt_duration(ms: u64) -> String {
 
 impl App {
     fn submit(&mut self, ctl: &Controller) {
+        if self.waiting_for_session_switch() {
+            return;
+        }
         let text = self.input.buf().trim().to_string();
         // Client namespaces don't take images — keep the chips editable
         // instead of silently dropping them.
@@ -4958,10 +4993,24 @@ impl App {
         self.send_agent_text(text, ctl);
     }
 
+    fn waiting_for_session_switch(&mut self) -> bool {
+        if self.session_switch.is_none() {
+            return false;
+        }
+        self.show_tip(self.locale.tr(
+            "waiting for the session switch — your draft is kept",
+            "正在等待会话切换，草稿已保留",
+        ));
+        true
+    }
+
     /// Send raw text as an agent prompt (shared by submit and command
     /// passthroughs like /plan). While a turn runs the text joins the client's
     /// FIFO instead of the driver's channel, so `⌥↑` can still edit it.
     fn send_agent_text(&mut self, text: String, ctl: &Controller) {
+        if self.waiting_for_session_switch() {
+            return;
+        }
         let running = self.turn_busy();
         let cell = self.transcript.cells.len();
         self.transcript.push_user(text.clone(), running);
@@ -5014,6 +5063,9 @@ impl App {
     /// item leaves the queue before the driver sees it, so a `/clear` or a
     /// session switch can never double-send it.
     fn dispatch_next_queued(&mut self, ctl: &Controller) {
+        if self.session_switch.is_some() {
+            return;
+        }
         if self.queue_edit.is_some() {
             // The item under edit keeps its slot and its pre-edit wording.
             self.state_note = self
@@ -5270,6 +5322,9 @@ impl App {
     /// Send-now is ACP steering: issue another prompt immediately while the
     /// current turn remains active. Esc is the only cancellation path.
     fn send_now(&mut self, ctl: &Controller) {
+        if self.waiting_for_session_switch() {
+            return;
+        }
         let raw = self.input.buf().trim().to_string();
         if !self.pending_images.is_empty() && raw.starts_with('/') {
             self.show_tip(self.locale.tr(
@@ -5361,12 +5416,18 @@ impl App {
 }
 
 pub fn timestamp() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{secs:x}")
+    format!(
+        "{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Slice `s` by display-cell range `[c0, c1)`: a char is included when its
@@ -5540,6 +5601,131 @@ mod resume_tests {
     }
 
     #[test]
+    fn failed_session_switch_preserves_history_identity_and_draft() {
+        for new_session in [false, true] {
+            let root = tmp_root("failed-switch");
+            let (mut app, _) = test_app_with_root(root.to_str().unwrap(), "/w");
+            let (ctl, commands) = crate::controller::test_controller();
+            let previous = app.session_id.clone();
+            app.transcript.push_user("original history".into(), false);
+            if new_session {
+                app.run_slash("new", "", &ctl);
+                assert!(matches!(commands.try_recv(), Ok(Cmd::NewSession)));
+            } else {
+                app.load_acp_session("target", &ctl);
+                assert!(
+                    matches!(commands.try_recv(), Ok(Cmd::LoadSession { session_id }) if session_id == "target")
+                );
+            }
+            app.input.set("unsent draft".into());
+            app.submit(&ctl);
+            app.send_now(&ctl);
+            assert_eq!(app.input.buf(), "unsent draft");
+            assert!(commands.try_recv().is_err(), "no prompts during a switch");
+            app.handle(
+                AppEvent::Ctl(CtlEvent::TuiOpFailed("unrelated operation".into())),
+                &ctl,
+            );
+            assert!(
+                app.session_switch.is_some(),
+                "unrelated failures cannot acknowledge the switch"
+            );
+            app.handle(
+                AppEvent::Ctl(CtlEvent::SessionSwitchFailed("cannot load target".into())),
+                &ctl,
+            );
+            assert!(app.session_switch.is_none());
+            assert_eq!(app.session_id, previous);
+            assert!(app.session_bound);
+            assert!(app.transcript.cells.iter().any(|cell| matches!(&cell.kind,
+                crate::transcript::CellKind::User { text, .. } if text == "original history")));
+            assert_eq!(app.input.buf(), "unsent draft");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn resume_ack_commits_the_view_and_never_moves_the_old_queue_to_the_new_session() {
+        let root = tmp_root("switch-queue");
+        let (mut app, _) = test_app_with_root(root.to_str().unwrap(), "/w");
+        let (ctl, commands) = crate::controller::test_controller();
+        let previous = app.session_id.clone();
+        app.state = RunState::Running;
+        app.send_agent_text("queued for old session".into(), &ctl);
+        app.load_acp_session("target", &ctl);
+        assert!(matches!(commands.try_recv(), Ok(Cmd::LoadSession { .. })));
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: previous.clone(),
+                running: false,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.session_id, previous);
+        assert_eq!(app.queued, 1);
+        assert!(
+            commands.try_recv().is_err(),
+            "idle must not dispatch through a pending switch"
+        );
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "target".into(),
+                notice: None,
+                model: None,
+                effort: None,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.session_id, "target");
+        assert_eq!(app.queued, 0);
+        assert!(app.transcript.cells.is_empty());
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::UserMessage {
+                session: "target".into(),
+                text: "restored history".into(),
+            }),
+            &ctl,
+        );
+        app.input.set("new draft".into());
+        app.submit(&ctl);
+        let sent: Vec<_> = commands.try_iter().collect();
+        assert_eq!(
+            sent.iter()
+                .filter(|cmd| matches!(cmd, Cmd::Prompt { .. }))
+                .count(),
+            1
+        );
+        assert!(sent.iter().any(|cmd| matches!(cmd, Cmd::Prompt { session_id, text } if session_id == "target" && text == "new draft")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_switch_resumes_the_previous_sessions_queue() {
+        let root = tmp_root("failed-switch-queue");
+        let (mut app, _) = test_app_with_root(root.to_str().unwrap(), "/w");
+        let (ctl, commands) = crate::controller::test_controller();
+        let previous = app.session_id.clone();
+        app.state = RunState::Running;
+        app.send_agent_text("queued for old session".into(), &ctl);
+        app.load_acp_session("target", &ctl);
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: previous.clone(),
+                running: false,
+            }),
+            &ctl,
+        );
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionSwitchFailed("cannot load target".into())),
+            &ctl,
+        );
+        assert_eq!(app.session_id, previous);
+        assert_eq!(app.queued, 0);
+        assert!(commands.try_iter().any(|cmd| matches!(cmd, Cmd::Prompt { session_id, text } if session_id == previous && text == "queued for old session")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resume_picker_lists_sessions_and_prefix_resolves() {
         let root = tmp_root("picker");
         let (mut app, ctl) = test_app_with_root(root.to_str().unwrap(), "/w");
@@ -5584,6 +5770,19 @@ mod resume_tests {
                     updated_at: None,
                 }],
                 prefix: Some("dsh-al".into()),
+            }),
+            &ctl,
+        );
+        assert_ne!(
+            app.session_id, "dsh-alpha",
+            "wait for the driver's acknowledgement"
+        );
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "dsh-alpha".into(),
+                notice: None,
+                model: None,
+                effort: None,
             }),
             &ctl,
         );
@@ -6540,6 +6739,20 @@ mod mode_tests {
 
         app.run_slash("new", "fresh", &ctl);
 
+        assert_eq!(
+            app.subagents.len(),
+            1,
+            "keep the old view until the switch succeeds"
+        );
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "new-session".into(),
+                notice: None,
+                model: None,
+                effort: None,
+            }),
+            &ctl,
+        );
         assert!(app.subagents.is_empty());
         assert!(app.active_subagent.is_none());
     }
@@ -6643,6 +6856,16 @@ mod mode_tests {
                     updated_at: None,
                 }],
                 prefix: Some("s-old".into()),
+            }),
+            &ctl,
+        );
+        assert_ne!(app.session_id, "s-old", "listing only requests the switch");
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "s-old".into(),
+                notice: None,
+                model: None,
+                effort: None,
             }),
             &ctl,
         );
@@ -9095,12 +9318,30 @@ mod right_slot_tests {
         };
 
         app.run_slash("new", "", &ctl);
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "first-new".into(),
+                notice: None,
+                model: None,
+                effort: None,
+            }),
+            &ctl,
+        );
         assert_eq!(
             greeting(&app),
             "- **Tip** · esc interrupts a running turn — your draft survives"
         );
 
         app.run_slash("new", "", &ctl);
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "second-new".into(),
+                notice: None,
+                model: None,
+                effort: None,
+            }),
+            &ctl,
+        );
         assert_eq!(
             greeting(&app),
             "- **Tip** · enter queues a follow-up; ctrl+enter steers the active turn now"

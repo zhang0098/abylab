@@ -21,6 +21,7 @@ mod log;
 use crate::{Error, ErrorKind, Result, SessionSnapshot};
 use log::{Discovery, scan};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
@@ -99,6 +100,13 @@ impl SessionHeader {
         }
         Ok(())
     }
+
+    fn validate_workspace(&self, workspace: &Path) -> Result<()> {
+        if Path::new(&self.cwd) != workspace {
+            return Err(invalid("session belongs to a different workspace"));
+        }
+        Ok(())
+    }
 }
 
 /// Discovery metadata. `modified` is the log file's last modification time.
@@ -130,9 +138,15 @@ pub struct SessionStore {
     slug: Option<String>,
 }
 
-/// `/Users/x/proj` → `--Users-x-proj--`: the workspace partition under a
-/// shared store root.
+/// A bounded, stable partition of the canonical path, including its raw bytes.
 pub(crate) fn workspace_slug(workspace: &Path) -> String {
+    format!(
+        "ws-{:x}",
+        Sha256::digest(workspace.as_os_str().as_encoded_bytes())
+    )
+}
+
+fn legacy_workspace_slug(workspace: &Path) -> String {
     format!("-{}--", workspace.to_string_lossy().replace('/', "-"))
 }
 
@@ -180,7 +194,35 @@ impl SessionStore {
             dir = dir.join(Self::escape_segment(slug));
         }
         dir = dir.join(Self::escape_segment(id));
+        // Continue verified legacy sessions in place, using their original
+        // lock file. Moving them would split locks with an older live writer.
+        if !dir
+            .try_exists()
+            .map_err(|e| io_error("inspect session directory", e))?
+            && let Some(legacy) = self.legacy_partition()
+        {
+            let legacy = legacy.join(Self::escape_segment(id));
+            match fs::File::open(legacy.join("session.jsonl")) {
+                Ok(file) => {
+                    let header = read_header(BufReader::new(file))?;
+                    header.validate(id)?;
+                    if header.validate_workspace(&self.workspace).is_ok() {
+                        return Ok(legacy);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error("read legacy session", error)),
+            }
+        }
         Ok(dir)
+    }
+
+    fn legacy_partition(&self) -> Option<PathBuf> {
+        self.slug.as_ref().map(|_| {
+            self.root.join(Self::escape_segment(&legacy_workspace_slug(
+                &self.workspace,
+            )))
+        })
     }
 
     fn log_file(&self, id: &str) -> Result<PathBuf> {
@@ -216,15 +258,17 @@ impl SessionStore {
             Some(slug) => self.root.join(Self::escape_segment(slug)),
             None => self.root.clone(),
         };
-        let entries = match fs::read_dir(&scan) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(error) => return Err(io_error("list sessions", error)),
-        };
         let mut summaries = vec![];
-        for entry in entries.flatten() {
-            if let Ok(summary) = self.summary(&entry.path()) {
-                summaries.push(summary);
+        for partition in std::iter::once(scan).chain(self.legacy_partition()) {
+            let entries = match fs::read_dir(&partition) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error("list sessions", error)),
+            };
+            for entry in entries.flatten() {
+                if let Ok(summary) = self.summary(&entry.path()) {
+                    summaries.push(summary);
+                }
             }
         }
         summaries.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
@@ -248,6 +292,7 @@ impl SessionStore {
         }
         let header = SessionHeader::parse(&line)?;
         header.validate(&header.id)?;
+        header.validate_workspace(&self.workspace)?;
         if self.dir_of(&header.id)? != dir {
             return Err(invalid("session directory identity mismatch"));
         }
@@ -281,6 +326,8 @@ impl SessionStore {
 
     /// Acquire the session's exclusive writer lock. Existing logs are validated
     /// and torn tails repaired before returning; new logs materialize on append.
+    /// For a new identity prefer [`Self::create_new`]; to continue existing
+    /// history use [`Self::open_for_resume`] instead of loading before locking.
     pub fn create(&self, id: &str, snapshot: &SessionSnapshot) -> Result<SessionWriter> {
         snapshot.validate()?;
         let dir = self.dir_of(id)?;
@@ -299,14 +346,44 @@ impl SessionStore {
         SessionWriter::open(dir, header)
     }
 
+    /// Reserve a new session id without replacing an existing committed log.
+    pub fn create_new(&self, id: &str, snapshot: &SessionSnapshot) -> Result<SessionWriter> {
+        let writer = self.create(id, snapshot)?;
+        if writer.len != 0 {
+            return Err(invalid(
+                "session already exists; resume it or choose a new id",
+            ));
+        }
+        Ok(writer)
+    }
+
+    /// Acquire the exclusive writer before reading the authoritative snapshot.
+    /// Keep the returned writer alive for the entire resumed session.
+    pub fn open_for_resume(&self, id: &str) -> Result<(SessionWriter, SessionSnapshot)> {
+        let header = SessionHeader::from_snapshot(
+            id,
+            &self.workspace.to_string_lossy(),
+            &SessionSnapshot::new("", crate::ModelOptions::default()),
+        );
+        let writer = SessionWriter::open(self.dir_of(id)?, header)?;
+        let snapshot = writer
+            .state
+            .clone()
+            .ok_or_else(|| invalid("session log has no checkpoint to resume"))?;
+        Ok((writer, snapshot))
+    }
+
     /// Load the last newline-terminated checkpoint, validating every complete
     /// record. An unfinished tail is ignored without modifying the file.
+    /// This is a read-only view, not a reservation for later writes. Continuing
+    /// the session requires [`Self::open_for_resume`].
     pub fn load(&self, id: &str) -> Result<(SessionHeader, SessionSnapshot)> {
         let file = fs::File::open(self.log_file(id)?).map_err(|e| io_error("read session", e))?;
         let scanned = scan(BufReader::new(file), id)?;
         let header = scanned
             .header
             .ok_or_else(|| invalid("session log has no committed header"))?;
+        header.validate_workspace(&self.workspace)?;
         let snapshot = scanned
             .snapshot
             .ok_or_else(|| invalid("session log has no checkpoint to resume"))?;
@@ -315,12 +392,18 @@ impl SessionStore {
 
     /// Return the most recent committed title, or None for absent/invalid logs.
     pub fn title_of(&self, id: &str) -> Option<String> {
-        let file = fs::File::open(self.log_file(id).ok()?).ok()?;
+        let dir = self.dir_of(id).ok()?;
+        let file = fs::File::open(dir.join("session.jsonl")).ok()?;
         let metadata = file.metadata().ok()?;
-        if let Some(discovery) = index::read(&self.dir_of(id).ok()?, &metadata) {
+        let mut reader = BufReader::new(file);
+        let header = read_header(&mut reader).ok()?;
+        header.validate(id).ok()?;
+        header.validate_workspace(&self.workspace).ok()?;
+        if let Some(discovery) = index::read(&dir, &metadata) {
             return discovery.title;
         }
-        scan(BufReader::new(file), id).ok()?.discovery.title
+        reader.seek(SeekFrom::Start(0)).ok()?;
+        scan(reader, id).ok()?.discovery.title
     }
 
     pub fn set_title(&self, writer: &mut SessionWriter, title: &str) -> Result<()> {
@@ -427,6 +510,11 @@ impl SessionWriter {
         &self.file
     }
 
+    /// The last committed title, read under this writer's exclusive lock.
+    pub fn title(&self) -> Option<&str> {
+        self.discovery.title.as_deref()
+    }
+
     /// Commit one valid title or snapshot record. Invalid JSON, unknown
     /// records, invalid snapshots and delta records are rejected before I/O:
     /// deltas are writer-internal; external callers express full state.
@@ -466,7 +554,9 @@ impl SessionWriter {
         let must_anchor = match &self.state {
             None => true,
             Some(state) => {
-                snapshot.items.len() < state.items.len()
+                snapshot.model != state.model
+                    || snapshot.system_prompt != state.system_prompt
+                    || snapshot.items.len() < state.items.len()
                     || snapshot.requests.len() < state.requests.len()
                     || self.deltas_since_anchor >= DELTAS_PER_ANCHOR
             }
@@ -565,7 +655,8 @@ impl SessionWriter {
         discovery: Discovery,
     ) -> Result<()> {
         let anchor =
-            serde_json::json!({"type":"snapshot", "seq":seq, "time":now_ms(), "snapshot":snapshot}).to_string();
+            serde_json::json!({"type":"snapshot", "seq":seq, "time":now_ms(), "snapshot":snapshot})
+                .to_string();
         self.rewrite(discovery, Some((anchor, Some(snapshot.clone()))))
     }
 
@@ -591,7 +682,9 @@ impl SessionWriter {
         body.push(b'\n');
         if let Some(title) = &discovery.title {
             body.extend_from_slice(
-                serde_json::json!({"type":"title", "title":title, "time":now_ms()}).to_string().as_bytes(),
+                serde_json::json!({"type":"title", "title":title, "time":now_ms()})
+                    .to_string()
+                    .as_bytes(),
             );
             body.push(b'\n');
         }
@@ -670,6 +763,9 @@ impl SessionWriter {
         file.seek(SeekFrom::Start(0))
             .map_err(|e| io_error("seek session log", e))?;
         let scanned = scan(BufReader::new(&mut *file), &self.id)?;
+        if let Some(header) = &scanned.header {
+            header.validate_workspace(Path::new(&self.header.cwd))?;
+        }
         let actual = file
             .metadata()
             .map_err(|e| io_error("inspect session log", e))?
@@ -707,6 +803,17 @@ impl Drop for SessionWriter {
 
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
+}
+
+fn read_header(mut reader: impl BufRead) -> Result<SessionHeader> {
+    let mut line = vec![];
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|e| io_error("read header", e))?;
+    if line.last() != Some(&b'\n') {
+        return Err(invalid("session has no committed header"));
+    }
+    SessionHeader::parse(&line)
 }
 
 fn now_ms() -> u64 {

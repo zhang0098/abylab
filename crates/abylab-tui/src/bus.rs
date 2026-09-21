@@ -78,6 +78,8 @@ pub enum CtlEvent {
     TuiOpDone(String),
     /// A client-side control call failed (or is unsupported on this transport).
     TuiOpFailed(String),
+    /// A switch failed; retain the currently displayed session and its queue.
+    SessionSwitchFailed(String),
     /// Agent advertised `loadSession` (`session/load`, usually with `session/list`).
     AgentCaps { load_session: bool },
     /// `session/new` or `session/load` resolved; the UI must use this id.

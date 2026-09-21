@@ -103,20 +103,27 @@ fn aby_loop(
 ) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            Cmd::Prompt { text, .. } => handle.send(abylab_backend::Cmd::Prompt { text }),
+            Cmd::Prompt { session_id, text } => {
+                handle.send(abylab_backend::Cmd::PromptForSession { session_id, text })
+            }
             Cmd::Steer {
-                message_id, text, ..
+                session_id,
+                message_id,
+                text,
             } => {
                 // Send Now: cancel the active turn; the prompt queues behind
                 // it inside the driver.
                 handle.interrupt();
-                handle.send(abylab_backend::Cmd::Prompt { text });
+                handle.send(abylab_backend::Cmd::PromptForSession { session_id, text });
                 let _ = bus.send(AppEvent::Ctl(CtlEvent::SteerSettled {
                     message_id,
                     deferred: false,
                 }));
             }
-            Cmd::PromptImages { blocks, .. } | Cmd::SteerImages { blocks, .. } => {
+            Cmd::PromptImages { session_id, blocks }
+            | Cmd::SteerImages {
+                session_id, blocks, ..
+            } => {
                 let text = blocks
                     .iter()
                     .filter_map(|block| match block {
@@ -126,7 +133,7 @@ fn aby_loop(
                     .collect::<Vec<_>>()
                     .join("");
                 handle.interrupt();
-                handle.send(abylab_backend::Cmd::Prompt { text });
+                handle.send(abylab_backend::Cmd::PromptForSession { session_id, text });
             }
             Cmd::Interrupt { .. } => {
                 // The cancel itself happened in interrupt_now(); the driver
@@ -203,6 +210,9 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                 abylab_backend::CtlEvent::Interrupted => CtlEvent::Interrupted,
                 abylab_backend::CtlEvent::TuiOpDone(message) => CtlEvent::TuiOpDone(message),
                 abylab_backend::CtlEvent::TuiOpFailed(message) => CtlEvent::TuiOpFailed(message),
+                abylab_backend::CtlEvent::SessionSwitchFailed(message) => {
+                    CtlEvent::SessionSwitchFailed(message)
+                }
                 abylab_backend::CtlEvent::SessionBound {
                     session_id,
                     notice,

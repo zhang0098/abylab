@@ -230,23 +230,17 @@ impl RepeatGuard {
     }
 }
 
-/// Shared persistence handle set: the session store plus the lazily created
-/// exclusive writer and its one-shot title event.
+/// The exclusive writer is reserved before a session is bound to the UI.
 struct PersistState {
     store: abycore::SessionStore,
-    session_id: String,
-    writer: std::sync::Mutex<Option<abycore::SessionWriter>>,
-    /// First user prompt preview written once as the title event.
-    title_written: std::sync::atomic::AtomicBool,
+    writer: std::sync::Mutex<abycore::SessionWriter>,
 }
 
 impl PersistState {
-    fn new(store: &abycore::SessionStore, session_id: &str) -> Self {
+    fn with_writer(store: &abycore::SessionStore, writer: abycore::SessionWriter) -> Self {
         Self {
             store: store.clone(),
-            session_id: session_id.to_string(),
-            writer: std::sync::Mutex::new(None),
-            title_written: std::sync::atomic::AtomicBool::new(false),
+            writer: std::sync::Mutex::new(writer),
         }
     }
 }
@@ -310,38 +304,19 @@ impl SessionAgent {
 
 impl PersistState {
     fn save(&self, snapshot: &abycore::SessionSnapshot) -> abycore::Result<()> {
-        let state = self;
-        let mut guard = state.writer.lock().map_err(|_| {
+        let mut writer = self.writer.lock().map_err(|_| {
             abycore::Error::new(abycore::ErrorKind::Session, "persist lock poisoned")
         })?;
-        if guard.is_none() {
-            let writer = state.store.create(&state.session_id, snapshot)?;
-            *guard = Some(writer);
-        }
-        // A host command can create the writer before the first prompt.
-        // Defer the title until text exists instead of consuming its one shot.
-        if !state
-            .title_written
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            let title = first_user_text(snapshot)
+        // Preserve stored titles on resume; defer a new title until a prompt exists.
+        if writer.title().is_none()
+            && let Some(title) = first_user_text(snapshot)
                 .map(|text| text.chars().take(48).collect::<String>())
-                .filter(|text| !text.is_empty());
-            if let Some(title) = title
-                && let Some(writer) = guard.as_mut()
-                && state.store.set_title(writer, &title).is_ok()
-            {
-                state
-                    .title_written
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
+                .filter(|text| !text.is_empty())
+        {
+            self.store.set_title(&mut writer, &title)?;
         }
-        if let Some(writer) = guard.as_mut() {
-            state
-                .store
-                .append_checkpoint(writer, snapshot.run_sequence, snapshot)?;
-        }
-        Ok(())
+        self.store
+            .append_checkpoint(&mut writer, snapshot.run_sequence, snapshot)
     }
 }
 
@@ -631,24 +606,16 @@ async fn drive(
             Arc::clone(&host.agent_sessions),
         );
     }
-    // Startup resume: `resume` names a persisted session to continue.
-    let mut active_session = cfg.resume.clone().unwrap_or_else(|| cfg.session_id.clone());
-    let mut resumed: Option<abycore::SessionSnapshot> = None;
-    if cfg.resume.is_some()
-        && let (Some(store), Some(_local)) = (store.as_ref(), local.as_ref())
+    // Retain the intended restore while credentials are unavailable or a
+    // load fails. Login must never turn a failed restore into a fresh session.
+    let mut resume_target = cfg.resume.clone();
+    let mut active_session = resume_target
+        .clone()
+        .unwrap_or_else(|| cfg.session_id.clone());
+    let mut agent = None;
+    if !api_key.trim().is_empty()
+        && let Some(local) = local.as_ref()
     {
-        match store.load(&active_session) {
-            Ok((header, snapshot)) => {
-                resumed = Some(snapshot);
-                let _ = header;
-            }
-            Err(err) => {
-                ctl(CtlEvent::Error(format!("resume failed · {err}")));
-                active_session = cfg.session_id.clone();
-            }
-        }
-    }
-    let mut agent = local.as_ref().and_then(|local| {
         let ctx = AgentContext {
             local,
             api_key: &api_key,
@@ -658,33 +625,45 @@ async fn drive(
             subagents: subagents.as_ref(),
             host: &host,
         };
-        match &resumed {
-            Some(snapshot) => resume_agent(&ctx, snapshot),
-            None => fresh_agent(&ctx, &model, effort),
+        let result = if resume_target.is_some() {
+            resume_agent(&ctx)
+        } else {
+            fresh_agent(&ctx, &model, effort)
+        };
+        match result {
+            Ok(next) => agent = Some(next),
+            Err(error) => ctl(CtlEvent::Error(format!("session open failed: {error}"))),
         }
-    });
-    // Bind the session up front — fresh or resumed — so the composer's meta
-    // row (mode/permission chips · model) renders from the first frame
-    // instead of staying hidden until the first turn.
-    if let Some(agent) = agent.as_ref() {
-        ctl(CtlEvent::SessionBound {
-            session_id: active_session.clone(),
-            notice: resumed
+    }
+    if let Some(current) = agent.as_ref() {
+        bind_session(
+            current,
+            &active_session,
+            resume_target
                 .as_ref()
-                .map(|snapshot| format!("resumed · {} turns", snapshot.run_sequence)),
-            model: Some(agent.snapshot().model.model.clone()),
-            effort: Some(effort_label(agent.snapshot().model.reasoning).to_owned()),
-        });
-        if let Some(snapshot) = &resumed {
-            for ui in replay_events(&active_session, snapshot) {
-                sink(Event::Ui(ui));
-            }
-        }
+                .map(|_| format!("resumed · {} turns", current.snapshot().run_sequence)),
+            resume_target.is_some(),
+            &sink,
+        );
     }
     emit_permission_facts(&sink, &active_session, permission_mode);
 
     while let Some(cmd) = cmd_rx.recv().await {
+        let cmd = match cmd {
+            Cmd::PromptForSession { session_id, text } => {
+                if session_id != active_session {
+                    ctl(CtlEvent::Error(
+                        "prompt rejected: the active session changed".into(),
+                    ));
+                    continue;
+                }
+                Cmd::Prompt { text }
+            }
+            cmd => cmd,
+        };
+        let restoring = matches!(cmd, Cmd::Resume { .. });
         match cmd {
+            Cmd::PromptForSession { .. } => unreachable!("normalized above"),
             // The skill catalog is a pure read of the launch snapshot and the handle
             // routes it to the query task so it answers mid-turn; this arm
             // covers a direct send on the loop channel.
@@ -848,118 +827,105 @@ async fn drive(
             }
             Cmd::Shutdown => break,
             Cmd::SetModel {
-                model: m,
-                effort: e,
+                model: next_model,
+                effort: next_effort,
             } => {
-                let fresh = agent
+                if agent
                     .as_ref()
-                    .map(|agent| agent.snapshot().items.is_empty())
-                    .unwrap_or(true);
-                if !fresh {
+                    .is_some_and(|agent| !agent.snapshot().items.is_empty())
+                    || (agent.is_none() && resume_target.is_some())
+                {
                     ctl(CtlEvent::TuiOpFailed(
                         "model is fixed for a live session — /new starts a fresh one".into(),
                     ));
                     continue;
                 }
-                if let Some(m) = m {
-                    model = m;
+                let next_model = next_model.unwrap_or_else(|| model.clone());
+                let next_effort = next_effort.as_deref().map(parse_effort).unwrap_or(effort);
+                if let (Some(current), Some(local)) = (agent.as_ref(), local.as_ref()) {
+                    let mut snapshot = current.snapshot();
+                    snapshot.model.model = next_model.clone();
+                    snapshot.model.reasoning = next_effort;
+                    let ctx = AgentContext {
+                        local,
+                        api_key: &api_key,
+                        base_url: cfg.base_url.as_deref(),
+                        store: store.as_ref(),
+                        session_id: &active_session,
+                        subagents: subagents.as_ref(),
+                        host: &host,
+                    };
+                    match build_agent(&ctx, snapshot, current.persist.clone()).and_then(|next| {
+                        next.save()?;
+                        Ok(next)
+                    }) {
+                        Ok(next) => agent = Some(next),
+                        Err(error) => {
+                            ctl(CtlEvent::TuiOpFailed(format!(
+                                "model switch failed: {error}"
+                            )));
+                            continue;
+                        }
+                    }
                 }
-                if let Some(e) = e {
-                    effort = parse_effort(&e);
-                }
-                agent = local.as_ref().and_then(|local| {
-                    fresh_agent(
-                        &AgentContext {
-                            local,
-                            api_key: &api_key,
-                            base_url: cfg.base_url.as_deref(),
-                            store: store.as_ref(),
-                            session_id: &active_session,
-                            subagents: subagents.as_ref(),
-                            host: &host,
-                        },
-                        &model,
-                        effort,
-                    )
-                });
-                if agent.is_some() {
+                model = next_model;
+                effort = next_effort;
+                if let Some(current) = &agent {
                     ctl(CtlEvent::TuiOpDone(format!(
                         "model → {model} · effort {}",
                         effort_label(effort)
                     )));
-                    // Rebind facts so the TUI's model row tracks the driver
-                    // even when the session id did not change.
-                    ctl(CtlEvent::SessionBound {
-                        session_id: active_session.clone(),
-                        notice: None,
-                        model: Some(model.clone()),
-                        effort: Some(effort_label(effort).to_owned()),
-                    });
+                    bind_session(current, &active_session, None, false, &sink);
                 }
             }
-            Cmd::NewSession { session_id: id } => {
-                active_session = id.clone();
-                agent = local.as_ref().and_then(|local| {
-                    fresh_agent(
-                        &AgentContext {
-                            local,
-                            api_key: &api_key,
-                            base_url: cfg.base_url.as_deref(),
-                            store: store.as_ref(),
-                            session_id: &id,
-                            subagents: subagents.as_ref(),
-                            host: &host,
-                        },
-                        &model,
-                        effort,
-                    )
-                });
-                if agent.is_some() {
-                    ctl(CtlEvent::SessionBound {
-                        session_id: id,
-                        notice: Some("new session · abycore".into()),
-                        model: Some(model.clone()),
-                        effort: Some(effort_label(effort).to_owned()),
-                    });
-                    emit_permission_facts(&sink, &active_session, permission_mode);
+            Cmd::NewSession { session_id: id } | Cmd::Resume { session_id: id } => {
+                // A same-session restore keeps the existing owner and its lock.
+                if restoring && id == active_session && agent.is_some() {
+                    bind_session(agent.as_ref().unwrap(), &id, None, false, &sink);
+                    continue;
                 }
-            }
-            Cmd::Resume { session_id: id } => {
-                let next = (|| -> Option<abycore::SessionSnapshot> {
-                    let store = store.as_ref()?;
-                    store.load(&id).ok().map(|(_, snapshot)| snapshot)
+                let result = (|| -> abycore::Result<SessionAgent> {
+                    let local = local.as_ref().ok_or_else(|| {
+                        abycore::Error::new(ErrorKind::Configuration, "local tools unavailable")
+                    })?;
+                    let ctx = AgentContext {
+                        local,
+                        api_key: &api_key,
+                        base_url: cfg.base_url.as_deref(),
+                        store: store.as_ref(),
+                        session_id: &id,
+                        subagents: subagents.as_ref(),
+                        host: &host,
+                    };
+                    if restoring {
+                        resume_agent(&ctx)
+                    } else {
+                        fresh_agent(&ctx, &model, effort)
+                    }
                 })();
-                match (next, local.as_ref()) {
-                    (Some(snapshot), Some(local)) => {
-                        agent = resume_agent(
-                            &AgentContext {
-                                local,
-                                api_key: &api_key,
-                                base_url: cfg.base_url.as_deref(),
-                                store: store.as_ref(),
-                                session_id: &id,
-                                subagents: subagents.as_ref(),
-                                host: &host,
-                            },
-                            &snapshot,
+                match result {
+                    Ok(next) => {
+                        let notice = if restoring {
+                            format!("resumed · {} turns", next.snapshot().run_sequence)
+                        } else {
+                            "new session · abycore".into()
+                        };
+                        agent = Some(next);
+                        active_session = id;
+                        resume_target = restoring.then(|| active_session.clone());
+                        goal_armed = false;
+                        bind_session(
+                            agent.as_ref().unwrap(),
+                            &active_session,
+                            Some(notice),
+                            restoring,
+                            &sink,
                         );
-                        active_session = id.clone();
-                        if agent.is_some() {
-                            ctl(CtlEvent::SessionBound {
-                                session_id: id,
-                                notice: Some(format!("resumed · {} turns", snapshot.run_sequence)),
-                                model: Some(snapshot.model.model.clone()),
-                                effort: Some(effort_label(snapshot.model.reasoning).to_owned()),
-                            });
-                            for ui in replay_events(&active_session, &snapshot) {
-                                sink(Event::Ui(ui));
-                            }
-                            emit_permission_facts(&sink, &active_session, permission_mode);
-                        }
+                        emit_permission_facts(&sink, &active_session, permission_mode);
                     }
-                    _ => {
-                        ctl(CtlEvent::TuiOpFailed("session cannot be resumed".into()));
-                    }
+                    Err(error) => ctl(CtlEvent::SessionSwitchFailed(format!(
+                        "session switch failed: {error}"
+                    ))),
                 }
             }
             Cmd::ListSessions { prefix } => {
@@ -1055,30 +1021,38 @@ async fn drive(
                         continue;
                     }
                 } else if let Some(local) = local.as_ref() {
-                    // A keyless boot left the agent unbuilt (abycore rejects
-                    // an empty client config): this `/login` brings the
-                    // session alive instead of demanding a restart.
-                    agent = fresh_agent(
-                        &AgentContext {
-                            local,
-                            api_key: &api_key,
-                            base_url: cfg.base_url.as_deref(),
-                            store: store.as_ref(),
-                            session_id: &active_session,
-                            subagents: subagents.as_ref(),
-                            host: &host,
-                        },
-                        &model,
-                        effort,
-                    );
-                    if agent.is_some() {
-                        ctl(CtlEvent::SessionBound {
-                            session_id: active_session.clone(),
-                            notice: Some("api key set — session ready".into()),
-                            model: Some(model.clone()),
-                            effort: Some(effort_label(effort).to_owned()),
-                        });
-                        emit_permission_facts(&sink, &active_session, permission_mode);
+                    let ctx = AgentContext {
+                        local,
+                        api_key: &api_key,
+                        base_url: cfg.base_url.as_deref(),
+                        store: store.as_ref(),
+                        session_id: &active_session,
+                        subagents: subagents.as_ref(),
+                        host: &host,
+                    };
+                    let result = if resume_target.is_some() {
+                        resume_agent(&ctx)
+                    } else {
+                        fresh_agent(&ctx, &model, effort)
+                    };
+                    match result {
+                        Ok(next) => {
+                            agent = Some(next);
+                            bind_session(
+                                agent.as_ref().unwrap(),
+                                &active_session,
+                                Some("api key set — session ready".into()),
+                                resume_target.is_some(),
+                                &sink,
+                            );
+                            emit_permission_facts(&sink, &active_session, permission_mode);
+                        }
+                        Err(error) => {
+                            ctl(CtlEvent::TuiOpFailed(format!(
+                                "session open failed: {error}"
+                            )));
+                            continue;
+                        }
                     }
                 }
                 if agent.is_some() {
@@ -1326,144 +1300,100 @@ struct AgentContext<'a> {
     host: &'a HostPolicy,
 }
 
-/// Build a fresh agent and register the local tool bundle atomically.
+/// A fresh session reserves its id before it is published to the UI.
 fn fresh_agent(
     ctx: &AgentContext<'_>,
     model: &str,
     effort: ReasoningEffort,
-) -> Option<SessionAgent> {
-    let AgentContext {
-        local,
-        api_key,
-        base_url,
-        store,
-        session_id,
-        subagents,
-        host,
-    } = *ctx;
-    let mut config = ClientConfig::new(api_key);
-    if let Some(url) = base_url {
-        config.base_url = url.to_string();
-    }
-    let client = match DeepSeekClient::new(config) {
-        Ok(client) => client,
-        Err(_) => return None,
-    };
-    let options = ModelOptions {
-        model: model.to_string(),
-        reasoning: effort,
-        max_tokens: host
-            .max_tokens
-            .unwrap_or_else(|| ModelOptions::default().max_tokens),
-        ..ModelOptions::default()
-    };
-    let mut agent = Agent::new(
-        client,
+) -> abycore::Result<SessionAgent> {
+    let snapshot = abycore::SessionSnapshot::new(
         "You are abylab, a coding agent in the user's terminal. Keep answers tight; use the provided tools to read, write, edit and run things in the workspace. Plan multi-step work with todo_write and keep the list current.",
-        options,
-    )
-    .ok()?;
-    local.register(&mut agent).ok()?;
-    // Todo plan rides by default: a stateless checklist write whose commits
-    // stream back as `PlanChanged` and render as the transcript's plan cell.
-    agent.register_tool(TodoWriteTool::new(false)).ok()?;
-    // One durable completion objective per session; the round driver below is
-    // the host half (harness's goal-round-driver).
-    agent.register_tool(abycore::GetGoalTool).ok()?;
-    agent.register_tool(abycore::CreateGoalTool).ok()?;
-    agent.register_tool(abycore::UpdateGoalTool).ok()?;
-    // Skills are read-only text: the tool serves the launch snapshot, exactly
-    // like the `/<name>` injection and the `/` menu.
-    if let Some(tool) = skill_tool(host) {
-        agent.register_tool(tool).ok()?;
-    }
-    if let Some(subagents) = subagents {
-        subagents.register(&mut agent).ok()?;
-    }
-    // Web search rides by default: an independent auxiliary Messages call
-    // with its own endpoint, so failures surface as tool errors at call time.
-    if !api_key.trim().is_empty() {
-        let search = SearchConfig::new(api_key);
-        if let Ok(tool) = DeepSeekWebSearch::new(search) {
-            agent.register_tool(tool).ok()?;
-        }
-    }
-    let persist = store.map(|store| Arc::new(PersistState::new(store, session_id)));
-    let mut agent = SessionAgent {
-        inner: agent,
-        persist,
-    };
-    agent.set_policy(local.permission_mode(), host);
-    host.agent_sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(agent.id().to_string(), session_id.to_string());
-    Some(agent)
+        ModelOptions {
+            model: model.to_string(),
+            reasoning: effort,
+            max_tokens: ctx
+                .host
+                .max_tokens
+                .unwrap_or_else(|| ModelOptions::default().max_tokens),
+            ..ModelOptions::default()
+        },
+    );
+    let persist = ctx
+        .store
+        .map(|store| {
+            store
+                .create_new(ctx.session_id, &snapshot)
+                .map(|writer| Arc::new(PersistState::with_writer(store, writer)))
+        })
+        .transpose()?;
+    build_agent(ctx, snapshot, persist)
 }
 
-/// Restore an agent from a persisted snapshot and register the tool bundle.
-fn resume_agent(
+/// The snapshot and writer come from one locked read; no pre-lock state is used.
+fn resume_agent(ctx: &AgentContext<'_>) -> abycore::Result<SessionAgent> {
+    let store = ctx
+        .store
+        .ok_or_else(|| abycore::Error::new(ErrorKind::Session, "session store unavailable"))?;
+    let (writer, snapshot) = store.open_for_resume(ctx.session_id)?;
+    let persist = Arc::new(PersistState::with_writer(store, writer));
+    build_agent(ctx, snapshot, Some(persist))
+}
+
+fn build_agent(
     ctx: &AgentContext<'_>,
-    snapshot: &abycore::SessionSnapshot,
-) -> Option<SessionAgent> {
-    let AgentContext {
-        local,
-        api_key,
-        base_url,
-        store,
-        session_id,
-        subagents,
-        host,
-    } = *ctx;
-    let mut config = ClientConfig::new(api_key);
-    if let Some(url) = base_url {
+    mut snapshot: abycore::SessionSnapshot,
+    persist: Option<Arc<PersistState>>,
+) -> abycore::Result<SessionAgent> {
+    let mut config = ClientConfig::new(ctx.api_key);
+    if let Some(url) = ctx.base_url {
         config.base_url = url.to_string();
     }
-    let client = match DeepSeekClient::new(config) {
-        Ok(client) => client,
-        Err(_) => return None,
-    };
-    let mut snapshot = snapshot.clone();
-    if let Some(max_tokens) = host.max_tokens {
+    let client = DeepSeekClient::new(config)?;
+    if let Some(max_tokens) = ctx.host.max_tokens {
         snapshot.model.max_tokens = max_tokens;
     }
-    let mut agent = Agent::restore(client, snapshot).ok()?;
-    local.register(&mut agent).ok()?;
-    // Same default registration as a fresh agent so resumed sessions can
-    // keep updating their plan.
-    agent.register_tool(TodoWriteTool::new(false)).ok()?;
-    // One durable completion objective per session; the round driver below is
-    // the host half (harness's goal-round-driver).
-    agent.register_tool(abycore::GetGoalTool).ok()?;
-    agent.register_tool(abycore::CreateGoalTool).ok()?;
-    agent.register_tool(abycore::UpdateGoalTool).ok()?;
-    // Skills are read-only text: the tool serves the launch snapshot, exactly
-    // like the `/<name>` injection and the `/` menu.
-    if let Some(tool) = skill_tool(host) {
-        agent.register_tool(tool).ok()?;
+    let mut inner = Agent::restore(client, snapshot)?;
+    ctx.local.register(&mut inner)?;
+    inner.register_tool(TodoWriteTool::new(false))?;
+    inner.register_tool(abycore::GetGoalTool)?;
+    inner.register_tool(abycore::CreateGoalTool)?;
+    inner.register_tool(abycore::UpdateGoalTool)?;
+    if let Some(tool) = skill_tool(ctx.host) {
+        inner.register_tool(tool)?;
     }
-    if let Some(subagents) = subagents {
-        subagents.register(&mut agent).ok()?;
+    if let Some(subagents) = ctx.subagents {
+        subagents.register(&mut inner)?;
     }
-    // Web search rides by default: an independent auxiliary Messages call
-    // with its own endpoint, so failures surface as tool errors at call time.
-    if !api_key.trim().is_empty() {
-        let search = SearchConfig::new(api_key);
-        if let Ok(tool) = DeepSeekWebSearch::new(search) {
-            agent.register_tool(tool).ok()?;
-        }
-    }
-    let persist = store.map(|store| Arc::new(PersistState::new(store, session_id)));
-    let mut agent = SessionAgent {
-        inner: agent,
-        persist,
-    };
-    agent.set_policy(local.permission_mode(), host);
-    host.agent_sessions
+    inner.register_tool(DeepSeekWebSearch::new(SearchConfig::new(ctx.api_key))?)?;
+    let mut agent = SessionAgent { inner, persist };
+    agent.set_policy(ctx.local.permission_mode(), ctx.host);
+    ctx.host
+        .agent_sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(agent.id().to_string(), session_id.to_string());
-    Some(agent)
+        .insert(agent.id().to_string(), ctx.session_id.to_string());
+    Ok(agent)
+}
+
+fn bind_session(
+    agent: &SessionAgent,
+    session: &str,
+    notice: Option<String>,
+    replay: bool,
+    sink: &Arc<dyn Fn(Event) + Send + Sync>,
+) {
+    let snapshot = agent.snapshot();
+    sink(Event::Ctl(CtlEvent::SessionBound {
+        session_id: session.into(),
+        notice,
+        model: Some(snapshot.model.model.clone()),
+        effort: Some(effort_label(snapshot.model.reasoning).into()),
+    }));
+    if replay {
+        for event in replay_events(session, &snapshot) {
+            sink(Event::Ui(event));
+        }
+    }
 }
 
 /// Rebuild transcript-side UiEvents from a restored snapshot so the TUI can
