@@ -501,6 +501,67 @@ fn legacy_partitions_remain_resumable_only_in_their_recorded_workspace() {
     assert_eq!(store_b.list().unwrap().len(), 1);
 }
 
+/// A damaged legacy log must not block the id in the new partition: `dir_of`
+/// used to propagate its parse error, failing lookups for a session that has
+/// nothing to do with the damaged file.
+#[test]
+fn a_corrupt_legacy_log_does_not_block_the_new_partition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("store");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&workspace).unwrap();
+    let store = SessionStore::at(&root, &workspace).unwrap();
+    let snapshot = store_snapshot("legacy history");
+    let mut writer = store.create_new("s", &snapshot).unwrap();
+    store.append_checkpoint(&mut writer, 0, &snapshot).unwrap();
+    drop(writer);
+    // Move the session into the legacy partition, then damage it.
+    let original = store.dir_of("s").unwrap();
+    let legacy = store.legacy_partition().unwrap().join("s");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::rename(&original, &legacy).unwrap();
+    fs::write(legacy.join("session.jsonl"), "not a session\n").unwrap();
+
+    // The damaged legacy copy is ignored: the id resolves to the new
+    // partition, where a fresh session can materialize.
+    assert_eq!(store.log_path("s").unwrap(), original.join("session.jsonl"));
+    let fresh = store_snapshot("fresh");
+    let mut fresh_writer = store.create_new("s", &fresh).unwrap();
+    store
+        .append_checkpoint(&mut fresh_writer, 0, &fresh)
+        .unwrap();
+    drop(fresh_writer);
+    assert_eq!(store.load("s").unwrap().1.items[0], Item::user("fresh"));
+    assert_eq!(store.list().unwrap().len(), 1);
+}
+
+/// The same id in both partitions lists once: `dir_of` resolves it to the new
+/// copy, so the legacy copy must not become a second row.
+#[test]
+fn a_shadowed_legacy_copy_is_listed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("store");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&workspace).unwrap();
+    let store = SessionStore::at(&root, &workspace).unwrap();
+    let snapshot = store_snapshot("legacy history");
+    let mut writer = store.create_new("s", &snapshot).unwrap();
+    store.append_checkpoint(&mut writer, 0, &snapshot).unwrap();
+    drop(writer);
+    // A valid second copy in the legacy partition, same id and workspace.
+    let current = store.dir_of("s").unwrap();
+    let legacy = store.legacy_partition().unwrap().join("s");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::copy(current.join("session.jsonl"), legacy.join("session.jsonl")).unwrap();
+
+    assert_eq!(store.log_path("s").unwrap(), current.join("session.jsonl"));
+    assert_eq!(
+        store.list().unwrap().len(),
+        1,
+        "the shadowed copy is not a second row"
+    );
+}
+
 #[test]
 fn a_foreign_header_is_rejected_before_any_log_repair() {
     let tmp = tempfile::tempdir().unwrap();
@@ -569,6 +630,59 @@ fn checkpoints_rewrite_to_header_title_and_latest_snapshot() {
     assert_eq!(summaries[0].title.as_deref(), Some("final title"));
     // The preview is the first user prompt of the session, not the latest.
     assert_eq!(summaries[0].preview, "turn 0");
+}
+
+/// Two titles before any checkpoint must not erase the only anchor: the first
+/// rewrite keeps the baseline it just wrote, so the second still has state to
+/// re-anchor instead of materializing header + title alone.
+#[test]
+fn a_second_title_keeps_the_committed_checkpoint() {
+    let workspace = temp_workspace("title-baseline");
+    let store = SessionStore::new(&workspace).expect("store");
+    let mut writer = store.create("s", &store_snapshot("seed")).expect("writer");
+    let snapshot = store_snapshot("hello");
+    store.append_checkpoint(&mut writer, 0, &snapshot).unwrap();
+    store.set_title(&mut writer, "title one").unwrap();
+    store.set_title(&mut writer, "title two").unwrap();
+    drop(writer);
+
+    let text = fs::read_to_string(store.log_path("s").unwrap()).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "header + title + one snapshot");
+    assert!(lines[1].contains("\"title\":\"title two\""), "{}", lines[1]);
+    let (_header, loaded) = store
+        .load("s")
+        .expect("the checkpoint survives a second title");
+    assert_eq!(loaded.items[0], Item::user("hello"));
+    assert_eq!(
+        store.list().unwrap()[0].title.as_deref(),
+        Some("title two"),
+        "the session still lists"
+    );
+}
+
+/// A writer whose log file disappeared must fail the next delta, not panic:
+/// `adopt_existing_log` reports a missing log as success (the first commit
+/// materializes it), which is only valid for a rewrite.
+#[test]
+fn a_missing_log_file_fails_the_next_delta_instead_of_panicking() {
+    let workspace = temp_workspace("missing-log");
+    let store = SessionStore::new(&workspace).unwrap();
+    let mut writer = store.create("s", &store_snapshot("seed")).unwrap();
+    let first = store_snapshot("one");
+    store.append_checkpoint(&mut writer, 0, &first).unwrap();
+    // Make the baseline dwarf the next delta so the checkpoint takes the
+    // delta path (the test snapshot is tiny, and `commit_snapshot` anchors
+    // whenever the delta is over half the anchor).
+    writer.anchor_bytes = 64 * 1024;
+    // Drop the handle and remove the file: the writer keeps committed state.
+    std::fs::remove_file(store.log_path("s").unwrap()).unwrap();
+    writer.refresh_log();
+    let second = store_snapshot("two");
+    let error = store
+        .append_checkpoint(&mut writer, 1, &second)
+        .expect_err("a delta without its log is an error");
+    assert!(error.to_string().contains("log is missing"), "{error}");
 }
 
 #[test]
