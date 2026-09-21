@@ -1827,7 +1827,10 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
     // The popup caps at the screen; `ListView` scrolls the overflow instead
     // of clipping it out of reach.
     let h = (items.len() as u16 + 2).min(screen.height.saturating_sub(2));
-    // Fit the widest row (marker + padded label + ✓ + meta); cap to the screen.
+    // Fit the widest row or the title, whichever needs more room; cap to the
+    // screen. The title carries the popup's keys, so clipping it would hide the
+    // bindings the dialog is there to teach (a tiny terminal still truncates —
+    // the cap comes first).
     let needed = items
         .iter()
         .map(|item| {
@@ -1835,7 +1838,8 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
             2 + label_w.max(crate::app::PICKER_LABEL_COL) + item.meta.width()
         })
         .max()
-        .unwrap_or(0) as u16;
+        .unwrap_or(0)
+        .max(title.width()) as u16;
     let cap = screen.width.saturating_sub(4).max(24);
     let overflow = items.len() as u16 + 2 > h;
     // The scrollbar gets its own column inside the popup when rows overflow,
@@ -3263,6 +3267,34 @@ mod tests {
         assert!(
             ascii_row.chars().count() >= 2 + PICKER_LABEL_COL + 8,
             "label column padded to {PICKER_LABEL_COL}"
+        );
+    }
+
+    /// The popup widens to fit its own title: the keys live there, and a hint
+    /// clipped off the border is a key nobody finds.
+    #[test]
+    fn picker_boxes_widen_to_fit_their_title() {
+        use crate::app::{Picker, PickerItem, PickerKind};
+        let mut app = test_app();
+        app.picker = Some(Picker {
+            kind: PickerKind::Queue,
+            title: " queued prompts · ↑/↓ · enter edit · ctrl+d delete · esc close ".into(),
+            sel: 0,
+            items: vec![PickerItem {
+                id: "1".into(),
+                label: "go".into(),
+                meta: "#1 · queued".into(),
+                provider: None,
+            }],
+        });
+
+        let frame = dump_frame(&mut app, 100, 30);
+
+        assert!(
+            frame.contains("queued prompts")
+                && frame.contains("ctrl+d delete")
+                && frame.contains("esc close"),
+            "the whole title is on screen:\n{frame}"
         );
     }
 

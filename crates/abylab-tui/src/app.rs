@@ -748,6 +748,10 @@ pub struct App {
     /// index advances per session and cycles the whole set over time.
     session_tip_idx: usize,
     ctrl_c_armed: Option<CtrlCQuitChord>,
+    /// The queued prompt whose `ctrl+d` in the queue picker already asked: the
+    /// id of the armed row, cleared when the highlight moves or the list is
+    /// rebuilt without it.
+    queue_delete_armed: Option<String>,
     pub session_id: String,
     pub cfg: RuntimeConfig,
     /// Current branch of the workspace checkout, shown after the project path
@@ -1128,6 +1132,7 @@ impl App {
             vim: crate::input::VimState::default(),
             session_tip_idx: 0,
             ctrl_c_armed: None,
+            queue_delete_armed: None,
             session_id,
             cfg,
             git_branch,
@@ -3588,13 +3593,26 @@ impl App {
         let page = self.picker_page_rows.max(1);
         let sel_before = picker.sel;
         match key.code {
-            KeyCode::Esc => self.picker = None,
+            KeyCode::Esc => {
+                self.picker = None;
+                self.queue_delete_armed = None;
+            }
             KeyCode::Up => picker.sel = picker.sel.checked_sub(1).unwrap_or(n - 1),
             KeyCode::Down => picker.sel = (picker.sel + 1) % n,
             KeyCode::PageUp => picker.sel = picker.sel.saturating_sub(page),
             KeyCode::PageDown => picker.sel = picker.sel.saturating_add(page).min(n - 1),
             KeyCode::Home => picker.sel = 0,
             KeyCode::End => picker.sel = n - 1,
+            // The queue list deletes rows in place (two presses, like the
+            // editor's ctrl+d): the highlighted row is the one it names.
+            KeyCode::Char('d')
+                if kind == PickerKind::Queue && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let row = picker.items.get(picker.sel).map(|item| item.id.clone());
+                if let Some(id) = row {
+                    self.press_queue_delete(&id, ctl);
+                }
+            }
             KeyCode::Enter => {
                 let Some(item) = picker.items.get(picker.sel).cloned() else {
                     self.picker = None;
@@ -3666,6 +3684,17 @@ impl App {
         {
             self.preview_picker_theme();
         }
+        // Moving off an armed queue row disarms it: `ctrl+d` deletes what the
+        // highlight is on, never a row the user has walked away from.
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == PickerKind::Queue && picker.sel != sel_before)
+            && self.queue_delete_armed.is_some()
+        {
+            self.queue_delete_armed = None;
+            self.refresh_queue_picker();
+        }
     }
 
     /// The wheel over an open picker walks its highlight (one notch = one
@@ -3693,6 +3722,19 @@ impl App {
                 .is_some_and(|picker| picker.sel != sel_before)
         {
             self.preview_picker_theme();
+        }
+        // The wheel walks the queue list too, so it disarms an armed row the
+        // same way ↑/↓ does.
+        if kind == PickerKind::Queue
+            && self.queue_delete_armed.is_some()
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.sel != sel_before)
+        {
+            self.queue_delete_armed = None;
+            self.refresh_queue_picker();
+            self.needs_redraw = true;
         }
     }
 
@@ -3734,7 +3776,9 @@ impl App {
     }
 
     /// `⌥↑` — pick one queued prompt to edit (Martty's queue selector). The
-    /// composer must be free: the chosen item is loaded into it.
+    /// composer must be free: the chosen item is loaded into it. The same list
+    /// deletes rows (`ctrl+d`), so it is also the place to drop a queued prompt
+    /// you no longer mean to send.
     fn open_queue_selector(&mut self) {
         if self.prompt_queue.is_empty() {
             self.show_tip(
@@ -3750,41 +3794,79 @@ impl App {
             ));
             return;
         }
+        // A fresh look at the queue: nothing is armed until ctrl+d asks here.
+        self.queue_delete_armed = None;
+        self.picker = self.queue_picker(None);
+    }
+
+    /// One queue-picker frame: rows in FIFO order, the item being edited marked,
+    /// and the armed row saying so. `sel` "None" opens on the natural row — the
+    /// item being edited, else the head — while `Some` keeps a highlight that
+    /// already exists (a delete rebuilds the list under it).
+    fn queue_picker(&self, sel: Option<usize>) -> Option<Picker> {
+        if self.prompt_queue.is_empty() {
+            return None;
+        }
         let editing = self.queue_edit.as_ref().map(|edit| edit.prompt_id);
         let items: Vec<PickerItem> = self
             .prompt_queue
             .iter()
             .enumerate()
-            .map(|(index, prompt)| PickerItem {
-                id: prompt.id.to_string(),
-                label: queue_prompt_summary(&prompt.blocks),
-                meta: format!(
-                    "#{} · {}",
-                    index + 1,
-                    if editing == Some(prompt.id) {
-                        self.locale.tr("editing", "编辑中")
-                    } else {
-                        self.locale.tr("queued", "排队中")
-                    }
-                ),
-                provider: None,
+            .map(|(index, prompt)| {
+                let id = prompt.id.to_string();
+                let armed = self.queue_delete_armed.as_deref() == Some(id.as_str());
+                let state = if armed {
+                    self.locale.tr("ctrl+d deletes", "再按 ctrl+d 删除")
+                } else if editing == Some(prompt.id) {
+                    self.locale.tr("editing", "编辑中")
+                } else {
+                    self.locale.tr("queued", "排队中")
+                };
+                PickerItem {
+                    id,
+                    label: queue_prompt_summary(&prompt.blocks),
+                    meta: format!("#{} · {state}", index + 1),
+                    provider: None,
+                }
             })
             .collect();
-        let sel = editing
-            .and_then(|id| items.iter().position(|item| item.id == id.to_string()))
-            .unwrap_or(0);
-        self.picker = Some(Picker {
+        let last = items.len() - 1;
+        let sel = match sel {
+            Some(sel) => sel.min(last),
+            None => editing
+                .and_then(|id| items.iter().position(|item| item.id == id.to_string()))
+                .unwrap_or(0),
+        };
+        Some(Picker {
             kind: PickerKind::Queue,
             title: self
                 .locale
                 .tr(
-                    " queued prompts · ↑/↓ select · enter edit · esc close ",
-                    " 排队消息 · ↑/↓ 选择 · enter 编辑 · esc 关闭 ",
+                    " queued prompts · ↑/↓ · enter edit · ctrl+d delete · esc close ",
+                    " 排队消息 · ↑/↓ · enter 编辑 · ctrl+d 删除 · esc 关闭 ",
                 )
                 .into(),
             sel,
             items,
-        });
+        })
+    }
+
+    /// Rebuild the open queue picker in place: a delete moves every row, and the
+    /// dialog stays open so the neighbor is one highlight away. The last delete
+    /// closes it — an empty list is not a dialog.
+    fn refresh_queue_picker(&mut self) {
+        let Some(sel) = self
+            .picker
+            .as_ref()
+            .filter(|picker| picker.kind == PickerKind::Queue)
+            .map(|picker| picker.sel)
+        else {
+            return;
+        };
+        self.picker = self.queue_picker(Some(sel));
+        if self.picker.is_none() {
+            self.queue_delete_armed = None;
+        }
     }
 
     /// Load one queued prompt back into the composer. The item keeps its FIFO
@@ -3941,6 +4023,31 @@ impl App {
         if self.state == RunState::Idle {
             self.dispatch_next_queued(ctl);
         }
+    }
+
+    /// `ctrl+d` in the queue picker: the first press arms the highlighted row,
+    /// the second deletes it — the same two-press idiom the editor's `ctrl+d`
+    /// uses, and the same "what is under the highlight" rule.
+    fn press_queue_delete(&mut self, id: &str, ctl: &Controller) {
+        if self.queue_delete_armed.as_deref() != Some(id) {
+            self.queue_delete_armed = Some(id.to_string());
+            self.refresh_queue_picker();
+            return;
+        }
+        self.queue_delete_armed = None;
+        // A row whose item already left (a session switch, another client's
+        // delete) is simply gone: the rebuild below shows the queue as it is.
+        if let Some(index) = self
+            .prompt_queue
+            .iter()
+            .position(|prompt| prompt.id.to_string() == id)
+        {
+            self.drop_queued_prompt(index, ctl);
+        }
+        // The drop may have shipped the next item: the rows are rebuilt from
+        // the queue as it stands, with the highlight on the row that took the
+        // deleted one's place.
+        self.refresh_queue_picker();
     }
 
     /// Take a queued prompt's echo out of the timeline.
@@ -4713,7 +4820,7 @@ impl App {
             "\
 - enter · 发送；当前轮次运行时将后续消息排队（草稿为空时立即发送队首）
 - ctrl+enter · 立即 steer 当前轮次（老终端会退化成普通 enter）
-- ⌥↑ · 编辑排队的后续消息（enter 保存 · ctrl+d 删除 · esc 取消）
+- ⌥↑ · 排队的后续消息：↑/↓ 选择 · enter 编辑 · 列表中 ctrl+d 连按两次删除 · esc 关闭
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 中断（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
@@ -4742,7 +4849,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
             "\
 - enter · send · queues a follow-up while a turn runs (an empty draft sends the queue head now)
 - ctrl+enter · steer the active turn immediately (legacy terminals fall back to plain enter)
-- ⌥↑ · edit a queued follow-up (enter save · ctrl+d delete · esc cancel)
+- ⌥↑ · queued follow-ups: ↑/↓ select · enter edit · ctrl+d twice deletes a row · esc close
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · interrupt (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
@@ -7881,6 +7988,83 @@ mod mode_tests {
             );
         }
         assert!(commands.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// The queue list deletes rows itself, without the editor round-trip:
+    /// `ctrl+d` arms the highlighted row (the row says so), the second press
+    /// drops it, and the dialog stays open on the row that took its place — so
+    /// several queued prompts can go without re-opening the selector.
+    #[test]
+    fn the_queue_picker_deletes_the_highlighted_row_in_place() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        let queued_echoes = |app: &App| -> Vec<String> {
+            app.transcript
+                .cells
+                .iter()
+                .filter_map(|cell| match &cell.kind {
+                    crate::transcript::CellKind::User { text, queued: true } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let ctrl_d = || KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        app.state = RunState::Running;
+        app.send_agent_text("drop me".into(), &ctl);
+        app.send_agent_text("keep me".into(), &ctl);
+        app.send_agent_text("keep me too".into(), &ctl);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &ctl);
+        let head = app.picker.as_ref().expect("queue picker").items[0]
+            .id
+            .clone();
+        app.handle_key(ctrl_d(), &ctl);
+        assert_eq!(
+            app.queue_delete_armed.as_deref(),
+            Some(head.as_str()),
+            "the first press arms the highlighted row"
+        );
+        assert!(
+            app.picker.as_ref().unwrap().items[0]
+                .meta
+                .contains("ctrl+d"),
+            "the armed row says what the next press does"
+        );
+        assert_eq!(app.prompt_queue.len(), 3, "the first press only asks");
+
+        // ↓ walks off the row and takes the arming with it: `ctrl+d` names the
+        // row under the highlight, never the one the user left behind.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        assert!(
+            app.queue_delete_armed.is_none(),
+            "moving the highlight disarms"
+        );
+        app.handle_key(ctrl_d(), &ctl);
+        assert_eq!(app.prompt_queue.len(), 3, "arming again deletes nothing");
+
+        // Second press: the row goes, its echo leaves the timeline with it, and
+        // the dialog stays open on the row that moved up into its place.
+        app.handle_key(ctrl_d(), &ctl);
+        assert_eq!(app.queued, 2);
+        assert_eq!(queued_echoes(&app), ["drop me", "keep me too"]);
+        let picker = app.picker.as_ref().expect("the list stays open");
+        assert_eq!(picker.sel, 1, "the highlight follows the survivor");
+        assert_eq!(picker.items[1].label, "keep me too");
+        assert!(app.queue_delete_armed.is_none(), "the arming is spent");
+
+        // Two more rounds empty the queue; the last delete closes the dialog.
+        for _ in 0..2 {
+            app.handle_key(ctrl_d(), &ctl);
+            app.handle_key(ctrl_d(), &ctl);
+        }
+        assert!(app.prompt_queue.is_empty());
+        assert_eq!(app.queued, 0);
+        assert!(queued_echoes(&app).is_empty(), "no echo outlives its item");
+        assert!(app.picker.is_none(), "an empty list is not a dialog");
+        assert!(
+            commands.try_recv().is_err(),
+            "deleting never sends anything"
+        );
     }
 
     /// While an item is loaded for editing the FIFO holds: a turn end must not

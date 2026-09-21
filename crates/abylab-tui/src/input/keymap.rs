@@ -376,8 +376,8 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_mac: &["⌥↑"],
         chords_other: &["alt+↑"],
         ctx: CtxNote::Always,
-        desc_en: "choose a queued follow-up to edit",
-        desc_zh: "选择一条排队消息编辑",
+        desc_en: "queued follow-ups: ↑/↓ select · enter edit · ctrl+d deletes",
+        desc_zh: "排队消息：↑/↓ 选择 · enter 编辑 · ctrl+d 删除",
         probes: &[p(KeyCode::Up, ALT, true)],
     },
     KeyRow {
