@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-21
+
 ### Added
 
 - The `⌥↑` queue list deletes too: besides ↑/↓ and enter-edit, `ctrl+d` drops the
@@ -219,7 +221,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/zhang0098/abylab/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
