@@ -255,6 +255,54 @@ impl Transcript {
         self.last_finish = None;
     }
 
+    /// Drop cells from the timeline and report the old→new index mapping, with
+    /// `None` for every removed cell.
+    ///
+    /// The transcript's own open-card indices are remapped here, so a stream or
+    /// a plan cell below the cut keeps pointing at its cell. Callers holding
+    /// cell indices of their own must remap them with the returned mapping.
+    pub fn remove_cells(&mut self, cells: &[usize]) -> Vec<Option<usize>> {
+        let mut gone = vec![false; self.cells.len()];
+        for &index in cells {
+            if let Some(slot) = gone.get_mut(index) {
+                *slot = true;
+            }
+        }
+        let mut mapping = Vec::with_capacity(gone.len());
+        let mut kept = 0;
+        for removed in &gone {
+            mapping.push(if *removed {
+                None
+            } else {
+                kept += 1;
+                Some(kept - 1)
+            });
+        }
+        if !gone.iter().any(|removed| *removed) {
+            return mapping;
+        }
+        let mut index = 0;
+        self.cells.retain(|_| {
+            let keep = !gone[index];
+            index += 1;
+            keep
+        });
+        let remap = |map: HashMap<String, usize>| -> HashMap<String, usize> {
+            map.into_iter()
+                .filter_map(|(key, index)| {
+                    mapping.get(index).copied().flatten().map(|at| (key, at))
+                })
+                .collect()
+        };
+        self.open_assistant = remap(std::mem::take(&mut self.open_assistant));
+        self.open_reasoning = remap(std::mem::take(&mut self.open_reasoning));
+        self.tools = remap(std::mem::take(&mut self.tools));
+        self.plan_cell = self
+            .plan_cell
+            .and_then(|index| mapping.get(index).copied().flatten());
+        mapping
+    }
+
     fn agent_label(&self, session: &str) -> Option<String> {
         if session == self.root_session || session.is_empty() {
             None
@@ -1628,6 +1676,47 @@ mod tests {
 
     fn t(session: &str) -> Transcript {
         Transcript::new(session.to_string())
+    }
+
+    /// Dropping cells shifts every index above the cut, so the transcript's own
+    /// open-card and plan indices have to move with them — a tool card below a
+    /// withdrawn echo must stay its own, and its click must still find it.
+    #[test]
+    fn removing_cells_remaps_the_transcripts_own_indices() {
+        let mut tr = t("s");
+        tr.apply(UiEvent::Plan {
+            session: "s".into(),
+            summary: "1 of 2 done".into(),
+            todos: Vec::new(),
+            active: None,
+            active_extra: 0,
+            completed: 1,
+            total: 2,
+        });
+        tr.apply(UiEvent::ToolCall {
+            session: "s".into(),
+            call_id: "c1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        });
+        assert_eq!(tr.plan_cell, Some(0));
+        assert_eq!(tr.tools.get("c1"), Some(&1));
+        tr.push_user("withdrawn".into(), true);
+        tr.push_user("still queued".into(), true);
+
+        // Cell 2 (the withdrawn echo) leaves the timeline.
+        let mapping = tr.remove_cells(&[2]);
+
+        assert_eq!(mapping, [Some(0), Some(1), None, Some(2)]);
+        assert_eq!(tr.cells.len(), 3);
+        assert_eq!(tr.plan_cell, Some(0), "the plan cell keeps its index");
+        assert_eq!(tr.tools.get("c1"), Some(&1), "so does the tool card");
+        assert!(matches!(tr.cells[0].kind, CellKind::Plan { .. }));
+        assert!(matches!(tr.cells[1].kind, CellKind::Tool { .. }));
+        assert!(
+            matches!(&tr.cells[2].kind, CellKind::User { text, queued: true } if text == "still queued"),
+            "the surviving echo moved into the gap"
+        );
     }
 
     /// Timeline chrome follows the interface language: the notices, the plan

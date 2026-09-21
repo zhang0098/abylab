@@ -1687,7 +1687,15 @@ impl App {
                 self.session_switch = None;
                 self.prompt_pending = false;
                 self.queued = 0;
-                self.prompt_queue.clear();
+                // The runtime is gone and so is the queue's chance to be sent:
+                // its echoes leave the timeline with it, exactly as a deleted
+                // item does (they were never delivered).
+                let dropped: Vec<usize> = self
+                    .prompt_queue
+                    .drain(..)
+                    .flat_map(|prompt| prompt.cells)
+                    .collect();
+                self.withdraw_prompt_echo(&dropped);
                 self.queue_edit = None;
                 self.pending_steer_cells.clear();
                 if self.state != RunState::Idle {
@@ -3910,9 +3918,21 @@ impl App {
             self.finish_queue_edit();
             return;
         };
-        self.prompt_queue.remove(index);
-        self.queued = self.prompt_queue.len();
+        // The editor closes before the drop: an idle client sends the next in
+        // line, and the "queue paused for edit" guard must not hold it back.
         self.finish_queue_edit();
+        self.drop_queued_prompt(index, ctl);
+    }
+
+    /// Delete one queued prompt for good: its echo leaves the timeline with it
+    /// (the message was never sent), the counter follows, and an idle client
+    /// sends the next in line. The editor's `ctrl+d` and the picker's land here.
+    fn drop_queued_prompt(&mut self, index: usize, ctl: &Controller) {
+        let Some(prompt) = self.prompt_queue.remove(index) else {
+            return;
+        };
+        self.withdraw_prompt_echo(&prompt.cells);
+        self.queued = self.prompt_queue.len();
         self.show_tip(
             self.locale
                 .tr("queued prompt #{n} deleted", "排队消息 #{n} 已删除")
@@ -3921,6 +3941,39 @@ impl App {
         if self.state == RunState::Idle {
             self.dispatch_next_queued(ctl);
         }
+    }
+
+    /// Take a queued prompt's echo out of the timeline.
+    ///
+    /// The prompt never left the client, so deleting it deletes its bubbles
+    /// too: leaving them behind as `queued` (or as plain, delivered-looking
+    /// prompts) would both be wrong. Removing cells shifts every index above
+    /// them, so the transcript's own open-card maps and this client's cell
+    /// bookkeeping — the queue, the pending steers, the `↥` jump — are remapped
+    /// in the same step. The line selection is dropped: its anchors moved.
+    fn withdraw_prompt_echo(&mut self, cells: &[usize]) {
+        let mapping = self.transcript.remove_cells(cells);
+        let remap = |cells: &mut Vec<usize>| {
+            cells.retain_mut(|index| match mapping.get(*index).copied().flatten() {
+                Some(at) => {
+                    *index = at;
+                    true
+                }
+                None => false,
+            });
+        };
+        for prompt in &mut self.prompt_queue {
+            remap(&mut prompt.cells);
+        }
+        for steer in self.pending_steer_cells.values_mut() {
+            remap(&mut steer.cells);
+        }
+        self.prompt_jump_cell = self
+            .prompt_jump_cell
+            .and_then(|index| mapping.get(index).copied().flatten());
+        self.prompt_flash = None;
+        self.prompt_flash_lines = None;
+        self.sel = None;
     }
 
     /// Leave edit mode: the draft (and the tray it resolved into) is dropped;
@@ -7586,6 +7639,13 @@ mod mode_tests {
         assert_eq!(app.queued, 0);
         assert!(app.prompt_queue.is_empty());
         assert!(app.pending_steer_cells.is_empty());
+        assert!(
+            app.transcript.cells.iter().all(|cell| !matches!(
+                &cell.kind,
+                crate::transcript::CellKind::User { queued: true, .. }
+            )),
+            "a dead queue's echoes stop claiming they are queued"
+        );
     }
 
     #[test]
@@ -7767,6 +7827,59 @@ mod mode_tests {
         assert!(app.queue_edit.is_none());
         assert!(app.prompt_queue.is_empty(), "the second press deleted it");
         assert_eq!(app.queued, 0);
+        assert!(commands.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// Deleting a queued prompt takes its echo out of the timeline with it: the
+    /// bubble never left the client, so leaving it behind as `queued` (or as a
+    /// plain, delivered-looking prompt) would both be wrong. The prompts behind
+    /// it keep their own bubbles, and the queue is remapped onto their new
+    /// indices.
+    #[test]
+    fn deleting_a_queued_prompt_drops_its_echo_and_remaps_the_rest() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        let queued_echoes = |app: &App| -> Vec<String> {
+            app.transcript
+                .cells
+                .iter()
+                .filter_map(|cell| match &cell.kind {
+                    crate::transcript::CellKind::User { text, queued: true } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        app.state = RunState::Running;
+        app.send_agent_text("delete me".into(), &ctl);
+        app.send_agent_text("keep me".into(), &ctl);
+        assert_eq!(queued_echoes(&app), ["delete me", "keep me"]);
+
+        let id = app.prompt_queue[0].id;
+        app.begin_queue_edit(&id.to_string(), &ctl);
+        for _ in 0..2 {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &ctl,
+            );
+        }
+
+        assert_eq!(app.queued, 1, "one item left in the queue");
+        assert_eq!(app.prompt_queue.len(), 1);
+        assert_eq!(
+            queued_echoes(&app),
+            ["keep me"],
+            "the deleted echo left the timeline, the survivor stayed"
+        );
+        assert_eq!(app.transcript.cells.len(), 1, "only its own bubble is left");
+        for cell in app.prompt_queue[0].cells.clone() {
+            assert!(
+                matches!(
+                    &app.transcript.cells[cell].kind,
+                    crate::transcript::CellKind::User { text, queued: true } if text == "keep me"
+                ),
+                "the queue still points at its own bubble (cell {cell})"
+            );
+        }
         assert!(commands.try_recv().is_err(), "nothing was sent");
     }
 
