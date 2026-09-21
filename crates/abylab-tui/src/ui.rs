@@ -1491,6 +1491,11 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
         .fg(theme.bubble_fg)
         .bg(theme.bubble_bg)
         .add_modifier(Modifier::BOLD);
+    // The widget's render above has already moved its viewport; sync the
+    // mirror here so the chip and selection patches land on this frame's
+    // rows, not the previous frame's.
+    app.input.update_scroll_top(area.height);
+    app.input_top = app.input.scroll_top;
     let top = app.input_top;
     let h = area.height as usize;
     let mut chip_rects: Vec<(Rect, usize)> = Vec::new();
@@ -1561,10 +1566,8 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     }
     app.att_chips = chip_rects;
 
-    app.input.update_scroll_top(area.height);
     // `input_top` is the app-side mirror mouse hit-testing reads between
-    // frames; keep it in lockstep with the editor's own scroll mirror.
-    app.input_top = app.input.scroll_top;
+    // frames; `update_scroll_top` above kept it in lockstep this frame.
     // Track the painted caret cell so `main` can park the hidden hardware
     // cursor on it after the frame (IME popups anchor there; the frame diff
     // leaves the cursor wherever its last cell write happened). The widget's

@@ -950,7 +950,11 @@ impl Transcript {
                     emit(&mut out, &mut owners, Line::default(), None);
                     // Web UI fidelity: the user bubble uses --dsw-specific-bubble.
                     let line = out.len();
-                    for (i, l) in wrap(text, width.saturating_sub(2)).into_iter().enumerate() {
+                    // "❯ " prefix (2 cells) plus the bubble's own " {l} "
+                    // padding (2 cells) leaves `width - 4` for the text; the
+                    // old subtraction of 2 painted every full line two cells
+                    // past the pane and clipped its tail.
+                    for (i, l) in wrap(text, width.saturating_sub(4)).into_iter().enumerate() {
                         let mut spans = vec![
                             Span::styled(
                                 if i == 0 { "❯ " } else { "  " }.to_string(),
@@ -2322,6 +2326,26 @@ mod tests {
         let theme = Theme::dark();
         let lines = tr.lines(&theme, 40, '⠋');
         assert!(lines.len() >= 3);
+    }
+
+    /// A wrapped user bubble keeps its `❯ ` prefix and `" {line} "` padding
+    /// inside the pane: wrapping used to reserve room for the prefix only, so
+    /// every full line lost its tail to the clip.
+    #[test]
+    fn a_wrapped_user_bubble_never_exceeds_the_viewport_width() {
+        let mut tr = t("s");
+        tr.push_user("x".repeat(200), false);
+        let theme = Theme::dark();
+        let width = 40u16;
+        let layout = tr.layout(&theme, width, ' ', false);
+        for (i, line) in layout.lines.iter().enumerate() {
+            let w = line_width(line);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                w <= width as usize,
+                "line {i} width {w} > {width}: {text:?}"
+            );
+        }
     }
 
     #[test]
