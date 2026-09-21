@@ -1240,6 +1240,25 @@ impl App {
             .push_markdown(format!("- **{label}** · {hint}"));
     }
 
+    /// The two lines the shell gets once the alternate screen is gone: the
+    /// session id and the ways back into it.
+    ///
+    /// The id is the one on screen at exit — a `/resume` switch moves it — so a
+    /// session entered mid-run is the one named. Both routes need the launch's
+    /// workspace and session root: resume from the same directory, or use
+    /// `/resume`, which lists exactly the sessions this one can still open.
+    pub fn exit_notice(&self) -> String {
+        let id = &self.session_id;
+        match self.locale {
+            Locale::En => format!(
+                "Session id: {id}\nResume it later: abylab --session-id {id} · or pick it with /resume"
+            ),
+            Locale::Zh => format!(
+                "会话 id：{id}\n下次继续：abylab --session-id {id} · 也可以在程序里用 /resume 选择"
+            ),
+        }
+    }
+
     /// The startup splash: the ASCII wordmark, the project URL and the launch
     /// facts — build version, working directory, permission preset and model —
     /// painted once per run at the top of the timeline (see `main`). `/new`
@@ -5506,6 +5525,33 @@ mod resume_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// Leaving prints the session that was on screen — a `/resume` switch moves
+    /// the id — plus the two ways back, in the interface language.
+    #[test]
+    fn the_exit_notice_names_the_session_and_the_way_back() {
+        let root = tmp_root("exit-notice");
+        let (mut app, _demo_ctl) = test_app_with_root(root.to_str().unwrap(), "/w");
+        for (locale, id) in [
+            (Locale::En, "dsh-current"),
+            (Locale::Zh, "aby-20250101-1200-a1b2"),
+        ] {
+            app.locale = locale;
+            app.session_id = id.into();
+            let notice = app.exit_notice();
+            assert_eq!(
+                notice.lines().count(),
+                2,
+                "the id, then the way back: {notice}"
+            );
+            assert!(notice.contains(id), "{notice}");
+            assert!(
+                notice.contains(&format!("abylab --session-id {id}")),
+                "the resume command carries the exact id: {notice}"
+            );
+            assert!(notice.contains("/resume"), "{notice}");
+        }
     }
 
     #[test]
