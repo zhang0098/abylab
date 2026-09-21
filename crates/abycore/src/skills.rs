@@ -473,9 +473,7 @@ fn fill_fields(front: &str, fields: &mut BTreeMap<String, String>) {
                     Folded::Newlines => block.join("\n"),
                 }
             }
-            None => value
-                .split_once(" #")
-                .map_or(value, |(value, _)| value.trim())
+            None => strip_inline_comment(value)
                 .trim_matches(['"', '\''])
                 .trim()
                 .to_string(),
@@ -484,6 +482,28 @@ fn fill_fields(front: &str, fields: &mut BTreeMap<String, String>) {
             fields.insert(key, text);
         }
     }
+}
+
+/// Strip an inline ` # comment` unless the value is a fully quoted scalar:
+/// YAML keeps `#` inside quotes literal (`description: "fix #42 quickly"`).
+fn strip_inline_comment(value: &str) -> &str {
+    if let Some(inner) = quoted_scalar(value) {
+        return inner;
+    }
+    value
+        .split_once(" #")
+        .map_or(value, |(value, _)| value.trim())
+}
+
+/// The contents of a fully quoted scalar (`"…"` or `'…'`), if the value is one.
+fn quoted_scalar(value: &str) -> Option<&str> {
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &value[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(&rest[..end])
 }
 
 /// Whether a block scalar's lines are folded into one paragraph or kept as is.
@@ -639,6 +659,22 @@ mod tests {
 
     fn catalog(workspace: &Path) -> SkillCatalog {
         SkillCatalog::discover(workspace)
+    }
+
+    /// YAML keeps `#` inside a quoted scalar literal; only an unquoted ` #`
+    /// opens a comment (`description: "fix #42 quickly"` used to truncate).
+    #[test]
+    fn frontmatter_quotes_keep_hash_and_unquoted_comments_do_not() {
+        let mut fields = BTreeMap::new();
+        fill_fields(
+            "---\ndescription: \"fix #42 quickly\"\nname: simple # a comment\n---\n",
+            &mut fields,
+        );
+        assert_eq!(
+            fields.get("description").map(String::as_str),
+            Some("fix #42 quickly")
+        );
+        assert_eq!(fields.get("name").map(String::as_str), Some("simple"));
     }
 
     /// The workspace's `.agents/skills` directory is the only root: two layouts,

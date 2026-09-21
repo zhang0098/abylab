@@ -300,7 +300,10 @@ impl DeepSeekWebSearch {
                 Err(error) => {
                     // Search-side quota/unavailability is query-scoped: keep
                     // the successful siblings instead of failing the batch.
-                    // Host budget, deadline and cancellation still fail fast.
+                    // Any other failure cancels the remaining queries, but
+                    // results that already arrived are still merged: the call
+                    // is best-effort and reports what it has (only an empty
+                    // batch surfaces the error).
                     if error.kind == ErrorKind::SearchUnavailable {
                         if first_failure.is_none() {
                             first_failure = Some(error);
