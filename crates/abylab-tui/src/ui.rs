@@ -2423,8 +2423,14 @@ mod tests {
         use ratatui::Terminal;
         use std::time::Duration;
         let mut app = test_app();
-        app.transcript.push_user("first prompt".into(), false);
-        app.transcript.push_user("second prompt".into(), false);
+        app.transcript.push_user(
+            "first prompt".into(),
+            crate::transcript::Delivery::Delivered,
+        );
+        app.transcript.push_user(
+            "second prompt".into(),
+            crate::transcript::Delivery::Delivered,
+        );
         let layout = app.transcript.layout(&app.theme, 78, app.spinner(), false);
         let target = layout.users[0];
         app.prompt_flash = Some((target.cell, Instant::now() + Duration::from_secs(5)));
@@ -3479,7 +3485,8 @@ mod tests {
     fn the_scroll_chip_records_the_cell_it_is_drawn_on() {
         let mut app = test_app();
         for i in 0..40 {
-            app.transcript.push_user(format!("line {i}"), false);
+            app.transcript
+                .push_user(format!("line {i}"), crate::transcript::Delivery::Delivered);
         }
         let _ = dump_frame(&mut app, 100, 14);
         assert!(
@@ -3526,7 +3533,8 @@ mod tests {
     fn scroll_up_survives_draw_and_shows_indicator() {
         let mut app = test_app();
         for i in 0..40 {
-            app.transcript.push_user(format!("line {i}"), false);
+            app.transcript
+                .push_user(format!("line {i}"), crate::transcript::Delivery::Delivered);
         }
         app.scroll_by(20);
         let frame = dump_frame(&mut app, 100, 14);
@@ -3540,8 +3548,10 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut app = test_app();
-        app.transcript
-            .push_user("hello selection world".into(), false);
+        app.transcript.push_user(
+            "hello selection world".into(),
+            crate::transcript::Delivery::Delivered,
+        );
         let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         // First draw fills chat_view; then select and draw again.

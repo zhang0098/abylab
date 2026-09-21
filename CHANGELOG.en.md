@@ -29,6 +29,24 @@ context compaction, session persistence, goal rounds) live in
 - Empty draft plus ctrl+enter steers every queued message, in FIFO order (it used
   to be a no-op); without a running turn the head ships as an ordinary prompt and
   the rest stay queued.
+- A steer is now visible in stages on the timeline: the bubble carries a
+  `steering` marker from ctrl+enter until the agent actually takes it at a
+  boundary (the inbox drain reports `SteerAdmitted`), and a rejected or late
+  steer goes back to `queued`. Before, only the "steered" tip said anything —
+  it could not show whether the message had landed.
+- The `⌥↑` queue list steers rows one at a time: ctrl+enter hands the
+  highlighted row to the running turn (the list rebuilds in place, the
+  highlight follows the row that moved up, and it closes when the queue is
+  empty) — the same chord the composer uses. The list title, `/help` and `/keys`
+  name the key.
+- Queued prompts survive a restart: the queue is the one thing the driver does
+  not own, and therefore the one thing a crash would drop, so every mutation
+  writes `$ABYLAB_HOME/queued/<session>.json` (one file per session, image
+  payloads included, removed when the queue drains). A start or `/resume` onto that session paints the items back as
+  queued bubbles and **holds** them — they were queued behind a turn that no
+  longer exists, so they are not spent unbidden; the next real turn end (or an
+  explicit enter/ctrl+enter) releases them in FIFO order. A missing or malformed
+  file is just an empty queue, exactly like `settings.json`.
 
 ### Fixed
 

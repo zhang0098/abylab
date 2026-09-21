@@ -131,6 +131,31 @@ pub fn spawn(
     })
 }
 
+/// Steers a running turn has taken into its inbox but not spent yet.
+///
+/// The agent's inbox drains as a unit at a step boundary, and that drain is
+/// exactly when [`abycore::CheckpointKind::MessagesReceived`] fires, so every
+/// outstanding id is admitted at the same moment — no per-message matching.
+#[derive(Default)]
+struct OutstandingSteers(std::sync::Mutex<std::collections::VecDeque<u64>>);
+
+impl OutstandingSteers {
+    fn push(&self, message_id: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_back(message_id);
+    }
+
+    fn take(&self) -> Vec<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect()
+    }
+}
+
 /// What a freshly built agent needs from the host: where its events go, and how
 /// its model-visible view may be reshaped at request boundaries.
 #[derive(Clone)]
@@ -140,9 +165,12 @@ struct HostPolicy {
     max_tokens: Option<u32>,
     agent_sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     instructions: crate::instructions::InstructionSource,
-    /// Discovered once at launch; the menu, the `/<name>` injection and the
+    /// Discovered once at launch; the menu, the `<name>` injection and the
     /// `skill` tool all serve this one snapshot.
     skills: Arc<abycore::SkillCatalog>,
+    /// Steers waiting for the next step boundary (the composer's
+    /// pending-steering rows).
+    steers: Arc<OutstandingSteers>,
 }
 
 /// Host hooks: sandboxed modes can route tool calls through the TUI's
@@ -155,6 +183,9 @@ struct UiHooks {
     persist: Option<std::sync::Weak<PersistState>>,
     /// Advisory loop guard behind [`abycore::AgentHooks::tool_reminder`].
     guard: RepeatGuard,
+    /// `Some` for the session's own agent: it reports admitted steers. Children
+    /// keep their own inbox, so their hook has nothing to report.
+    steers: Option<Arc<OutstandingSteers>>,
     /// Host context policy answered at every request boundary
     /// ([`abycore::AgentHooks::view_request`]); `None` disables automatic
     /// compaction, leaving only `/compact` and overflow recovery.
@@ -314,6 +345,7 @@ impl SessionAgent {
             permission_mode: mode,
             persist: self.persist.as_ref().map(Arc::downgrade),
             guard: RepeatGuard::default(),
+            steers: Some(Arc::clone(&host.steers)),
             compaction: host.compaction,
             context,
         }));
@@ -350,6 +382,14 @@ impl AgentHooks for UiHooks {
     ) -> futures_util::future::BoxFuture<'a, abycore::Result<()>> {
         if kind == abycore::CheckpointKind::RunStarted {
             self.guard.reset();
+        }
+        // The inbox drained: every steer that was waiting is in the transcript
+        // now, so the composer's pending rows can settle.
+        if matches!(kind, abycore::CheckpointKind::MessagesReceived) {
+            let message_ids = self.steers.as_ref().map(|steers| steers.take());
+            if let Some(message_ids) = message_ids.filter(|ids| !ids.is_empty()) {
+                (self.sink)(Event::Ctl(CtlEvent::SteerAdmitted { message_ids }));
+            }
         }
         let result = self
             .persist
@@ -522,6 +562,8 @@ async fn drive(
     for warning in skills.warnings() {
         ctl(CtlEvent::Error(format!("skills: {warning}")));
     }
+    // Steers the running turn has taken but not spent (see OutstandingSteers).
+    let admitted: Arc<OutstandingSteers> = Arc::default();
     let host = HostPolicy {
         sink: Arc::clone(&sink),
         compaction,
@@ -534,6 +576,7 @@ async fn drive(
             home: cfg.home.as_ref().map(Into::into),
         },
         skills: Arc::clone(&skills),
+        steers: Arc::clone(&admitted),
     };
     // Harness arms goal continuation explicitly: creating a goal from the model
     // does not start spending rounds, `/goal <objective>` or `/goal resume` does.
@@ -629,6 +672,7 @@ async fn drive(
                         permission_mode: PermissionMode::FullAccess,
                         persist: None,
                         guard: RepeatGuard::default(),
+                        steers: None,
                         compaction,
                         // The SDK inherits the parent's request context, so a
                         // child sees the same skill index; the skill tool
@@ -749,6 +793,7 @@ async fn drive(
                     steer_rx: &mut steer_rx,
                     steer: agent.steer_handle(),
                     skills: &skills,
+                    admitted: &admitted,
                     limits,
                     compaction,
                 };
@@ -1161,6 +1206,7 @@ async fn drive(
                     steer_rx: &mut steer_rx,
                     steer: agent.steer_handle(),
                     skills: &skills,
+                    admitted: &admitted,
                     limits,
                     compaction,
                 };
@@ -1943,6 +1989,8 @@ struct TurnCtx<'a> {
     /// The launch skill snapshot: a steered `/<name>` line expands here too,
     /// because the steer path skips the prompt loop's own expansion.
     skills: &'a Arc<abycore::SkillCatalog>,
+    /// Steers taken but not yet spent, so the next inbox drain can report them.
+    admitted: &'a Arc<OutstandingSteers>,
     limits: TurnLimits,
     /// Host compaction policy for overflow recovery inside a turn.
     compaction: Option<CompactionConfig>,
@@ -2032,7 +2080,10 @@ fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
     // body, not the bare command line.
     let text = ctx.skills.expand(&request.text).unwrap_or(request.text);
     let deferred = match ctx.steer.send(text) {
-        Ok(()) => false,
+        Ok(()) => {
+            ctx.admitted.push(request.message_id);
+            false
+        }
         Err(error) => {
             (ctx.sink)(Event::Ctl(CtlEvent::TuiOpFailed(format!(
                 "send now failed: {error} / 立即发送失败：{error}"
@@ -2725,6 +2776,7 @@ mod tests {
             permission_mode: mode,
             persist: None,
             guard: RepeatGuard::default(),
+            steers: None,
             compaction: None,
             context: None,
         }
@@ -3200,11 +3252,13 @@ mod tests {
                 home: None,
             },
             skills: Arc::new(catalog),
+            steers: Arc::default(),
         };
         assert!(skill_tool(&host).is_some(), "a session with skills has it");
         let without = scratch_dir("skills-none");
         let empty = HostPolicy {
             skills: Arc::new(abycore::SkillCatalog::discover(&without)),
+            steers: Arc::default(),
             instructions: crate::instructions::InstructionSource {
                 workspace: without.clone(),
                 home: None,
@@ -3577,6 +3631,75 @@ mod tests {
             .collect()
     }
 
+    /// The boundary that drains the inbox is what tells the composer its
+    /// pending-steering rows landed — end to end, through a real SSE fixture.
+    #[tokio::test]
+    async fn the_admission_boundary_reports_the_pending_steer() {
+        let workspace = scratch_dir("steer-admit");
+        let provider = FakeProvider::start(
+            vec!["first answer", "steered answer"],
+            Duration::from_millis(400),
+        )
+        .await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::PromptForSession {
+                session_id: "steer-test".into(),
+                text: "start".into(),
+            })
+            .expect("queue prompt");
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            steer_tx
+                .send(SteerRequest {
+                    session_id: "steer-test".into(),
+                    message_id: 31,
+                    text: "change course".into(),
+                })
+                .expect("queue steer");
+            provider.served(2).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let admitted: Vec<Vec<u64>> = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ctl(CtlEvent::SteerAdmitted { message_ids }) => Some(message_ids.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(admitted, vec![vec![31]], "one boundary, one report");
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// A steer nobody admitted yet stays outstanding: no report is invented,
+    /// and the id survives until the boundary that spends it.
+    #[test]
+    fn outstanding_steers_is_a_fifo_of_unspent_ids() {
+        let steers = OutstandingSteers::default();
+        assert!(steers.take().is_empty(), "nothing outstanding yet");
+        steers.push(1);
+        steers.push(2);
+        assert_eq!(steers.take(), vec![1, 2], "FIFO order");
+        assert!(steers.take().is_empty(), "the report spends them");
+    }
+
     /// A steered `/<name>` line crosses the same skill seam a typed prompt
     /// does: the model sees the skill body, not the bare command.
     #[tokio::test]
@@ -3849,6 +3972,7 @@ mod tests {
         let skills = Arc::new(abycore::SkillCatalog::discover(std::path::Path::new(
             "/nonexistent-workspace",
         )));
+        let admitted: Arc<OutstandingSteers> = Arc::default();
         let (_interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let mut ctx = TurnCtx {
@@ -3858,6 +3982,7 @@ mod tests {
             steer_rx: &mut steer_rx,
             steer: steer.clone(),
             skills: &skills,
+            admitted: &admitted,
             limits: TurnLimits::default(),
             compaction: None,
         };

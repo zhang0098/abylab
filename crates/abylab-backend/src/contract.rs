@@ -153,6 +153,12 @@ pub enum CtlEvent {
         message_id: u64,
         deferred: bool,
     },
+    /// The agent appended steered messages to the transcript at a step boundary:
+    /// the composer's pending-steering rows are ordinary user rows from here on.
+    /// One event per boundary, however many messages it drained.
+    SteerAdmitted {
+        message_ids: Vec<u64>,
+    },
     Error(String),
     CancelRequested,
     Interrupted,

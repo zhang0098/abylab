@@ -58,6 +58,9 @@ pub enum CtlEvent {
     /// A Send Now request settled. Rejected concurrent prompts degrade to
     /// the client FIFO without changing the active turn lifecycle.
     SteerSettled { message_id: u64, deferred: bool },
+    /// The agent appended steered messages at a step boundary: their pending
+    /// rows are ordinary parts of the conversation from here on.
+    SteerAdmitted { message_ids: Vec<u64> },
     /// A command failed.
     Error(String),
     /// Backchat `session.cancel_requested`: user stop accepted; `session/cancel`

@@ -230,9 +230,25 @@ A steer **cancels nothing**:
   Without a running turn the head goes out as an ordinary prompt and the rest
   stay queued.
 
+A steer has three visible states on the timeline: the bubble first carries a
+`steering` marker, the inbox drain that spends it fires a checkpoint, and the
+driver reports `SteerAdmitted`, which clears the marker; a rejected or late
+steer goes back to `queued` instead.
+
 Queueing stays a client behavior: items live in the TUI's FIFO (queued tint,
-`⌥↑` to edit or delete) and ship in order when the turn ends and the session
-goes idle.
+`⌥↑` to edit, steer or delete a row — enter edits, ctrl+enter steers the
+highlighted one, ctrl+d deletes, matching harness's QueueDock row actions) and
+ship in order when the turn ends and the session goes idle.
+
+Because the queue is the client's, it is also the one thing a crash would drop:
+the session snapshot is durable, the unsent prompts behind it were not. Every
+queue mutation now writes `$ABYLAB_HOME/queued/<session>.json` (one file per
+session, image payloads included; a drained queue removes its file), a start or `/resume` onto that session paints the
+items back as queued bubbles, and they are **held**: they were queued behind a
+turn that no longer exists, and spending them unbidden is not the app's call.
+The next real turn end (or an explicit enter/ctrl+enter) releases them in FIFO
+order. A missing, malformed or deleted file is just an empty queue, exactly like
+`settings.json`.
 
 ## Packaging and releases
 

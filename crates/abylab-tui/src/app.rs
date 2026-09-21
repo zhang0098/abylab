@@ -764,6 +764,9 @@ pub struct App {
     /// What plain Enter does while busy (`/enter`); the accelerated chord
     /// always does the other one (harness's `busyEnter` preference).
     pub enter: crate::locale::EnterBehavior,
+    /// Set while the queue shown on screen was restored from disk: those items
+    /// wait for the next turn instead of shipping the moment the app idles.
+    pub queue_hold: bool,
     /// Which usage hint the next new session opens with. The composer cap row
     /// no longer rotates hints live; a session start shows one instead, so the
     /// index advances per session and cycles the whole set over time.
@@ -844,6 +847,41 @@ fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
 enum StagedBlock {
     Text(String),
     Image(crate::attachments::Attachment),
+}
+
+/// A staged block in the durable queue's shape.
+fn persisted_block(block: &StagedBlock) -> crate::queue_store::Block {
+    match block {
+        StagedBlock::Text(text) => crate::queue_store::Block::Text { text: text.clone() },
+        StagedBlock::Image(att) => crate::queue_store::Block::Image {
+            name: att.name.clone(),
+            path: att.path.clone(),
+            media_type: att.media_type.clone(),
+            data: att.data.to_vec(),
+        },
+    }
+}
+
+/// The inverse: a persisted block as a staged one. The token and id are minted
+/// again if the item is ever pulled back into the composer for editing, so the
+/// restored attachment does not need them.
+fn staged_block(block: crate::queue_store::Block) -> StagedBlock {
+    match block {
+        crate::queue_store::Block::Text { text } => StagedBlock::Text(text),
+        crate::queue_store::Block::Image {
+            name,
+            path,
+            media_type,
+            data,
+        } => StagedBlock::Image(crate::attachments::Attachment {
+            id: 0,
+            token: String::new(),
+            name,
+            path,
+            media_type,
+            data: data.into(),
+        }),
+    }
 }
 
 /// One client-owned queued prompt: the blocks (text and/or staged images)
@@ -1078,6 +1116,8 @@ impl App {
         // Persisted global preferences seed the per-workspace mode chips when
         // this workspace has no cached facts of its own.
         let mut modes = Self::load_modes_cache(&cfg).unwrap_or_default();
+        // `app` is assembled first so the durable queue can paint itself back
+        // with the same helpers every other echo uses.
         if modes.effort.is_none() {
             modes.effort = settings.effort.clone();
         }
@@ -1088,7 +1128,7 @@ impl App {
         // here; `tick` re-checks on a throttle so mid-session checkouts (the
         // agent's shell tool, another terminal) stay in sync.
         let git_branch = crate::ui::head_branch(&cfg.workspace);
-        App {
+        let mut app = App {
             theme,
             locale,
             palettes,
@@ -1153,6 +1193,7 @@ impl App {
             key_debug: std::env::var("ABYLAB_KEYDEBUG").is_ok_and(|v| v == "1"),
             vim: crate::input::VimState::default(),
             enter,
+            queue_hold: false,
             session_tip_idx: 0,
             ctrl_c_armed: None,
             queue_delete_armed: None,
@@ -1172,7 +1213,11 @@ impl App {
             prompt_pending: false,
             server_info: None,
             needs_redraw: true,
-        }
+        };
+        // The session's unsent queue is the one thing the driver does not own;
+        // bring it back before the first frame paints.
+        app.restore_queue();
+        app
     }
 
     pub fn spinner(&self) -> char {
@@ -1822,6 +1867,15 @@ impl App {
                             }
                         }
                     }
+                    CtlEvent::SteerAdmitted { message_ids } => {
+                        // The agent drained its inbox: those messages are in the
+                        // transcript now, so their rows stop being pending.
+                        for message_id in message_ids {
+                            if let Some(pending) = self.pending_steer_cells.remove(&message_id) {
+                                self.transcript.mark_prompt_delivered(&pending.cells);
+                            }
+                        }
+                    }
                     CtlEvent::Error(err) => {
                         self.prompt_pending = false;
                         self.state = RunState::Idle;
@@ -1933,6 +1987,9 @@ impl App {
                         if fresh {
                             self.push_session_tip();
                         }
+                        // A resumed session brings its own unsent queue back
+                        // with it (the store is keyed by session id).
+                        self.restore_queue();
                         // The driver is the source of truth for the bound
                         // session's model: a resumed session keeps its stored
                         // model, and a rejected /model never moves this row.
@@ -1969,6 +2026,11 @@ impl App {
     /// Direct ACP facts and JSON-RPC notifications must take the same path.
     fn apply_ui(&mut self, ui: crate::events::UiEvent) {
         use crate::events::UiEvent as E;
+        // A turn reached its end: a restored queue has waited long enough, and
+        // the next idle status ships its head like any other queued item.
+        if matches!(ui, E::TurnEnd { .. }) {
+            self.queue_hold = false;
+        }
 
         if let E::SubagentStarted {
             parent,
@@ -3716,6 +3778,28 @@ impl App {
                     self.press_queue_delete(&id, ctl);
                 }
             }
+            // ctrl+enter is Send Now, the same chord the composer uses: on the
+            // queue list it steers the highlighted row and keeps the list open,
+            // so several rows can go in a row.
+            KeyCode::Enter
+                if kind == PickerKind::Queue
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                let index = picker
+                    .items
+                    .get(picker.sel)
+                    .and_then(|item| item.id.parse::<u64>().ok())
+                    .and_then(|id| self.prompt_queue.iter().position(|prompt| prompt.id == id));
+                if let Some(index) = index {
+                    self.steer_queued(index, ctl);
+                    // The steered row left the FIFO: rebuild the list on the row
+                    // that took its place, and close it when nothing is left.
+                    self.queue_delete_armed = None;
+                    self.refresh_queue_picker();
+                }
+            }
             KeyCode::Enter => {
                 let Some(item) = picker.items.get(picker.sel).cloned() else {
                     self.picker = None;
@@ -3945,8 +4029,8 @@ impl App {
             title: self
                 .locale
                 .tr(
-                    " queued prompts · ↑/↓ · enter edit · ctrl+d delete · esc close ",
-                    " 排队消息 · ↑/↓ · enter 编辑 · ctrl+d 删除 · esc 关闭 ",
+                    " queued prompts · ↑/↓ · enter edit · ctrl+enter steer · ctrl+d delete · esc close ",
+                    " 排队消息 · ↑/↓ · enter 编辑 · ctrl+enter 插话 · ctrl+d 删除 · esc 关闭 ",
                 )
                 .into(),
             sel,
@@ -4070,6 +4154,7 @@ impl App {
             return;
         };
         self.prompt_queue[index].blocks = blocks;
+        self.persist_queue();
         self.repaint_prompt_echo(index);
         self.finish_queue_edit();
         self.show_tip(
@@ -4119,6 +4204,7 @@ impl App {
         };
         self.withdraw_prompt_echo(&prompt.cells);
         self.queued = self.prompt_queue.len();
+        self.persist_queue();
         self.show_tip(
             self.locale
                 .tr("queued prompt #{n} deleted", "排队消息 #{n} 已删除")
@@ -4192,7 +4278,8 @@ impl App {
                         },
                     })
                     .collect();
-                self.transcript.prompt_echo_cells(&echo_blocks)
+                self.transcript
+                    .prompt_echo_cells(&echo_blocks, crate::transcript::Delivery::Queued)
             }
         };
         let (shift, painted) = self.transcript.replace_cells(&run, echo);
@@ -4254,26 +4341,17 @@ impl App {
         if self.queue_edit.is_some() || self.prompt_queue.is_empty() {
             return;
         }
+        self.queue_hold = false;
         let running = matches!(self.state, RunState::Running) || self.prompt_pending;
         if !running {
             self.send_queue_head_now(ctl);
             return;
         }
-        let prompts: Vec<QueuedPrompt> = self.prompt_queue.drain(..).collect();
-        self.queued = 0;
-        self.scroll_up = 0;
-        let count = prompts.len();
-        for prompt in prompts {
-            let message_id = prompt.id;
-            let wire = prompt_blocks_from_staged(&prompt.blocks);
-            self.pending_steer_cells.insert(
-                message_id,
-                PendingSteer {
-                    cells: prompt.cells,
-                    blocks: prompt.blocks,
-                },
-            );
-            self.send_wire_prompt(wire, Some(message_id), ctl);
+        // Always index 0: each steer takes the head, so the FIFO order the
+        // rows were shown in is the order the agent sees.
+        let count = self.prompt_queue.len();
+        for _ in 0..count {
+            self.steer_queued(0, ctl);
         }
         self.show_tip(
             self.locale
@@ -4289,41 +4367,37 @@ impl App {
         if self.queue_edit.is_some() {
             return;
         }
+        self.queue_hold = false;
         // `turn_busy` counts this non-empty queue itself, so it cannot say
         // whether a turn is in flight; ask the run state directly. Idle (a
         // cancelled edit, a failed turn) sends the head as a plain prompt.
         let running = matches!(self.state, RunState::Running) || self.prompt_pending;
-        let Some(prompt) = self.prompt_queue.pop_front() else {
+        if !running {
+            // The item leaves the queue before the driver sees it, so a
+            // `/clear` or a session switch can never double-send it.
+            self.deliver_queued(0, ctl);
+            return;
+        }
+        let Some(prompt) = self.prompt_queue.remove(0) else {
             return;
         };
         self.queued = self.prompt_queue.len();
         self.scroll_up = 0;
         let message_id = prompt.id;
         let wire = prompt_blocks_from_staged(&prompt.blocks);
-        if running {
-            self.pending_steer_cells.insert(
-                message_id,
-                PendingSteer {
-                    cells: prompt.cells,
-                    blocks: prompt.blocks,
-                },
-            );
-            self.show_tip(self.locale.tr(
-                "queue head sent now — lands at the next agent step",
-                "队首已立即发送 —— 在下一步 Agent 处生效",
-            ));
-            self.send_wire_prompt(wire, Some(message_id), ctl);
-            return;
-        }
-        self.transcript.mark_prompt_delivered(&prompt.cells);
-        self.prompt_pending = true;
-        self.state = RunState::Starting;
-        self.run_started = Some(Instant::now());
-        self.state_note = self
-            .locale
-            .tr("sending queued followup", "正在发送排队消息")
-            .into();
-        self.send_wire_prompt(wire, None, ctl);
+        self.transcript.mark_prompt_steering(&prompt.cells);
+        self.pending_steer_cells.insert(
+            message_id,
+            PendingSteer {
+                cells: prompt.cells,
+                blocks: prompt.blocks,
+            },
+        );
+        self.show_tip(self.locale.tr(
+            "queue head sent now — lands at the next agent step",
+            "队首已立即发送 —— 在下一步 Agent 处生效",
+        ));
+        self.send_wire_prompt(wire, Some(message_id), ctl);
     }
 
     fn open_model_picker(&mut self, ctl: &Controller) {
@@ -5020,7 +5094,7 @@ impl App {
 - enter · 发送；当前轮次运行时将后续消息排队（草稿为空时立即发送队首）
 - ctrl+enter · 与 enter 相反的模式：默认立即 steer 当前轮次（老终端会退化成普通 enter）
 - /enter · 繁忙时 enter 的模式：queue 排队 / steer 立即插话 · ctrl+enter 始终是另一种
-- ⌥↑ · 排队的后续消息：↑/↓ 选择 · enter 编辑 · 列表中 ctrl+d 连按两次删除 · esc 关闭
+- ⌥↑ · 排队的后续消息：↑/↓ 选择 · enter 编辑 · ctrl+enter 立即插话 · 列表中 ctrl+d 连按两次删除 · esc 关闭
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 中断（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
@@ -5050,7 +5124,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - enter · send · queues a follow-up while a turn runs (an empty draft sends the queue head now)
 - ctrl+enter · the opposite of enter: by default it steers the active turn (legacy terminals fall back to plain enter)
 - /enter · what enter does while busy: queue / steer · ctrl+enter is always the other mode
-- ⌥↑ · queued follow-ups: ↑/↓ select · enter edit · ctrl+d twice deletes a row · esc close
+- ⌥↑ · queued follow-ups: ↑/↓ select · enter edit · ctrl+enter steers one now · ctrl+d twice deletes a row · esc close
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · interrupt (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
@@ -5434,9 +5508,18 @@ impl App {
         if self.waiting_for_session_switch() {
             return;
         }
+        // The user is driving again: a restored queue no longer needs holding.
+        self.queue_hold = false;
         let running = self.turn_busy();
         let cell = self.transcript.cells.len();
-        self.transcript.push_user(text.clone(), running);
+        self.transcript.push_user(
+            text.clone(),
+            if running {
+                crate::transcript::Delivery::Queued
+            } else {
+                crate::transcript::Delivery::Delivered
+            },
+        );
         if running {
             self.enqueue_prompt(vec![StagedBlock::Text(text)], vec![cell]);
             // The tail hint names the escape hatch, which is whichever gesture
@@ -5484,6 +5567,51 @@ impl App {
         self.prompt_queue
             .push_back(QueuedPrompt { id, blocks, cells });
         self.queued = self.prompt_queue.len();
+        self.persist_queue();
+    }
+
+    /// Write this session's FIFO to `$ABYLAB_HOME/queued.json`.
+    ///
+    /// The queue is the one thing the driver does not own, so it is also the one
+    /// thing a crash would silently drop: the session snapshot is durable, the
+    /// unsent prompts behind it are not. Persisting them is what
+    /// deepseek-harness gets from keeping its queue in the host process.
+    fn persist_queue(&self) {
+        let items: Vec<Vec<crate::queue_store::Block>> = self
+            .prompt_queue
+            .iter()
+            .map(|prompt| prompt.blocks.iter().map(persisted_block).collect())
+            .collect();
+        crate::queue_store::save(&self.cfg.home, &self.session_id, &items);
+    }
+
+    /// Paint the queue stored for this session back into the timeline.
+    ///
+    /// The items are held (`queue_hold`): they were queued behind a turn that
+    /// no longer exists, and spending them without being asked would be the
+    /// app doing work on its own. The next turn (or an explicit enter/chord on
+    /// the queue) releases them in FIFO order.
+    fn restore_queue(&mut self) {
+        let items = crate::queue_store::load(&self.cfg.home, &self.session_id);
+        if items.is_empty() {
+            return;
+        }
+        let count = items.len();
+        for blocks in items {
+            let blocks: Vec<StagedBlock> = blocks.into_iter().map(staged_block).collect();
+            let cells = self.paint_staged_echo(&blocks, crate::transcript::Delivery::Queued);
+            self.enqueue_prompt(blocks, cells);
+        }
+        self.queue_hold = true;
+        self.show_tip(
+            self.locale
+                .tr(
+                    "restored {n} queued — they go out after the next turn · ⌥↑ lists them",
+                    "已恢复 {n} 条排队消息 —— 下一轮结束后送出 · ⌥↑ 查看",
+                )
+                .replace("{n}", &count.to_string()),
+        );
+        self.scroll_up = 0;
     }
 
     /// Send the FIFO head — the turn it waited behind has ended. The echo
@@ -5502,10 +5630,23 @@ impl App {
                 .into();
             return;
         }
-        let Some(prompt) = self.prompt_queue.pop_front() else {
+        if self.queue_hold {
+            // Restored items wait for a turn the user actually ran (or an
+            // explicit enter/chord on the queue).
             return;
+        }
+        self.deliver_queued(0, ctl);
+    }
+
+    /// Ship one queued item as an ordinary prompt, wherever it sits in the
+    /// FIFO. The item leaves the queue before the driver sees it, so a `/clear`
+    /// or a session switch can never double-send it.
+    fn deliver_queued(&mut self, index: usize, ctl: &Controller) -> bool {
+        let Some(prompt) = self.prompt_queue.remove(index) else {
+            return false;
         };
         self.queued = self.prompt_queue.len();
+        self.persist_queue();
         self.transcript.mark_prompt_delivered(&prompt.cells);
         self.prompt_pending = true;
         self.state = RunState::Starting;
@@ -5517,6 +5658,41 @@ impl App {
         self.scroll_up = 0;
         let wire = prompt_blocks_from_staged(&prompt.blocks);
         self.send_wire_prompt(wire, None, ctl);
+        true
+    }
+
+    /// Steer one queued item into the running turn at its next step boundary.
+    ///
+    /// This is the per-row counterpart of the empty-draft chord and of
+    /// deepseek-harness's QueueDock Steer button: the row leaves the FIFO, its
+    /// bubble turns into a pending-steering row, and the driver settles it when
+    /// the agent takes it (or puts it back when it cannot).
+    fn steer_queued(&mut self, index: usize, ctl: &Controller) -> bool {
+        self.queue_hold = false;
+        let running = matches!(self.state, RunState::Running) || self.prompt_pending;
+        if !running {
+            // Nothing to steer into: the item ships as this turn's prompt; the
+            // items ahead of it keep their order and wait their turn.
+            return self.deliver_queued(index, ctl);
+        }
+        let Some(prompt) = self.prompt_queue.remove(index) else {
+            return false;
+        };
+        self.queued = self.prompt_queue.len();
+        self.persist_queue();
+        self.scroll_up = 0;
+        let message_id = prompt.id;
+        let wire = prompt_blocks_from_staged(&prompt.blocks);
+        self.transcript.mark_prompt_steering(&prompt.cells);
+        self.pending_steer_cells.insert(
+            message_id,
+            PendingSteer {
+                cells: prompt.cells,
+                blocks: prompt.blocks,
+            },
+        );
+        self.send_wire_prompt(wire, Some(message_id), ctl);
+        true
     }
 
     /// Fire one prompt at the driver: a lone text block takes the plain
@@ -5663,29 +5839,39 @@ impl App {
 
     /// Echo staged blocks in the transcript (text and image thumbnails in
     /// draft order) and send one prompt whose ACP blocks match that order.
-    fn emit_staged_prompt(
+    /// Paint one staged prompt's echo — text bubbles and image thumbnails in
+    /// draft order — and report the cell indices.
+    fn paint_staged_echo(
         &mut self,
-        staged: Vec<StagedBlock>,
-        queued: bool,
-        steer_message_id: Option<u64>,
-        ctl: &Controller,
-    ) {
+        staged: &[StagedBlock],
+        delivery: crate::transcript::Delivery,
+    ) -> Vec<usize> {
         let first_cell = self.transcript.cells.len();
-        for block in &staged {
+        for block in staged {
             match block {
-                StagedBlock::Text(text) => self.transcript.push_user(text.clone(), queued),
+                StagedBlock::Text(text) => self.transcript.push_user(text.clone(), delivery),
                 StagedBlock::Image(att) => self.transcript.push_image(
                     att.name.clone(),
                     String::new(),
                     att.path.clone(),
                     att.data.clone(),
-                    queued,
+                    delivery,
                 ),
             }
         }
-        let cells: Vec<usize> = (first_cell..self.transcript.cells.len()).collect();
+        (first_cell..self.transcript.cells.len()).collect()
+    }
+
+    fn emit_staged_prompt(
+        &mut self,
+        staged: Vec<StagedBlock>,
+        delivery: crate::transcript::Delivery,
+        steer_message_id: Option<u64>,
+        ctl: &Controller,
+    ) {
+        let cells = self.paint_staged_echo(&staged, delivery);
         self.scroll_up = 0;
-        if queued {
+        if delivery == crate::transcript::Delivery::Queued {
             self.enqueue_prompt(staged, cells);
             return;
         }
@@ -5708,6 +5894,7 @@ impl App {
     /// Submit path for the staged tray: set run state / queue bookkeeping,
     /// then emit the interleaved prompt.
     fn send_staged(&mut self, staged: Vec<StagedBlock>, ctl: &Controller) {
+        self.queue_hold = false;
         if staged.is_empty() {
             return;
         }
@@ -5744,11 +5931,17 @@ impl App {
                     .replace("{n}", &n.to_string())
             };
         }
-        self.emit_staged_prompt(staged, running, None, ctl);
+        let delivery = if running {
+            crate::transcript::Delivery::Queued
+        } else {
+            crate::transcript::Delivery::Delivered
+        };
+        self.emit_staged_prompt(staged, delivery, None, ctl);
     }
 
-    /// Send-now is ACP steering: issue another prompt immediately while the
-    /// current turn remains active. Esc is the only cancellation path.
+    /// Send-now is steering: hand the message to the running turn, which takes
+    /// it at its next step boundary. Nothing is cancelled — esc is the only
+    /// cancellation path.
     fn send_now(&mut self, ctl: &Controller) {
         if self.waiting_for_session_switch() {
             return;
@@ -5775,7 +5968,13 @@ impl App {
         let running = self.state == RunState::Running || self.prompt_pending || self.queued > 0;
         self.input.history.push(self.input.buf().clone());
         self.input.clear();
-        let queued = false;
+        // A running turn paints the echo as pending steering; an idle session
+        // is just sending, so the bubble is an ordinary user row.
+        let delivery = if running {
+            crate::transcript::Delivery::Steering
+        } else {
+            crate::transcript::Delivery::Delivered
+        };
         let has_images = staged.iter().any(|b| matches!(b, StagedBlock::Image(_)));
         if has_images {
             let n = staged
@@ -5800,14 +5999,14 @@ impl App {
                 };
             }
             let steer_message_id = running.then(|| self.next_prompt_id());
-            self.emit_staged_prompt(staged, queued, steer_message_id, ctl);
+            self.emit_staged_prompt(staged, delivery, steer_message_id, ctl);
         } else {
             let text = match staged.into_iter().next() {
                 Some(StagedBlock::Text(t)) => t,
                 _ => return,
             };
             let cell = self.transcript.cells.len();
-            self.transcript.push_user(text.clone(), queued);
+            self.transcript.push_user(text.clone(), delivery);
             if running {
                 self.show_tip(self.locale.tr(
                     "steered — lands at the next agent step",
@@ -6063,7 +6262,10 @@ mod resume_tests {
             let (mut app, _) = test_app_with_root(root.to_str().unwrap(), "/w");
             let (ctl, commands) = crate::controller::test_controller();
             let previous = app.session_id.clone();
-            app.transcript.push_user("original history".into(), false);
+            app.transcript.push_user(
+                "original history".into(),
+                crate::transcript::Delivery::Delivered,
+            );
             if new_session {
                 app.run_slash("new", "", &ctl);
                 assert!(matches!(commands.try_recv(), Ok(Cmd::NewSession)));
@@ -7064,7 +7266,10 @@ mod mode_tests {
     #[test]
     fn enter_from_the_agent_switcher_opens_the_child_transcript() {
         let (mut app, ctl, _rx) = test_app();
-        app.transcript.push_user("main-only text".into(), false);
+        app.transcript.push_user(
+            "main-only text".into(),
+            crate::transcript::Delivery::Delivered,
+        );
         app.apply_ui(crate::events::UiEvent::SubagentStarted {
             parent: "dsh-test".into(),
             child: "child-1".into(),
@@ -7085,7 +7290,10 @@ mod mode_tests {
     #[test]
     fn esc_from_a_child_transcript_returns_to_main() {
         let (mut app, ctl, _rx) = test_app();
-        app.transcript.push_user("main-only text".into(), false);
+        app.transcript.push_user(
+            "main-only text".into(),
+            crate::transcript::Delivery::Delivered,
+        );
         app.apply_ui(crate::events::UiEvent::SubagentStarted {
             parent: "dsh-test".into(),
             child: "child-1".into(),
@@ -7704,7 +7912,11 @@ mod mode_tests {
         assert_ne!(app.state_note, "cancelling");
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::User { text, queued: false })
+            Some(crate::transcript::CellKind::User {
+                text,
+                // Pending steering until the agent admits it at a boundary.
+                delivery: crate::transcript::Delivery::Steering,
+            })
                 if text == "change course"
         ));
     }
@@ -7735,7 +7947,7 @@ mod mode_tests {
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::User {
                 text,
-                queued: true,
+                delivery: crate::transcript::Delivery::Queued,
             }) if text == "change course"
         ));
     }
@@ -7764,7 +7976,10 @@ mod mode_tests {
         for cell in cells {
             assert!(matches!(
                 &app.transcript.cells[cell].kind,
-                crate::transcript::CellKind::User { queued: false, .. }
+                crate::transcript::CellKind::User {
+                    delivery: crate::transcript::Delivery::Delivered,
+                    ..
+                }
             ));
         }
     }
@@ -7787,7 +8002,10 @@ mod mode_tests {
         assert_eq!(app.queued, 0);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::Image { queued: false, .. })
+            Some(crate::transcript::CellKind::Image {
+                delivery: crate::transcript::Delivery::Steering,
+                ..
+            })
         ));
     }
 
@@ -7893,6 +8111,60 @@ mod mode_tests {
         );
     }
 
+    /// The pending-steering row becomes an ordinary user row the moment the
+    /// agent takes it — and a steer that never gets admitted keeps its marker.
+    #[test]
+    fn an_admitted_steer_stops_looking_pending() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.input.set("change course".into());
+        app.send_now(&ctl);
+        let message_id = *app
+            .pending_steer_cells
+            .keys()
+            .next()
+            .expect("tracked steer");
+        let cell = app.transcript.cells.len() - 1;
+        assert!(matches!(
+            &app.transcript.cells[cell].kind,
+            crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Steering,
+                ..
+            }
+        ));
+
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SteerAdmitted {
+                message_ids: vec![message_id],
+            }),
+            &ctl,
+        );
+
+        assert!(app.pending_steer_cells.is_empty(), "nothing left pending");
+        assert!(matches!(
+            &app.transcript.cells[cell].kind,
+            crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Delivered,
+                ..
+            }
+        ));
+        // An unrelated id in the same report changes nothing.
+        app.input.set("later".into());
+        app.send_now(&ctl);
+        let other = *app.pending_steer_cells.keys().next().expect("second steer");
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SteerAdmitted {
+                message_ids: vec![message_id, 999],
+            }),
+            &ctl,
+        );
+        assert!(
+            app.pending_steer_cells.contains_key(&other),
+            "a stale settlement must not clear a live steer"
+        );
+    }
+
     /// Only a steer's own rejection puts it back in the queue; a delivery
     /// settles it in place.
     #[test]
@@ -7941,10 +8213,302 @@ mod mode_tests {
             "settlement order is the driver's"
         );
         for cell in &app.transcript.cells {
-            if let crate::transcript::CellKind::User { text, queued } = &cell.kind {
-                assert!(queued, "{text} must look queued again");
+            if let crate::transcript::CellKind::User { text, delivery } = &cell.kind {
+                assert_eq!(
+                    *delivery,
+                    crate::transcript::Delivery::Queued,
+                    "{text} must look queued again"
+                );
             }
         }
+    }
+
+    /// The queue is the one thing the driver does not own, so it is also the
+    /// one thing a restart would drop: it survives in `$ABYLAB_HOME/queued.json`
+    /// and comes back as queued bubbles.
+    #[test]
+    fn a_queued_prompt_survives_a_restart() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.send_agent_text("second".into(), &ctl);
+        let home = app.cfg.home.clone();
+        let session = app.session_id.clone();
+
+        let restarted = App::new(
+            crate::theme::Theme::dark(),
+            app.cfg.clone(),
+            session.clone(),
+        );
+
+        assert_eq!(restarted.queued, 2, "both items came back");
+        assert!(restarted.queue_hold, "restored items are held, not spent");
+        let texts: Vec<String> = restarted
+            .prompt_queue
+            .iter()
+            .map(|prompt| match prompt.blocks.first() {
+                Some(StagedBlock::Text(text)) => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(texts, ["first", "second"], "FIFO order");
+        let echoes: Vec<&String> = restarted
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::User { text, delivery }
+                    if *delivery == crate::transcript::Delivery::Queued =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(echoes, [&"first".to_string(), &"second".to_string()]);
+
+        // The store is per session: another session's start sees nothing.
+        let other = App::new(
+            crate::theme::Theme::dark(),
+            app.cfg.clone(),
+            "other-session".into(),
+        );
+        assert_eq!(other.queued, 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Restored items wait: an idle status must not spend them on their own,
+    /// and the user's next move releases them.
+    #[test]
+    fn a_restored_queue_waits_for_a_real_turn() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("remember me".into(), &ctl);
+        let restarted = {
+            let mut next = App::new(
+                crate::theme::Theme::dark(),
+                app.cfg.clone(),
+                "dsh-test".into(),
+            );
+            next.session_id = "dsh-test".into();
+            next
+        };
+        assert_eq!(restarted.queued, 1);
+
+        // The startup idle status is not an invitation.
+        let (ctl2, commands) = crate::controller::test_controller();
+        let mut app = restarted;
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl2,
+        );
+        assert_eq!(app.queued, 1, "the hold survived the idle status");
+        assert!(commands.try_recv().is_err(), "nothing was sent");
+
+        // A finished turn releases it: this is the case the queue was holding.
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::TurnEnd {
+                session: "dsh-test".into(),
+                kind: "completed".into(),
+            }),
+            &ctl2,
+        );
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl2,
+        );
+        assert_eq!(app.queued, 0, "the release shipped the head");
+        assert!(
+            matches!(commands.try_recv(), Ok(Cmd::Prompt { text, .. }) if text == "remember me"),
+            "the restored prompt went out as an ordinary send"
+        );
+        let _ = std::fs::remove_dir_all(&app.cfg.home);
+    }
+
+    /// Every queue mutation is mirrored to disk; a drained queue leaves no
+    /// entry behind for the next start to resurrect.
+    #[test]
+    fn the_store_follows_the_queue() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        let home = app.cfg.home.clone();
+        let session = app.session_id.clone();
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.send_agent_text("second".into(), &ctl);
+        assert_eq!(crate::queue_store::load(&home, &session).len(), 2);
+
+        // Editing rewrites the stored item, deleting removes it.
+        let head = app.prompt_queue[0].id;
+        app.begin_queue_edit(&head.to_string(), &ctl);
+        app.input.set("first, corrected".into());
+        app.save_queue_edit(&ctl);
+        let stored = crate::queue_store::load(&home, &session);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored[0],
+            vec![crate::queue_store::Block::Text {
+                text: "first, corrected".into()
+            }]
+        );
+
+        app.drop_queued_prompt(1, &ctl);
+        assert_eq!(crate::queue_store::load(&home, &session).len(), 1);
+
+        // Steered items leave the queue, so they leave the store too.
+        app.steer_queued(0, &ctl);
+        assert!(
+            crate::queue_store::load(&home, &session).is_empty(),
+            "a drained queue is not stored"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A session switch brings the target session's queue back, and the queue
+    /// left behind keeps its own entry.
+    #[test]
+    fn each_session_keeps_its_own_restored_queue() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        let home = app.cfg.home.clone();
+        app.state = RunState::Running;
+        app.send_agent_text("belongs to dsh-test".into(), &ctl);
+
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "second".into(),
+                notice: None,
+                model: None,
+                effort: None,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.session_id, "second");
+        assert_eq!(app.queued, 0, "a fresh session starts with an empty queue");
+
+        // Queue it behind that session's own running turn.
+        app.state = RunState::Running;
+        app.send_agent_text("belongs to second".into(), &ctl);
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "dsh-test".into(),
+                notice: None,
+                model: None,
+                effort: None,
+            }),
+            &ctl,
+        );
+        let texts: Vec<String> = app
+            .prompt_queue
+            .iter()
+            .map(|prompt| match prompt.blocks.first() {
+                Some(StagedBlock::Text(text)) => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(texts, ["belongs to dsh-test"], "the old session's queue");
+        assert_eq!(
+            crate::queue_store::load(&home, "second"),
+            vec![vec![crate::queue_store::Block::Text {
+                text: "belongs to second".into()
+            }]]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `ctrl+enter` on the queue list steers the highlighted row and keeps the
+    /// list open on the row that took its place — the per-row counterpart of
+    /// the empty-draft chord (harness's QueueDock Steer button).
+    #[test]
+    fn the_queue_list_steers_the_highlighted_row() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.send_agent_text("second".into(), &ctl);
+        app.send_agent_text("third".into(), &ctl);
+        app.open_queue_selector();
+        assert!(app.picker.is_some(), "three rows open the list");
+
+        // Walk to the middle row and steer it with the composer's chord.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+
+        let steered: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                Cmd::Steer { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steered, ["second"], "only the highlighted row went");
+        assert_eq!(app.queued, 2, "the other two keep their FIFO slots");
+        let remaining: Vec<String> = app
+            .prompt_queue
+            .iter()
+            .map(|prompt| match prompt.blocks.first() {
+                Some(StagedBlock::Text(text)) => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(remaining, ["first", "third"]);
+        let picker = app.picker.as_ref().expect("the list stays open");
+        assert_eq!(picker.items.len(), 2, "the steered row left the list");
+        assert_eq!(picker.sel, 1, "the highlight followed the row count");
+        assert_eq!(picker.items[1].label, "third");
+        assert!(
+            picker.title.contains("ctrl+enter"),
+            "the title names the key: {}",
+            picker.title
+        );
+
+        // The highlight sits on the row that took the steered one's place, so
+        // the next chord steers that one; the last steer closes the list.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+        assert_eq!(app.queued, 1);
+        let picker = app.picker.as_ref().expect("one row left");
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[picker.sel].label, "first");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+        assert_eq!(app.queued, 0);
+        assert!(app.picker.is_none(), "nothing queued, nothing to list");
+
+        let steered: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                Cmd::Steer { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steered, ["third", "first"], "the survivors, in list order");
+    }
+
+    /// Steering a row with no turn to steer into ships it as an ordinary prompt
+    /// instead of inventing a steer.
+    #[test]
+    fn a_row_steer_without_a_running_turn_is_an_ordinary_send() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.send_agent_text("second".into(), &ctl);
+        app.handle(AppEvent::Ctl(CtlEvent::Interrupted), &ctl);
+        app.state = RunState::Idle;
+
+        app.steer_queued(1, &ctl);
+
+        assert_eq!(app.queued, 1);
+        assert!(
+            matches!(commands.try_recv(), Ok(Cmd::Prompt { text, .. }) if text == "second"),
+            "an idle queue steer is a plain prompt"
+        );
+        assert!(app.pending_steer_cells.is_empty());
     }
 
     /// `/enter` sets and persists the busy mode, and an unknown argument keeps
@@ -8023,7 +8587,10 @@ mod mode_tests {
         assert_eq!(app.queued, 0);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::User { queued: false, .. })
+            Some(crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Delivered,
+                ..
+            })
         ));
     }
 
@@ -8071,13 +8638,19 @@ mod mode_tests {
             .cells
             .iter()
             .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::User { text, queued } => {
-                    Some((text.as_str(), *queued))
+                crate::transcript::CellKind::User { text, delivery } => {
+                    Some((text.as_str(), *delivery))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(users, [("first", false), ("second", true)]);
+        assert_eq!(
+            users,
+            [
+                ("first", crate::transcript::Delivery::Delivered),
+                ("second", crate::transcript::Delivery::Queued)
+            ]
+        );
     }
 
     #[test]
@@ -8103,7 +8676,7 @@ mod mode_tests {
                 app.transcript.cells.last().map(|cell| &cell.kind),
                 Some(crate::transcript::CellKind::User {
                     text,
-                    queued: false
+                    delivery: crate::transcript::Delivery::Delivered,
                 }) if text == "retry"
             ));
         }
@@ -8214,7 +8787,7 @@ mod mode_tests {
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::User {
                 text,
-                queued: false
+                delivery: crate::transcript::Delivery::Delivered,
             }) if text == "new session"
         ));
     }
@@ -8263,7 +8836,10 @@ mod mode_tests {
         assert!(
             app.transcript.cells.iter().all(|cell| !matches!(
                 &cell.kind,
-                crate::transcript::CellKind::User { queued: true, .. }
+                crate::transcript::CellKind::User {
+                    delivery: crate::transcript::Delivery::Queued,
+                    ..
+                }
             )),
             "a dead queue's echoes stop claiming they are queued"
         );
@@ -8287,7 +8863,10 @@ mod mode_tests {
         );
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::User { queued: true, .. })
+            Some(crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Queued,
+                ..
+            })
         ));
     }
 
@@ -8340,7 +8919,10 @@ mod mode_tests {
         assert_eq!(app.prompt_queue.len(), 2);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::Image { queued: true, .. })
+            Some(crate::transcript::CellKind::Image {
+                delivery: crate::transcript::Delivery::Queued,
+                ..
+            })
         ));
     }
 
@@ -8360,7 +8942,7 @@ mod mode_tests {
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::User {
                 text,
-                queued: false,
+                delivery: crate::transcript::Delivery::Steering,
             }) if text == "urgent correction"
         ));
     }
@@ -8456,7 +9038,7 @@ mod mode_tests {
             assert!(
                 matches!(
                     &app.transcript.cells[cell].kind,
-                    crate::transcript::CellKind::User { text, queued: true } if text == "fixed"
+                    crate::transcript::CellKind::User { text, delivery: crate::transcript::Delivery::Queued } if text == "fixed"
                 ),
                 "the queue points at the repainted bubble (cell {cell})"
             );
@@ -8520,7 +9102,10 @@ mod mode_tests {
                 .cells
                 .iter()
                 .filter_map(|cell| match &cell.kind {
-                    crate::transcript::CellKind::User { text, queued: true } => Some(text.clone()),
+                    crate::transcript::CellKind::User {
+                        text,
+                        delivery: crate::transcript::Delivery::Queued,
+                    } => Some(text.clone()),
                     _ => None,
                 })
                 .collect()
@@ -8551,7 +9136,7 @@ mod mode_tests {
             assert!(
                 matches!(
                     &app.transcript.cells[cell].kind,
-                    crate::transcript::CellKind::User { text, queued: true } if text == "keep me"
+                    crate::transcript::CellKind::User { text, delivery: crate::transcript::Delivery::Queued } if text == "keep me"
                 ),
                 "the queue still points at its own bubble (cell {cell})"
             );
@@ -8572,7 +9157,10 @@ mod mode_tests {
                 .cells
                 .iter()
                 .filter_map(|cell| match &cell.kind {
-                    crate::transcript::CellKind::User { text, queued: true } => Some(text.clone()),
+                    crate::transcript::CellKind::User {
+                        text,
+                        delivery: crate::transcript::Delivery::Queued,
+                    } => Some(text.clone()),
                     _ => None,
                 })
                 .collect()
@@ -8735,7 +9323,10 @@ mod mode_tests {
         assert_eq!(app.queued, 1);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::User { queued: true, .. })
+            Some(crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Queued,
+                ..
+            })
         ));
 
         app.handle(
@@ -8750,7 +9341,10 @@ mod mode_tests {
         assert!(app.prompt_queue.is_empty(), "the head left the queue");
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::User { queued: false, .. })
+            Some(crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Delivered,
+                ..
+            })
         ));
         assert!(matches!(
             commands.try_recv(),
@@ -8803,12 +9397,19 @@ mod mode_tests {
             .cells
             .iter()
             .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::User { queued, .. }
-                | crate::transcript::CellKind::Image { queued, .. } => Some(*queued),
+                crate::transcript::CellKind::User { delivery, .. }
+                | crate::transcript::CellKind::Image { delivery, .. } => Some(*delivery),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(queued, [false, false, true]);
+        assert_eq!(
+            queued,
+            [
+                crate::transcript::Delivery::Delivered,
+                crate::transcript::Delivery::Delivered,
+                crate::transcript::Delivery::Queued
+            ]
+        );
     }
 
     #[test]
@@ -9799,7 +10400,8 @@ mod mode_tests {
 
         // New cells land where the old index pointed; deleting the queued
         // prompt must not touch them.
-        app.transcript.push_user("unrelated".into(), false);
+        app.transcript
+            .push_user("unrelated".into(), crate::transcript::Delivery::Delivered);
         let unrelated = app.transcript.cells.len() - 1;
         app.drop_queued_prompt(0, &ctl);
         assert_eq!(app.prompt_queue.len(), 0);
@@ -9836,7 +10438,10 @@ mod mode_tests {
         assert!(
             !app.transcript.cells.iter().any(|cell| matches!(
                 &cell.kind,
-                crate::transcript::CellKind::User { queued: true, .. }
+                crate::transcript::CellKind::User {
+                    delivery: crate::transcript::Delivery::Queued,
+                    ..
+                }
             )),
             "no queued echo is left behind"
         );
@@ -10319,7 +10924,10 @@ mod right_slot_tests {
     fn new_session_greets_with_the_next_usage_hint() {
         let (mut app, ctl, _rx) = test_app();
         app.locale = Locale::En;
-        app.transcript.push_user("a previous prompt".into(), false);
+        app.transcript.push_user(
+            "a previous prompt".into(),
+            crate::transcript::Delivery::Delivered,
+        );
         let greeting = |app: &App| -> String {
             let first = app.transcript.cells.first().expect("greeting cell");
             let crate::transcript::CellKind::MarkdownNotice { text } = &first.kind else {
@@ -10936,7 +11544,8 @@ mod resume_replay_tests {
     fn clicking_the_scroll_chip_follows_the_tail_again() {
         let (mut app, ctl, _rx) = test_app();
         for i in 0..40 {
-            app.transcript.push_user(format!("line {i}"), false);
+            app.transcript
+                .push_user(format!("line {i}"), crate::transcript::Delivery::Delivered);
         }
         app.scroll_by(20);
         let _ = crate::ui::dump_frame(&mut app, 100, 14);
@@ -11051,7 +11660,8 @@ mod resume_replay_tests {
     fn prompt_jump_walks_user_prompts_newest_first() {
         let (mut app, _ctl, _rx) = test_app();
         for text in ["first prompt", "second prompt", "third prompt"] {
-            app.transcript.push_user(text.into(), false);
+            app.transcript
+                .push_user(text.into(), crate::transcript::Delivery::Delivered);
             // Long bodies make each bubble several rows, so the anchor math
             // has room to move the viewport.
             app.transcript.apply(crate::events::UiEvent::TextDelta {

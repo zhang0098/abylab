@@ -230,6 +230,9 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                     message_id,
                     deferred,
                 },
+                abylab_backend::CtlEvent::SteerAdmitted { message_ids } => {
+                    CtlEvent::SteerAdmitted { message_ids }
+                }
                 abylab_backend::CtlEvent::Error(err) => CtlEvent::Error(err),
                 abylab_backend::CtlEvent::CancelRequested => CtlEvent::CancelRequested,
                 abylab_backend::CtlEvent::Interrupted => CtlEvent::Interrupted,
