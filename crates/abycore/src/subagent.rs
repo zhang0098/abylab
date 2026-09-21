@@ -332,15 +332,16 @@ impl Subagents {
             .clone())
     }
 
-    /// Resolve one pending call after verifying its side effects. Never replays a tool.
-    pub fn resolve_tool(&self, id: &str, call_id: &str, output: ToolOutput) -> Result<()> {
+    /// Resolve one pending call after verifying its side effects. Never replays a
+    /// tool. Returns the output as committed (see [`Agent::resolve_tool`]).
+    pub fn resolve_tool(&self, id: &str, call_id: &str, output: ToolOutput) -> Result<ToolOutput> {
         let entry = self.0.entry(id)?;
         let mut state = entry.state.lock().unwrap_or_else(|p| p.into_inner());
         let agent = state
             .agent
             .as_mut()
             .ok_or_else(|| invalid("agent is running or unavailable"))?;
-        agent.resolve_tool(call_id, output)?;
+        let committed = agent.resolve_tool(call_id, output)?;
         let snapshot = agent.snapshot();
         state.info.status = if snapshot.pending.is_empty() {
             SubagentStatus::Idle
@@ -348,7 +349,7 @@ impl Subagents {
             SubagentStatus::NeedsResolution
         };
         *entry.snapshot.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
-        Ok(())
+        Ok(committed)
     }
 
     /// Forget a settled leaf. Children must be forgotten first to preserve control ancestry.

@@ -1384,6 +1384,12 @@ pub fn tool_title(name: &str, arguments: &str) -> String {
             }
             _ => {}
         }
+        // A call with no arguments takes no title: `{}` is noise the tool name
+        // already answers for (`get_goal`), and the result below carries the
+        // content.
+        if v.as_object().is_some_and(|object| object.is_empty()) {
+            return String::new();
+        }
         // generic: compact json
         return one_line(&v.to_string());
     }
@@ -1808,6 +1814,17 @@ mod tests {
             }
             other => panic!("unexpected cell {other:?}"),
         }
+    }
+
+    /// A call that takes no arguments titles nothing: `{}` would sit after the
+    /// tool name saying nothing, and the answer belongs in the card's body.
+    #[test]
+    fn no_argument_tool_calls_title_nothing() {
+        assert_eq!(tool_title("get_goal", "{}"), "");
+        assert_eq!(tool_title("get_goal", " {} "), "");
+        assert_eq!(tool_title("get_goal", ""), "");
+        // Anything an argument-free call does carry still shows.
+        assert_eq!(tool_title("get_goal", r#"{"note":"x"}"#), r#"{"note":"x"}"#);
     }
 
     #[test]

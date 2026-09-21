@@ -255,7 +255,12 @@ impl Agent {
 
     /// Supply a verified result (or an explicit host decision) for the first pending call.
     /// This method never executes a tool. Resolve the batch in its original order.
-    pub fn resolve_tool(&mut self, call_id: &str, output: ToolOutput) -> Result<()> {
+    ///
+    /// Returns the output as committed. The agent answers `get_goal` from its
+    /// own state and settles goal mutations here, so the result the model sees
+    /// is not always the one the tool handed in: hosts showing a tool result
+    /// must display the returned value, not their own copy.
+    pub fn resolve_tool(&mut self, call_id: &str, output: ToolOutput) -> Result<ToolOutput> {
         if self
             .state
             .pending
@@ -316,14 +321,14 @@ impl Agent {
             call_id: call_id.into(),
             output: output.wire(),
             is_error: output.is_error,
-            meta: output.meta,
+            meta: output.meta.clone(),
         });
         self.state.pending.remove(0);
         self.state.needs_response = true;
         if let Some(plan) = plan {
             self.state.todos = Some(plan.todos);
         }
-        Ok(())
+        Ok(output)
     }
 
     /// The exact request envelope the loop would send for `history`.
@@ -1055,7 +1060,10 @@ impl Agent {
                         }
                     }
                 }.bounded(options.max_tool_output_bytes.saturating_sub("Tool error: ".len()));
-                self.resolve_tool(&call.call_id, output.clone())?;
+                // From here on `output` is the committed result, not the tool's
+                // proposal: checkpoints, host events and the next request all
+                // carry the same text (see `resolve_tool`).
+                let output = self.resolve_tool(&call.call_id, output)?;
                 self.checkpoint(
                     CheckpointKind::ToolResult {
                         call_id: call.call_id.clone(),
