@@ -148,6 +148,27 @@ impl Window {
                 self.any_truncated = true;
             }
             if text.len().saturating_add(1) > self.max_bytes.saturating_sub(self.bytes) {
+                let room = self.max_bytes.saturating_sub(self.bytes);
+                // The window's first line can be larger than the whole byte
+                // budget. Emit a bounded preview of it anyway: the body then
+                // still starts at the requested offset, and the footer's
+                // continuation offset moves past the line. A window that
+                // shows nothing would otherwise name the same offset again
+                // and send the caller in a circle.
+                if self.lines.is_empty() && room >= 2 {
+                    let marker = room > 4;
+                    let keep = room.saturating_sub(if marker { 4 } else { 1 });
+                    let mut preview = prefix(&text, keep).to_string();
+                    if marker {
+                        preview.push('…');
+                    }
+                    self.bytes += preview.len() + 1;
+                    self.lines.push(Line {
+                        number: self.total,
+                        text: preview,
+                    });
+                    self.any_truncated = true;
+                }
                 self.capped = true;
             } else {
                 self.bytes += text.len() + 1;
@@ -162,6 +183,22 @@ impl Window {
     }
 
     fn footer(&self, end: usize, compact: bool) -> String {
+        // Nothing from the requested window fit the byte or budget cap (the
+        // first line overflowed). Naming `offset` again would point the
+        // caller back at the very line that just overflowed, so point past
+        // it. An empty file (total below the requested offset) keeps the
+        // plain EOF footer below.
+        if end < self.offset && self.total >= self.offset {
+            let next = self.offset.saturating_add(1);
+            return if compact {
+                format!("\n[offset={next}]")
+            } else {
+                format!(
+                    "\n(No line from offset {} fits this read; use offset={next} to continue.)",
+                    self.offset
+                )
+            };
+        }
         if compact {
             if end < self.total {
                 format!("\n[offset={}]", end + 1)

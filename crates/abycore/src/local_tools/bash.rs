@@ -352,6 +352,10 @@ async fn run(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .snapshot();
+    // A permission-error signature under a sandboxed preset. The sandbox does
+    // not report its denials and ordinary OS EACCES looks the same on stderr,
+    // so this is a heuristic: hosts must not present it as proof that the
+    // sandbox blocked the command.
     let denied = status.code() != Some(0)
         && workspace.config.permission_mode != PermissionMode::FullAccess
         && [

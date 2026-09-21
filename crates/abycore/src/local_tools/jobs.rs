@@ -32,6 +32,10 @@ pub struct BashResult {
     pub timeout_ms: Option<u64>,
     pub output_complete: bool,
     pub permission_mode: PermissionMode,
+    /// Heuristic: the command failed with stderr that names a permission
+    /// error while a sandboxed preset was active. The sandbox and an ordinary
+    /// OS permission error are indistinguishable from stderr alone, so hosts
+    /// must not treat this as proof of containment.
     pub sandbox_denied: bool,
 }
 

@@ -222,3 +222,69 @@ async fn grep_requires_pattern_and_respects_gitignore() {
         .unwrap_err();
     assert!(matches!(empty, ToolError::Failed(_)));
 }
+
+/// An explicit file operand obeys the host's file-size policy exactly like
+/// the walk does, instead of searching past it.
+#[tokio::test]
+async fn grep_single_file_honors_the_file_size_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.txt"), "needle here\n").unwrap();
+    let mut config = LocalToolConfig::new(dir.path());
+    config.max_file_bytes = Some(4);
+    let tools = LocalTools::with_config(config).unwrap();
+    let ctx = context(8192);
+    let error = tools
+        .grep()
+        .execute(json!({"pattern":"needle","path":"big.txt"}), ctx.clone())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("max_file_bytes"), "{error}");
+    // The directory walk keeps skipping oversized files, as before.
+    let output = grep(&tools, "needle", None, None, &ctx).await;
+    assert!(
+        output.content.contains("No matches found"),
+        "{}",
+        output.content
+    );
+}
+
+/// A file whose line trips the searcher heap cap is skipped, but the result
+/// says so: a silent skip reads as a definitive "No matches found".
+#[tokio::test]
+async fn grep_reports_files_it_could_not_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut line = String::with_capacity(17 * 1024 * 1024);
+    line.push_str("needle ");
+    line.push_str(&"a".repeat(17 * 1024 * 1024));
+    line.push('\n');
+    std::fs::write(dir.path().join("minified.js"), line).unwrap();
+    std::fs::write(dir.path().join("small.txt"), "needle here\n").unwrap();
+    let tools = LocalTools::new(dir.path()).unwrap();
+    let ctx = context(8192);
+    let output = grep(&tools, "needle", None, None, &ctx).await;
+    assert!(
+        output.content.contains("Found 1 match"),
+        "{}",
+        output.content
+    );
+    assert!(
+        output.content.contains("could not be searched"),
+        "{}",
+        output.content
+    );
+    assert_eq!(output.details.unwrap()["unsearched"], 1);
+}
+
+/// A leading `!` excludes, ripgrep's `--glob` semantics: `!*.txt` lists every
+/// file except the txt ones instead of silently admitting nothing.
+#[tokio::test]
+async fn glob_leading_bang_excludes_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("keep.rs"), "x\n").unwrap();
+    std::fs::write(dir.path().join("drop.txt"), "x\n").unwrap();
+    let tools = LocalTools::new(dir.path()).unwrap();
+    let ctx = context(8192);
+    let output = glob(&tools, "!*.txt", None, &ctx).await;
+    assert!(output.content.contains("keep.rs"), "{}", output.content);
+    assert!(!output.content.contains("drop.txt"), "{}", output.content);
+}
