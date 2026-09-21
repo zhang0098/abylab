@@ -3967,6 +3967,7 @@ impl App {
             return;
         };
         self.prompt_queue[index].blocks = blocks;
+        self.repaint_prompt_echo(index);
         self.finish_queue_edit();
         self.show_tip(
             self.locale
@@ -4059,9 +4060,53 @@ impl App {
     /// bookkeeping — the queue, the pending steers, the `↥` jump — are remapped
     /// in the same step. The line selection is dropped: its anchors moved.
     fn withdraw_prompt_echo(&mut self, cells: &[usize]) {
-        let mapping = self.transcript.remove_cells(cells);
+        let shift = self.transcript.remove_cells(cells);
+        self.remap_cell_indices(shift, None);
+    }
+
+    /// Repaint one queued prompt's echo after an edit.
+    ///
+    /// The bubbles are painted from the item's blocks, so an edited item has to
+    /// be repainted or the timeline keeps showing what the queue no longer
+    /// holds. The bubbles stay where they were — the timeline shows the queue's
+    /// FIFO order, and the `⌥↑` list numbers its rows the same way — and the
+    /// blocks may well have changed shape (a text and an image swapped), so the
+    /// run is replaced rather than rewritten cell by cell.
+    fn repaint_prompt_echo(&mut self, index: usize) {
+        let blocks = std::mem::take(&mut self.prompt_queue[index].blocks);
+        let run = std::mem::take(&mut self.prompt_queue[index].cells);
+        let echo = match blocks[..] {
+            [] => Vec::new(),
+            _ => {
+                let echo_blocks: Vec<crate::transcript::EchoBlock<'_>> = blocks
+                    .iter()
+                    .map(|block| match block {
+                        StagedBlock::Text(text) => crate::transcript::EchoBlock::Text(text),
+                        StagedBlock::Image(att) => crate::transcript::EchoBlock::Image {
+                            name: &att.name,
+                            path: &att.path,
+                            data: &att.data,
+                        },
+                    })
+                    .collect();
+                self.transcript.prompt_echo_cells(&echo_blocks)
+            }
+        };
+        let (shift, painted) = self.transcript.replace_cells(&run, echo);
+        self.remap_cell_indices(shift, Some(index));
+        self.prompt_queue[index].cells = painted;
+        self.prompt_queue[index].blocks = blocks;
+        self.needs_redraw = true;
+    }
+
+    /// Move this client's cell indices through one edit to the timeline: every
+    /// queued prompt, the pending steers and the `↥` jump cursor. `skip` names
+    /// the prompt whose run was just repainted — its indices come from the
+    /// caller, not from the shift. The flash is dropped: its anchor may be
+    /// stale.
+    fn remap_cell_indices(&mut self, shift: crate::transcript::CellShift, skip: Option<usize>) {
         let remap = |cells: &mut Vec<usize>| {
-            cells.retain_mut(|index| match mapping.get(*index).copied().flatten() {
+            cells.retain_mut(|index| match shift.map(*index) {
                 Some(at) => {
                     *index = at;
                     true
@@ -4069,15 +4114,15 @@ impl App {
                 None => false,
             });
         };
-        for prompt in &mut self.prompt_queue {
-            remap(&mut prompt.cells);
+        for (index, prompt) in self.prompt_queue.iter_mut().enumerate() {
+            if Some(index) != skip {
+                remap(&mut prompt.cells);
+            }
         }
         for steer in self.pending_steer_cells.values_mut() {
             remap(&mut steer.cells);
         }
-        self.prompt_jump_cell = self
-            .prompt_jump_cell
-            .and_then(|index| mapping.get(index).copied().flatten());
+        self.prompt_jump_cell = self.prompt_jump_cell.and_then(|index| shift.map(index));
         self.prompt_flash = None;
         self.prompt_flash_lines = None;
         self.sel = None;
@@ -7892,6 +7937,61 @@ mod mode_tests {
             matches!(&app.prompt_queue[1].blocks[..], [StagedBlock::Text(text)] if text == "second followup, revised"),
             "the edit replaced the blocks"
         );
+        assert!(
+            commands.try_recv().is_err(),
+            "editing a queued prompt never sends anything"
+        );
+    }
+
+    /// Saving an edit repaints the item's echo: the timeline shows what the
+    /// queue would send, in the same place, while the prompts around it keep
+    /// their own bubbles and indices.
+    #[test]
+    fn saving_an_edit_repaints_the_queued_echo_in_place() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        let echo_texts = |app: &App| -> Vec<String> {
+            app.transcript
+                .cells
+                .iter()
+                .filter_map(|cell| match &cell.kind {
+                    crate::transcript::CellKind::User { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.send_agent_text("typo here".into(), &ctl);
+        app.send_agent_text("third".into(), &ctl);
+        assert_eq!(echo_texts(&app), ["first", "typo here", "third"]);
+
+        let id = app.prompt_queue[1].id;
+        app.begin_queue_edit(&id.to_string(), &ctl);
+        app.input.set("fixed".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+
+        assert!(app.queue_edit.is_none());
+        assert_eq!(app.queued, 3, "an edit is not a send and not a delete");
+        assert_eq!(
+            echo_texts(&app),
+            ["first", "fixed", "third"],
+            "the edited bubble shows the new text, in its own place"
+        );
+        assert_eq!(
+            app.prompt_queue[1].cells.len(),
+            1,
+            "the run matches the item's blocks"
+        );
+        for cell in app.prompt_queue[1].cells.clone() {
+            assert!(
+                matches!(
+                    &app.transcript.cells[cell].kind,
+                    crate::transcript::CellKind::User { text, queued: true } if text == "fixed"
+                ),
+                "the queue points at the repainted bubble (cell {cell})"
+            );
+        }
         assert!(
             commands.try_recv().is_err(),
             "editing a queued prompt never sends anything"

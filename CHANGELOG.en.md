@@ -26,6 +26,11 @@ context compaction, session persistence, goal rounds) live in
 
 ### Fixed
 
+- An edited queued prompt repaints its echo: saving an edit in the `⌥↑` editor
+  replaced the queue item but left the timeline showing the old wording. The
+  run of bubbles is now repainted in place when the edit is saved — the queue
+  order stays the order on screen — block count and kind changes included, with
+  the queue, the `↥` jump and every other item's indices recalculated.
 - A deleted queued prompt no longer lingers in the timeline: after `ctrl+d` in
   the `⌥↑` editor the echo bubble used to keep saying `queued` even though the
   prompt never left the client. Deleting the message now deletes its bubbles,
