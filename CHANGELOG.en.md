@@ -10,6 +10,35 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-21
+
+### Fixed
+
+- Session files no longer grow with every checkpoint: each checkpoint used to
+  append the whole snapshot again, which wrote a 64 MB log for one README task.
+  A log is now one header, one title, one anchor and the deltas appended after
+  it: a delta carries only the divergent tail of items/requests plus the small
+  fields wholesale, and every 64 deltas (or when a single delta dwarfs the
+  anchor) the writer re-anchors through a synced temp file and an atomic rename,
+  so a failed rewrite never damages the previous state. Loading folds the deltas
+  onto the last anchor and validates the result, leaving resume semantics and
+  every caller signature unchanged.
+- Recovery and switching stop losing history: a session's write lock is taken
+  before it is restored, so a second process cannot displace a session that is
+  being written — it waits for the lock and then reads the latest snapshot; a
+  resume intent recorded while no key was set survives until `/login`, after
+  which the latest history and title are still there. A failed switch keeps the
+  UI on the old session: view, draft and queue stay put, the switch is committed
+  only once the driver confirms the new session is ready, and a prompt meant for
+  the old session can no longer land in the new one.
+- Workspace storage partitions by the SHA-256 digest of the canonical path, so
+  different paths whose names collide no longer share a directory; legacy
+  directories stay resumable in place after checking the recorded `cwd`, and
+  they keep the same lock file.
+- Configuration a session carries (model options, system prompt) is written with
+  the checkpoint and survives replay; every folded delta is validated on load, so
+  a damaged record is rejected instead of being read as ordinary history.
+
 ## [0.1.6] - 2026-09-20
 
 ### Added
@@ -155,7 +184,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/zhang0098/abylab/compare/v0.1.3...v0.1.4
