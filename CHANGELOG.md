@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-21
+
 ### 新增
 
 - `⌥↑` 的排队列表现在也能删消息：除了 ↑/↓ 选择、enter 编辑，还有 `ctrl+d` 删除
@@ -173,7 +175,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/zhang0098/abylab/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
