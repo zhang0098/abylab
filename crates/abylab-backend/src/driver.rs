@@ -880,8 +880,11 @@ async fn drive(
             }
             Cmd::NewSession { session_id: id } | Cmd::Resume { session_id: id } => {
                 // A same-session restore keeps the existing owner and its lock.
-                if restoring && id == active_session && agent.is_some() {
-                    bind_session(agent.as_ref().unwrap(), &id, None, false, &sink);
+                if restoring
+                    && id == active_session
+                    && let Some(current) = agent.as_ref()
+                {
+                    bind_session(current, &id, None, false, &sink);
                     continue;
                 }
                 let result = (|| -> abycore::Result<SessionAgent> {
