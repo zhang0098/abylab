@@ -51,3 +51,10 @@ abylab 不读 `DEEPSEEK_API_KEY`，也不读任何别的变量；`--api-key <key
 
 你的偏好存在 `$ABYLAB_HOME/settings.json`：界面语言（默认中文）、模型、推理强度、
 权限预设，以及外观（明暗 + 主题包）。命令行开关只覆盖本次运行。
+
+## 许可与致谢
+
+版权与许可：[MIT License](LICENSE)（© 2025 zhang@qimiao.org）。
+
+本项目参考了两个项目：[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+与 [pi.dev](https://pi.dev/)。

@@ -50,3 +50,11 @@ plus `ABYLAB_HOME` and `ABY_MODEL`.
 Your preferences live in `$ABYLAB_HOME/settings.json`: interface language
 (Chinese by default), model, reasoning effort, permission preset, and
 appearance (mode + palette). Flags override them for that run only.
+
+## License and credits
+
+Copyright and license: [MIT License](LICENSE) (© 2025 zhang@qimiao.org).
+
+The project was built with reference to two projects:
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) and
+[pi.dev](https://pi.dev/).

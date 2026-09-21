@@ -10,6 +10,35 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+### Added
+
+- The `⌥↑` queue list deletes too: besides ↑/↓ and enter-edit, `ctrl+d` drops the
+  highlighted row (two presses, and the armed row says "ctrl+d deletes" while it
+  waits). The list rebuilds in place with the highlight on the row that moved up,
+  so several queued prompts can go in a row; deleting the last one closes the
+  dialog. The key is in the dialog's title, in `/help` and in `/keys`, and popups
+  now widen to fit their title instead of clipping the hint.
+- Quitting prints the session id and the way back: once the alternate screen is
+  restored, the shell gets `Session id: aby-…` and
+  `Resume it later: abylab --session-id aby-…`, with `/resume` named as the
+  in-app route. The id is the session that was on screen at exit — a mid-run
+  `/resume` switch moves it — and each interface language words it its own way.
+
+### Fixed
+
+- A deleted queued prompt no longer lingers in the timeline: after `ctrl+d` in
+  the `⌥↑` editor the echo bubble used to keep saying `queued` even though the
+  prompt never left the client. Deleting the message now deletes its bubbles,
+  the items behind it are remapped onto their new cell indices (the `↥` jump and
+  any waiting steer are recalculated too), and a runtime exit drops a dead
+  queue's echoes the same way.
+- Tool cards are no longer blank: for a call the agent answers itself, the UI
+  used to show the tool's placeholder output (an empty string for `get_goal`),
+  leaving a bare `get_goal {}` line with nothing under it. The result event, the
+  checkpoint and the next request now all carry the committed result — a goal
+  read shows the goal snapshot, a mutation shows `goal → …` — and a call with no
+  arguments no longer trails a `{}` that says nothing.
+
 ## [0.1.7] - 2026-09-21
 
 ### Fixed
