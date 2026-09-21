@@ -465,6 +465,20 @@ impl Manager {
         );
         if request.mode == SubagentMode::Fork {
             snapshot.items = parent.history.clone();
+            // The inherited prefix can end with a compaction summary — a user
+            // item standing in for completed history. The snapshot invariant
+            // ties `needs_response` to that boundary, so mirror it here; the
+            // child's own prompt then answers the summary in the same run
+            // instead of `Agent::restore` rejecting the fork outright.
+            snapshot.needs_response = matches!(
+                snapshot.items.last(),
+                Some(
+                    Item::Message {
+                        role: crate::MessageRole::User,
+                        ..
+                    } | Item::FunctionCallOutput { .. }
+                )
+            );
         }
         let mut agent = Agent::restore(parent.client.clone(), snapshot.clone())?;
         agent.depth = parent.depth + 1;
