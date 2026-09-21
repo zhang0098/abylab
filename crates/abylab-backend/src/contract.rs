@@ -146,6 +146,13 @@ pub enum CtlEvent {
     PromptQueued {
         message_id: String,
     },
+    /// One Send Now request settled. `deferred` means the driver could not take
+    /// the message into a running turn (no agent, a session switch, a full
+    /// inbox), so the composer keeps it queued instead of claiming delivery.
+    SteerSettled {
+        message_id: u64,
+        deferred: bool,
+    },
     Error(String),
     CancelRequested,
     Interrupted,
@@ -395,6 +402,19 @@ pub fn persisted_session_id(
     Some(session_id.to_string())
 }
 
+/// One Send Now request on its own channel, so a running turn can take it
+/// while it is streaming. Kept out of [`Cmd`] on purpose: commands are strictly
+/// serialized behind the turn, and a steer that waits for the turn to end is
+/// exactly the behavior this replaces.
+#[derive(Debug, Clone)]
+pub struct SteerRequest {
+    /// Reject the steer if a session switch changed the intended owner.
+    pub session_id: String,
+    /// The composer's optimistic echo, settled by [`CtlEvent::SteerSettled`].
+    pub message_id: u64,
+    pub text: String,
+}
+
 /// UI → driver commands. The driver serializes turns; a `Prompt` that arrives
 /// while a turn is running queues behind it.
 #[derive(Debug, Clone)]
@@ -405,6 +425,21 @@ pub enum Cmd {
     /// Reject a prompt if a queued session switch changed its intended owner.
     PromptForSession {
         session_id: String,
+        text: String,
+    },
+    /// Send Now: inject a message into the turn that is already running, at its
+    /// next complete step boundary, **without cancelling anything**.
+    ///
+    /// The composer routes the gesture through [`SteerRequest`] instead, whose
+    /// channel a running turn polls; the driver only produces this variant for
+    /// itself when no turn was running. Such a steer is normalized into
+    /// [`Cmd::Prompt`] — admitted as the next waking turn, never a failure
+    /// (the harness's best-effort steer contract).
+    SteerForSession {
+        session_id: String,
+        /// The composer's optimistic echo id, settled by
+        /// [`CtlEvent::SteerSettled`].
+        message_id: u64,
         text: String,
     },
     /// Switch model/effort. Applied only while the session has no history;

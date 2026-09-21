@@ -75,6 +75,12 @@ impl Agent {
         })
     }
 
+    /// Handle for injecting user text at the next step boundary of a running
+    /// turn (see [`SteerHandle`](crate::SteerHandle)). Never cancels a step.
+    pub fn steer_handle(&self) -> crate::SteerHandle {
+        crate::SteerHandle(Arc::clone(&self.inbox))
+    }
+
     pub fn register_tool(&mut self, tool: impl Tool + 'static) -> Result<()> {
         self.register_shared_tool(Arc::new(tool))
     }

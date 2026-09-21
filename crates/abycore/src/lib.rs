@@ -57,7 +57,7 @@ pub use skills::{
     MAX_SKILL_BYTES, SKILL_FILENAME, SKILLS_DIR, Skill, SkillCatalog, SkillInvocation, SkillTool,
 };
 pub use subagent::{
-    SubagentConfig, SubagentEvent, SubagentHookFactory, SubagentInfo, SubagentMode,
+    SteerHandle, SubagentConfig, SubagentEvent, SubagentHookFactory, SubagentInfo, SubagentMode,
     SubagentRequest, SubagentResult, SubagentStatus, Subagents,
 };
 pub use todo::{PlanView, TodoCounts, TodoItem, TodoStatus, TodoWriteTool};

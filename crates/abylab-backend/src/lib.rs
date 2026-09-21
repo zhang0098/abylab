@@ -10,6 +10,6 @@ mod instructions;
 pub use abycore::MIN_PRUNE_BYTES;
 pub use contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
-    PlanStatus, TurnLimits, UiEvent, persisted_session_id,
+    PlanStatus, SteerRequest, TurnLimits, UiEvent, persisted_session_id,
 };
 pub use driver::DriverHandle;

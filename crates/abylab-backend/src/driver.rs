@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
-    PlanStatus, TurnLimits, UiEvent,
+    PlanStatus, SteerRequest, TurnLimits, UiEvent,
 };
 
 const SERVER_LABEL: &str = "abycore · deepseek-responses";
@@ -30,11 +30,13 @@ const SERVER_LABEL: &str = "abycore · deepseek-responses";
 /// the driver, so a prompt sent mid-turn queues after it. Read-only queries
 /// (`ListSessions`, `FetchCatalog`) take a side channel instead: the driver
 /// loop is busy for the whole turn, and neither `/resume`'s picker nor the
-/// `/model` listing should wait for it.
+/// `/model` listing should wait for it. Steers take a third channel: they are
+/// taken *by* the running turn (next step boundary), not queued behind it.
 pub struct DriverHandle {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     query_tx: mpsc::UnboundedSender<Cmd>,
     interrupt_tx: mpsc::UnboundedSender<()>,
+    steer_tx: mpsc::UnboundedSender<SteerRequest>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -47,6 +49,13 @@ impl DriverHandle {
             _ => &self.cmd_tx,
         };
         let _ = tx.send(cmd);
+    }
+
+    /// Send Now: hand a message to the turn that is running, at its next step
+    /// boundary. Nothing is cancelled. Without a running turn the driver admits
+    /// it as the next turn and answers [`CtlEvent::SteerSettled`].
+    pub fn steer(&self, request: SteerRequest) {
+        let _ = self.steer_tx.send(request);
     }
 
     /// Cancel the active turn (no-op when idle).
@@ -86,6 +95,7 @@ pub fn spawn(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let (query_tx, query_rx) = mpsc::unbounded_channel::<Cmd>();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
+    let (steer_tx, steer_rx) = mpsc::unbounded_channel::<SteerRequest>();
     let join = std::thread::Builder::new()
         .name("aby-driver".into())
         .spawn(move || {
@@ -102,13 +112,21 @@ pub fn spawn(
                     return;
                 }
             };
-            runtime.block_on(drive(cfg, cmd_rx, query_rx, interrupt_rx, Arc::new(sink)));
+            runtime.block_on(drive(
+                cfg,
+                cmd_rx,
+                query_rx,
+                interrupt_rx,
+                steer_rx,
+                Arc::new(sink),
+            ));
         })
         .map_err(|err| format!("spawn aby driver: {err}"))?;
     Ok(DriverHandle {
         cmd_tx,
         query_tx,
         interrupt_tx,
+        steer_tx,
         join: Some(join),
     })
 }
@@ -459,11 +477,34 @@ impl AgentHooks for UiHooks {
     }
 }
 
+/// The driver's idle wait: commands first, then steers.
+///
+/// A steer is not a command — it belongs to the turn that is already running,
+/// and `turn`/`run_segment` poll the same receiver while they stream. Anything
+/// that reaches this wait therefore arrived with no running turn: it becomes a
+/// [`Cmd::SteerForSession`], which the loop admits as the next turn (the
+/// harness turns a steer that missed its window into the next waking turn).
+async fn next_command(
+    cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    steer_rx: &mut mpsc::UnboundedReceiver<SteerRequest>,
+) -> Option<Cmd> {
+    tokio::select! {
+        biased;
+        cmd = cmd_rx.recv() => cmd,
+        request = steer_rx.recv() => request.map(|request| Cmd::SteerForSession {
+            session_id: request.session_id,
+            message_id: request.message_id,
+            text: request.text,
+        }),
+    }
+}
+
 async fn drive(
     cfg: DriverConfig,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     query_rx: mpsc::UnboundedReceiver<Cmd>,
     mut interrupt_rx: mpsc::UnboundedReceiver<()>,
+    mut steer_rx: mpsc::UnboundedReceiver<SteerRequest>,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
 ) {
     let ctl = |event: CtlEvent| sink(Event::Ctl(event));
@@ -649,7 +690,7 @@ async fn drive(
     }
     emit_permission_facts(&sink, &active_session, permission_mode);
 
-    while let Some(cmd) = cmd_rx.recv().await {
+    while let Some(cmd) = next_command(&mut cmd_rx, &mut steer_rx).await {
         let cmd = match cmd {
             Cmd::PromptForSession { session_id, text } => {
                 if session_id != active_session {
@@ -662,9 +703,32 @@ async fn drive(
             }
             cmd => cmd,
         };
+        // A steer reaches this loop only with no turn in flight: `next_command`
+        // takes them out of the channel while one runs. It is then admitted as
+        // the next turn — the harness's "missed the window, wake the next turn"
+        // contract — so it rides the ordinary prompt path and settles there,
+        // where the driver knows whether a turn really started.
+        let (cmd, steered) = match cmd {
+            Cmd::SteerForSession {
+                session_id,
+                message_id,
+                text,
+            } => {
+                if session_id != active_session {
+                    ctl(CtlEvent::SteerSettled {
+                        message_id,
+                        deferred: true,
+                    });
+                    continue;
+                }
+                (Cmd::Prompt { text }, Some(message_id))
+            }
+            cmd => (cmd, None),
+        };
         let restoring = matches!(cmd, Cmd::Resume { .. });
         match cmd {
             Cmd::PromptForSession { .. } => unreachable!("normalized above"),
+            Cmd::SteerForSession { .. } => unreachable!("normalized above"),
             // The skill catalog is a pure read of the launch snapshot and the handle
             // routes it to the query task so it answers mid-turn; this arm
             // covers a direct send on the loop channel.
@@ -682,6 +746,9 @@ async fn drive(
                     session: &active_session,
                     sink: &sink,
                     interrupt_rx: &mut interrupt_rx,
+                    steer_rx: &mut steer_rx,
+                    steer: agent.steer_handle(),
+                    skills: &skills,
                     limits,
                     compaction,
                 };
@@ -1061,6 +1128,15 @@ async fn drive(
             }
             Cmd::Prompt { text } => {
                 let Some(agent) = agent.as_mut() else {
+                    // A steer that cannot start a turn stays the client's queue
+                    // item; the composer keeps its echo queued instead of
+                    // pretending it was delivered.
+                    if let Some(message_id) = steered {
+                        ctl(CtlEvent::SteerSettled {
+                            message_id,
+                            deferred: true,
+                        });
+                    }
                     ctl(CtlEvent::Error(
                         "agent unavailable — /login <apikey> first, or restart abylab".into(),
                     ));
@@ -1072,10 +1148,19 @@ async fn drive(
                 let text = skills.expand(&text).unwrap_or(text);
                 let message_id = format!("aby-{}", agent.snapshot().run_sequence + 1);
                 ctl(CtlEvent::PromptQueued { message_id });
+                if let Some(message_id) = steered {
+                    ctl(CtlEvent::SteerSettled {
+                        message_id,
+                        deferred: false,
+                    });
+                }
                 let mut ctx = TurnCtx {
                     session: &active_session,
                     sink: &sink,
                     interrupt_rx: &mut interrupt_rx,
+                    steer_rx: &mut steer_rx,
+                    steer: agent.steer_handle(),
+                    skills: &skills,
                     limits,
                     compaction,
                 };
@@ -1845,12 +1930,19 @@ fn last_turn_start(items: &[abycore::Item], cuts: &[usize]) -> Option<usize> {
 }
 
 /// What one turn needs besides the agent: the session label, the event sink,
-/// the interrupt channel and the budgets. Grouped so the segment helpers do
-/// not grow one parameter per turn feature.
+/// the interrupt channel, the steer channel and the budgets. Grouped so the
+/// segment helpers do not grow one parameter per turn feature.
 struct TurnCtx<'a> {
     session: &'a str,
     sink: &'a Arc<dyn Fn(Event) + Send + Sync>,
     interrupt_rx: &'a mut mpsc::UnboundedReceiver<()>,
+    steer_rx: &'a mut mpsc::UnboundedReceiver<SteerRequest>,
+    /// Inbox of the live agent: text pushed here is appended at its next step
+    /// boundary, which is what makes Send Now not cancel anything.
+    steer: abycore::SteerHandle,
+    /// The launch skill snapshot: a steered `/<name>` line expands here too,
+    /// because the steer path skips the prompt loop's own expansion.
+    skills: &'a Arc<abycore::SkillCatalog>,
     limits: TurnLimits,
     /// Host compaction policy for overflow recovery inside a turn.
     compaction: Option<CompactionConfig>,
@@ -1860,7 +1952,9 @@ struct TurnCtx<'a> {
 /// the next request even when the session still has an unfinished turn.
 ///
 /// Cancellation races the run future; the losing branch still drains the
-/// outcome so history stays consistent.
+/// outcome so history stays consistent. A steer races it too but never wins:
+/// it rides into the agent's inbox and the run keeps its output, which is the
+/// difference between "change course mid-turn" and "cancel and retype".
 async fn run_segment(
     agent: &mut Agent,
     text: Option<String>,
@@ -1908,13 +2002,48 @@ async fn run_segment(
         Some(text) => Box::pin(agent.run(text, options, on_event)),
         None => Box::pin(agent.continue_run(options, on_event)),
     };
-    tokio::select! {
-        result = &mut run_fut => result,
-        _ = ctx.interrupt_rx.recv() => {
-            cancellation.cancel();
-            (&mut run_fut).await
+    // Three-way race: the segment's own outcome, an interrupt (cancel), and a
+    // steer (inject, keep going). `biased` keeps an already-settled outcome
+    // from losing to a steer that arrived in the same poll.
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut run_fut => return result,
+            _ = ctx.interrupt_rx.recv() => {
+                cancellation.cancel();
+                return (&mut run_fut).await;
+            }
+            request = ctx.steer_rx.recv() => {
+                let Some(request) = request else { continue };
+                settle_steer(request, ctx);
+            }
         }
     }
+}
+
+/// Take one Send Now request into the live agent.
+///
+/// Success means "the agent holds it": abycore appends it at the next complete
+/// tool-batch boundary, or — when the model was already about to end the turn —
+/// continues one more step instead of stopping. Nothing is cancelled and no
+/// event from the in-flight step is discarded.
+fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
+    // Same seam every prompt crosses: `/name` naming a skill ships that skill's
+    // body, not the bare command line.
+    let text = ctx.skills.expand(&request.text).unwrap_or(request.text);
+    let deferred = match ctx.steer.send(text) {
+        Ok(()) => false,
+        Err(error) => {
+            (ctx.sink)(Event::Ctl(CtlEvent::TuiOpFailed(format!(
+                "send now failed: {error} / 立即发送失败：{error}"
+            ))));
+            true
+        }
+    };
+    (ctx.sink)(Event::Ctl(CtlEvent::SteerSettled {
+        message_id: request.message_id,
+        deferred,
+    }));
 }
 
 /// Drive one turn: `Some(text)` adds a prompt to a fresh or unfinished turn;
@@ -2830,6 +2959,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
@@ -2861,6 +2991,7 @@ mod tests {
             cmd_rx,
             query_rx,
             interrupt_rx,
+            steer_rx,
             sink,
         )
         .await;
@@ -2894,6 +3025,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
@@ -2920,6 +3052,7 @@ mod tests {
             cmd_rx,
             query_rx,
             interrupt_rx,
+            steer_rx,
             sink,
         )
         .await;
@@ -2958,6 +3091,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
@@ -2989,6 +3123,7 @@ mod tests {
             cmd_rx,
             query_rx,
             interrupt_rx,
+            steer_rx,
             sink,
         )
         .await;
@@ -3117,6 +3252,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
@@ -3143,6 +3279,7 @@ mod tests {
             cmd_rx,
             query_rx,
             interrupt_rx,
+            steer_rx,
             sink,
         )
         .await;
@@ -3186,6 +3323,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_query_tx, query_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
         let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
@@ -3218,6 +3356,7 @@ mod tests {
             cmd_rx,
             query_rx,
             interrupt_rx,
+            steer_rx,
             sink,
         )
         .await;
@@ -3240,5 +3379,530 @@ mod tests {
         );
         drop(events);
         std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    // --- Send Now (steer) -------------------------------------------------
+
+    /// A tiny Anthropic-style SSE fixture: it records every request body and
+    /// answers from a scripted list, optionally delaying the first response so
+    /// a test can steer while the turn is streaming.
+    struct FakeProvider {
+        url: String,
+        requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FakeProvider {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl FakeProvider {
+        async fn start(answers: Vec<&str>, first_response_delay: Duration) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fixture");
+            let url = format!("http://{}", listener.local_addr().expect("addr"));
+            let requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+            let captured = Arc::clone(&requests);
+            let answers: Vec<String> = answers.into_iter().map(str::to_owned).collect();
+            let task = tokio::spawn(async move {
+                let mut served = 0usize;
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let end = loop {
+                        let Ok(count) =
+                            tokio::io::AsyncReadExt::read(&mut socket, &mut chunk).await
+                        else {
+                            break 0;
+                        };
+                        if count == 0 {
+                            break 0;
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    if end == 0 {
+                        continue;
+                    }
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < end + length {
+                        let Ok(count) =
+                            tokio::io::AsyncReadExt::read(&mut socket, &mut chunk).await
+                        else {
+                            break;
+                        };
+                        if count == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    if let Ok(body) =
+                        serde_json::from_slice::<serde_json::Value>(&bytes[end..end + length])
+                    {
+                        captured.lock().expect("request lock").push(body);
+                    }
+                    if served == 0 && !first_response_delay.is_zero() {
+                        tokio::time::sleep(first_response_delay).await;
+                    }
+                    let answer = answers
+                        .get(served)
+                        .cloned()
+                        .unwrap_or_else(|| "exhausted".into());
+                    served += 1;
+                    let events = [
+                        serde_json::json!({"type":"message_start","message":{"type":"message","role":"assistant","id":"m","model":"fixture","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
+                        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":answer}}),
+                        serde_json::json!({"type":"content_block_stop","index":0}),
+                        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}),
+                        serde_json::json!({"type":"message_stop"}),
+                    ];
+                    let body: String = events
+                        .iter()
+                        .map(|event| {
+                            format!(
+                                "event: {}\ndata: {}\n\n",
+                                event["type"].as_str().unwrap_or("message"),
+                                event
+                            )
+                        })
+                        .collect();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut socket).await;
+                }
+            });
+            Self {
+                url,
+                requests,
+                task,
+            }
+        }
+
+        fn bodies(&self) -> Vec<serde_json::Value> {
+            self.requests.lock().expect("request lock").clone()
+        }
+
+        async fn served(&self, count: usize) {
+            for _ in 0..2000 {
+                if self.bodies().len() >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("fixture never served {count} request(s)");
+        }
+    }
+
+    fn steer_test_config(workspace: &std::path::Path, base_url: &str) -> DriverConfig {
+        DriverConfig {
+            session_id: "steer-test".into(),
+            resume: None,
+            sessions_root: None,
+            home: None,
+            workspace: workspace.to_string_lossy().into_owned(),
+            model: "deepseek-flash".into(),
+            reasoning: "off".into(),
+            permission: Some("danger-full-access".into()),
+            max_tokens: None,
+            api_key: Some("test-key".into()),
+            base_url: Some(base_url.into()),
+            limits: TurnLimits {
+                continuations: 0,
+                ..TurnLimits::default()
+            },
+            compaction: None,
+        }
+    }
+
+    /// Every `text` string in a request body, at any depth.
+    fn body_texts(body: &serde_json::Value) -> Vec<String> {
+        fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::String(text)) = map.get("text") {
+                        out.push(text.clone());
+                    }
+                    for nested in map.values() {
+                        walk(nested, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&body["messages"], &mut out);
+        out
+    }
+
+    fn steer_events(events: &Arc<std::sync::Mutex<Vec<Event>>>) -> Vec<String> {
+        events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ctl(CtlEvent::Interrupted) => Some("interrupted".to_string()),
+                Event::Ctl(CtlEvent::SteerSettled { deferred, .. }) => {
+                    Some(if *deferred { "deferred" } else { "accepted" }.to_string())
+                }
+                Event::Ui(UiEvent::TurnEnd { kind, .. }) => Some(format!("turn-end:{kind}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A steered `/<name>` line crosses the same skill seam a typed prompt
+    /// does: the model sees the skill body, not the bare command.
+    #[tokio::test]
+    async fn a_steered_skill_line_ships_the_skill_body() {
+        let workspace = scratch_dir("steer-skill");
+        let skills = workspace.join(".agents/skills");
+        std::fs::create_dir_all(&skills).expect("skills dir");
+        std::fs::write(
+            skills.join("review.md"),
+            "---\ndescription: review the diff\n---\nREVIEW-BODY-MARKER\n",
+        )
+        .expect("skill file");
+        let provider = FakeProvider::start(
+            vec!["first answer", "steered answer"],
+            Duration::from_millis(400),
+        )
+        .await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::PromptForSession {
+                session_id: "steer-test".into(),
+                text: "start".into(),
+            })
+            .expect("queue prompt");
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            steer_tx
+                .send(SteerRequest {
+                    session_id: "steer-test".into(),
+                    message_id: 21,
+                    text: "/review the diff".into(),
+                })
+                .expect("queue steer");
+            provider.served(2).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let bodies = provider.bodies();
+        assert_eq!(bodies.len(), 2);
+        let second = body_texts(&bodies[1]);
+        assert!(
+            second
+                .iter()
+                .any(|text| text.contains("REVIEW-BODY-MARKER")),
+            "the skill body rides the steer: {second:?}"
+        );
+        assert!(
+            second.iter().any(|text| text.contains("/review the diff")),
+            "the typed line stays as the trigger: {second:?}"
+        );
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// The heart of the feature: a steer during a running turn is injected at
+    /// the next step boundary. The turn is not cancelled, nothing in flight is
+    /// discarded, and the reply the model already produced is still delivered.
+    #[tokio::test]
+    async fn a_steer_injects_into_the_running_turn_without_interrupting_it() {
+        let workspace = scratch_dir("steer-midturn");
+        let provider = FakeProvider::start(
+            vec!["first answer", "steered answer"],
+            Duration::from_millis(400),
+        )
+        .await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::PromptForSession {
+                session_id: "steer-test".into(),
+                text: "start".into(),
+            })
+            .expect("queue prompt");
+        let config = steer_test_config(&workspace, &provider.url);
+        // The driver future is `!Send` by design (it owns the boxed run future),
+        // which is why production runs it on its own thread; joining both
+        // futures on this task keeps the same guarantee.
+        let actor = async {
+            provider.served(1).await;
+            steer_tx
+                .send(SteerRequest {
+                    session_id: "steer-test".into(),
+                    message_id: 7,
+                    text: "change course".into(),
+                })
+                .expect("queue steer");
+            provider.served(2).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let bodies = provider.bodies();
+        let seen = steer_events(&events);
+        assert!(seen.contains(&"accepted".to_string()), "{seen:?}");
+        assert!(
+            !seen.iter().any(|event| event == "interrupted"),
+            "a steer must never interrupt the turn: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|event| event.starts_with("turn-end:interrupted")),
+            "{seen:?}"
+        );
+        assert_eq!(bodies.len(), 2, "the steer adds a step to the same turn");
+        let second = body_texts(&bodies[1]);
+        assert!(second.contains(&"start".to_string()), "{second:?}");
+        assert!(second.contains(&"first answer".to_string()), "{second:?}");
+        assert!(second.contains(&"change course".to_string()), "{second:?}");
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// A steer that finds no running turn is admitted as the next turn instead
+    /// of failing — the harness's best-effort "next waking turn" contract.
+    #[tokio::test]
+    async fn an_idle_steer_is_admitted_as_the_next_turn() {
+        let workspace = scratch_dir("steer-idle");
+        let provider = FakeProvider::start(vec!["answer"], Duration::ZERO).await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        steer_tx
+            .send(SteerRequest {
+                session_id: "steer-test".into(),
+                message_id: 9,
+                text: "cold start".into(),
+            })
+            .expect("queue steer");
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let seen = steer_events(&events);
+        assert!(seen.contains(&"accepted".to_string()), "{seen:?}");
+        let bodies = provider.bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(body_texts(&bodies[0]).contains(&"cold start".to_string()));
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// With no agent to receive it, the steer stays the client's queue item:
+    /// the composer keeps its echo queued instead of claiming delivery.
+    #[tokio::test]
+    async fn a_steer_without_an_agent_defers_instead_of_claiming_delivery() {
+        let workspace = scratch_dir("steer-noagent");
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        steer_tx
+            .send(SteerRequest {
+                session_id: "steer-test".into(),
+                message_id: 11,
+                text: "now".into(),
+            })
+            .expect("queue steer");
+        let mut config = steer_test_config(&workspace, "http://127.0.0.1:1");
+        config.api_key = None;
+        // Shutdown only after the steer settled: the idle wait prefers commands,
+        // so a queued Shutdown would win the race and hide the steer.
+        let actor = async {
+            for _ in 0..400 {
+                if !steer_events(&events).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let seen = steer_events(&events);
+        assert_eq!(seen, vec!["deferred".to_string()], "{seen:?}");
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// The idle wait prefers commands, and turns a steer into the prompt that
+    /// the turn loop already knows how to run.
+    #[tokio::test]
+    async fn the_idle_wait_turns_a_steer_into_the_next_turn() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+        steer_tx
+            .send(SteerRequest {
+                session_id: "s".into(),
+                message_id: 3,
+                text: "hello".into(),
+            })
+            .expect("queue steer");
+        match next_command(&mut cmd_rx, &mut steer_rx).await {
+            Some(Cmd::SteerForSession {
+                message_id, text, ..
+            }) => {
+                assert_eq!(message_id, 3);
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected an admitted steer, got {other:?}"),
+        }
+        cmd_tx.send(Cmd::Shutdown).expect("queue command");
+        assert!(matches!(
+            next_command(&mut cmd_rx, &mut steer_rx).await,
+            Some(Cmd::Shutdown)
+        ));
+    }
+
+    /// Acceptance means "the agent holds it": the text sits in the inbox until
+    /// the next step boundary, and the composer is told so without any cancel.
+    #[test]
+    fn acceptance_puts_the_text_in_the_inbox_and_settles_the_echo() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        let mut config = ClientConfig::new("test-key");
+        config.base_url = "http://127.0.0.1:1".into();
+        let agent = Agent::new(
+            DeepSeekClient::new(config).expect("fixture client"),
+            "persona",
+            ModelOptions::default(),
+        )
+        .expect("fixture agent");
+        let steer = agent.steer_handle();
+        let skills = Arc::new(abycore::SkillCatalog::discover(std::path::Path::new(
+            "/nonexistent-workspace",
+        )));
+        let (_interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+        let mut ctx = TurnCtx {
+            session: "s",
+            sink: &sink,
+            interrupt_rx: &mut interrupt_rx,
+            steer_rx: &mut steer_rx,
+            steer: steer.clone(),
+            skills: &skills,
+            limits: TurnLimits::default(),
+            compaction: None,
+        };
+
+        settle_steer(
+            SteerRequest {
+                session_id: "s".into(),
+                message_id: 5,
+                text: "steer me".into(),
+            },
+            &mut ctx,
+        );
+        assert!(!steer.is_empty(), "the message waits for the next boundary");
+        assert!(matches!(
+            events.lock().expect("event lock").as_slice(),
+            [Event::Ctl(CtlEvent::SteerSettled {
+                message_id: 5,
+                deferred: false
+            })]
+        ));
+
+        // Rejection is honest: the inbox stays empty and the client keeps the
+        // item queued.
+        events.lock().expect("event lock").clear();
+        settle_steer(
+            SteerRequest {
+                session_id: "s".into(),
+                message_id: 6,
+                text: "   ".into(),
+            },
+            &mut ctx,
+        );
+        let seen: Vec<String> = {
+            let events = events.lock().expect("event lock");
+            events
+                .iter()
+                .map(|event| match event {
+                    Event::Ctl(CtlEvent::TuiOpFailed(_)) => "failed".to_string(),
+                    Event::Ctl(CtlEvent::SteerSettled { deferred, .. }) => {
+                        if *deferred { "deferred" } else { "accepted" }.to_string()
+                    }
+                    _ => "other".to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(seen, vec!["failed".to_string(), "deferred".to_string()]);
     }
 }

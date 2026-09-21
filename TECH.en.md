@@ -203,6 +203,37 @@ One durable objective per session, with an explicit round allowance:
   turn on its own; the driver here does.
 
 
+## Steering
+
+While a turn is running, your next message takes one of two paths: queue, or
+steer. `/enter` picks which one plain Enter takes and ctrl+enter always takes
+the other; an idle session sends either way. This is deepseek-harness's
+busy-Enter preference (the `ui-conversation` `resolveSubmitMode` policy), and
+the default matches: queue.
+
+A steer **cancels nothing**:
+
+- The message enters the running agent's inbox (abycore `Agent::steer_handle`).
+  The SDK drains that inbox before building each request — the boundary right
+  after a completed tool batch — and appends the text as a user message. When
+  the model had already finished its last step, the run is pulled back for one
+  more step instead of a new turn being opened.
+- The in-flight step's streamed output and its completed tool results all
+  survive; esc remains the only interrupt (it rides the cancellation token on a
+  separate channel from steering).
+- Steering is best-effort: a message that misses the window (the turn ended
+  first) is not a failure, it is delivered as the next waking turn. With no
+  running turn at all (no `/login`, say) the driver answers
+  `SteerSettled{deferred}` and the UI returns the item to the client queue with
+  its queued tint back.
+- An empty draft plus ctrl+enter steers every queued message, in FIFO order.
+  Without a running turn the head goes out as an ordinary prompt and the rest
+  stay queued.
+
+Queueing stays a client behavior: items live in the TUI's FIFO (queued tint,
+`⌥↑` to edit or delete) and ship in order when the turn ends and the session
+goes idle.
+
 ## Packaging and releases
 
 Linux ships one kind of asset: a single musl static binary per architecture

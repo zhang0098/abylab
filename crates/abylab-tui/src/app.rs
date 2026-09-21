@@ -1,8 +1,9 @@
 //! App state and input handling — the grok-build interaction homage.
 //!
-//! Enter sends (or queues mid-turn, client-side); Ctrl+X steers the active
-//! turn immediately; Esc cancels a running turn with the draft preserved, and
-//! Esc owns interrupt; Ctrl+C clears a draft, then needs two empty presses to quit;
+//! Enter sends (or queues mid-turn, client-side, unless `/enter steer`); the
+//! accelerated Ctrl+Enter takes the other mode and steers the active turn at its
+//! next step boundary — never by cancelling it; Esc is the only interrupt and
+//! preserves the draft; Ctrl+C clears a draft, then needs two empty presses to quit;
 //! `/` opens the slash menu; Up recalls history on an empty prompt.
 
 use std::collections::{HashMap, VecDeque};
@@ -215,6 +216,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "vim",
         usage: "/vim [on|off]",
         desc: "toggle vim modal editing in the composer",
+    },
+    SlashCommand {
+        name: "enter",
+        usage: "/enter [queue|steer]",
+        desc: "what Enter does while the agent is busy",
     },
     SlashCommand {
         name: "theme",
@@ -608,6 +614,18 @@ pub struct Modes {
     pub effort: Option<String>,
 }
 
+/// What one composer submit gesture should do. The policy that picks it lives
+/// in [`App::submit_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitMode {
+    /// Ship it now as a fresh turn.
+    Send,
+    /// Queue behind the active turn (the client FIFO).
+    Queue,
+    /// Steer into the active turn at its next step boundary.
+    Steer,
+}
+
 pub struct App {
     pub theme: Theme,
     pub locale: Locale,
@@ -743,6 +761,9 @@ pub struct App {
     key_debug: bool,
     /// Optional vim modal editing for the composer (`/vim`).
     pub vim: crate::input::VimState,
+    /// What plain Enter does while busy (`/enter`); the accelerated chord
+    /// always does the other one (harness's `busyEnter` preference).
+    pub enter: crate::locale::EnterBehavior,
     /// Which usage hint the next new session opens with. The composer cap row
     /// no longer rotates hints live; a session start shows one instead, so the
     /// index advances per session and cycles the whole set over time.
@@ -1040,6 +1061,7 @@ impl App {
         palettes.extend(crate::theme::PalettePack::builtin_gallery());
         let settings = Self::load_settings(&cfg);
         let locale = settings.language;
+        let enter = crate::locale::EnterBehavior::from_settings(&settings);
         // The persisted palette pack survives restarts; the appearance mode
         // arrives already resolved (flag > persisted > dark). A fresh install
         // opens on One, dark — the built-in DeepSeek pack stays selectable.
@@ -1130,6 +1152,7 @@ impl App {
             prompt_flash_lines: None,
             key_debug: std::env::var("ABYLAB_KEYDEBUG").is_ok_and(|v| v == "1"),
             vim: crate::input::VimState::default(),
+            enter,
             session_tip_idx: 0,
             ctrl_c_armed: None,
             queue_delete_armed: None,
@@ -1427,6 +1450,34 @@ impl App {
         if !still_highlighted {
             self.clear_theme_preview();
         }
+    }
+
+    /// `/enter queue|steer`: what plain Enter does while a turn is running.
+    ///
+    /// The accelerated ctrl+enter chord always does the other one, and an idle
+    /// session sends either way — deepseek-harness's busy-Enter preference.
+    fn apply_enter_arg(&mut self, arg: &str) {
+        let Some(behavior) = crate::locale::EnterBehavior::parse(arg) else {
+            self.show_tip(format!(
+                "{}: {} · {}",
+                self.locale.tr("enter while busy", "繁忙时 Enter"),
+                self.enter.as_str(),
+                self.locale.tr(
+                    "/enter queue|steer — the other mode rides ctrl+enter",
+                    "/enter queue|steer —— 另一种模式走 ctrl+enter",
+                )
+            ));
+            return;
+        };
+        self.enter = behavior;
+        self.save_settings();
+        self.show_tip(format!(
+            "{}: {} · {}",
+            self.locale.tr("enter while busy", "繁忙时 Enter"),
+            behavior.as_str(),
+            self.locale
+                .tr("the other mode rides ctrl+enter", "另一种模式走 ctrl+enter",)
+        ));
     }
 
     fn apply_theme_arg(&mut self, arg: &str) {
@@ -2782,6 +2833,7 @@ impl App {
             permission: self.modes.permission.clone(),
             theme: Some(self.theme.mode.as_str().to_string()),
             palette: Some(self.active_palette_id.clone()),
+            enter: Some(self.enter.as_str().to_string()),
         };
         let Ok(text) = serde_json::to_string_pretty(&settings) else {
             return;
@@ -3371,7 +3423,7 @@ impl App {
                     let entry = menu[self.slash_sel.min(menu.len() - 1)].clone();
                     self.accept_slash(&entry, ctl);
                 } else {
-                    self.submit(ctl);
+                    self.submit_with(false, ctl);
                 }
             }
             Action::TabComplete => {
@@ -3434,7 +3486,20 @@ impl App {
                     )
                 });
             }
-            Action::SendNow => self.send_now(ctl),
+            Action::SendNow => {
+                // Empty draft: the accelerated chord steers every queued
+                // follow-up into the running turn, in FIFO order (harness's
+                // empty-draft steer-all gesture). With a draft it resolves
+                // against the busy-Enter preference.
+                if self.input.is_empty()
+                    && self.pending_images.is_empty()
+                    && !self.prompt_queue.is_empty()
+                {
+                    self.steer_all_queued(ctl);
+                } else {
+                    self.submit_with(true, ctl);
+                }
+            }
             Action::EditQueuedPrompt => self.open_queue_selector(),
             Action::AttachClipboard => self.clip_image("", ctl),
             Action::ModelPicker => self.open_model_picker(ctl),
@@ -4178,6 +4243,48 @@ impl App {
     /// Empty-draft Enter: promote the FIFO head into the active turn. While a
     /// turn runs this is the same steer the composer's ctrl+enter takes
     /// (interrupt + resend); idle it simply goes out now.
+    /// Send Now with an empty draft: steer every queued follow-up into the
+    /// running turn, in FIFO order.
+    ///
+    /// This is deepseek-harness's empty-draft accelerated chord, which flushes
+    /// the host queue as `next-step` messages. With no turn to steer, nothing
+    /// is invented: the head goes out as an ordinary prompt and the rest stay
+    /// queued for the idle dispatcher (the harness reports this case silently).
+    fn steer_all_queued(&mut self, ctl: &Controller) {
+        if self.queue_edit.is_some() || self.prompt_queue.is_empty() {
+            return;
+        }
+        let running = matches!(self.state, RunState::Running) || self.prompt_pending;
+        if !running {
+            self.send_queue_head_now(ctl);
+            return;
+        }
+        let prompts: Vec<QueuedPrompt> = self.prompt_queue.drain(..).collect();
+        self.queued = 0;
+        self.scroll_up = 0;
+        let count = prompts.len();
+        for prompt in prompts {
+            let message_id = prompt.id;
+            let wire = prompt_blocks_from_staged(&prompt.blocks);
+            self.pending_steer_cells.insert(
+                message_id,
+                PendingSteer {
+                    cells: prompt.cells,
+                    blocks: prompt.blocks,
+                },
+            );
+            self.send_wire_prompt(wire, Some(message_id), ctl);
+        }
+        self.show_tip(
+            self.locale
+                .tr(
+                    "steered {n} queued — lands at the next agent step",
+                    "已 steer {n} 条排队消息 —— 在 Agent 下一步生效",
+                )
+                .replace("{n}", &count.to_string()),
+        );
+    }
+
     fn send_queue_head_now(&mut self, ctl: &Controller) {
         if self.queue_edit.is_some() {
             return;
@@ -4778,6 +4885,7 @@ impl App {
             }
             "quit" => self.quit = true,
             "theme" => self.apply_theme_arg(arg),
+            "enter" => self.apply_enter_arg(arg),
             "vim" => {
                 let on = match arg {
                     "on" | "1" => true,
@@ -4910,7 +5018,8 @@ impl App {
         let text = if self.locale == Locale::Zh {
             "\
 - enter · 发送；当前轮次运行时将后续消息排队（草稿为空时立即发送队首）
-- ctrl+enter · 立即 steer 当前轮次（老终端会退化成普通 enter）
+- ctrl+enter · 与 enter 相反的模式：默认立即 steer 当前轮次（老终端会退化成普通 enter）
+- /enter · 繁忙时 enter 的模式：queue 排队 / steer 立即插话 · ctrl+enter 始终是另一种
 - ⌥↑ · 排队的后续消息：↑/↓ 选择 · enter 编辑 · 列表中 ctrl+d 连按两次删除 · esc 关闭
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 中断（保留草稿）；空闲时清除草稿
@@ -4939,7 +5048,8 @@ token 用量（含缓存命中）以及轮次结束原因。"
         } else {
             "\
 - enter · send · queues a follow-up while a turn runs (an empty draft sends the queue head now)
-- ctrl+enter · steer the active turn immediately (legacy terminals fall back to plain enter)
+- ctrl+enter · the opposite of enter: by default it steers the active turn (legacy terminals fall back to plain enter)
+- /enter · what enter does while busy: queue / steer · ctrl+enter is always the other mode
 - ⌥↑ · queued follow-ups: ↑/↓ select · enter edit · ctrl+d twice deletes a row · esc close
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · interrupt (draft survives) · clears the draft when idle
@@ -5211,6 +5321,49 @@ pub(crate) fn fmt_duration(ms: u64) -> String {
 }
 
 impl App {
+    /// Whether the draft is a built-in `/` command line. Commands execute
+    /// immediately: they are never queued and never steered (harness keeps
+    /// command lines on plain Send too).
+    fn command_draft(&self) -> bool {
+        let draft = self.input.buf().trim().to_string();
+        let Some(rest) = draft.strip_prefix('/') else {
+            return false;
+        };
+        let name = rest.split_whitespace().next().unwrap_or("");
+        SLASH_COMMANDS.iter().any(|command| command.name == name)
+    }
+
+    /// Resolve one submission gesture against the busy-Enter preference.
+    ///
+    /// This is deepseek-harness's `resolveSubmitMode(busyEnter, running,
+    /// gesture, steeringAvailable)` (`ui-conversation`'s submission policy):
+    /// idle sessions send either way, and while a turn runs plain Enter uses
+    /// the preference while the accelerated chord uses the other mode.
+    fn submit_mode(&self, accelerated: bool) -> SubmitMode {
+        if !self.turn_busy() || self.command_draft() {
+            return SubmitMode::Send;
+        }
+        let preferred = if accelerated {
+            self.enter.flipped()
+        } else {
+            self.enter
+        };
+        match preferred {
+            crate::locale::EnterBehavior::Queue => SubmitMode::Queue,
+            crate::locale::EnterBehavior::Steer => SubmitMode::Steer,
+        }
+    }
+
+    /// One gesture, resolved: send, queue or steer.
+    fn submit_with(&mut self, accelerated: bool, ctl: &Controller) {
+        match self.submit_mode(accelerated) {
+            // Queueing is what `submit` does with a busy turn; commands inside
+            // it still run immediately.
+            SubmitMode::Send | SubmitMode::Queue => self.submit(ctl),
+            SubmitMode::Steer => self.send_now(ctl),
+        }
+    }
+
     fn submit(&mut self, ctl: &Controller) {
         if self.waiting_for_session_switch() {
             return;
@@ -5286,14 +5439,19 @@ impl App {
         self.transcript.push_user(text.clone(), running);
         if running {
             self.enqueue_prompt(vec![StagedBlock::Text(text)], vec![cell]);
-            self.show_tip(
-                self.locale
-                    .tr(
-                        "queued ({n} waiting) — lands after this turn · ⌥↑ edits · ctrl+enter sends now",
-                        "已排队（{n} 条等待）—— 本轮结束后送出 · ⌥↑ 编辑 · ctrl+enter 立即发送",
-                    )
-                    .replace("{n}", &self.queued.to_string()),
-            );
+            // The tail hint names the escape hatch, which is whichever gesture
+            // the busy-Enter preference left free.
+            let template = match self.enter {
+                crate::locale::EnterBehavior::Queue => self.locale.tr(
+                    "queued ({n} waiting) — lands after this turn · ⌥↑ edits · ctrl+enter steers now",
+                    "已排队（{n} 条等待）—— 本轮结束后送出 · ⌥↑ 编辑 · ctrl+enter 立即插话",
+                ),
+                crate::locale::EnterBehavior::Steer => self.locale.tr(
+                    "queued ({n} waiting) — lands after this turn · ⌥↑ edits · ctrl+enter queues",
+                    "已排队（{n} 条等待）—— 本轮结束后送出 · ⌥↑ 编辑 · ctrl+enter 排队",
+                ),
+            };
+            self.show_tip(template.replace("{n}", &self.queued.to_string()));
             self.scroll_up = 0;
             return;
         }
@@ -7631,6 +7789,217 @@ mod mode_tests {
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::Image { queued: false, .. })
         ));
+    }
+
+    /// The busy-Enter preference is harness's `busyEnter`: plain Enter takes
+    /// the selected mode, the accelerated chord the other one, an idle session
+    /// sends either way, and a built-in `/` command line is never queued or
+    /// steered.
+    #[test]
+    fn the_busy_enter_setting_swaps_what_enter_and_the_chord_do() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.state = RunState::Running;
+        assert_eq!(
+            app.submit_mode(false),
+            SubmitMode::Queue,
+            "default is Queue"
+        );
+        assert_eq!(app.submit_mode(true), SubmitMode::Steer);
+
+        app.enter = crate::locale::EnterBehavior::Steer;
+        assert_eq!(app.submit_mode(false), SubmitMode::Steer);
+        assert_eq!(app.submit_mode(true), SubmitMode::Queue, "the chord flips");
+
+        // Idle: both gestures open a fresh turn (harness resolves them to the
+        // same Queue-mode send).
+        app.state = RunState::Idle;
+        assert_eq!(app.submit_mode(false), SubmitMode::Send);
+        assert_eq!(app.submit_mode(true), SubmitMode::Send);
+
+        // A built-in command runs immediately under either gesture.
+        app.state = RunState::Running;
+        app.input.set("/model".into());
+        assert_eq!(app.submit_mode(false), SubmitMode::Send);
+        assert_eq!(app.submit_mode(true), SubmitMode::Send);
+
+        // A skill line ships as a prompt, so it follows the Enter pair.
+        app.input.set("/shipit now".into());
+        assert_eq!(app.submit_mode(false), SubmitMode::Steer);
+        assert_eq!(app.submit_mode(true), SubmitMode::Queue);
+    }
+
+    /// The chord steers without touching the interrupt channel, and with
+    /// `/enter steer` the same key queues instead.
+    #[test]
+    fn the_accelerated_chord_steers_while_enter_queues() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.input.set("change course".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+
+        assert!(
+            matches!(commands.try_recv(), Ok(Cmd::Steer { text, .. }) if text == "change course"),
+            "ctrl+enter hands the text to the running turn"
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "no interrupt is sent: a steer is not a cancel"
+        );
+
+        // With the preference flipped the same key queues client-side.
+        app.enter = crate::locale::EnterBehavior::Steer;
+        app.input.set("later".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+        assert_eq!(app.queued, 1);
+        assert_eq!(app.prompt_queue.len(), 1);
+        assert!(commands.try_recv().is_err(), "queued, not sent");
+
+        // Plain Enter now steers, since it takes the selected mode.
+        app.input.set("now instead".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(
+            matches!(commands.try_recv(), Ok(Cmd::Steer { text, .. }) if text == "now instead")
+        );
+    }
+
+    /// Empty draft + chord: every queued follow-up goes into the running turn,
+    /// in FIFO order (harness's empty-draft steer-all gesture).
+    #[test]
+    fn an_empty_draft_chord_steers_every_queued_follow_up_in_order() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.send_agent_text("second".into(), &ctl);
+        assert_eq!(app.queued, 2, "queued client-side first");
+        assert!(commands.try_recv().is_err());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
+
+        let steered: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                Cmd::Steer { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steered, ["first", "second"], "FIFO, all of them");
+        assert_eq!(app.queued, 0, "the queue emptied into the turn");
+        assert_eq!(
+            app.pending_steer_cells.len(),
+            2,
+            "both echoes await their settlement"
+        );
+    }
+
+    /// Only a steer's own rejection puts it back in the queue; a delivery
+    /// settles it in place.
+    #[test]
+    fn a_deferred_steer_returns_to_the_queue_tail() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.input.set("first".into());
+        app.send_now(&ctl);
+        app.input.set("second".into());
+        app.send_now(&ctl);
+        let (first, second) = {
+            let mut ids: Vec<u64> = app.pending_steer_cells.keys().copied().collect();
+            ids.sort_unstable();
+            (ids[0], ids[1])
+        };
+
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SteerSettled {
+                message_id: second,
+                deferred: true,
+            }),
+            &ctl,
+        );
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SteerSettled {
+                message_id: first,
+                deferred: true,
+            }),
+            &ctl,
+        );
+
+        assert!(app.pending_steer_cells.is_empty());
+        assert_eq!(app.queued, 2);
+        let texts: Vec<String> = app
+            .prompt_queue
+            .iter()
+            .map(|prompt| match prompt.blocks.first() {
+                Some(StagedBlock::Text(text)) => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["second", "first"],
+            "settlement order is the driver's"
+        );
+        for cell in &app.transcript.cells {
+            if let crate::transcript::CellKind::User { text, queued } = &cell.kind {
+                assert!(queued, "{text} must look queued again");
+            }
+        }
+    }
+
+    /// `/enter` sets and persists the busy mode, and an unknown argument keeps
+    /// the current one instead of silently changing behavior.
+    #[test]
+    fn the_enter_command_sets_and_persists_the_busy_mode() {
+        let (mut app, ctl, _rx) = test_app();
+        assert_eq!(app.enter, crate::locale::EnterBehavior::Queue);
+
+        app.run_slash("enter", "steer", &ctl);
+        assert_eq!(app.enter, crate::locale::EnterBehavior::Steer);
+        assert_eq!(
+            crate::locale::UiSettings::load(&app.cfg.home)
+                .enter
+                .as_deref(),
+            Some("steer"),
+            "the choice survives a restart"
+        );
+        let restarted = App::new(crate::theme::Theme::dark(), app.cfg.clone(), "next".into());
+        assert_eq!(restarted.enter, crate::locale::EnterBehavior::Steer);
+
+        // No argument: the tip reports the live mode instead of changing it.
+        app.run_slash("enter", "", &ctl);
+        assert_eq!(app.enter, crate::locale::EnterBehavior::Steer);
+        assert!(
+            app.tip.as_ref().expect("tip").0.contains("steer"),
+            "{:?}",
+            app.tip
+        );
+
+        // An unknown value is a typo, not a mode.
+        app.run_slash("enter", "sometimes", &ctl);
+        assert_eq!(app.enter, crate::locale::EnterBehavior::Steer);
+    }
+
+    /// The composer hint names the pair the preference actually installed.
+    #[test]
+    fn the_composer_hints_follow_the_enter_setting() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.state = RunState::Running;
+        app.input.set("next step".into());
+        let default_hints: String = crate::ui::context_hints(&app)
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(default_hints.contains("queue"), "{default_hints}");
+        assert!(default_hints.contains("steer"), "{default_hints}");
+
+        app.enter = crate::locale::EnterBehavior::Steer;
+        let flipped: String = crate::ui::context_hints(&app)
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(flipped.contains("steer"), "{flipped}");
+        assert!(flipped.contains("queue"), "{flipped}");
     }
 
     #[test]
@@ -9986,7 +10355,7 @@ mod right_slot_tests {
         );
         assert_eq!(
             greeting(&app),
-            "- **Tip** · enter queues a follow-up; ctrl+enter steers the active turn now"
+            "- **Tip** · enter queues a follow-up; ctrl+enter steers it — /enter swaps the pair"
         );
     }
 }

@@ -111,33 +111,37 @@ fn aby_loop(
                 message_id,
                 text,
             } => {
-                // Send Now: cancel the active turn; the prompt queues behind
-                // it inside the driver.
-                handle.interrupt();
-                handle.send(abylab_backend::Cmd::PromptForSession { session_id, text });
-                let _ = bus.send(AppEvent::Ctl(CtlEvent::SteerSettled {
+                // Send Now: the running turn takes this at its next step
+                // boundary — nothing is cancelled, and a steer that finds no
+                // turn is admitted as the next one. The driver answers with
+                // SteerSettled once it knows which of the two happened.
+                handle.steer(abylab_backend::SteerRequest {
+                    session_id,
                     message_id,
-                    deferred: false,
-                }));
+                    text,
+                });
             }
-            Cmd::PromptImages { session_id, blocks }
-            | Cmd::SteerImages {
-                session_id, blocks, ..
+            Cmd::PromptImages { session_id, blocks } => {
+                handle.send(abylab_backend::Cmd::PromptForSession {
+                    session_id,
+                    text: prompt_text(&blocks),
+                });
+            }
+            Cmd::SteerImages {
+                session_id,
+                message_id,
+                blocks,
             } => {
-                let text = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        crate::bus::PromptBlock::Text(text) => Some(text.as_str()),
-                        crate::bus::PromptBlock::Image(_) => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                handle.interrupt();
-                handle.send(abylab_backend::Cmd::PromptForSession { session_id, text });
+                handle.steer(abylab_backend::SteerRequest {
+                    session_id,
+                    message_id,
+                    text: prompt_text(&blocks),
+                });
             }
             Cmd::Interrupt { .. } => {
                 // The cancel itself happened in interrupt_now(); the driver
-                // reports the settled turn on its own.
+                // reports the settled turn on its own. Steers do NOT come
+                // through here: they never cancel anything.
             }
             Cmd::SelectModel { model, effort, .. } => {
                 handle.send(abylab_backend::Cmd::SetModel { model, effort });
@@ -186,6 +190,20 @@ fn aby_loop(
     }
 }
 
+/// The text half of staged prompt blocks. The in-process abycore transport
+/// carries text: an image rides as the composer's own echo and chip, exactly as
+/// it did before this transport existed.
+fn prompt_text(blocks: &[crate::bus::PromptBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            crate::bus::PromptBlock::Text(text) => Some(text.as_str()),
+            crate::bus::PromptBlock::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 /// Backend events → TUI `AppEvent`s (the seam between the two contracts).
 fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
     match event {
@@ -205,6 +223,13 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                 abylab_backend::CtlEvent::PromptQueued { message_id } => {
                     CtlEvent::PromptQueued { message_id }
                 }
+                abylab_backend::CtlEvent::SteerSettled {
+                    message_id,
+                    deferred,
+                } => CtlEvent::SteerSettled {
+                    message_id,
+                    deferred,
+                },
                 abylab_backend::CtlEvent::Error(err) => CtlEvent::Error(err),
                 abylab_backend::CtlEvent::CancelRequested => CtlEvent::CancelRequested,
                 abylab_backend::CtlEvent::Interrupted => CtlEvent::Interrupted,

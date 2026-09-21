@@ -72,7 +72,7 @@ impl Locale {
     pub fn session_tip(self, index: usize) -> &'static str {
         const EN: [&str; 7] = [
             "esc interrupts a running turn — your draft survives",
-            "enter queues a follow-up; ctrl+enter steers the active turn now",
+            "enter queues a follow-up; ctrl+enter steers it — /enter swaps the pair",
             "click a tool to expand it · wheel always scrolls the conversation",
             "token usage + cache hit rate live in /status · it also names the session",
             "answers render markdown: headings, code, links, and images",
@@ -81,7 +81,7 @@ impl Locale {
         ];
         const ZH: [&str; 7] = [
             "esc 可中断当前轮次，草稿会保留",
-            "enter 会排队后续消息；ctrl+enter 立即 steer 当前轮次",
+            "enter 会排队后续消息，ctrl+enter 立即插话 —— /enter 可对调两者",
             "点击工具可展开 · 滚轮始终滚动对话",
             "token 用量和缓存命中率见 /status · 会话身份也在那里",
             "回答支持 Markdown：标题、代码、链接和图片",
@@ -111,6 +111,67 @@ pub struct UiSettings {
     pub theme: Option<String>,
     /// Active palette pack id (`/theme <pack>`).
     pub palette: Option<String>,
+    /// What plain Enter does while the agent is busy (`/enter queue|steer`).
+    /// The accelerated ctrl+enter chord always uses the other one. Stored as a
+    /// string so an unknown value costs the default, never the whole file.
+    pub enter: Option<String>,
+}
+
+/// What plain Enter does while a turn is running.
+///
+/// This is deepseek-harness's `busyEnter` preference (`ui-conversation`): the
+/// chord pair is always `Enter` = this, `ctrl+enter` = the other one, and an
+/// idle session sends either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EnterBehavior {
+    /// Queue behind the active turn; the FIFO drains when it ends (default).
+    #[default]
+    Queue,
+    /// Steer into the active turn at its next step boundary.
+    Steer,
+}
+
+impl EnterBehavior {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnterBehavior::Queue => "queue",
+            EnterBehavior::Steer => "steer",
+        }
+    }
+
+    /// Parse a `/enter` argument or a persisted value; `None` is unknown.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "queue" | "q" => Some(EnterBehavior::Queue),
+            "steer" | "s" => Some(EnterBehavior::Steer),
+            _ => None,
+        }
+    }
+
+    /// The mode the accelerated chord uses.
+    pub fn flipped(self) -> Self {
+        match self {
+            EnterBehavior::Queue => EnterBehavior::Steer,
+            EnterBehavior::Steer => EnterBehavior::Queue,
+        }
+    }
+
+    /// The verb this mode contributes to a hint line.
+    pub fn label(self, locale: Locale) -> &'static str {
+        match self {
+            EnterBehavior::Queue => locale.tr("queue", "排队"),
+            EnterBehavior::Steer => locale.tr("steer", "插话"),
+        }
+    }
+
+    /// Read the persisted preference, defaulting an absent or unknown value.
+    pub fn from_settings(settings: &UiSettings) -> Self {
+        settings
+            .enter
+            .as_deref()
+            .and_then(Self::parse)
+            .unwrap_or_default()
+    }
 }
 
 impl UiSettings {

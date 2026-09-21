@@ -153,7 +153,10 @@ pub enum Cmd {
         session_id: String,
         text: String,
     },
-    /// Send another ACP `session/prompt` immediately while a turn is active.
+    /// Send Now: hand this text to the turn that is running, at its next step
+    /// boundary, without cancelling it. With no running turn it is admitted as
+    /// the next one — never a failure. `message_id` names the optimistic echo
+    /// the driver settles with `CtlEvent::SteerSettled`.
     Steer {
         session_id: String,
         message_id: u64,
@@ -164,7 +167,8 @@ pub enum Cmd {
         session_id: String,
         blocks: Vec<PromptBlock>,
     },
-    /// Image-capable form of [`Cmd::Steer`].
+    /// Image-capable form of [`Cmd::Steer`]. The in-process transport composes
+    /// the text blocks; the chips stay the composer's own echo.
     SteerImages {
         session_id: String,
         message_id: u64,

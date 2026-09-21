@@ -10,6 +10,32 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+### Changed
+
+- ctrl+enter steers instead of cancelling and re-sending: the message enters the
+  running agent's inbox, and the SDK appends it as an ordinary user message at
+  the next completed tool-batch boundary (or runs one more step when the model
+  had already finished), so the current step's streamed output and its tool
+  results survive — and the "interrupted — turn cancelled" notice is gone from
+  this path. esc is now the only interrupt. A steer that misses its window is
+  not an error: it is delivered as the next waking turn, and with no running turn
+  at all (no `/login`, say) the item returns to the client queue with its queued
+  tint back.
+- New `/enter queue|steer` busy-state preference: it picks whether plain enter
+  queues or steers while the agent runs, ctrl+enter always takes the other one,
+  and an idle session sends either way. Queue stays the default; the choice is
+  written to `settings.json` and survives a restart. The composer's shortcut
+  hints, `/help` and `/keys` follow it.
+- Empty draft plus ctrl+enter steers every queued message, in FIFO order (it used
+  to be a no-op); without a running turn the head ships as an ordinary prompt and
+  the rest stay queued.
+
+### Fixed
+
+- "steered — lands at the next agent step" now means it: the old gesture actually
+  cancelled the active segment and re-sent the prompt, and the UI reported an
+  interrupt alongside it.
+
 ## [0.1.8] - 2026-09-21
 
 ### Added
