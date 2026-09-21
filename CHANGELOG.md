@@ -10,6 +10,25 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-21
+
+### 修复
+
+- 会话文件不再随 checkpoint 膨胀：此前每次 checkpoint 都整份追加一遍快照，一个
+  README 任务就能把日志写到 64 MB。现在一条日志只有一条头部、一条标题、一个锚点，
+  之后只追加 delta：delta 只带 items/requests 分叉的那段尾巴，其余小字段整份替换，
+  攒够 64 条 delta（或某条 delta 比锚点还大）就经同步的临时文件原子改写成新锚点，
+  改写失败不会碰坏上一份状态。载入时把 delta 折到最后一个锚点上再校验，恢复语义和
+  所有调用方签名都没变。
+- 恢复和切换不再丢历史：恢复前先拿下该会话的写锁，第二个进程顶不掉正在写的会话，
+  它会等锁、之后读到的是最新快照；没有 key 时发出的恢复意图留到 `/login` 之后，
+  登录后读到的仍是最新历史、标题也在。切换失败时界面留在原会话——视图、草稿、队列
+  都不动，等驱动确认新会话就绪才切过去，为旧会话敲的提示语不会落到新会话上。
+- 工作区存储改按规范路径的 SHA-256 摘要分区：路径不同、名字相撞的工作区不再共用
+  目录；旧目录核对日志里的 `cwd` 后仍可原地恢复，沿用同一把写锁。
+- 会话带的配置（模型参数、系统提示）会随 checkpoint 记下来，重放后仍在；载入时
+  逐条校验折进来的 delta，损坏的记录被拒，不会当成正常历史读进来。
+
 ## [0.1.6] - 2026-09-20
 
 ### 新增
@@ -128,7 +147,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/zhang0098/abylab/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/zhang0098/abylab/compare/v0.1.3...v0.1.4
