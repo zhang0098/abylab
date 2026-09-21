@@ -53,6 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **会话** — 共享存储里每个会话一份 fsync 的 JSONL 日志，按工作区分目录；
   `SessionWriter` 追加 checkpoint，agent 可从快照恢复，未完成回合安全重放
   （挂起的工具调用在下一次请求前被结算为未核实错误）。
+  新建使用 `SessionStore::create_new`，恢复使用 `open_for_resume`，它在持有
+  写锁后返回 `(writer, snapshot)`；writer 应保留到会话结束。`load` 仅用于
+  只读查看。共享目录使用规范工作路径的 SHA-256 摘要分区，已有旧目录在核对
+  日志 `cwd` 后仍可原地恢复，沿用同一写锁。
 - **上下文压缩** — 宿主在每个模型请求边界回答 `AgentHooks::view_request`；
   SDK 压缩或修剪请求视图而不改写持久化记录，提供商确认的溢出会"硬压缩"
   （只留当前回合）并重试同一回合。

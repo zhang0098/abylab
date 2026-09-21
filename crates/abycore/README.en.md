@@ -58,6 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   partitioned per workspace; `SessionWriter` appends checkpoints, and an agent
   restores from a snapshot, replaying unfinished turns safely (pending tool
   calls settle as unverified errors before the next request).
+  Use `SessionStore::create_new` for a new identity and `open_for_resume` for
+  continuation: it returns `(writer, snapshot)` after acquiring the write lock.
+  Retain the writer until the session ends; `load` is for read-only inspection.
+  Shared partitions use a SHA-256 digest of the canonical workspace path.
+  Legacy directories remain resumable in place after checking their recorded
+  `cwd`, retaining the same lock file.
 - **Context compaction** — the host answers `AgentHooks::view_request` at
   every model request boundary; the SDK condenses or prunes the request view
   without rewriting the durable transcript, and provider-confirmed overflow

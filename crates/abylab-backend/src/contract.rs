@@ -151,6 +151,8 @@ pub enum CtlEvent {
     Interrupted,
     TuiOpDone(String),
     TuiOpFailed(String),
+    /// A requested switch failed; the previously bound session is unchanged.
+    SessionSwitchFailed(String),
     SessionBound {
         session_id: String,
         notice: Option<String>,
@@ -391,6 +393,11 @@ pub fn persisted_session_id(
 #[derive(Debug, Clone)]
 pub enum Cmd {
     Prompt {
+        text: String,
+    },
+    /// Reject a prompt if a queued session switch changed its intended owner.
+    PromptForSession {
+        session_id: String,
         text: String,
     },
     /// Switch model/effort. Applied only while the session has no history;
