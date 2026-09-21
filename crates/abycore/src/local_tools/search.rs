@@ -224,7 +224,7 @@ impl Tool for GlobTool {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "minLength": 1,
-                        "description": "Glob pattern to match file paths against (e.g. \"**/*.rs\", \"src/**/*.test.js\")."},
+                        "description": "Glob pattern to match file paths against (e.g. \"**/*.rs\", \"src/**/*.test.js\"). A leading \"!\" excludes matches (e.g. \"!*.min.js\")."},
                     "path": {"type": "string",
                         "description": "Directory to search in. Defaults to the workspace; a relative path resolves against it."}
                 },
@@ -242,13 +242,21 @@ impl Tool for GlobTool {
             let input = self.input(&value)?;
             let overrides = with_vcs_excludes(&self.workspace, None)?;
             let pattern = whitelist(&self.workspace, &input.pattern)?;
+            let negated = input.pattern.trim_start().starts_with('!');
             run_filesystem(
                 self.workspace.clone(),
                 context,
                 input.path.clone().unwrap_or_else(|| ".".into()),
                 false,
                 move |workspace, root, operation| {
-                    glob_search(workspace, root, &overrides, Some(&pattern), operation)
+                    glob_search(
+                        workspace,
+                        root,
+                        &overrides,
+                        Some(&pattern),
+                        negated,
+                        operation,
+                    )
                 },
             )
             .await
@@ -332,12 +340,15 @@ fn walk_builder(
 /// `rg --files --sort=modified` semantics, adapted: the newest-first head of
 /// the matched files, bounded by the inline cap and the scan safety limit.
 /// Discovery filters (.gitignore, hidden, VCS) prune the walk natively; the
-/// glob pattern itself is a whitelist post-filter, like pi's find backend.
+/// glob pattern itself is a post-filter, like pi's find backend. A leading
+/// `!` follows ripgrep's `--glob` meaning (exclude what it matches) instead of
+/// admitting nothing.
 fn glob_search(
     workspace: &Workspace,
     root: &Path,
     overrides: &ignore::overrides::Override,
     pattern: Option<&ignore::overrides::Override>,
+    negated: bool,
     operation: &Operation,
 ) -> ToolResult<ToolOutput> {
     let mut collected: Vec<(std::time::SystemTime, PathBuf)> = vec![];
@@ -355,12 +366,16 @@ fn glob_search(
             .and_then(|metadata| metadata.modified().ok())
             .unwrap_or(std::time::UNIX_EPOCH);
         let path = entry.into_path();
-        if let Some(pattern) = pattern
-            && !pattern
-                .matched(workspace_child(workspace, &path), false)
-                .is_whitelist()
-        {
-            continue;
+        if let Some(pattern) = pattern {
+            let matched = pattern.matched(workspace_child(workspace, &path), false);
+            let admitted = if negated {
+                !matched.is_ignore()
+            } else {
+                matched.is_whitelist()
+            };
+            if !admitted {
+                continue;
+            }
         }
         total += 1;
         if collected.len() >= GLOB_SCAN_LIMIT {
@@ -433,9 +448,17 @@ fn grep_search(
     let mut matches: Vec<Match> = vec![];
     let mut count = 0usize;
     let mut overflow = false;
+    let mut unsearched = 0usize;
     if single_file(&absolute) {
         // An explicit file operand bypasses traversal; the include filter
-        // still applies to its workspace-relative path (pi's single-file rule).
+        // still applies to its workspace-relative path (pi's single-file rule),
+        // and so does the host's file-size policy that the walk enforces.
+        if workspace.config.max_file_bytes.is_some_and(|max| {
+            std::fs::metadata(&absolute).is_ok_and(|meta| meta.len() > max as u64)
+        }) {
+            return Err(failed("file exceeds the host max_file_bytes limit"));
+        }
+        operation.check()?;
         let admitted = include.as_ref().is_none_or(|filter| {
             filter
                 .matched(workspace_child(workspace, &absolute), false)
@@ -451,7 +474,18 @@ fn grep_search(
                 cap,
                 limit,
             };
-            let _ = searcher.search_path(matcher, &absolute, collector);
+            if let Err(error) = search_file(&mut searcher, matcher, &absolute, operation, collector)
+            {
+                // The scan stopped because the caller cancelled or the
+                // deadline passed: surface that, not a search failure.
+                if operation.interrupted() {
+                    operation.check()?;
+                }
+                return Err(failed(format!(
+                    "cannot search {}: {error}",
+                    display(workspace, &absolute)
+                )));
+            }
             overflow = file_overflow;
         }
     } else {
@@ -488,14 +522,26 @@ fn grep_search(
             };
             // An unreadable or binary-quitting file is skipped, like rg's
             // stderr warning: the search continues with the remaining files.
-            if searcher.search_path(matcher, &path, collector).is_ok() {
-                overflow = file_overflow;
+            // The skip is counted, because a missing file can mean the answer
+            // is incomplete (a line over the searcher heap cap, for example).
+            match search_file(&mut searcher, matcher, &path, operation, collector) {
+                Ok(()) => overflow = file_overflow,
+                Err(_) if operation.interrupted() => operation.check()?,
+                Err(_) => unsearched += 1,
             }
         }
     }
     let truncated = overflow;
+    let notice = if unsearched > 0 {
+        format!(
+            "\n\n({unsearched} file{} could not be searched; the results may be incomplete.)",
+            if unsearched == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
     let content = if count == 0 {
-        "No matches found".to_owned()
+        format!("No matches found{notice}")
     } else {
         let noun = if count == 1 { "match" } else { "matches" };
         let header = if truncated {
@@ -511,7 +557,7 @@ fn grep_search(
         } else {
             String::new()
         };
-        format!("{header}\n\n{}\n{footer}", grouped(&matches))
+        format!("{header}\n\n{}\n{footer}{notice}", grouped(&matches))
     };
     operation.check()?;
     Ok(ToolOutput {
@@ -521,6 +567,7 @@ fn grep_search(
         details: Some(json!({
             "matches": matches,
             "total": count,
+            "unsearched": unsearched,
         })),
         meta: None,
     }
@@ -536,6 +583,44 @@ fn workspace_child(workspace: &Workspace, path: &Path) -> PathBuf {
 
 fn single_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Scan one file through an interruptible reader. `search_path` opens its own
+/// reader, so the only way to stop a long non-matching scan at cancellation or
+/// the deadline is `search_reader` with a wrapper: the searcher checks nothing
+/// between reads itself.
+fn search_file(
+    searcher: &mut grep_searcher::Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    path: &Path,
+    operation: &Operation,
+    collector: Collector<'_>,
+) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    searcher.search_reader(
+        matcher,
+        InterruptibleReader {
+            inner: file,
+            operation,
+        },
+        collector,
+    )
+}
+
+/// A `Read` that fails once the tool call is cancelled or past its deadline.
+/// The error kind is intentionally not `Interrupted`: the searcher retries
+/// `Interrupted` reads in its own buffering loop, which would spin forever.
+struct InterruptibleReader<'a, R> {
+    inner: R,
+    operation: &'a Operation,
+}
+impl<R: std::io::Read> std::io::Read for InterruptibleReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.operation.interrupted() {
+            return Err(std::io::Error::other("local operation interrupted"));
+        }
+        self.inner.read(buffer)
+    }
 }
 
 /// grep-searcher line sink: validate UTF-8 per matched line, cap the preview,

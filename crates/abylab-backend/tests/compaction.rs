@@ -536,3 +536,21 @@ fn automatic_pruning_advances_as_more_tool_results_arrive() {
             .any(|body| body.contains("compaction engine"))
     );
 }
+
+/// `compact_at = 0` is the documented "threshold off" value: it must never
+/// trigger compaction (or the prune pass that rides the same boundary), not
+/// fire at the first request.
+#[test]
+fn a_zero_compact_at_disables_the_threshold() {
+    let off = CompactionConfig {
+        compact_at: 0.0,
+        ..policy()
+    };
+    assert_eq!(off.threshold_tokens(), u64::MAX);
+    let on = CompactionConfig {
+        context_window: 1_000,
+        compact_at: 0.5,
+        ..policy()
+    };
+    assert_eq!(on.threshold_tokens(), 500);
+}

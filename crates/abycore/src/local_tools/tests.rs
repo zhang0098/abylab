@@ -409,6 +409,80 @@ async fn byte_caps_and_diff_caps_do_not_break_file_edits() {
     );
 }
 
+/// A first line larger than the whole read budget must not produce a footer
+/// that points back at the same offset: the window emits a bounded preview
+/// and the continuation moves past the line (a self-referential offset loops
+/// a caller that follows it).
+#[tokio::test]
+async fn an_oversized_first_line_never_points_back_at_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(4096);
+    let text = format!("{}\nsecond\n", "a".repeat(64));
+
+    let mut config = LocalToolConfig::new(dir.path());
+    config.max_read_bytes = 24;
+    let tools = LocalTools::with_config(config).unwrap();
+    write(&tools, "a", &text, &ctx).await;
+    let page = read(&tools, "a", &ctx).await;
+    assert!(page.content.contains("1: a"), "{}", page.content);
+    assert!(
+        page.content.contains("offset=2"),
+        "the continuation moves past the oversized line: {}",
+        page.content
+    );
+    assert!(!page.content.contains("offset=1"), "{}", page.content);
+    assert!(page.truncated, "{}", page.content);
+
+    // A budget too small even for a preview still moves the caller on.
+    let mut config = LocalToolConfig::new(dir.path());
+    config.max_read_bytes = 1;
+    let tools = LocalTools::with_config(config).unwrap();
+    let page = read(&tools, "a", &ctx).await;
+    assert!(page.content.contains("use offset=2"), "{}", page.content);
+}
+
+/// A pair that differs only in line endings normalizes to the same text: it
+/// must be rejected up front, not reported as a successful no-op.
+#[tokio::test]
+async fn an_edit_that_only_changes_line_endings_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = LocalTools::new(dir.path()).unwrap();
+    let ctx = context(4096);
+    write(&tools, "a", "a\r\nb\n", &ctx).await;
+    let error = edit(&tools, "a", "a\r\n", "a\n", false, &ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("differ"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a")).unwrap(),
+        "a\r\nb\n"
+    );
+}
+
+/// Literal matching buffers the whole file, so `edit` refuses a file over the
+/// host's `max_file_bytes` cap instead of growing without bound (a built-in
+/// ceiling applies when the host sets none).
+#[tokio::test]
+async fn edit_refuses_a_file_over_the_host_file_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(4096);
+    let lenient = LocalTools::new(dir.path()).unwrap();
+    write(&lenient, "a", "0123456789abcdefg", &ctx).await; // 17 bytes
+    let mut config = LocalToolConfig::new(dir.path());
+    config.max_file_bytes = Some(16);
+    let strict = LocalTools::with_config(config).unwrap();
+    let error = edit(&strict, "a", "0", "x", false, &ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("max_file_bytes"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a")).unwrap(),
+        "0123456789abcdefg"
+    );
+}
+
 #[tokio::test]
 async fn cancelled_filesystem_operations_have_no_new_effects() {
     let dir = tempfile::tempdir().unwrap();

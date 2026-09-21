@@ -215,7 +215,7 @@ pub(super) fn render(result: &BashResult, budget: usize) -> ToolOutput {
     }
     if result.sandbox_denied {
         status.push_str(&format!(
-            "\n[sandbox: file access denied under {} mode]",
+            "\n[sandbox: permission error under {} mode — writes outside the workspace are blocked; this may also be an ordinary OS permission error]",
             result.permission_mode
         ));
     }

@@ -169,3 +169,100 @@ fn the_host_controls_the_goal_lifecycle() {
     );
     assert_eq!(run.count(), 1, "pause costs no model request");
 }
+
+/// The round driver owns exactly one idle status: a `running:false` after
+/// every round told the UI the session was idle while the driver was still
+/// inside the goal loop (and it dispatched queued prompts early).
+#[test]
+fn goal_rounds_emit_one_idle_status_after_the_last_round() {
+    let run = common::drive(
+        Scenario::new(
+            "goal-status",
+            vec![
+                Reply::sse(text_body("msg-r1", "still working")),
+                Reply::sse(text_body("msg-r2", "still working")),
+            ],
+        )
+        .goal("@2 make the widget faster"),
+    );
+
+    let statuses: Vec<&String> = run
+        .events
+        .iter()
+        .filter(|event| event.starts_with("status:"))
+        .collect();
+    assert_eq!(
+        statuses.last().map(|status| status.as_str()),
+        Some("status:false"),
+        "the sequence ends idle: {}",
+        run.explain()
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| status.as_str() == "status:false")
+            .count(),
+        1,
+        "one idle status for the whole sequence: {}",
+        run.explain()
+    );
+    let last_end = run
+        .events
+        .iter()
+        .rposition(|event| event.starts_with("turn-end:"))
+        .expect("rounds ended");
+    let last_status = run
+        .events
+        .iter()
+        .rposition(|event| event.starts_with("status:"))
+        .expect("a status");
+    assert!(
+        last_status > last_end,
+        "idle comes after the last round: {}",
+        run.explain()
+    );
+}
+
+/// An active goal can remain armed after a failed round. A later user prompt
+/// then starts the remaining round; there must be no idle event between them,
+/// because the TUI dispatches its queued prompt on every idle event.
+#[test]
+fn an_armed_goal_keeps_the_user_turn_busy_until_its_followup_round_finishes() {
+    let run = common::drive(
+        Scenario::new(
+            "goal-prompt-status",
+            vec![
+                Reply::error(400, "invalid_request_error"),
+                Reply::sse(text_body("msg-user", "working on it")),
+                Reply::sse(text_body("msg-round", "finished the next round")),
+            ],
+        )
+        .goal("@2 make the widget faster")
+        .prompt("continue the work")
+        .goal("status"),
+    );
+
+    let starts: Vec<usize> = run
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| event.starts_with("turn-start:").then_some(index))
+        .collect();
+    assert_eq!(starts.len(), 3, "{}", run.explain());
+    assert!(
+        !run.events[starts[1]..starts[2]]
+            .iter()
+            .any(|event| event == "status:false"),
+        "the user turn must not release the UI before the goal round: {}",
+        run.explain()
+    );
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| *event == "status:false")
+            .count(),
+        2,
+        "one idle status per completed sequence: {}",
+        run.explain()
+    );
+}

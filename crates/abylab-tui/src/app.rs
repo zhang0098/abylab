@@ -1693,16 +1693,16 @@ impl App {
             AppEvent::RuntimeExited(code) => {
                 self.session_switch = None;
                 self.prompt_pending = false;
-                self.queued = 0;
                 // The runtime is gone and so is the queue's chance to be sent:
                 // its echoes leave the timeline with it, exactly as a deleted
-                // item does (they were never delivered).
-                let dropped: Vec<usize> = self
-                    .prompt_queue
-                    .drain(..)
-                    .flat_map(|prompt| prompt.cells)
-                    .collect();
-                self.withdraw_prompt_echo(&dropped);
+                // item does (they were never delivered). One item at a time:
+                // `withdraw_prompt_echo` remaps the cells of the items still
+                // queued behind it, which a single flattened pass cannot do
+                // (their echoes are not one contiguous run).
+                while let Some(prompt) = self.prompt_queue.pop_front() {
+                    self.withdraw_prompt_echo(&prompt.cells);
+                }
+                self.queued = 0;
                 self.queue_edit = None;
                 self.pending_steer_cells.clear();
                 if self.state != RunState::Idle {
@@ -1763,6 +1763,11 @@ impl App {
                                     "agent deferred Send Now — queued after the active turn",
                                     "Agent 推迟了立即发送 —— 已排到本轮之后",
                                 ));
+                            } else {
+                                // The steer was accepted (a promoted queue head
+                                // reuses its queued echo): it is delivered now,
+                                // so the queued tint goes.
+                                self.transcript.mark_prompt_delivered(&pending.cells);
                             }
                         }
                     }
@@ -2117,14 +2122,17 @@ impl App {
                     return;
                 }
                 // Clicking a tool block toggles its expand/collapse instead of
-                // starting a text selection.
-                if let Some(ci) = self.tool_at(mouse.column, mouse.row) {
-                    self.sel = None;
-                    self.selecting = false;
-                    self.last_click = None;
-                    self.input_selecting = false;
-                    self.toggle_tool(ci);
-                    return;
+                // starting a text selection. A modal owns the screen: clicks
+                // must not reach the chrome behind it.
+                if !self.modal_open() {
+                    if let Some(ci) = self.tool_at(mouse.column, mouse.row) {
+                        self.sel = None;
+                        self.selecting = false;
+                        self.last_click = None;
+                        self.input_selecting = false;
+                        self.toggle_tool(ci);
+                        return;
+                    }
                 }
                 // The mouse-only `⛶` glyph (issue #92) pins the well to the
                 // amplified height and restores it on the next click.
@@ -2739,6 +2747,11 @@ impl App {
         if !root.is_object() {
             root = serde_json::json!({});
         }
+        // Repair a hand-edited or truncated cache: indexing a non-object
+        // `workspaces` would panic instead of replacing it.
+        if !root["workspaces"].is_object() {
+            root["workspaces"] = serde_json::json!({});
+        }
         let Ok(entry) = serde_json::to_value(&self.modes) else {
             return;
         };
@@ -2899,7 +2912,17 @@ impl App {
     }
 
     pub fn scroll_by(&mut self, delta: i64) {
-        let cur = self.scroll_up as i64;
+        // JumpTop stores `usize::MAX` until the next draw clamps it. Resolve
+        // that sentinel against the last layout first: casting it to i64
+        // yields -1, and a scroll batched after Home would teleport to the
+        // wrong end of the viewport.
+        let cur = if self.scroll_up == usize::MAX {
+            self.chat_view
+                .total
+                .saturating_sub(self.chat_view.area.height as usize) as i64
+        } else {
+            self.scroll_up as i64
+        };
         self.scroll_up = (cur + delta).max(0) as usize; // clamped to content in ui::draw
         self.needs_redraw = true;
     }
@@ -3369,6 +3392,19 @@ impl App {
             Action::ClearScrollback => {
                 self.transcript.clear();
                 self.sel = None;
+                // The cleared timeline took every echo with it: client-owned
+                // cell indices now name nothing, and once new cells land they
+                // would name a stranger's cell. Drop them; the queue items
+                // themselves stay queued.
+                for prompt in &mut self.prompt_queue {
+                    prompt.cells.clear();
+                }
+                for steer in self.pending_steer_cells.values_mut() {
+                    steer.cells.clear();
+                }
+                self.prompt_jump_cell = None;
+                self.prompt_flash = None;
+                self.prompt_flash_lines = None;
                 self.transcript.push_notice(
                     NoticeLevel::Info,
                     self.locale.tr("scrollback cleared", "滚动区已清空").into(),
@@ -4146,7 +4182,10 @@ impl App {
         if self.queue_edit.is_some() {
             return;
         }
-        let running = self.turn_busy();
+        // `turn_busy` counts this non-empty queue itself, so it cannot say
+        // whether a turn is in flight; ask the run state directly. Idle (a
+        // cancelled edit, a failed turn) sends the head as a plain prompt.
+        let running = matches!(self.state, RunState::Running) || self.prompt_pending;
         let Some(prompt) = self.prompt_queue.pop_front() else {
             return;
         };
@@ -4539,13 +4578,18 @@ impl App {
             self.needs_redraw = true;
             return;
         }
-        // A queued prompt loaded for editing leaves the item untouched.
+        // A queued prompt loaded for editing leaves the item untouched. The
+        // idle status that could ship the FIFO was already spent holding the
+        // queue back, so cancelling the edit has to hand the head over now.
         if self.queue_edit.is_some() {
             self.finish_queue_edit();
             self.show_tip(
                 self.locale
                     .tr("queued prompt edit cancelled", "已取消编辑排队消息"),
             );
+            if self.state == RunState::Idle {
+                self.dispatch_next_queued(ctl);
+            }
             return;
         }
         // A lingering copy highlight is dismissed first (idle only — while
@@ -6453,6 +6497,30 @@ mod mode_tests {
         assert!(app3.modes.permission.is_none(), "cache is per workspace");
     }
 
+    /// A hand-edited or truncated cache must be repaired, not panic: indexing
+    /// a non-object `workspaces` aborts the save path.
+    #[test]
+    fn a_malformed_modes_cache_is_repaired() {
+        let cfg = test_cfg();
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let mut app = App::new(Theme::dark(), cfg.clone(), "s1".into());
+        std::fs::write(App::modes_cache_path(&cfg), "{\"workspaces\": 3}").unwrap();
+
+        app.modes.permission = Some("workspace-write".into());
+        app.save_modes_cache();
+
+        let text = std::fs::read_to_string(App::modes_cache_path(&cfg)).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            root["workspaces"].is_object(),
+            "the cache was repaired: {text}"
+        );
+        assert!(
+            !root["workspaces"][&cfg.workspace].is_null(),
+            "this workspace's entry landed: {text}"
+        );
+    }
+
     /// The launch splash reports the four facts a user wants before the first
     /// prompt: build version, working directory, permission preset, model.
     /// A preset cached from an earlier run is what the splash names.
@@ -7514,6 +7582,35 @@ mod mode_tests {
         ));
     }
 
+    /// A queue head promoted by an empty enter is delivered when the steer
+    /// settles: its echo loses the queued tint (the item already left the
+    /// queue, so leaving it tinted contradicts the counter).
+    #[test]
+    fn a_settled_queue_head_steer_clears_the_queued_tint() {
+        let (mut app, ctl, _rx) = test_app();
+        app.state = RunState::Running;
+        app.send_agent_text("head".into(), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        let (message_id, cells) = {
+            let (id, pending) = app.pending_steer_cells.iter().next().expect("steer");
+            (*id, pending.cells.clone())
+        };
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SteerSettled {
+                message_id,
+                deferred: false,
+            }),
+            &ctl,
+        );
+        assert!(app.pending_steer_cells.is_empty());
+        for cell in cells {
+            assert!(matches!(
+                &app.transcript.cells[cell].kind,
+                crate::transcript::CellKind::User { queued: false, .. }
+            ));
+        }
+    }
+
     #[test]
     fn send_now_with_an_image_keeps_the_active_turn_running() {
         let (mut app, ctl, _rx) = test_app();
@@ -8194,15 +8291,9 @@ mod mode_tests {
         assert!(commands.try_recv().is_err(), "nothing went out");
         assert!(app.state_note.contains("paused"), "{}", app.state_note);
 
-        // Closing the editor lets the next idle status ship the head.
+        // Cancelling the edit ships the head now: the idle status it waited
+        // for was already spent holding the queue back.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
-                session: "dsh-test".into(),
-                running: false,
-            }),
-            &ctl,
-        );
         assert_eq!(app.queued, 1);
         assert!(matches!(
             commands.try_recv(),
@@ -8236,6 +8327,31 @@ mod mode_tests {
             1,
             "the steer awaits settlement"
         );
+    }
+
+    /// An idle client that still holds a queue (a cancelled edit, a failed
+    /// turn) sends the head as a plain prompt on an empty enter — not as a
+    /// steer, which would interrupt a turn that is not running.
+    #[test]
+    fn empty_enter_on_an_idle_queue_goes_out_as_a_plain_prompt() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("head".into(), &ctl);
+        app.send_agent_text("tail".into(), &ctl);
+        // The turn failed or was interrupted: the queue survives, the client is idle.
+        app.state = RunState::Idle;
+        app.prompt_pending = false;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Prompt { text, .. }) if text == "head"
+        ));
+        assert_eq!(app.queued, 1, "the tail stays queued");
+        assert!(app.prompt_pending, "the head is now in flight");
+        assert_eq!(app.state, RunState::Starting);
     }
 
     /// The idle status is what hands the FIFO head to the driver: it is not
@@ -9293,6 +9409,86 @@ mod mode_tests {
             rx.blocking_recv().expect("reply"),
             crate::bus::PermissionAskReply::Cancelled
         );
+    }
+
+    /// `/clear` empties the timeline, so the client's cell indices must go
+    /// with it: a later delete of a queued prompt used to splice whatever cell
+    /// now sat at the stale index.
+    #[test]
+    fn clearing_the_scrollback_forgets_client_cell_indices() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("queued".into(), &ctl);
+        assert_eq!(app.prompt_queue[0].cells.len(), 1);
+
+        app.dispatch(Action::ClearScrollback, &ctl);
+        assert!(
+            app.prompt_queue[0].cells.is_empty(),
+            "the cleared timeline's index is dropped"
+        );
+
+        // New cells land where the old index pointed; deleting the queued
+        // prompt must not touch them.
+        app.transcript.push_user("unrelated".into(), false);
+        let unrelated = app.transcript.cells.len() - 1;
+        app.drop_queued_prompt(0, &ctl);
+        assert_eq!(app.prompt_queue.len(), 0);
+        assert_eq!(app.transcript.cells.len(), 2, "the notice and the bubble");
+        assert!(matches!(
+            &app.transcript.cells[unrelated].kind,
+            crate::transcript::CellKind::User { text, .. } if text == "unrelated"
+        ));
+    }
+
+    /// A dead runtime's queue is withdrawn one echo at a time: the flattened
+    /// multi-prompt set is not one contiguous run, and a single pass would
+    /// delete the unrelated cell between two echoes.
+    #[test]
+    fn runtime_exit_withdraws_each_queued_echo() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.transcript
+            .push_notice(NoticeLevel::Info, "between".into());
+        app.send_agent_text("second".into(), &ctl);
+
+        app.handle(AppEvent::RuntimeExited(Some(1)), &ctl);
+
+        assert!(app.prompt_queue.is_empty());
+        assert!(
+            app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::Notice { text, .. } if text == "between"
+            )),
+            "the cell between the echoes survives"
+        );
+        assert!(
+            !app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::User { queued: true, .. }
+            )),
+            "no queued echo is left behind"
+        );
+    }
+
+    /// Home stores the `usize::MAX` top sentinel until the next draw clamps
+    /// it; a scroll batched before that draw resolves against the last layout
+    /// instead of casting the sentinel to -1.
+    #[test]
+    fn a_scroll_after_jump_to_top_is_relative_to_the_top() {
+        let (mut app, _demo, _rx) = test_app();
+        app.chat_view.total = 100;
+        app.chat_view.area = ratatui::layout::Rect::new(0, 0, 80, 10);
+
+        app.scroll_up = usize::MAX;
+        app.scroll_by(-2);
+        assert_eq!(app.scroll_up, 88, "the top, minus the delta");
+
+        app.scroll_up = usize::MAX;
+        app.scroll_by(5);
+        assert_eq!(app.scroll_up, 95, "up from the top stays at the top");
     }
 }
 

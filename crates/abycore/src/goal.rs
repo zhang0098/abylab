@@ -311,7 +311,12 @@ impl Tool for CreateGoalTool {
         let object = arguments
             .as_object()
             .ok_or_else(|| tool_error("create_goal takes an object"))?;
-        if object.len() != 1 && object.len() != 2 {
+        // The schema is additionalProperties:false; a count check alone let
+        // `{"objective":"x","bogus":1}` through.
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "objective" | "max_rounds"))
+        {
             return Err(tool_error(
                 "create_goal takes objective and optional max_rounds",
             ));
@@ -373,6 +378,16 @@ impl Tool for UpdateGoalTool {
         let object = arguments
             .as_object()
             .ok_or_else(|| tool_error("update_goal takes an object"))?;
+        // The schema is additionalProperties:false; unknown fields have to be
+        // refused here too, or the declared contract is not enforced.
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "goal_id" | "revision" | "status" | "note"))
+        {
+            return Err(tool_error(
+                "update_goal takes goal_id, revision, status and optional note",
+            ));
+        }
         if !object
             .get("goal_id")
             .and_then(Value::as_str)
@@ -420,5 +435,46 @@ impl Tool for UpdateGoalTool {
             };
             Ok(ToolOutput::text("goal updated").with_meta(json!({ "goal_request": request })))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both tool schemas declare `additionalProperties: false`; the validators
+    /// have to refuse unknown fields, not only count them.
+    #[test]
+    fn goal_tools_reject_unknown_fields_like_their_schemas_say() {
+        assert!(
+            CreateGoalTool
+                .validate(&json!({"objective": "x", "bogus": 1}))
+                .is_err()
+        );
+        assert!(CreateGoalTool.validate(&json!({"objective": "x"})).is_ok());
+        assert!(
+            CreateGoalTool
+                .validate(&json!({"objective": "x", "max_rounds": 3}))
+                .is_ok()
+        );
+        assert!(
+            UpdateGoalTool
+                .validate(&json!({
+                    "goal_id": "g", "revision": 1, "status": "active", "bogus": true
+                }))
+                .is_err()
+        );
+        assert!(
+            UpdateGoalTool
+                .validate(&json!({"goal_id": "g", "revision": 1, "status": "active"}))
+                .is_ok()
+        );
+        assert!(
+            UpdateGoalTool
+                .validate(&json!({
+                    "goal_id": "g", "revision": 1, "status": "blocked", "note": "why"
+                }))
+                .is_ok()
+        );
     }
 }

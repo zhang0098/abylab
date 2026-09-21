@@ -16,6 +16,9 @@ pub enum ErrorKind {
     Timeout,
     Cancelled,
     Protocol,
+    /// The provider completed a response with no content: a transient defect
+    /// (`deepseek-harness`'s `EMPTY_RESPONSE`), worth retrying inside the turn.
+    EmptyResponse,
     StreamClosed,
     BudgetExceeded,
     Session,

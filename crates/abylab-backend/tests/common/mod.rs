@@ -387,6 +387,7 @@ fn captured_sink(events: Captured) -> impl Fn(Event) + Send + Sync + 'static {
             Event::Ui(ui) => match ui {
                 UiEvent::TurnStart { turn, .. } => format!("turn-start:{turn}"),
                 UiEvent::TurnEnd { kind, .. } => format!("turn-end:{kind}"),
+                UiEvent::SessionStatus { running, .. } => format!("status:{running}"),
                 UiEvent::PermissionPreset { preset, .. } => format!("permission:{preset}"),
                 // The live tool line: streamed arguments, then the completed
                 // call, then execution start, then the result.

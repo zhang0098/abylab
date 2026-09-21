@@ -171,6 +171,57 @@ async fn fork_seeds_completed_turns_and_excludes_current_prompt_and_open_calls()
     agents.shutdown().await;
 }
 
+/// A fork whose inherited prefix is a compaction summary (the parent's
+/// completed history condensed, the active prompt still unanswered) must seed
+/// a valid child: the summary is a user item, so the snapshot has to say the
+/// turn owes a response — restore used to reject the whole fork.
+#[tokio::test]
+async fn fork_seeds_a_compaction_summary_that_ends_at_the_active_prompt() {
+    let server = Server::start(vec![Reply::sse(response(
+        "child",
+        vec![message("m", "fork answer")],
+    ))])
+    .await;
+    let mut snapshot = SessionSnapshot::new("parent persona", ModelOptions::default());
+    snapshot.items = vec![
+        Item::user("previous question"),
+        Item::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::OutputText {
+                text: "previous answer".into(),
+            }],
+        },
+        Item::user("current private turn"),
+    ];
+    snapshot.needs_response = true;
+    snapshot.compactions = vec![Compaction {
+        start: 0,
+        end: 2,
+        summary: "condensed history".into(),
+    }];
+    let parent = Agent::restore(server.client(), snapshot).unwrap();
+    let agents = Subagents::new();
+    let request = SubagentRequest {
+        description: "fork".into(),
+        prompt: "new child task".into(),
+        mode: SubagentMode::Fork,
+    };
+    let child = agents
+        .start(&parent, request)
+        .expect("the condensed prefix is seeded, not rejected");
+    let info = settled(&agents, &child.id).await;
+    assert_eq!(info.status, SubagentStatus::Idle);
+    let body = &server.captured()[0].body;
+    let json = body["messages"].to_string();
+    assert!(
+        json.contains("condensed history") && json.contains("new child task"),
+        "{json}"
+    );
+    assert!(!json.contains("current private turn"), "{json}");
+    agents.shutdown().await;
+}
+
 #[tokio::test]
 async fn background_runs_concurrently_and_enforces_capacity_and_retention() {
     let server = Server::start(vec![delayed("first"), delayed("second"), delayed("third")]).await;

@@ -407,9 +407,10 @@ impl AgentHooks for UiHooks {
         // already enforce the selected root policy, so safe reads and
         // workspace-scoped mutations do not need a second prompt. Bash and
         // unknown tools still go through approval in sandboxed modes.
+        // `glob`/`grep` are workspace-rooted reads, exactly like `read`.
         // `todo_write` only updates the in-memory checklist, so it never asks.
         if self.permission_mode == PermissionMode::FullAccess
-            || call.name == "read"
+            || matches!(call.name.as_str(), "read" | "glob" | "grep")
             || call.name == "todo_write"
             // Goal tools only read and update session metadata, exactly like
             // the checklist: they never touch the workspace or the network.
@@ -685,17 +686,7 @@ async fn drive(
                     compaction,
                 };
                 let arg = arg.trim();
-                // `/goal @3 objective` sets the round allowance with the goal.
-                let (arg, max_rounds) = match arg.strip_prefix('@') {
-                    Some(rest) => match rest.split_once(char::is_whitespace) {
-                        Some((rounds, objective)) => match rounds.parse::<u64>() {
-                            Ok(rounds) => (objective.trim(), Some(rounds)),
-                            Err(_) => (arg, None),
-                        },
-                        None => (arg, None),
-                    },
-                    None => (arg, None),
-                };
+                let (arg, max_rounds) = parse_goal_argument(arg);
                 match arg {
                     "" | "status" => match agent.goal() {
                         Some(goal) => ctl(CtlEvent::TuiOpDone(format!(
@@ -1091,15 +1082,29 @@ async fn drive(
                 // Context pressure is handled by the agent itself at every
                 // request boundary (`AgentHooks::view_request`), so it applies
                 // inside a turn too; nothing to do before shipping the prompt.
-                match turn(agent, Some(text), &mut ctx).await {
-                    Ok(outcome) => {
-                        if goal_armed && outcome.stop_reason == StopReason::Completed {
-                            drive_goal_rounds(agent, &mut ctx, &ctl).await;
-                            goal_armed = goal_armed
-                                && agent.goal().is_some_and(abycore::Goal::may_start_round);
+                // An armed goal can continue immediately after this prompt.
+                // Keep the UI busy until those rounds settle, so its queued
+                // prompts cannot be dispatched between the two turns.
+                let goal_continues = goal_armed;
+                match turn(agent, Some(text), &mut ctx, !goal_continues).await {
+                    Ok(outcome)
+                        if goal_continues && outcome.stop_reason == StopReason::Completed =>
+                    {
+                        drive_goal_rounds(agent, &mut ctx, &ctl).await;
+                        goal_armed =
+                            goal_armed && agent.goal().is_some_and(abycore::Goal::may_start_round);
+                    }
+                    Ok(_) => {
+                        if goal_continues {
+                            emit_idle_status(&ctx);
                         }
                     }
-                    Err(err) => report_turn_err(&ctl, &err, limits),
+                    Err(err) => {
+                        if goal_continues {
+                            emit_idle_status(&ctx);
+                        }
+                        report_turn_err(&ctl, &err, limits);
+                    }
                 }
             }
         }
@@ -1191,6 +1196,9 @@ fn turn_error_text(err: &abycore::Error, limits: TurnLimits) -> String {
         ErrorKind::Transport | ErrorKind::StreamClosed => {
             "connection lost — the turn is unfinished; send a message to continue it / 连接中断：回合未完成，继续输入可续跑"
         }
+        ErrorKind::EmptyResponse => {
+            "the provider returned an empty response — the turn is unfinished; send a message to continue it / 返回了空响应：回合未完成，继续输入可续跑"
+        }
         ErrorKind::Protocol => "protocol error — likely a gateway incompatibility / 协议不兼容",
         _ => "turn failed",
     };
@@ -1219,6 +1227,24 @@ fn permission_preset(mode: PermissionMode) -> &'static str {
         PermissionMode::ReadOnly => "read-only",
         PermissionMode::WorkspaceWrite => "workspace-write",
         PermissionMode::FullAccess => "danger-full-access",
+    }
+}
+
+/// Split `/goal`'s argument into the objective and an optional round
+/// allowance: `/goal @3 objective` sets the allowance, a bare `@3` names no
+/// objective (the caller routes the literal `"rounds"` to its usage arm), and
+/// anything else is the objective as typed.
+fn parse_goal_argument(arg: &str) -> (&str, Option<u64>) {
+    let Some(rest) = arg.strip_prefix('@') else {
+        return (arg, None);
+    };
+    match rest.split_once(char::is_whitespace) {
+        Some((rounds, objective)) => match rounds.parse::<u64>() {
+            Ok(rounds) => (objective.trim(), Some(rounds)),
+            Err(_) => (arg, None),
+        },
+        None if rest.trim().parse::<u64>().is_ok() => ("rounds", None),
+        None => (arg, None),
     }
 }
 
@@ -1497,7 +1523,10 @@ fn effort_label(effort: ReasoningEffort) -> &'static str {
 /// model-visible explanation for calls that never started. A call whose
 /// execution was interrupted may already have side effects, so its output
 /// always asks the model to verify the result before repeating it.
-fn settle_pending(agent: &mut Agent, reason: &str, ctx: &TurnCtx<'_>) {
+///
+/// `resolve_tool` only removes the first pending call on success, so ignoring
+/// its `Result` would spin on the same call forever; a refusal ends the turn.
+fn settle_pending(agent: &mut Agent, reason: &str, ctx: &TurnCtx<'_>) -> abycore::Result<()> {
     while let Some(call) = agent.snapshot().pending.first().cloned() {
         let reason = match call.state {
             abycore::PendingState::Unknown => {
@@ -1505,7 +1534,7 @@ fn settle_pending(agent: &mut Agent, reason: &str, ctx: &TurnCtx<'_>) {
             }
             abycore::PendingState::Ready => reason,
         };
-        let _ = agent.resolve_tool(
+        agent.resolve_tool(
             &call.call_id,
             ToolOutput {
                 content: reason.into(),
@@ -1514,7 +1543,7 @@ fn settle_pending(agent: &mut Agent, reason: &str, ctx: &TurnCtx<'_>) {
                 details: None,
                 meta: None,
             },
-        );
+        )?;
         (ctx.sink)(Event::Ui(UiEvent::ToolResult {
             session: ctx.session.into(),
             call_id: call.call_id,
@@ -1523,6 +1552,7 @@ fn settle_pending(agent: &mut Agent, reason: &str, ctx: &TurnCtx<'_>) {
             error: None,
         }));
     }
+    Ok(())
 }
 
 /// Spend rounds on an armed, active goal.
@@ -1540,6 +1570,7 @@ async fn drive_goal_rounds(
     run_goal_rounds(agent, ctx, ctl).await;
     if let Err(error) = agent.save() {
         ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
+        emit_idle_status(ctx);
         return;
     }
     // One settled state after the loop, whatever stopped it: the transcript's
@@ -1551,6 +1582,16 @@ async fn drive_goal_rounds(
             goal.summary()
         )));
     }
+    // The rounds suppressed their per-turn idle status; emit it once after
+    // the sequence and final save, even if no round was needed.
+    emit_idle_status(ctx);
+}
+
+fn emit_idle_status(ctx: &TurnCtx<'_>) {
+    (ctx.sink)(Event::Ui(UiEvent::SessionStatus {
+        session: ctx.session.into(),
+        running: false,
+    }));
 }
 
 async fn run_goal_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &impl Fn(CtlEvent)) {
@@ -1594,7 +1635,7 @@ async fn run_goal_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &
             "Continue working toward the session goal (round {}/{}): {}\n             When the objective is achieved, call update_goal with status \"complete\".              If progress is impossible, call update_goal with status \"blocked\" and explain in note.              Otherwise keep working; do not restate the goal, just make progress.",
             goal.rounds_started, goal.max_rounds, goal.objective
         );
-        match turn(agent, Some(prompt), ctx).await {
+        match turn(agent, Some(prompt), ctx, false).await {
             Ok(outcome) if outcome.stop_reason == StopReason::Completed => {}
             Ok(_) => return,
             Err(err) => {
@@ -1891,13 +1932,14 @@ async fn turn(
     agent: &mut SessionAgent,
     text: Option<String>,
     ctx: &mut TurnCtx<'_>,
+    settle_status: bool,
 ) -> abycore::Result<RunOutcome> {
     if text.is_some() && agent.snapshot().needs_response {
         settle_pending(
             agent,
             "previous tool call was interrupted; its result is unverified — check before repeating",
             ctx,
-        );
+        )?;
     }
     let session = ctx.session.to_string();
     let sink = Arc::clone(ctx.sink);
@@ -1966,7 +2008,7 @@ async fn turn(
                 agent,
                 "the turn stopped before this tool ran — it did not execute; re-issue it if it is still needed",
                 ctx,
-            );
+            )?;
         }
         // Transient failures carry their own pacing; a cheap retry
         // storm would only burn the remaining headroom. The wait stays
@@ -2015,10 +2057,15 @@ async fn turn(
             reasoning: usage.and_then(|u| u.reasoning_tokens).unwrap_or(0),
         }));
     }
-    emit(Event::Ui(UiEvent::SessionStatus {
-        session,
-        running: false,
-    }));
+    // The goal-round sequence owns exactly one idle status: a `running:false`
+    // after every round told the UI the session was idle while the driver was
+    // still inside the loop (and it dispatched queued prompts early).
+    if settle_status {
+        emit(Event::Ui(UiEvent::SessionStatus {
+            session,
+            running: false,
+        }));
+    }
     outcome
 }
 
@@ -2039,6 +2086,7 @@ fn resumable_failure(err: &abycore::Error) -> bool {
             | ErrorKind::StreamClosed
             | ErrorKind::Server
             | ErrorKind::RateLimit
+            | ErrorKind::EmptyResponse
     )
 }
 
@@ -2067,6 +2115,11 @@ fn continuation_notice(err: &abycore::Error, round: usize, rounds: usize) -> Str
     if err.kind == ErrorKind::Timeout {
         return format!(
             "timed out — continuing the unfinished turn ({round}/{rounds}) / 超时，自动续跑（{round}/{rounds}）"
+        );
+    }
+    if err.kind == ErrorKind::EmptyResponse {
+        return format!(
+            "empty response — retrying the unfinished step ({round}/{rounds}) / 空响应，正在同一回合内重试（{round}/{rounds}）"
         );
     }
     let (en, zh) = match err.kind {
@@ -2687,6 +2740,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn goal_arguments_split_the_round_allowance_from_the_objective() {
+        assert_eq!(
+            parse_goal_argument("ship the release"),
+            ("ship the release", None)
+        );
+        assert_eq!(
+            parse_goal_argument("@3 ship the release"),
+            ("ship the release", Some(3))
+        );
+        assert_eq!(parse_goal_argument("@0 ship"), ("ship", Some(0)));
+        // A bare allowance names no objective: the usage arm handles "rounds".
+        assert_eq!(parse_goal_argument("@3"), ("rounds", None));
+        // A non-numeric round token is an ordinary objective.
+        assert_eq!(parse_goal_argument("@here fix it"), ("@here fix it", None));
+        assert_eq!(parse_goal_argument("rounds"), ("rounds", None));
+    }
+
     #[tokio::test]
     async fn modes_apply_the_expected_approval_policy() {
         let denied = hooks(PermissionMode::ReadOnly)
@@ -2706,6 +2777,18 @@ mod tests {
             .await
             .expect("authorization succeeds");
         assert_eq!(workspace_write, ToolDecision::Allow);
+
+        // Read-only file tools never ask, in either sandboxed preset: glob and
+        // grep are workspace-rooted reads like `read`.
+        for mode in [PermissionMode::ReadOnly, PermissionMode::WorkspaceWrite] {
+            for name in ["read", "glob", "grep", "todo_write"] {
+                let decision = hooks(mode)
+                    .authorize(pending(name))
+                    .await
+                    .expect("authorization succeeds");
+                assert_eq!(decision, ToolDecision::Allow, "{name} in {mode:?}");
+            }
+        }
     }
 
     #[test]

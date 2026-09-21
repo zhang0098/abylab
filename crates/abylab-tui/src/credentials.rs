@@ -305,7 +305,9 @@ fn render_delete(text: &str, name: &str) -> String {
 /// Store (or replace) one reference. Read-modify-write against the document
 /// as it stands now: only the matched entry's line changes, so comments,
 /// blank lines and every sibling entry survive byte for byte; a hand-written
-/// flat layout migrates to the version-1 layout in the same write.
+/// flat layout (or an unversioned `refs:` block) migrates to the version-1
+/// layout in the same write, and a document that cannot be read is never
+/// overwritten.
 ///
 /// The document is replaced atomically at `0600` (temp file in the same
 /// directory, renamed over the target), so a reader never observes a partial
@@ -321,16 +323,22 @@ pub fn store_key(home: &str, name: &str, value: &str) -> Result<(), String> {
     if !valid_ref_name(name) {
         return Err(format!("\"{name}\" is not an env-style reference name"));
     }
+    if value.chars().any(char::is_control) {
+        return Err("keys must not contain control characters".into());
+    }
     let path = credentials_path(home);
     assert_owner_only(&path)?;
 
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    parse_document(&text)?; // never overwrite a document this build cannot parse
-    let next = if has_version_layout(&text) {
-        patch_refs_section(&text, name, value)
-    } else {
-        patch_refs_section(&migrate_flat(&text), name, value)
+    // Only an absent document is the empty store; every other read failure
+    // must surface, because `unwrap_or_default` would replace a document this
+    // build cannot read (EACCES, invalid UTF-8) with the new key alone.
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
     };
+    parse_document(&text)?; // never overwrite a document this build cannot parse
+    let next = upsert_ref(&text, name, value);
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|err| format!("cannot create {dir:?}: {err}"))?;
@@ -350,35 +358,51 @@ pub fn store_key(home: &str, name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Create/replace-safe secret write: the temp file is `0600` from the start,
-/// so the renamed document never exposes a wider mode window.
+/// Create/replace-safe secret write: the temp file is created at `0600`
+/// (not chmodded after an umask-wide create), and a failed write removes it
+/// instead of leaving a secret-bearing fragment behind.
 fn write_secret_file(path: &Path, text: &str) -> Result<(), String> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|err| format!("cannot create {path:?}: {err}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("cannot protect {path:?}: {err}"))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    file.write_all(text.as_bytes())
+    let mut file = options
+        .open(path)
+        .map_err(|err| format!("cannot create {path:?}: {err}"))?;
+    if let Err(err) = file
+        .write_all(text.as_bytes())
         .and_then(|_| file.flush())
         .and_then(|_| file.sync_all())
-        .map_err(|err| format!("cannot write {path:?}: {err}"))?;
+    {
+        let _ = std::fs::remove_file(path);
+        return Err(format!("cannot write {path:?}: {err}"));
+    }
     Ok(())
 }
 
-/// Whether the document already carries the version-1 envelope.
-fn has_version_layout(text: &str) -> bool {
+/// Whether the document carries the top-level layout key `key` (outside
+/// comments and indented entries).
+fn has_top_layout_key(text: &str, key: &str) -> bool {
     text.lines().any(|line| {
         !line.starts_with(char::is_whitespace)
             && !line.trim().is_empty()
             && !line.trim().starts_with('#')
-            && top_layout_key(line) == Some("version")
+            && top_layout_key(line) == Some(key)
     })
+}
+
+/// Whether the document already carries the version-1 envelope.
+fn has_version_layout(text: &str) -> bool {
+    has_top_layout_key(text, "version")
+}
+
+/// Whether the document already opens a top-level `refs:` block. The parser
+/// admits one without a `version:` line, so the writer must recognize it too.
+fn has_refs_section(text: &str) -> bool {
+    has_top_layout_key(text, "refs")
 }
 
 /// Render the version-1 layout for a pre-release flat (or empty) document:
@@ -386,6 +410,10 @@ fn has_version_layout(text: &str) -> bool {
 /// nest verbatim under `refs:` at two spaces' indent, then the new entry
 /// follows. A flat entry for the same name is carried too; the patch step
 /// below replaces it in place, so no duplicate can be written.
+///
+/// Callers must only reach this with a document that has neither a `version:`
+/// line nor a `refs:` block: indenting an existing envelope header would nest
+/// it under the new block instead.
 fn migrate_flat(text: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!("version: {DOCUMENT_VERSION}\nrefs:\n"));
@@ -399,8 +427,28 @@ fn migrate_flat(text: &str) -> String {
     out
 }
 
+/// Store (or replace) one reference in a document the parser admits. Every
+/// layout `parse_document` accepts is normalized first — a flat document
+/// migrates to the version-1 envelope, and an unversioned `refs:` block gains
+/// the version line — so the write can never produce a document its own
+/// loader refuses.
+fn upsert_ref(text: &str, name: &str, value: &str) -> String {
+    if !has_version_layout(text) && !has_refs_section(text) {
+        return patch_refs_section(&migrate_flat(text), name, value);
+    }
+    if has_version_layout(text) {
+        patch_refs_section(text, name, value)
+    } else {
+        patch_refs_section(&format!("version: {DOCUMENT_VERSION}\n{text}"), name, value)
+    }
+}
+
 /// Replace the named entry's line in place inside the refs block, or append
 /// it after the last entry (creating the `refs:` block when absent).
+///
+/// A top-level entry with the same name — only possible in an admitted hybrid
+/// document — is dropped in the same pass and re-added under `refs:`, so the
+/// write cannot leave the duplicate key the parser rejects.
 fn patch_refs_section(text: &str, name: &str, value: &str) -> String {
     let entry = format!("  {name}: {value}");
     let mut out: Vec<String> = Vec::new();
@@ -419,11 +467,22 @@ fn patch_refs_section(text: &str, name: &str, value: &str) -> String {
                 refs_header = Some(out.len());
             }
         }
-        if refs_header.is_some() && line.starts_with(char::is_whitespace) {
+        if !line.starts_with(char::is_whitespace) {
+            if top_layout_key(line).is_none()
+                && parse_entry(line).is_some_and(|(ref_name, _)| ref_name == name)
+            {
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if refs_header.is_some() {
             if let Some((ref_name, _)) = parse_entry(line) {
                 if ref_name == name {
-                    out.push(entry.clone());
-                    replaced = true;
+                    if !replaced {
+                        out.push(entry.clone());
+                        replaced = true;
+                    }
                     continue;
                 }
                 last_ref_entry = Some(out.len());
@@ -432,15 +491,16 @@ fn patch_refs_section(text: &str, name: &str, value: &str) -> String {
         out.push(line.to_string());
     }
 
-    match (replaced, refs_header) {
-        (true, _) => {}
-        (false, Some(header)) => {
-            let at = last_ref_entry.map(|i| i + 1).unwrap_or(header + 1);
-            out.insert(at, entry);
-        }
-        (false, None) => {
-            out.push("refs:".to_string());
-            out.push(entry);
+    if !replaced {
+        match refs_header {
+            Some(header) => {
+                let at = last_ref_entry.map(|i| i + 1).unwrap_or(header + 1);
+                out.insert(at, entry);
+            }
+            None => {
+                out.push("refs:".to_string());
+                out.push(entry);
+            }
         }
     }
     let mut text = out.join("\n");
@@ -544,6 +604,86 @@ mod tests {
         );
         let refs = parse_document(&text).unwrap();
         assert_eq!(refs.get(API_KEY_REF), Some("sk-migrated"));
+    }
+
+    /// A document this build cannot read must never be replaced: the previous
+    /// write path turned every read error into the empty document and stored
+    /// the new key on top of it.
+    #[test]
+    fn store_refuses_a_document_it_cannot_read() {
+        let home = tmp_home("unreadable");
+        let path = credentials_path(home.to_str().unwrap());
+        let broken = b"version: 1\nrefs:\n  OTHER: keep-me\n\xff\n".to_vec();
+        std::fs::write(&path, &broken).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let err = store_key(home.to_str().unwrap(), API_KEY_REF, "sk-new").unwrap_err();
+        assert!(err.contains("cannot read"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            broken,
+            "the unreadable document survives untouched"
+        );
+    }
+
+    /// An unversioned `refs:` block is admitted by the parser, so the writer
+    /// has to recognize it; it used to be re-indented under a second `refs:`
+    /// header, which made the next load fail.
+    #[test]
+    fn store_migrates_an_unversioned_refs_block() {
+        let home = tmp_home("refs-no-version");
+        let path = credentials_path(home.to_str().unwrap());
+        write_fixture(&path, "refs:\n  OTHER_TOKEN: keep-me\n");
+        store_key(home.to_str().unwrap(), API_KEY_REF, "sk-new").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "version: 1\nrefs:\n  OTHER_TOKEN: keep-me\n  DEEPSEEK_API_KEY: sk-new\n"
+        );
+        let refs = parse_document(&text).expect("the written document parses");
+        assert_eq!(refs.get("OTHER_TOKEN"), Some("keep-me"));
+        assert_eq!(refs.get(API_KEY_REF), Some("sk-new"));
+    }
+
+    /// The parser admits a flat entry beside a `refs:` block. Upserting that
+    /// name must move it under `refs:` instead of leaving a duplicate key the
+    /// parser refuses.
+    #[test]
+    fn store_never_duplicates_an_admitted_hybrid_entry() {
+        let home = tmp_home("hybrid");
+        let path = credentials_path(home.to_str().unwrap());
+        write_fixture(
+            &path,
+            "version: 1\nrefs:\n  OTHER_TOKEN: keep-me\nDEEPSEEK_API_KEY: sk-old\n",
+        );
+        store_key(home.to_str().unwrap(), API_KEY_REF, "sk-new").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let refs = parse_document(&text).expect("the written document parses");
+        assert_eq!(refs.get(API_KEY_REF), Some("sk-new"));
+        assert_eq!(refs.get("OTHER_TOKEN"), Some("keep-me"));
+        assert!(!text.contains("sk-old"), "{text}");
+        assert_eq!(text.matches(API_KEY_REF).count(), 1, "{text}");
+    }
+
+    /// Values are written verbatim into the line-based document, so a newline
+    /// (reachable through a multi-line `/login`) has to be refused, not stored.
+    #[test]
+    fn store_rejects_control_characters_in_the_value() {
+        let home = tmp_home("control");
+        let err = store_key(
+            home.to_str().unwrap(),
+            API_KEY_REF,
+            "sk-abc\nDEEPSEEK_API_KEY: sk-evil",
+        )
+        .unwrap_err();
+        assert!(err.contains("control characters"), "{err}");
+        assert!(!credentials_path(home.to_str().unwrap()).exists());
     }
 
     #[test]

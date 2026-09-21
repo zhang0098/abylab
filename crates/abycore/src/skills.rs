@@ -473,17 +473,63 @@ fn fill_fields(front: &str, fields: &mut BTreeMap<String, String>) {
                     Folded::Newlines => block.join("\n"),
                 }
             }
-            None => value
-                .split_once(" #")
-                .map_or(value, |(value, _)| value.trim())
-                .trim_matches(['"', '\''])
-                .trim()
-                .to_string(),
+            None => scalar_value(value),
         };
         if !text.is_empty() {
             fields.insert(key, text);
         }
     }
+}
+
+/// Read the small scalar subset used by skill frontmatter. A comment after a
+/// closing quote is ignored, while a `#` inside the quotes stays literal.
+fn scalar_value(value: &str) -> String {
+    if let Some(inner) = quoted_scalar(value) {
+        return inner.trim().to_string();
+    }
+    value
+        .split_once(" #")
+        .map_or(value, |(value, _)| value.trim())
+        .trim_matches(['"', '\''])
+        .trim()
+        .to_string()
+}
+
+/// The contents of a fully quoted scalar. Double-quoted backslash escapes and
+/// doubled single quotes must not be mistaken for the closing delimiter.
+fn quoted_scalar(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        if quote == b'"' && bytes[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        if quote == b'\'' && bytes[index] == b'\'' && bytes.get(index + 1) == Some(&b'\'') {
+            index += 2;
+            continue;
+        }
+        if bytes[index] == quote {
+            let tail = value[index + 1..].trim_start();
+            if !tail.is_empty() && !tail.starts_with('#') {
+                return None;
+            }
+            let inner = &value[1..index];
+            return if quote == b'\'' {
+                Some(inner.replace("''", "'"))
+            } else {
+                // JSON's double-quoted escapes cover the common YAML forms.
+                // Keep rarer YAML escapes intact rather than losing the field.
+                Some(serde_json::from_str(&value[..=index]).unwrap_or_else(|_| inner.to_string()))
+            };
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Whether a block scalar's lines are folded into one paragraph or kept as is.
@@ -639,6 +685,39 @@ mod tests {
 
     fn catalog(workspace: &Path) -> SkillCatalog {
         SkillCatalog::discover(workspace)
+    }
+
+    /// YAML keeps `#` inside a quoted scalar literal; only an unquoted ` #`
+    /// opens a comment (`description: "fix #42 quickly"` used to truncate).
+    #[test]
+    fn frontmatter_quotes_keep_hash_and_unquoted_comments_do_not() {
+        let mut fields = BTreeMap::new();
+        fill_fields(
+            "---\ndescription: \"fix #42 quickly\"\nname: simple # a comment\n---\n",
+            &mut fields,
+        );
+        assert_eq!(
+            fields.get("description").map(String::as_str),
+            Some("fix #42 quickly")
+        );
+        assert_eq!(fields.get("name").map(String::as_str), Some("simple"));
+    }
+
+    #[test]
+    fn frontmatter_escaped_quotes_do_not_end_a_scalar_early() {
+        let mut fields = BTreeMap::new();
+        fill_fields(
+            "---\ndescription: 'it''s ready #42' # note\ninput-hint: \"say \\\"hello\\\" #42\" # note\n---\n",
+            &mut fields,
+        );
+        assert_eq!(
+            fields.get("description").map(String::as_str),
+            Some("it's ready #42")
+        );
+        assert_eq!(
+            fields.get("input-hint").map(String::as_str),
+            Some("say \"hello\" #42")
+        );
     }
 
     /// The workspace's `.agents/skills` directory is the only root: two layouts,

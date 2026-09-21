@@ -7,6 +7,13 @@ pub(super) struct Edit {
     pub replacements: usize,
 }
 
+/// CRLF and LF spellings describe the same text: every replacement is applied
+/// to the normalized form, and a pair that differs only in line endings must
+/// be rejected before that (it would report success without changing a byte).
+pub(super) fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 pub(super) fn replacement(
     source: &str,
     old: &str,
@@ -15,9 +22,9 @@ pub(super) fn replacement(
     operation: &Operation,
 ) -> ToolResult<Edit> {
     operation.check()?;
-    let normalized = source.replace("\r\n", "\n");
-    let old = old.replace("\r\n", "\n");
-    let new = new.replace("\r\n", "\n");
+    let normalized = normalize_newlines(source);
+    let old = normalize_newlines(old);
+    let new = normalize_newlines(new);
     if old.is_empty() {
         return Err(failed("FS_EDIT_NOT_FOUND: old_string must not be empty"));
     }

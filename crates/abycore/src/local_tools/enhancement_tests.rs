@@ -386,7 +386,7 @@ async fn bash_permission_modes_are_enforced_by_descendant_sandbox() {
     assert!(
         output
             .content
-            .contains("file access denied under read-only mode")
+            .contains("permission error under read-only mode")
     );
     assert!(!blocked.exists());
 

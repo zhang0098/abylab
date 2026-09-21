@@ -1,8 +1,8 @@
 use super::{
     LocalTools, edit, read,
     workspace::{
-        Operation, ToolResult, Workspace, failed, inspect, parse, read_file, read_file_limited,
-        replace, run_filesystem,
+        Operation, ToolResult, Workspace, failed, inspect, parse, read_file_limited, replace,
+        run_filesystem,
     },
 };
 use crate::{Result, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolOutput};
@@ -22,6 +22,11 @@ pub struct WriteTool {
 pub struct EditTool {
     pub(super) workspace: Arc<Workspace>,
 }
+
+/// Built-in ceiling for the whole-file read `edit` performs when the host has
+/// not set `max_file_bytes`. Generous enough for source trees, small enough
+/// that a runaway file cannot exhaust memory.
+const EDIT_MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +91,14 @@ impl EditTool {
     fn input(&self, value: &Value) -> ToolResult<EditInput> {
         let input: EditInput = parse(value)?;
         self.workspace.path(&input.file_path)?;
-        if input.old_string.is_empty() || input.old_string == input.new_string {
+        // CRLF and LF spellings are the same text to the replacement, which
+        // normalizes first; accepting a pair that differs only there would
+        // report "Updated file" without changing a byte.
+        if input.old_string.is_empty()
+            || input.old_string == input.new_string
+            || edit::normalize_newlines(&input.old_string)
+                == edit::normalize_newlines(&input.new_string)
+        {
             return Err(failed(
                 "old_string must be nonempty and differ from new_string",
             ));
@@ -171,7 +183,15 @@ impl Tool for EditTool {
                 let previous = inspect(&workspace.directory, path)?;
                 let key = workspace.absolute(path);
                 operation.session.guard(&key, previous.as_ref(), true)?;
-                let source = read_file(workspace, path, operation)?;
+                // Literal matching needs the whole file in memory. The host's
+                // `max_file_bytes` bounds the read when set; otherwise the
+                // built-in ceiling keeps an arbitrarily large file from
+                // ballooning the process.
+                let cap = workspace
+                    .config
+                    .max_file_bytes
+                    .unwrap_or(EDIT_MAX_FILE_BYTES);
+                let source = read_file_limited(workspace, path, operation, Some(cap))?;
                 let edited = edit::replacement(&source, &input.old_string, &input.new_string, input.replace_all, operation)?;
                 let committed = replace(workspace, path, &edited.content, previous.as_ref(), operation)?;
                 operation.session.observe(key.clone(), Some(committed));

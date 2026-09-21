@@ -176,20 +176,26 @@ fn visual_line_motions_follow_soft_wraps() {
     let mut e = ComposerEditor::new();
     e.insert_str("hello world");
     render(&e, 5);
+    // Rows in the widget's model: "hello" [0,5), " worl" [5,10), "d" [10,11).
     e.set_cursor_char(6); // "w", first char of the wrapped row
     e.line_start(5);
     assert_eq!(e.cursor_char(), 5, "wrap boundary start");
     e.line_end(5);
-    assert_eq!(e.cursor_char(), 5, "upstream affinity at the boundary");
+    assert_eq!(e.cursor_char(), 10, "the wrapped row's end");
+    // That end is the next row's first char in the widget's model, so Home
+    // stays on the row the caret is visibly in.
+    e.line_start(5);
+    assert_eq!(e.cursor_char(), 10, "the boundary is the next row's head");
     e.set_cursor_char(8);
-    e.line_end(5);
-    assert_eq!(e.cursor_char(), 10);
     e.line_start(5);
     assert_eq!(e.cursor_char(), 5, "back to the wrapped row head");
+    e.set_cursor_char(4);
     e.line_start(5);
-    assert_eq!(e.cursor_char(), 0, "and onward to the logical row head");
-    e.line_start(5);
-    assert_eq!(e.cursor_char(), 0, "idempotent");
+    assert_eq!(
+        e.cursor_char(),
+        0,
+        "the upstream row still has its own head"
+    );
 }
 
 #[test]
@@ -450,20 +456,21 @@ fn explicit_range_kills_ignore_an_active_selection() {
     );
 }
 
-/// A ZWJ family emoji is one 2-cell grapheme, not the 6 cells its chars sum
-/// to: the mirror must keep it and the following glyph on the same row.
+/// The widget sums per-`char` widths, so a ZWJ family emoji measures the 6
+/// cells its chars carry — not the 2 a grapheme-aware width reports. The
+/// mirror follows the widget, or every click, Home/End and chip row after the
+/// emoji addresses the wrong cell.
 #[test]
-fn zwj_emoji_is_one_two_cell_grapheme() {
+fn zwj_emoji_measures_like_the_widget() {
     let map = LayoutMap::new(&lines(&["👨‍👩‍👧x"]), 4);
-    assert_eq!(map.row_count(), 1, "cluster + x fit one 4-cell row");
-    assert_eq!(map.rows[0].graphemes.len(), 2);
+    // 👨(2) ZWJ(0) 👩(2) ZWJ(0) 👧(2) = 6 > 4: the cluster stands alone on
+    // row 0, and x wraps to row 1.
+    assert_eq!(map.row_count(), 2, "cluster overflows the row on its own");
+    assert_eq!(map.rows[0].graphemes.len(), 1);
     assert_eq!(
-        map.rows[0].graphemes[0].width, 2,
-        "cluster is one 2-cell glyph"
+        map.rows[0].graphemes[0].width, 6,
+        "char-sum width, like the widget"
     );
     assert_eq!(map.rows[0].graphemes[0].start_col, 0);
-    assert_eq!(
-        map.rows[0].graphemes[1].start_col, 2,
-        "x follows the cluster"
-    );
+    assert_eq!(map.rows[1].graphemes[0].start_col, 0, "x wraps");
 }

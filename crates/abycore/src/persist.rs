@@ -204,9 +204,14 @@ impl SessionStore {
             let legacy = legacy.join(Self::escape_segment(id));
             match fs::File::open(legacy.join("session.jsonl")) {
                 Ok(file) => {
-                    let header = read_header(BufReader::new(file))?;
-                    header.validate(id)?;
-                    if header.validate_workspace(&self.workspace).is_ok() {
+                    // A legacy log that cannot be parsed, or that belongs to
+                    // another id/workspace, is not this session: fall through
+                    // to the new partition instead of failing every lookup
+                    // for this id because of one damaged file.
+                    if let Ok(header) = read_header(BufReader::new(file))
+                        && header.validate(id).is_ok()
+                        && header.validate_workspace(&self.workspace).is_ok()
+                    {
                         return Ok(legacy);
                     }
                 }
@@ -272,6 +277,12 @@ impl SessionStore {
             }
         }
         summaries.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
+        // A legacy partition can hold a second copy of an id the new partition
+        // already owns; `dir_of` resolves such ids to the new copy, so the
+        // listing must not show the shadowed one twice. The newest copy wins
+        // the row.
+        let mut seen = std::collections::HashSet::new();
+        summaries.retain(|summary| seen.insert(summary.id.clone()));
         Ok(summaries)
     }
 
@@ -346,13 +357,20 @@ impl SessionStore {
         SessionWriter::open(dir, header)
     }
 
-    /// Reserve a new session id without replacing an existing committed log.
+    /// Reserve a new session id without replacing an existing checkpoint.
+    /// A header/title-only log has no state to resume; reclaim it under the
+    /// writer lock and start with the new session's header and empty discovery.
     pub fn create_new(&self, id: &str, snapshot: &SessionSnapshot) -> Result<SessionWriter> {
-        let writer = self.create(id, snapshot)?;
-        if writer.len != 0 {
+        let mut writer = self.create(id, snapshot)?;
+        if writer.state.is_some() {
             return Err(invalid(
                 "session already exists; resume it or choose a new id",
             ));
+        }
+        if writer.len != 0 {
+            writer.header =
+                SessionHeader::from_snapshot(id, &self.workspace.to_string_lossy(), snapshot);
+            writer.rewrite(Discovery::default(), None)?;
         }
         Ok(writer)
     }
@@ -608,7 +626,14 @@ impl SessionWriter {
         }
         let mut data = line.as_bytes().to_vec();
         data.push(b'\n');
-        let file = self.log.as_mut().expect("delta append requires the log");
+        // A delta needs the anchor file that `adopt_existing_log` reports as
+        // missing-but-fine (the first commit materializes it). A writer that
+        // lost its log after a rewrite must fail here, not panic.
+        let Some(file) = self.log.as_mut() else {
+            return Err(invalid(
+                "session log is missing; reopen the writer before appending",
+            ));
+        };
         let previous = self.len;
         if let Err(error) = file.write_all(&data).and_then(|_| file.sync_all()) {
             if file
@@ -633,7 +658,10 @@ impl SessionWriter {
     }
 
     /// Materialize a title update. With committed state the rewrite re-anchors
-    /// it: accumulated deltas fold into the new anchor and the title stays.
+    /// it: accumulated deltas fold into the new anchor, the title stays, and
+    /// the writer keeps the baseline it just wrote — dropping it here would
+    /// make a second title (before any checkpoint) rewrite header + title
+    /// alone and delete the log's only snapshot.
     fn commit_title(&mut self, discovery: &Discovery) -> Result<()> {
         if self.poisoned {
             return Err(invalid(
@@ -641,10 +669,13 @@ impl SessionWriter {
             ));
         }
         let anchor = self.state.as_ref().map(|state| {
-            serde_json::json!({"type":"snapshot", "seq":state.run_sequence, "time":now_ms(), "snapshot":state})
-                .to_string()
+            (
+                serde_json::json!({"type":"snapshot", "seq":state.run_sequence, "time":now_ms(), "snapshot":state})
+                    .to_string(),
+                self.state.clone(),
+            )
         });
-        self.rewrite(discovery.clone(), anchor.map(|anchor| (anchor, None)))
+        self.rewrite(discovery.clone(), anchor)
     }
 
     /// Rewrite the log to a full anchor from the given snapshot.

@@ -56,8 +56,8 @@ pub struct AtToken {
 ///   never trigger.
 /// - The caret must be on or inside the token (`start <= col <= end`);
 ///   `@` alone (empty query) is a valid token.
-/// - `@"…"` spans to the closing quote; `@` chars inside quoted regions
-///   are not separate tokens.
+/// - `@"…"` spans through the closing quote (to the line end when
+///   unterminated); `@` chars inside quoted regions are not separate tokens.
 pub fn active_at_token(line: &str, cursor_col: usize) -> Option<AtToken> {
     let chars: Vec<char> = line.chars().collect();
     let mut found: Option<AtToken> = None;
@@ -70,7 +70,14 @@ pub fn active_at_token(line: &str, cursor_col: usize) -> Option<AtToken> {
                 let body = i + 1 + usize::from(quoted);
                 let (end, query) = if quoted {
                     match chars[body..].iter().position(|&c| c == '"') {
-                        Some(off) => (body + off, chars[body..body + off].iter().collect()),
+                        Some(off) => (
+                            // The closing quote belongs to the token: the span
+                            // replaced on settle must include it, or the
+                            // mention's own closing quote lands beside the
+                            // original one (`@"my file.txt""`).
+                            body + off + 1,
+                            chars[body..body + off].iter().collect(),
+                        ),
                         None => (chars.len(), chars[body..].iter().collect()),
                     }
                 } else {

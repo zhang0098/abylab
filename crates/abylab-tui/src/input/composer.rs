@@ -13,7 +13,7 @@
 
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 /// Tab stops, matching the widget's default `tab_length`.
 const TAB_LEN: u8 = 4;
@@ -53,14 +53,12 @@ pub struct LayoutMap {
 /// Display width of one grapheme starting at display column `col`
 /// (tab advances to the next stop; control chars have no width).
 ///
-/// The cluster is measured as a whole: ZWJ/modifier/variation-selector
-/// sequences render as a single 2-cell glyph, so summing their `char` widths
-/// (6 cells for a family emoji) would desynchronize this mirror from the
-/// widget's own grapheme-based wrap.
+/// Measured per `char`, exactly like the widget's own wrap
+/// (`ratatui-textarea`'s `display_width_to` sums `char` widths). A grapheme
+/// measured as a cluster would disagree with the rendered rows for ZWJ and
+/// variation-selector sequences — "👨‍👩‍👧" is 6 cells to the widget, not 2 —
+/// and every click, Home/End and chip placement after it would be off.
 fn grapheme_width(grapheme: &str, col: usize) -> usize {
-    if !grapheme.contains('\t') {
-        return UnicodeWidthStr::width(grapheme);
-    }
     let mut width = 0usize;
     for c in grapheme.chars() {
         if c == '\t' {
@@ -627,18 +625,21 @@ impl ComposerEditor {
         (sc.row, sc.col)
     }
 
-    /// The mirrored screen row the cursor sits in: the *upstream* row at
-    /// a soft-wrap boundary (the boundary character belongs to the next
-    /// row in the widget's model, but the caret stays on this row's end),
-    /// matching the old editor's wrap-end affinity. Independent of the
-    /// widget's render state — the layout mirror drives it.
+    /// The mirrored screen row the cursor sits in, matching the widget's own
+    /// screen map: a soft-wrap boundary character belongs to the next row
+    /// (`start_col <= c < end_col`), while a logical line's last row owns its
+    /// end (the caret at EOL is inclusive). Independent of the widget's
+    /// render state — the layout mirror drives it.
     fn cursor_screen_row(&mut self, wrap_width: usize) -> Option<usize> {
         let c = self.cursor_char();
         let layout = self.layout(wrap_width);
-        layout
-            .rows
-            .iter()
-            .position(|r| r.start_char <= c && c <= r.end_char)
+        let rows = &layout.rows;
+        rows.iter().enumerate().position(|(index, row)| {
+            row.start_char <= c
+                && (c < row.end_char
+                    || (c == row.end_char
+                        && rows.get(index + 1).is_none_or(|next| next.line != row.line)))
+        })
     }
 
     /// Move to the beginning of the current rendered row (soft wrap or

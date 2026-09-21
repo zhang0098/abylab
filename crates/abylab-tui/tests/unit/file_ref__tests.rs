@@ -101,7 +101,7 @@ fn quoted_token_allows_spaces() {
     let t = active_at_token("@\"my file.txt\"", 13).expect("token");
     assert!(t.quoted);
     assert_eq!(t.query, "my file.txt");
-    assert_eq!(t.end, 13);
+    assert_eq!(t.end, 14, "the closing quote is part of the token");
 }
 
 #[test]

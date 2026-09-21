@@ -261,8 +261,15 @@ pub(super) struct Operation {
     pub session: Arc<LocalSession>,
 }
 impl Operation {
+    /// Whether cancellation or the deadline has already fired. Callers that
+    /// cannot return a `ToolError` (the grep reader wrapper) use this to abort
+    /// the work they are inside instead of letting it outlive the call.
+    pub fn interrupted(&self) -> bool {
+        self.cancellation.is_cancelled() || Instant::now() >= self.deadline
+    }
+
     pub fn check(&self) -> ToolResult<()> {
-        if self.cancellation.is_cancelled() || Instant::now() >= self.deadline {
+        if self.interrupted() {
             return Err(ToolError::Uncertain(
                 "local operation interrupted; verify any filesystem changes before continuing"
                     .into(),
@@ -355,14 +362,6 @@ pub(super) fn open_file(workspace: &Workspace, path: &Path) -> ToolResult<(File,
     Ok((file, metadata))
 }
 
-pub(super) fn read_file(
-    workspace: &Workspace,
-    path: &Path,
-    operation: &Operation,
-) -> ToolResult<String> {
-    read_file_limited(workspace, path, operation, None)
-}
-
 pub(super) fn read_file_limited(
     workspace: &Workspace,
     path: &Path,
@@ -382,7 +381,7 @@ pub(super) fn read_file_limited(
         }
         workspace.check_size(bytes.len().saturating_add(count))?;
         if limit.is_some_and(|limit| bytes.len().saturating_add(count) >= limit) {
-            return Err(failed("file exceeds the optional diff basis limit"));
+            return Err(failed("file exceeds the configured size limit"));
         }
         bytes.extend_from_slice(&buffer[..count]);
     }
