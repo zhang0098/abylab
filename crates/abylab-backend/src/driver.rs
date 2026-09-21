@@ -1082,15 +1082,29 @@ async fn drive(
                 // Context pressure is handled by the agent itself at every
                 // request boundary (`AgentHooks::view_request`), so it applies
                 // inside a turn too; nothing to do before shipping the prompt.
-                match turn(agent, Some(text), &mut ctx, true).await {
-                    Ok(outcome) => {
-                        if goal_armed && outcome.stop_reason == StopReason::Completed {
-                            drive_goal_rounds(agent, &mut ctx, &ctl).await;
-                            goal_armed = goal_armed
-                                && agent.goal().is_some_and(abycore::Goal::may_start_round);
+                // An armed goal can continue immediately after this prompt.
+                // Keep the UI busy until those rounds settle, so its queued
+                // prompts cannot be dispatched between the two turns.
+                let goal_continues = goal_armed;
+                match turn(agent, Some(text), &mut ctx, !goal_continues).await {
+                    Ok(outcome)
+                        if goal_continues && outcome.stop_reason == StopReason::Completed =>
+                    {
+                        drive_goal_rounds(agent, &mut ctx, &ctl).await;
+                        goal_armed =
+                            goal_armed && agent.goal().is_some_and(abycore::Goal::may_start_round);
+                    }
+                    Ok(_) => {
+                        if goal_continues {
+                            emit_idle_status(&ctx);
                         }
                     }
-                    Err(err) => report_turn_err(&ctl, &err, limits),
+                    Err(err) => {
+                        if goal_continues {
+                            emit_idle_status(&ctx);
+                        }
+                        report_turn_err(&ctl, &err, limits);
+                    }
                 }
             }
         }
@@ -1553,17 +1567,10 @@ async fn drive_goal_rounds(
     ctx: &mut TurnCtx<'_>,
     ctl: &impl Fn(CtlEvent),
 ) {
-    let spent = run_goal_rounds(agent, ctx, ctl).await;
-    if spent {
-        // The rounds suppressed their per-turn idle status; the sequence
-        // emits the single one the UI waits for.
-        (ctx.sink)(Event::Ui(UiEvent::SessionStatus {
-            session: ctx.session.into(),
-            running: false,
-        }));
-    }
+    run_goal_rounds(agent, ctx, ctl).await;
     if let Err(error) = agent.save() {
         ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
+        emit_idle_status(ctx);
         return;
     }
     // One settled state after the loop, whatever stopped it: the transcript's
@@ -1575,21 +1582,25 @@ async fn drive_goal_rounds(
             goal.summary()
         )));
     }
+    // The rounds suppressed their per-turn idle status; emit it once after
+    // the sequence and final save, even if no round was needed.
+    emit_idle_status(ctx);
 }
 
-async fn run_goal_rounds(
-    agent: &mut SessionAgent,
-    ctx: &mut TurnCtx<'_>,
-    ctl: &impl Fn(CtlEvent),
-) -> bool {
-    // Whether any round ran: the caller emits the idle status only then.
-    let mut spent = false;
+fn emit_idle_status(ctx: &TurnCtx<'_>) {
+    (ctx.sink)(Event::Ui(UiEvent::SessionStatus {
+        session: ctx.session.into(),
+        running: false,
+    }));
+}
+
+async fn run_goal_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &impl Fn(CtlEvent)) {
     loop {
         let Some(goal) = agent.goal() else {
-            return spent;
+            return;
         };
         if goal.status != abycore::GoalStatus::Active {
-            return spent;
+            return;
         }
         if goal.remaining_rounds() == 0 {
             let _ = agent.update_goal(
@@ -1598,21 +1609,20 @@ async fn run_goal_rounds(
             );
             if let Err(error) = agent.save() {
                 ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
-                return spent;
+                return;
             }
             ctl(CtlEvent::TuiOpFailed(
                 "goal rounds exhausted — marked blocked / 目标轮次用尽，已标记 blocked".into(),
             ));
-            return spent;
+            return;
         }
         let Some(goal) = agent.begin_goal_round().ok().flatten() else {
-            return spent;
+            return;
         };
         if let Err(error) = agent.save() {
             ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
-            return spent;
+            return;
         }
-        spent = true;
         ctl(CtlEvent::TuiOpDone(format!(
             "goal round {}/{} — {} / 目标第 {}/{} 轮",
             goal.rounds_started,
@@ -1627,10 +1637,10 @@ async fn run_goal_rounds(
         );
         match turn(agent, Some(prompt), ctx, false).await {
             Ok(outcome) if outcome.stop_reason == StopReason::Completed => {}
-            Ok(_) => return spent,
+            Ok(_) => return,
             Err(err) => {
                 report_turn_err(ctl, &err, ctx.limits);
-                return spent;
+                return;
             }
         }
     }

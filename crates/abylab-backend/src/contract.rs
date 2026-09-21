@@ -389,7 +389,7 @@ pub fn persisted_session_id(
     let store = (SessionStore::at(sessions_root, workspace).ok())?;
     // A log can hold a header and a title with no checkpoint yet (a crash
     // between `set_title` and the first `append_checkpoint`): resuming it
-    // fails and wedges startup, while `create_new` repairs it. Only a
+    // fails, while `create_new` can reclaim it under the writer lock. Only a
     // committed, loadable snapshot resumes.
     store.load(session_id).ok()?;
     Some(session_id.to_string())

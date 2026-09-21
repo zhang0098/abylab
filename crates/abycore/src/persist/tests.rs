@@ -52,6 +52,32 @@ fn lazy_materialization_and_load_roundtrip() {
 }
 
 #[test]
+fn a_new_session_reclaims_a_log_without_a_checkpoint() {
+    let workspace = temp_workspace("uncheckpointed-restart");
+    let store = SessionStore::new(&workspace).unwrap();
+    let mut abandoned = store.create_new("s", &store_snapshot("old")).unwrap();
+    store.set_title(&mut abandoned, "old title").unwrap();
+    drop(abandoned);
+    assert!(store.load("s").is_err(), "the abandoned log cannot resume");
+
+    let mut fresh = store_snapshot("new");
+    fresh.model.model = "deepseek-reasoner".into();
+    let mut writer = store.create_new("s", &fresh).unwrap();
+    assert!(writer.title().is_none(), "the abandoned title was cleared");
+    store.append_checkpoint(&mut writer, 0, &fresh).unwrap();
+    drop(writer);
+
+    let (header, loaded) = store.load("s").unwrap();
+    assert_eq!(header.model, "deepseek-reasoner");
+    assert_eq!(loaded.items[0], Item::user("new"));
+    assert_eq!(store.list().unwrap()[0].title, None);
+    assert!(
+        store.create_new("s", &fresh).is_err(),
+        "a checkpoint is never replaced"
+    );
+}
+
+#[test]
 fn torn_tail_is_dropped_on_load() {
     let workspace = temp_workspace("torn");
     let store = SessionStore::new(&workspace).unwrap();

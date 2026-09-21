@@ -357,13 +357,20 @@ impl SessionStore {
         SessionWriter::open(dir, header)
     }
 
-    /// Reserve a new session id without replacing an existing committed log.
+    /// Reserve a new session id without replacing an existing checkpoint.
+    /// A header/title-only log has no state to resume; reclaim it under the
+    /// writer lock and start with the new session's header and empty discovery.
     pub fn create_new(&self, id: &str, snapshot: &SessionSnapshot) -> Result<SessionWriter> {
-        let writer = self.create(id, snapshot)?;
-        if writer.len != 0 {
+        let mut writer = self.create(id, snapshot)?;
+        if writer.state.is_some() {
             return Err(invalid(
                 "session already exists; resume it or choose a new id",
             ));
+        }
+        if writer.len != 0 {
+            writer.header =
+                SessionHeader::from_snapshot(id, &self.workspace.to_string_lossy(), snapshot);
+            writer.rewrite(Discovery::default(), None)?;
         }
         Ok(writer)
     }
