@@ -45,6 +45,25 @@ pub fn permission_ask_default_sel(options: &[PermissionAskOption]) -> usize {
         .unwrap_or(0)
 }
 
+/// One change to a queued row, as the queue list's gestures express it.
+#[derive(Debug, Clone)]
+pub enum QueueAction {
+    /// `ctrl+d`: the row leaves the queue (and its echo leaves the timeline).
+    Remove,
+    /// The `⌥↑` editor saved new text for the row.
+    Edit(String),
+}
+
+/// One row of the session's host-owned queue, as the driver publishes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueRow {
+    pub item_id: u64,
+    pub text: String,
+    /// `true` while the running turn has the message and has not appended it
+    /// yet (the composer paints those as pending steering).
+    pub steering: bool,
+}
+
 /// Controller → UI status updates.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // message_id: protocol fidelity; surfaced in debug logs only
@@ -58,6 +77,13 @@ pub enum CtlEvent {
     /// A Send Now request settled. Rejected concurrent prompts degrade to
     /// the client FIFO without changing the active turn lifecycle.
     SteerSettled { message_id: u64, deferred: bool },
+    /// The session's queue, after every change and once when a session binds.
+    /// The rows are the driver's; the client renders them.
+    Queue { items: Vec<QueueRow> },
+    /// One row left the queue because the driver delivered it.
+    QueueClaimed { item_id: u64 },
+    /// One row left the queue without being delivered.
+    QueueRemoved { item_id: u64 },
     /// The agent appended steered messages at a step boundary: their pending
     /// rows are ordinary parts of the conversation from here on.
     SteerAdmitted { message_ids: Vec<u64> },
@@ -156,6 +182,21 @@ pub enum Cmd {
         session_id: String,
         text: String,
     },
+    /// Queue one message in the session's host-owned FIFO. The driver owns
+    /// delivery order: the item ships when the turn in flight ends, or right
+    /// away when none is running. `item_id` names the optimistic echo the
+    /// driver settles with `CtlEvent::QueueClaimed` / `QueueRemoved`.
+    Queue {
+        session_id: String,
+        item_id: u64,
+        text: String,
+    },
+    /// Change one queued row (remove it, or save edited text).
+    UpdateQueue {
+        session_id: String,
+        item_id: u64,
+        action: QueueAction,
+    },
     /// Send Now: hand this text to the turn that is running, at its next step
     /// boundary, without cancelling it. With no running turn it is admitted as
     /// the next one — never a failure. `message_id` names the optimistic echo
@@ -164,18 +205,6 @@ pub enum Cmd {
         session_id: String,
         message_id: u64,
         text: String,
-    },
-    /// Send a prompt whose text and images stay in draft order (图文交替).
-    PromptImages {
-        session_id: String,
-        blocks: Vec<PromptBlock>,
-    },
-    /// Image-capable form of [`Cmd::Steer`]. The in-process transport composes
-    /// the text blocks; the chips stay the composer's own echo.
-    SteerImages {
-        session_id: String,
-        message_id: u64,
-        blocks: Vec<PromptBlock>,
     },
     /// Interrupt the active turn over ACP.
     Interrupt {

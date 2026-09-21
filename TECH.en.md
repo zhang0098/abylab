@@ -230,25 +230,41 @@ A steer **cancels nothing**:
   Without a running turn the head goes out as an ordinary prompt and the rest
   stay queued.
 
-A steer has three visible states on the timeline: the bubble first carries a
-`steering` marker, the inbox drain that spends it fires a checkpoint, and the
-driver reports `SteerAdmitted`, which clears the marker; a rejected or late
-steer goes back to `queued` instead.
+A steer is visible in three states: the bubble carries a `steering` marker from
+ctrl+enter, the inbox drain that spends it fires a checkpoint, and the driver
+reports `SteerAdmitted`, which clears the marker; a rejected or late steer goes
+back to `queued`. Messages the turn has not taken yet are painted as a tail
+section (`⏳ N steering`) — harness's pending-steering rows: they belong after
+the live output, not in the middle of the step they are about to interrupt, and
+they drop back into their chronological slot once the agent takes them.
 
-Queueing stays a client behavior: items live in the TUI's FIFO (queued tint,
-`⌥↑` to edit, steer or delete a row — enter edits, ctrl+enter steers the
-highlighted one, ctrl+d deletes, matching harness's QueueDock row actions) and
-ship in order when the turn ends and the session goes idle.
+## The queue
 
-Because the queue is the client's, it is also the one thing a crash would drop:
-the session snapshot is durable, the unsent prompts behind it were not. Every
-queue mutation now writes `$ABYLAB_HOME/queued/<session>.json` (one file per
-session, image payloads included; a drained queue removes its file), a start or `/resume` onto that session paints the
-items back as queued bubbles, and they are **held**: they were queued behind a
-turn that no longer exists, and spending them unbidden is not the app's call.
-The next real turn end (or an explicit enter/ctrl+enter) releases them in FIFO
-order. A missing, malformed or deleted file is just an empty queue, exactly like
-`settings.json`.
+The queue lives in the **driver**, not in a client: `drive` owns a
+`VecDeque<QueuedItem>` and publishes the whole list through `CtlEvent::Queue`
+on every change, so every client (the TUI today, a second process or a web UI
+later) renders the same FIFO. Each row carries a `placement`: `Queued` (waiting
+for the turn in flight to end) or `Steering` (the running turn already has it).
+
+- Delivery order is decided in `next_command`: pending **commands first** (a
+  removal, an edit, a new steer), then rows the turn took (`settle_taken`), and
+  only then is the head shipped as the next prompt. A removal can therefore
+  never lose a race with the boundary that drains the row it changes.
+- Steering rides its own channel (`DriverHandle::steer`): it is the only one a
+  *running* turn reads, taking the message at its next step boundary, while
+  queue commands are read at the idle wait. Clients no longer have to guess
+  whether the agent is busy: the `⌥↑` list's enter / ctrl+enter / ctrl+d just
+  send commands.
+- Taken ids stay in a tombstone set: a client's "queue it, then steer it" pair
+  can be in flight at once, and the late queue command must not turn a delivered
+  row back into a queued one.
+- The queue is process memory while the session snapshot is durable, so every
+  mutation writes `$ABYLAB_HOME/queued/<session>.json` (one file per session,
+  removed when the queue drains). A start or `/resume` reads it back as `held`
+  rows: they were queued behind a turn that no longer exists, so they are not
+  spent unbidden — the first turn this process actually runs releases them, and
+  they ship in FIFO order after it. A missing, malformed or differently shaped
+  file is just an empty queue, exactly like `settings.json`.
 
 ## Packaging and releases
 

@@ -8,6 +8,7 @@
 //! while read-only queries (`/resume`'s listing, `/model`'s catalog) ride a
 //! third channel served off the loop — a running turn never holds a picker.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
-    PlanStatus, SteerRequest, TurnLimits, UiEvent,
+    PlanStatus, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits, UiEvent,
 };
 
 const SERVER_LABEL: &str = "abycore · deepseek-responses";
@@ -154,6 +155,51 @@ impl OutstandingSteers {
             .drain(..)
             .collect()
     }
+
+    fn contains(&self, message_id: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&message_id)
+    }
+
+    /// Remember an id without ever draining it (the tombstone set): the oldest
+    /// entries fall off, so a long session cannot grow forever.
+    fn remember(&self, message_id: u64) {
+        const TOMBSTONES: usize = 4096;
+        let mut ids = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if ids.len() >= TOMBSTONES {
+            ids.pop_front();
+        }
+        ids.push_back(message_id);
+    }
+}
+
+/// One item of the session's host-owned FIFO.
+///
+/// The queue lives in the driver — not in the client — so that delivery order
+/// survives a client, and so that every client renders the same rows
+/// ([`CtlEvent::Queue`]). deepseek-harness keeps the same list in its host
+/// inbox; this is that list, with the wire form the driver will send.
+struct QueuedItem {
+    item_id: u64,
+    text: String,
+    placement: QueuePlacement,
+    /// Restored from disk: it waits for a turn this process actually ran,
+    /// because the turn it was queued behind no longer exists.
+    held: bool,
+}
+
+/// The wire rows for one publish.
+fn queue_rows(queue: &VecDeque<QueuedItem>) -> Vec<QueueRow> {
+    queue
+        .iter()
+        .map(|item| QueueRow {
+            item_id: item.item_id,
+            text: item.text.clone(),
+            placement: item.placement,
+        })
+        .collect()
 }
 
 /// What a freshly built agent needs from the host: where its events go, and how
@@ -517,6 +563,68 @@ impl AgentHooks for UiHooks {
     }
 }
 
+/// Ids for items the driver restored itself. Clients mint theirs from 1 and
+/// count up, so restored rows live far above that range and can never shadow a
+/// live row's echo.
+const RESTORED_ITEM_ID_BASE: u64 = 1 << 48;
+
+fn next_queue_item_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(RESTORED_ITEM_ID_BASE);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Write the session's FIFO down, so a crash does not swallow prompts the user
+/// already sent — the same promise the client used to keep itself.
+fn persist_queue(cfg: &DriverConfig, session: &str, queue: &VecDeque<QueuedItem>) {
+    let home = cfg.home.as_deref().unwrap_or_default();
+    if home.is_empty() {
+        return;
+    }
+    let texts: Vec<String> = queue.iter().map(|item| item.text.clone()).collect();
+    crate::queue_store::save(home, session, &texts);
+}
+
+/// Publish the whole queue, the way every client renders it.
+fn publish_queue(queue: &VecDeque<QueuedItem>, session: &str, ctl: &impl Fn(CtlEvent)) {
+    ctl(CtlEvent::Queue {
+        session_id: session.to_string(),
+        items: queue_rows(queue),
+    });
+}
+
+/// Drop queue items the running turn has taken, and tell the clients.
+fn settle_taken(
+    queue: &mut VecDeque<QueuedItem>,
+    taken: &OutstandingSteers,
+    cfg: &DriverConfig,
+    session: &str,
+    ctl: &impl Fn(CtlEvent),
+) {
+    let ids = taken.take();
+    if ids.is_empty() {
+        return;
+    }
+    let before = queue.len();
+    queue.retain(|item| !ids.contains(&item.item_id));
+    if queue.len() == before {
+        return;
+    }
+    persist_queue(cfg, session, queue);
+    publish_queue(queue, session, ctl);
+}
+
+/// Take the first item a turn may be started with: the queue drains in order, a
+/// restored item waits until this process has run a turn, and an item the
+/// running turn already took (a steer whose queue command was still in flight)
+/// is skipped instead of being delivered twice.
+fn claim_queued(queue: &mut VecDeque<QueuedItem>, taken: &OutstandingSteers) -> Option<QueuedItem> {
+    let index = queue
+        .iter()
+        .position(|item| !item.held && !taken.contains(item.item_id))?;
+    queue.remove(index)
+}
+
 /// The driver's idle wait: commands first, then steers.
 ///
 /// A steer is not a command — it belongs to the turn that is already running,
@@ -524,18 +632,47 @@ impl AgentHooks for UiHooks {
 /// that reaches this wait therefore arrived with no running turn: it becomes a
 /// [`Cmd::SteerForSession`], which the loop admits as the next turn (the
 /// harness turns a steer that missed its window into the next waking turn).
+#[allow(clippy::too_many_arguments)] // the queue's owners live in drive's scope
 async fn next_command(
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     steer_rx: &mut mpsc::UnboundedReceiver<SteerRequest>,
+    queue: &mut VecDeque<QueuedItem>,
+    taken: &OutstandingSteers,
+    cfg: &DriverConfig,
+    session: &str,
+    ctl: &impl Fn(CtlEvent),
 ) -> Option<Cmd> {
+    // Commands first: a removal or an edit that is already waiting must be
+    // applied to the queue before the boundary that drains it, or the item it
+    // changes could ship ahead of the change.
+    match cmd_rx.try_recv() {
+        Ok(cmd) => return Some(cmd),
+        Err(mpsc::error::TryRecvError::Disconnected) => return None,
+        Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+    // Steers the running turn took leave the FIFO before it drains.
+    settle_taken(queue, taken, cfg, session, ctl);
+    if let Some(item) = claim_queued(queue, taken) {
+        ctl(CtlEvent::QueueClaimed {
+            item_id: item.item_id,
+        });
+        persist_queue(cfg, session, queue);
+        publish_queue(queue, session, ctl);
+        return Some(Cmd::Prompt { text: item.text });
+    }
     tokio::select! {
         biased;
         cmd = cmd_rx.recv() => cmd,
-        request = steer_rx.recv() => request.map(|request| Cmd::SteerForSession {
-            session_id: request.session_id,
-            message_id: request.message_id,
-            text: request.text,
-        }),
+        request = steer_rx.recv() => {
+            // No turn is running (this is the idle wait), so a steer is
+            // admitted as the next turn: the harness's best-effort contract,
+            // and the reason a steer never fails.
+            request.map(|request| Cmd::SteerForSession {
+                session_id: request.session_id,
+                message_id: request.message_id,
+                text: request.text,
+            })
+        }
     }
 }
 
@@ -564,6 +701,9 @@ async fn drive(
     }
     // Steers the running turn has taken but not spent (see OutstandingSteers).
     let admitted: Arc<OutstandingSteers> = Arc::default();
+    // Queue items the running turn has taken: they left the FIFO, and the
+    // clients hear about it through the next snapshot.
+    let taken: Arc<OutstandingSteers> = Arc::default();
     let host = HostPolicy {
         sink: Arc::clone(&sink),
         compaction,
@@ -734,7 +874,34 @@ async fn drive(
     }
     emit_permission_facts(&sink, &active_session, permission_mode);
 
-    while let Some(cmd) = next_command(&mut cmd_rx, &mut steer_rx).await {
+    // The session's FIFO, restored from disk. The items wait for a turn this
+    // process actually runs before they are spent: the turn they were queued
+    // behind belongs to a dead process, and spending them unbidden is not the
+    // driver's call.
+    let mut queue: VecDeque<QueuedItem> = crate::queue_store::load(&cfg, &active_session)
+        .into_iter()
+        .map(|text| QueuedItem {
+            item_id: next_queue_item_id(),
+            text,
+            placement: QueuePlacement::Queued,
+            held: true,
+        })
+        .collect();
+    if !queue.is_empty() {
+        publish_queue(&queue, &active_session, &ctl);
+    }
+
+    while let Some(cmd) = next_command(
+        &mut cmd_rx,
+        &mut steer_rx,
+        &mut queue,
+        &taken,
+        &cfg,
+        &active_session,
+        &ctl,
+    )
+    .await
+    {
         let cmd = match cmd {
             Cmd::PromptForSession { session_id, text } => {
                 if session_id != active_session {
@@ -765,6 +932,17 @@ async fn drive(
                     });
                     continue;
                 }
+                // It may have been a queue row: it is being delivered now, and
+                // the row must leave the FIFO.
+                if let Some(index) = queue.iter().position(|item| item.item_id == message_id) {
+                    queue.remove(index);
+                    taken.remember(message_id);
+                    ctl(CtlEvent::QueueClaimed {
+                        item_id: message_id,
+                    });
+                    persist_queue(&cfg, &active_session, &queue);
+                    publish_queue(&queue, &active_session, &ctl);
+                }
                 (Cmd::Prompt { text }, Some(message_id))
             }
             cmd => (cmd, None),
@@ -794,6 +972,7 @@ async fn drive(
                     steer: agent.steer_handle(),
                     skills: &skills,
                     admitted: &admitted,
+                    taken: &taken,
                     limits,
                     compaction,
                 };
@@ -1020,6 +1199,23 @@ async fn drive(
                         active_session = id;
                         resume_target = restoring.then(|| active_session.clone());
                         goal_armed = false;
+                        // The queue belongs to a session. The old one's items are
+                        // already written down (every mutation persists); this
+                        // session's own saved queue comes back as held items.
+                        queue.clear();
+                        taken.take();
+                        admitted.take();
+                        queue.extend(
+                            crate::queue_store::load(&cfg, &active_session)
+                                .into_iter()
+                                .map(|text| QueuedItem {
+                                    item_id: next_queue_item_id(),
+                                    text,
+                                    placement: QueuePlacement::Queued,
+                                    held: true,
+                                }),
+                        );
+                        publish_queue(&queue, &active_session, &ctl);
                         bind_session(
                             agent.as_ref().unwrap(),
                             &active_session,
@@ -1171,6 +1367,67 @@ async fn drive(
                     ));
                 }
             }
+            Cmd::QueueForSession {
+                session_id,
+                item_id,
+                text,
+            } => {
+                if session_id != active_session || text.trim().is_empty() {
+                    // The session moved on, or there is nothing to send: the
+                    // client's optimistic row goes away instead of lying.
+                    ctl(CtlEvent::QueueRemoved { item_id });
+                    continue;
+                }
+                if taken.contains(item_id) || admitted.contains(item_id) {
+                    // The running turn already took this id (the client queued
+                    // and steered it in the same breath): it is being delivered,
+                    // so say that instead of queueing a duplicate.
+                    ctl(CtlEvent::QueueClaimed { item_id });
+                    continue;
+                }
+                queue.push_back(QueuedItem {
+                    item_id,
+                    text,
+                    placement: QueuePlacement::Queued,
+                    held: false,
+                });
+                persist_queue(&cfg, &active_session, &queue);
+                publish_queue(&queue, &active_session, &ctl);
+            }
+            Cmd::UpdateQueue {
+                session_id,
+                item_id,
+                action,
+            } => {
+                if session_id != active_session {
+                    ctl(CtlEvent::QueueRemoved { item_id });
+                    continue;
+                }
+                match action {
+                    QueueAction::Remove => {
+                        if let Some(index) = queue.iter().position(|item| item.item_id == item_id) {
+                            queue.remove(index);
+                        }
+                        ctl(CtlEvent::QueueRemoved { item_id });
+                    }
+                    QueueAction::Edit(text) => {
+                        match queue.iter().position(|item| item.item_id == item_id) {
+                            Some(index) if text.trim().is_empty() => {
+                                queue.remove(index);
+                                ctl(CtlEvent::QueueRemoved { item_id });
+                            }
+                            Some(index) => {
+                                queue[index].text = text;
+                            }
+                            // Already delivered or removed: the client's row is
+                            // stale, and saying so is cheaper than resurrecting it.
+                            None => ctl(CtlEvent::QueueRemoved { item_id }),
+                        }
+                    }
+                }
+                persist_queue(&cfg, &active_session, &queue);
+                publish_queue(&queue, &active_session, &ctl);
+            }
             Cmd::Prompt { text } => {
                 let Some(agent) = agent.as_mut() else {
                     // A steer that cannot start a turn stays the client's queue
@@ -1207,6 +1464,7 @@ async fn drive(
                     steer: agent.steer_handle(),
                     skills: &skills,
                     admitted: &admitted,
+                    taken: &taken,
                     limits,
                     compaction,
                 };
@@ -1236,6 +1494,14 @@ async fn drive(
                         }
                         report_turn_err(&ctl, &err, limits);
                     }
+                }
+                // This process has run a turn: restored items are no longer
+                // waiting for one, so the next drain may spend them.
+                if queue.iter().any(|item| item.held) {
+                    for item in queue.iter_mut() {
+                        item.held = false;
+                    }
+                    persist_queue(&cfg, &active_session, &queue);
                 }
             }
         }
@@ -1991,6 +2257,9 @@ struct TurnCtx<'a> {
     skills: &'a Arc<abycore::SkillCatalog>,
     /// Steers taken but not yet spent, so the next inbox drain can report them.
     admitted: &'a Arc<OutstandingSteers>,
+    /// Ids the running turn took out of the host queue; the driver removes them
+    /// from the FIFO when control comes back to it.
+    taken: &'a Arc<OutstandingSteers>,
     limits: TurnLimits,
     /// Host compaction policy for overflow recovery inside a turn.
     compaction: Option<CompactionConfig>,
@@ -2082,8 +2351,13 @@ fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
     let deferred = match ctx.steer.send(text) {
         Ok(()) => {
             ctx.admitted.push(request.message_id);
+            // It is not a queued item any more: the running turn owns it now.
+            // The id is remembered (never consumed) so a queue command that is
+            // still in flight cannot put the row back.
+            ctx.taken.remember(request.message_id);
             false
         }
+
         Err(error) => {
             (ctx.sink)(Event::Ctl(CtlEvent::TuiOpFailed(format!(
                 "send now failed: {error} / 立即发送失败：{error}"
@@ -3570,11 +3844,13 @@ mod tests {
     }
 
     fn steer_test_config(workspace: &std::path::Path, base_url: &str) -> DriverConfig {
+        // The workspace doubles as the aby home: the durable queue writes under
+        // it, and the scratch directory is removed by each test.
         DriverConfig {
             session_id: "steer-test".into(),
             resume: None,
             sessions_root: None,
-            home: None,
+            home: Some(workspace.to_string_lossy().into_owned()),
             workspace: workspace.to_string_lossy().into_owned(),
             model: "deepseek-flash".into(),
             reasoning: "off".into(),
@@ -3629,6 +3905,464 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The queue lives in the driver: an item queued while a turn runs ships
+    /// after that turn, through the same prompt path, and the clients hear the
+    /// whole story (snapshot, claim).
+    #[tokio::test]
+    async fn a_queued_item_ships_after_the_running_turn() {
+        let workspace = scratch_dir("host-queue-drain");
+        let provider = FakeProvider::start(
+            vec!["first answer", "queued answer"],
+            Duration::from_millis(400),
+        )
+        .await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::PromptForSession {
+                session_id: "steer-test".into(),
+                text: "start".into(),
+            })
+            .expect("queue prompt");
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            cmd_tx
+                .send(Cmd::QueueForSession {
+                    session_id: "steer-test".into(),
+                    item_id: 7,
+                    text: "queued next".into(),
+                })
+                .expect("queue follow-up");
+            provider.served(2).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let bodies = provider.bodies();
+        assert_eq!(bodies.len(), 2, "the queued item got its own turn");
+        let second = body_texts(&bodies[1]);
+        assert!(second.contains(&"queued next".to_string()), "{second:?}");
+        assert!(second.contains(&"first answer".to_string()), "{second:?}");
+
+        let snapshots: Vec<Vec<QueueRow>> = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ctl(CtlEvent::Queue { items, .. }) => Some(items.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            snapshots.iter().any(|items| items.len() == 1
+                && items[0].item_id == 7
+                && items[0].placement == QueuePlacement::Queued
+                && items[0].text == "queued next"),
+            "the client saw the row: {snapshots:?}"
+        );
+        assert!(
+            snapshots.last().is_some_and(Vec::is_empty),
+            "and saw it leave: {snapshots:?}"
+        );
+        let claimed: Vec<u64> = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ctl(CtlEvent::QueueClaimed { item_id }) => Some(*item_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(claimed, vec![7], "the claim names the delivered item");
+        // A drained queue leaves no durable trace behind.
+        let store =
+            crate::queue_store::load(&steer_test_config(&workspace, &provider.url), "steer-test");
+        assert!(store.is_empty(), "{store:?}");
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// Steering a queued row hands it to the running turn and takes it out of
+    /// the FIFO — the row gesture's whole contract.
+    #[tokio::test]
+    async fn steering_a_queued_row_takes_it_out_of_the_queue() {
+        let workspace = scratch_dir("host-queue-steer");
+        let provider = FakeProvider::start(
+            vec!["first answer", "steered answer"],
+            Duration::from_millis(400),
+        )
+        .await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::PromptForSession {
+                session_id: "steer-test".into(),
+                text: "start".into(),
+            })
+            .expect("queue prompt");
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            cmd_tx
+                .send(Cmd::QueueForSession {
+                    session_id: "steer-test".into(),
+                    item_id: 9,
+                    text: "send me now".into(),
+                })
+                .expect("queue follow-up");
+            // The steer rides its own channel: only that reaches a running turn.
+            steer_tx
+                .send(SteerRequest {
+                    session_id: "steer-test".into(),
+                    message_id: 9,
+                    text: "send me now".into(),
+                })
+                .expect("steer the row");
+            provider.served(2).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let bodies = provider.bodies();
+        assert_eq!(bodies.len(), 2, "one turn, the steer joined it");
+        let second = body_texts(&bodies[1]);
+        assert!(second.contains(&"send me now".to_string()), "{second:?}");
+        let events = events.lock().expect("event lock");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Ctl(CtlEvent::SteerSettled {
+                    message_id: 9,
+                    deferred: false
+                })
+            )),
+            "the steer settled as accepted"
+        );
+        // The steer beat the queue command: the driver never queued the item,
+        // it told the client it was already taken (so the optimistic row can
+        // settle as delivered instead of lingering).
+        let snapshots: Vec<Vec<QueueRow>> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ctl(CtlEvent::Queue { items, .. }) => Some(items.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            snapshots
+                .iter()
+                .all(|items| items.iter().all(|row| row.item_id != 9)),
+            "a steered item is never queued: {snapshots:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Ctl(CtlEvent::QueueClaimed { item_id: 9 }))),
+            "the client is told the row is delivered"
+        );
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// A command that changes the queue is applied before the next item ships —
+    /// a removal must never lose a race with the boundary that drains it.
+    #[tokio::test]
+    async fn a_removal_arriving_during_a_turn_is_applied_before_the_next_item() {
+        let workspace = scratch_dir("host-queue-edit");
+        let provider = FakeProvider::start(
+            vec!["first answer", "second answer"],
+            Duration::from_millis(400),
+        )
+        .await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::PromptForSession {
+                session_id: "steer-test".into(),
+                text: "start".into(),
+            })
+            .expect("queue prompt");
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            cmd_tx
+                .send(Cmd::QueueForSession {
+                    session_id: "steer-test".into(),
+                    item_id: 1,
+                    text: "drop me".into(),
+                })
+                .expect("queue first");
+            cmd_tx
+                .send(Cmd::QueueForSession {
+                    session_id: "steer-test".into(),
+                    item_id: 2,
+                    text: "keep me".into(),
+                })
+                .expect("queue second");
+            cmd_tx
+                .send(Cmd::UpdateQueue {
+                    session_id: "steer-test".into(),
+                    item_id: 1,
+                    action: QueueAction::Remove,
+                })
+                .expect("remove the first");
+            cmd_tx
+                .send(Cmd::UpdateQueue {
+                    session_id: "steer-test".into(),
+                    item_id: 2,
+                    action: QueueAction::Edit("keep me, edited".into()),
+                })
+                .expect("edit the second");
+            provider.served(2).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let bodies = provider.bodies();
+        assert_eq!(bodies.len(), 2, "exactly one queued item was delivered");
+        let second = body_texts(&bodies[1]);
+        assert!(
+            second.contains(&"keep me, edited".to_string()),
+            "{second:?}"
+        );
+        assert!(
+            !second.iter().any(|text| text == "drop me"),
+            "the removed row never shipped: {second:?}"
+        );
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// A restored queue waits for a turn this process runs, and the client rows
+    /// it paints come from the driver's snapshot, not from a file the client read.
+    #[tokio::test]
+    async fn a_restored_queue_is_held_until_a_turn_runs() {
+        let workspace = scratch_dir("host-queue-restore");
+        crate::queue_store::save(
+            &workspace.to_string_lossy(),
+            "steer-test",
+            &["from the last run".into()],
+        );
+        let provider = FakeProvider::start(vec!["nothing yet"], Duration::from_millis(200)).await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            // Idle with a restored queue: it must not spend itself.
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                provider.bodies().is_empty(),
+                "a restored queue waits for a turn"
+            );
+            cmd_tx
+                .send(Cmd::PromptForSession {
+                    session_id: "steer-test".into(),
+                    text: "now start".into(),
+                })
+                .expect("queue prompt");
+            provider.served(2).await;
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let bodies = provider.bodies();
+        assert_eq!(bodies.len(), 2, "the prompt, then the restored item");
+        assert!(body_texts(&bodies[0]).contains(&"now start".to_string()));
+        assert!(body_texts(&bodies[1]).contains(&"from the last run".to_string()));
+        let first_snapshot =
+            events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .find_map(|event| match event {
+                    Event::Ctl(CtlEvent::Queue { items, .. }) => Some(items.clone()),
+                    _ => None,
+                });
+        assert_eq!(
+            first_snapshot.map(|items| items.len()),
+            Some(1),
+            "the client was handed the restored row at bind time"
+        );
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// The queue belongs to a session: a switch parks the old one's items and
+    /// brings the target session's own saved queue back, held.
+    #[tokio::test]
+    async fn a_session_switch_swaps_the_queue() {
+        let workspace = scratch_dir("host-queue-switch");
+        crate::queue_store::save(
+            &workspace.to_string_lossy(),
+            "second",
+            &["second's own follow-up".into()],
+        );
+        let provider = FakeProvider::start(vec!["first answer"], Duration::from_millis(200)).await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::PromptForSession {
+                session_id: "steer-test".into(),
+                text: "start".into(),
+            })
+            .expect("queue prompt");
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            cmd_tx
+                .send(Cmd::QueueForSession {
+                    session_id: "steer-test".into(),
+                    item_id: 4,
+                    text: "old session's follow-up".into(),
+                })
+                .expect("queue follow-up");
+            cmd_tx
+                .send(Cmd::NewSession {
+                    session_id: "second".into(),
+                })
+                .expect("switch session");
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let snapshots: Vec<(String, Vec<QueueRow>)> = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ctl(CtlEvent::Queue { session_id, items }) => {
+                    Some((session_id.clone(), items.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            snapshots.iter().any(|(session, items)| {
+                session == "second" && items.len() == 1 && items[0].text == "second's own follow-up"
+            }),
+            "the target session's queue came back: {snapshots:?}"
+        );
+        assert!(
+            snapshots
+                .iter()
+                .filter(|(session, _)| session == "second")
+                .flat_map(|(_, items)| items.iter())
+                .all(|row| row.text != "old session's follow-up"),
+            "the old session's item did not follow us: {snapshots:?}"
+        );
+        // The old session's item is still parked on disk for its own next start.
+        assert_eq!(
+            crate::queue_store::load(&steer_test_config(&workspace, &provider.url), "steer-test"),
+            vec!["old session's follow-up".to_string()]
+        );
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
+    }
+
+    /// A queue command for another session removes the client's row instead of
+    /// letting it sit there forever.
+    #[tokio::test]
+    async fn queue_commands_for_another_session_remove_the_row() {
+        let workspace = scratch_dir("host-queue-mismatch");
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
+            captured.lock().expect("event lock").push(event);
+        });
+        cmd_tx
+            .send(Cmd::QueueForSession {
+                session_id: "someone-else".into(),
+                item_id: 3,
+                text: "not mine".into(),
+            })
+            .expect("queue for another session");
+        let actor = async {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
+        };
+        let mut config = steer_test_config(&workspace, "http://127.0.0.1:1");
+        config.api_key = None;
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+
+        let removed: Vec<u64> = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                Event::Ctl(CtlEvent::QueueRemoved { item_id }) => Some(*item_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, vec![3]);
+        drop(events);
+        std::fs::remove_dir_all(&workspace).expect("remove test workspace");
     }
 
     /// The boundary that drains the inbox is what tells the composer its
@@ -3928,6 +4662,10 @@ mod tests {
     async fn the_idle_wait_turns_a_steer_into_the_next_turn() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+        let mut queue = VecDeque::new();
+        let taken = OutstandingSteers::default();
+        let cfg = steer_test_config(std::path::Path::new("/tmp"), "http://127.0.0.1:1");
+        let ctl = |_event: CtlEvent| {};
         steer_tx
             .send(SteerRequest {
                 session_id: "s".into(),
@@ -3935,7 +4673,17 @@ mod tests {
                 text: "hello".into(),
             })
             .expect("queue steer");
-        match next_command(&mut cmd_rx, &mut steer_rx).await {
+        match next_command(
+            &mut cmd_rx,
+            &mut steer_rx,
+            &mut queue,
+            &taken,
+            &cfg,
+            "s",
+            &ctl,
+        )
+        .await
+        {
             Some(Cmd::SteerForSession {
                 message_id, text, ..
             }) => {
@@ -3946,9 +4694,90 @@ mod tests {
         }
         cmd_tx.send(Cmd::Shutdown).expect("queue command");
         assert!(matches!(
-            next_command(&mut cmd_rx, &mut steer_rx).await,
+            next_command(
+                &mut cmd_rx,
+                &mut steer_rx,
+                &mut queue,
+                &taken,
+                &cfg,
+                "s",
+                &ctl
+            )
+            .await,
             Some(Cmd::Shutdown)
         ));
+    }
+
+    /// The idle wait drains the FIFO, in order, and a command that is already
+    /// waiting is applied first — the item it changes cannot ship ahead of it.
+    #[tokio::test]
+    async fn the_idle_wait_drains_the_queue_after_pending_commands() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+        let mut queue = VecDeque::new();
+        let taken = OutstandingSteers::default();
+        let cfg = steer_test_config(std::path::Path::new("/tmp"), "http://127.0.0.1:1");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let ctl = move |event: CtlEvent| captured.lock().expect("event lock").push(event);
+        let push = |item_id: u64, text: &str| QueuedItem {
+            item_id,
+            text: text.into(),
+            placement: QueuePlacement::Queued,
+            held: false,
+        };
+        queue.push_back(push(1, "first"));
+        queue.push_back(push(2, "second"));
+
+        // A removal is waiting: it is read before anything ships.
+        cmd_tx
+            .send(Cmd::UpdateQueue {
+                session_id: "s".into(),
+                item_id: 1,
+                action: QueueAction::Remove,
+            })
+            .expect("queue removal");
+        match next_command(
+            &mut cmd_rx,
+            &mut steer_rx,
+            &mut queue,
+            &taken,
+            &cfg,
+            "s",
+            &ctl,
+        )
+        .await
+        {
+            Some(Cmd::UpdateQueue { .. }) => {}
+            other => panic!("the command goes first, got {other:?}"),
+        }
+        // The loop applies it (the arm body is in `drive`); do it here.
+        queue.retain(|item| item.item_id != 1);
+        match next_command(
+            &mut cmd_rx,
+            &mut steer_rx,
+            &mut queue,
+            &taken,
+            &cfg,
+            "s",
+            &ctl,
+        )
+        .await
+        {
+            Some(Cmd::Prompt { text }) => assert_eq!(text, "second"),
+            other => panic!("the survivor ships, got {other:?}"),
+        }
+        assert!(queue.is_empty(), "a claimed item left the FIFO");
+        let claimed: Vec<u64> = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                CtlEvent::QueueClaimed { item_id } => Some(*item_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(claimed, vec![2]);
     }
 
     /// Acceptance means "the agent holds it": the text sits in the inbox until
@@ -3973,6 +4802,7 @@ mod tests {
             "/nonexistent-workspace",
         )));
         let admitted: Arc<OutstandingSteers> = Arc::default();
+        let taken: Arc<OutstandingSteers> = Arc::default();
         let (_interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let mut ctx = TurnCtx {
@@ -3983,6 +4813,7 @@ mod tests {
             steer: steer.clone(),
             skills: &skills,
             admitted: &admitted,
+            taken: &taken,
             limits: TurnLimits::default(),
             compaction: None,
         };

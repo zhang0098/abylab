@@ -39,14 +39,29 @@ context compaction, session persistence, goal rounds) live in
   highlight follows the row that moved up, and it closes when the queue is
   empty) — the same chord the composer uses. The list title, `/help` and `/keys`
   name the key.
-- Queued prompts survive a restart: the queue is the one thing the driver does
-  not own, and therefore the one thing a crash would drop, so every mutation
-  writes `$ABYLAB_HOME/queued/<session>.json` (one file per session, image
-  payloads included, removed when the queue drains). A start or `/resume` onto that session paints the items back as
+- Queued prompts survive a restart: every mutation writes
+  `$ABYLAB_HOME/queued/<session>.json` (one file per session, removed when the
+  queue drains). A start or `/resume` onto that session paints the items back as
   queued bubbles and **holds** them — they were queued behind a turn that no
-  longer exists, so they are not spent unbidden; the next real turn end (or an
-  explicit enter/ctrl+enter) releases them in FIFO order. A missing or malformed
-  file is just an empty queue, exactly like `settings.json`.
+  longer exists, so they are not spent unbidden; the first turn this process
+  actually runs releases them, and they ship in FIFO order after it. A missing
+  or malformed file is just an empty queue, exactly like `settings.json`.
+- Messages the turn has not taken yet render as a tail section (`⏳ N steering`):
+  they sit below the live output until the agent takes them at a boundary, and
+  then drop back into their chronological slot (harness's pending-steering
+  rows).
+- The queue moved into the driver, and clients render snapshots: `CtlEvent::Queue`
+  publishes every row on every change, so any client (the TUI today, a second
+  process or a web UI later) sees the same FIFO. Rows carry a placement —
+  queueing and steering are two states of one list.
+- Delivery order is decided at the driver's idle wait: pending commands first
+  (removals, edits, new steers), then rows the turn took, and only then the head
+  ships — a removal can never lose a race with the boundary that drains the row
+  it changes. Taken ids stay as tombstones so a late queue command cannot turn a
+  delivered row back into a queued one.
+- Queue persistence moved with it: the driver writes
+  `$ABYLAB_HOME/queued/<session>.json` and reads rows back as held, released by
+  the first turn this process actually runs (same promise, new owner).
 
 ### Fixed
 

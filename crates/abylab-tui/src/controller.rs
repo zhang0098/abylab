@@ -121,21 +121,31 @@ fn aby_loop(
                     text,
                 });
             }
-            Cmd::PromptImages { session_id, blocks } => {
-                handle.send(abylab_backend::Cmd::PromptForSession {
+            Cmd::Queue {
+                session_id,
+                item_id,
+                text,
+            } => {
+                handle.send(abylab_backend::Cmd::QueueForSession {
                     session_id,
-                    text: prompt_text(&blocks),
+                    item_id,
+                    text,
                 });
             }
-            Cmd::SteerImages {
+            Cmd::UpdateQueue {
                 session_id,
-                message_id,
-                blocks,
+                item_id,
+                action,
             } => {
-                handle.steer(abylab_backend::SteerRequest {
+                handle.send(abylab_backend::Cmd::UpdateQueue {
                     session_id,
-                    message_id,
-                    text: prompt_text(&blocks),
+                    item_id,
+                    action: match action {
+                        crate::bus::QueueAction::Remove => abylab_backend::QueueAction::Remove,
+                        crate::bus::QueueAction::Edit(text) => {
+                            abylab_backend::QueueAction::Edit(text)
+                        }
+                    },
                 });
             }
             Cmd::Interrupt { .. } => {
@@ -190,20 +200,6 @@ fn aby_loop(
     }
 }
 
-/// The text half of staged prompt blocks. The in-process abycore transport
-/// carries text: an image rides as the composer's own echo and chip, exactly as
-/// it did before this transport existed.
-fn prompt_text(blocks: &[crate::bus::PromptBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            crate::bus::PromptBlock::Text(text) => Some(text.as_str()),
-            crate::bus::PromptBlock::Image(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 /// Backend events → TUI `AppEvent`s (the seam between the two contracts).
 fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
     match event {
@@ -232,6 +228,25 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                 },
                 abylab_backend::CtlEvent::SteerAdmitted { message_ids } => {
                     CtlEvent::SteerAdmitted { message_ids }
+                }
+                abylab_backend::CtlEvent::Queue { session_id, items } => {
+                    let _ = session_id;
+                    CtlEvent::Queue {
+                        items: items
+                            .into_iter()
+                            .map(|row| crate::bus::QueueRow {
+                                item_id: row.item_id,
+                                text: row.text,
+                                steering: row.placement == abylab_backend::QueuePlacement::Steering,
+                            })
+                            .collect(),
+                    }
+                }
+                abylab_backend::CtlEvent::QueueClaimed { item_id } => {
+                    CtlEvent::QueueClaimed { item_id }
+                }
+                abylab_backend::CtlEvent::QueueRemoved { item_id } => {
+                    CtlEvent::QueueRemoved { item_id }
                 }
                 abylab_backend::CtlEvent::Error(err) => CtlEvent::Error(err),
                 abylab_backend::CtlEvent::CancelRequested => CtlEvent::CancelRequested,

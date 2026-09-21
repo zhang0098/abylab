@@ -153,6 +153,22 @@ pub enum CtlEvent {
         message_id: u64,
         deferred: bool,
     },
+    /// The session's queue, after every change and once at bind time. Clients
+    /// render these rows instead of keeping a queue of their own.
+    Queue {
+        session_id: String,
+        items: Vec<QueueRow>,
+    },
+    /// One item left the queue because the driver delivered it (or started a
+    /// turn with it): the client's echo for it is an ordinary user row now.
+    QueueClaimed {
+        item_id: u64,
+    },
+    /// One item left the queue without being delivered: removed, edited away or
+    /// rejected. The client's echo goes with it.
+    QueueRemoved {
+        item_id: u64,
+    },
     /// The agent appended steered messages to the transcript at a step boundary:
     /// the composer's pending-steering rows are ordinary user rows from here on.
     /// One event per boundary, however many messages it drained.
@@ -408,6 +424,42 @@ pub fn persisted_session_id(
     Some(session_id.to_string())
 }
 
+/// Where one client follow-up stands in the host's inbox.
+///
+/// This mirrors deepseek-harness's inbox `placement`: an item is either waiting
+/// behind the active turn or already handed to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePlacement {
+    /// Waiting: it becomes the next turn when the running one ends.
+    Queued,
+    /// Send Now: the running turn has it and appends it at a step boundary.
+    Steering,
+}
+
+/// One item of the session's host-owned FIFO.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueRow {
+    /// Minted by the client that queued it; echoed back in the settlement
+    /// events so that client can settle its own optimistic echo.
+    pub item_id: u64,
+    /// The wire form the driver will send when the item's turn comes.
+    pub text: String,
+    pub placement: QueuePlacement,
+}
+
+/// One change to a queued item, as the composer's row gestures express it.
+///
+/// Steering is *not* here on purpose: these commands are read when the driver
+/// is idle, while a steer has to reach a turn that is already running, so it
+/// rides [`SteerRequest`]'s channel instead (with the item id as the message
+/// id, which is how the queue learns the item was taken).
+#[derive(Debug, Clone)]
+pub enum QueueAction {
+    Remove,
+    /// Replace the item's text (the `⌥↑` editor).
+    Edit(String),
+}
+
 /// One Send Now request on its own channel, so a running turn can take it
 /// while it is streaming. Kept out of [`Cmd`] on purpose: commands are strictly
 /// serialized behind the turn, and a steer that waits for the turn to end is
@@ -432,6 +484,22 @@ pub enum Cmd {
     PromptForSession {
         session_id: String,
         text: String,
+    },
+    /// Append a follow-up to the session's FIFO.
+    ///
+    /// The queue lives here, not in the client: the driver owns delivery order,
+    /// drains the head when a turn ends, and publishes the whole list through
+    /// [`CtlEvent::Queue`] so every client renders the same rows.
+    QueueForSession {
+        session_id: String,
+        item_id: u64,
+        text: String,
+    },
+    /// Change one queued item (steer it, remove it, edit its text).
+    UpdateQueue {
+        session_id: String,
+        item_id: u64,
+        action: QueueAction,
     },
     /// Send Now: inject a message into the turn that is already running, at its
     /// next complete step boundary, **without cancelling anything**.

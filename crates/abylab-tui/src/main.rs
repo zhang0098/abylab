@@ -13,7 +13,6 @@ mod input;
 mod locale;
 mod markdown;
 mod pet;
-mod queue_store;
 mod runtime;
 mod slots;
 mod theme;

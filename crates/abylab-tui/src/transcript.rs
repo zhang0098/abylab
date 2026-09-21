@@ -959,6 +959,20 @@ impl Transcript {
         }
     }
 
+    /// Whether this cell is a message the running turn has not taken yet.
+    fn pending_steering(&self, index: usize) -> bool {
+        matches!(
+            self.cells.get(index).map(|cell| &cell.kind),
+            Some(CellKind::User {
+                delivery: Delivery::Steering,
+                ..
+            }) | Some(CellKind::Image {
+                delivery: Delivery::Steering,
+                ..
+            })
+        )
+    }
+
     /// Is any assistant/reasoning cell currently streaming?
     pub fn streaming(&self) -> bool {
         !self.open_assistant.is_empty() || !self.open_reasoning.is_empty()
@@ -986,7 +1000,43 @@ impl Transcript {
         let mut owners: Vec<Option<usize>> = Vec::new();
         let mut images: Vec<ImageShot> = Vec::new();
         let mut users: Vec<UserPromptLine> = Vec::new();
-        for (ci, cell) in self.cells.iter().enumerate() {
+        // Pending steering renders as a tail section, the way deepseek-harness
+        // shows `data-pending-steering` rows: a message the running turn has not
+        // picked up yet belongs *after* the live output, not in the middle of
+        // the step it is about to interrupt. The cell indices (and everything
+        // keyed by them) stay put; only the paint order changes, so the bubble
+        // drops back into its chronological slot the moment it is admitted.
+        let pending: Vec<usize> = (0..self.cells.len())
+            .filter(|ci| self.pending_steering(*ci))
+            .collect();
+        let order: Vec<usize> = (0..self.cells.len())
+            .filter(|ci| !self.pending_steering(*ci))
+            .chain(pending.iter().copied())
+            .collect();
+        let mut in_tail = false;
+        for ci in order {
+            let cell = &self.cells[ci];
+            if !in_tail && self.pending_steering(ci) {
+                in_tail = true;
+                emit(&mut out, &mut owners, Line::default(), None);
+                emit(
+                    &mut out,
+                    &mut owners,
+                    Line::from(Span::styled(
+                        format!(
+                            "⏳ {}",
+                            self.locale
+                                .tr(
+                                    "{n} steering · lands at the next agent step",
+                                    "{n} 条待插话 · Agent 下一步生效",
+                                )
+                                .replace("{n}", &pending.len().to_string())
+                        ),
+                        Style::default().fg(Delivery::Steering.tint(theme)),
+                    )),
+                    None,
+                );
+            }
             let expanded = cell.expanded || self.expand_all;
             match &cell.kind {
                 CellKind::User { text, delivery } => {
@@ -2756,5 +2806,81 @@ mod tests {
         assert_eq!(tr.stats.steps, 1);
         assert_eq!(tr.stats.ttft_count, 1, "only the first delta samples TTFT");
         assert!(tr.stats.tool_millis <= tr.stats.turn_millis);
+    }
+
+    /// A pending steer is painted after the live output, under its own header,
+    /// and falls back into its chronological slot once the agent takes it —
+    /// deepseek-harness's `data-pending-steering` tail rows.
+    #[test]
+    fn pending_steering_renders_as_a_tail_section() {
+        let mut tr = Transcript::new("s".into());
+        tr.set_locale(Locale::En);
+        let paint = |tr: &Transcript| -> (String, Vec<String>) {
+            let lines: Vec<String> = tr
+                .lines(&Theme::dark(), 40, '⠋')
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
+            (lines.join("\n"), lines)
+        };
+        tr.push_user("typed first".into(), Delivery::Delivered);
+        tr.apply(crate::events::UiEvent::AssistantFinal {
+            session: "s".into(),
+            text: "streaming answer".into(),
+            model: None,
+        });
+        tr.push_user("change course".into(), Delivery::Steering);
+        // Newer timeline content: a pending steer floats past it to the tail.
+        tr.push_notice(NoticeLevel::Info, "later output".into());
+
+        let (joined, lines) = paint(&tr);
+        let header = lines
+            .iter()
+            .position(|line| line.contains("steering · lands"))
+            .expect("the tail section names itself");
+        let bubble = lines
+            .iter()
+            .position(|line| line.contains("change course"))
+            .expect("the pending bubble");
+        let answer = lines
+            .iter()
+            .position(|line| line.contains("streaming answer"))
+            .expect("the live output");
+        let later = lines
+            .iter()
+            .position(|line| line.contains("later output"))
+            .expect("newer content");
+        assert!(header < bubble, "the header opens the section:\n{joined}");
+        assert!(
+            answer < bubble && later < bubble,
+            "the pending steer sits below everything else:\n{joined}"
+        );
+        assert!(
+            joined.contains("1 steering"),
+            "the header counts them:\n{joined}"
+        );
+        assert!(
+            lines[bubble].contains("steering"),
+            "the row still names its own state:\n{joined}"
+        );
+        // The chronological row kept its place: only the pending one moved.
+        let first = lines
+            .iter()
+            .position(|line| line.contains("typed first"))
+            .expect("the admitted row");
+        assert!(first < answer, "an admitted row stays where it was typed");
+
+        // Admitted: the bubble returns to its slot and the section disappears.
+        tr.mark_prompt_delivered(&[2]);
+        let (after, _) = paint(&tr);
+        assert!(!after.contains("steering · lands"), "{after}");
+        let bubble = after.find("change course").expect("bubble");
+        let later = after.find("later output").expect("newer content");
+        assert!(bubble < later, "back in its chronological slot:\n{after}");
     }
 }

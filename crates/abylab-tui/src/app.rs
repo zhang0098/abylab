@@ -764,9 +764,6 @@ pub struct App {
     /// What plain Enter does while busy (`/enter`); the accelerated chord
     /// always does the other one (harness's `busyEnter` preference).
     pub enter: crate::locale::EnterBehavior,
-    /// Set while the queue shown on screen was restored from disk: those items
-    /// wait for the next turn instead of shipping the moment the app idles.
-    pub queue_hold: bool,
     /// Which usage hint the next new session opens with. The composer cap row
     /// no longer rotates hints live; a session start shows one instead, so the
     /// index advances per session and cycles the whole set over time.
@@ -849,39 +846,17 @@ enum StagedBlock {
     Image(crate::attachments::Attachment),
 }
 
-/// A staged block in the durable queue's shape.
-fn persisted_block(block: &StagedBlock) -> crate::queue_store::Block {
-    match block {
-        StagedBlock::Text(text) => crate::queue_store::Block::Text { text: text.clone() },
-        StagedBlock::Image(att) => crate::queue_store::Block::Image {
-            name: att.name.clone(),
-            path: att.path.clone(),
-            media_type: att.media_type.clone(),
-            data: att.data.to_vec(),
-        },
-    }
-}
-
-/// The inverse: a persisted block as a staged one. The token and id are minted
-/// again if the item is ever pulled back into the composer for editing, so the
-/// restored attachment does not need them.
-fn staged_block(block: crate::queue_store::Block) -> StagedBlock {
-    match block {
-        crate::queue_store::Block::Text { text } => StagedBlock::Text(text),
-        crate::queue_store::Block::Image {
-            name,
-            path,
-            media_type,
-            data,
-        } => StagedBlock::Image(crate::attachments::Attachment {
-            id: 0,
-            token: String::new(),
-            name,
-            path,
-            media_type,
-            data: data.into(),
-        }),
-    }
+/// The wire text of a staged prompt: the in-process transport is text-only, so
+/// an image rides as the composer's own chip and echo.
+fn staged_text(staged: &[StagedBlock]) -> String {
+    staged
+        .iter()
+        .filter_map(|block| match block {
+            StagedBlock::Text(text) => Some(text.as_str()),
+            StagedBlock::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// One client-owned queued prompt: the blocks (text and/or staged images)
@@ -1116,8 +1091,6 @@ impl App {
         // Persisted global preferences seed the per-workspace mode chips when
         // this workspace has no cached facts of its own.
         let mut modes = Self::load_modes_cache(&cfg).unwrap_or_default();
-        // `app` is assembled first so the durable queue can paint itself back
-        // with the same helpers every other echo uses.
         if modes.effort.is_none() {
             modes.effort = settings.effort.clone();
         }
@@ -1128,7 +1101,7 @@ impl App {
         // here; `tick` re-checks on a throttle so mid-session checkouts (the
         // agent's shell tool, another terminal) stay in sync.
         let git_branch = crate::ui::head_branch(&cfg.workspace);
-        let mut app = App {
+        App {
             theme,
             locale,
             palettes,
@@ -1193,7 +1166,6 @@ impl App {
             key_debug: std::env::var("ABYLAB_KEYDEBUG").is_ok_and(|v| v == "1"),
             vim: crate::input::VimState::default(),
             enter,
-            queue_hold: false,
             session_tip_idx: 0,
             ctrl_c_armed: None,
             queue_delete_armed: None,
@@ -1213,11 +1185,7 @@ impl App {
             prompt_pending: false,
             server_info: None,
             needs_redraw: true,
-        };
-        // The session's unsent queue is the one thing the driver does not own;
-        // bring it back before the first frame paints.
-        app.restore_queue();
-        app
+        }
     }
 
     pub fn spinner(&self) -> char {
@@ -1779,9 +1747,7 @@ impl App {
                         if *session == self.session_id
                 );
                 self.apply_ui(ui);
-                if idle {
-                    self.dispatch_next_queued(ctl);
-                }
+                let _ = idle;
             }
             AppEvent::RuntimeStderr(_line) => {
                 // kept in proto's tail buffer for diagnostics; stay quiet here
@@ -1854,7 +1820,17 @@ impl App {
                         if let Some(pending) = self.pending_steer_cells.remove(&message_id) {
                             if deferred {
                                 self.transcript.mark_prompt_queued(&pending.cells);
-                                self.enqueue_prompt(pending.blocks, pending.cells);
+                                let blocks = pending.blocks;
+                                let text = match blocks.first() {
+                                    Some(StagedBlock::Text(text)) => text.clone(),
+                                    _ => String::new(),
+                                };
+                                self.enqueue_prompt(message_id, blocks, pending.cells);
+                                ctl.send(Cmd::Queue {
+                                    session_id: self.session_id.clone(),
+                                    item_id: message_id,
+                                    text,
+                                });
                                 self.show_tip(self.locale.tr(
                                     "agent deferred Send Now — queued after the active turn",
                                     "Agent 推迟了立即发送 —— 已排到本轮之后",
@@ -1867,6 +1843,9 @@ impl App {
                             }
                         }
                     }
+                    CtlEvent::Queue { items } => self.fold_queue(items),
+                    CtlEvent::QueueClaimed { item_id } => self.claim_queue_row(item_id),
+                    CtlEvent::QueueRemoved { item_id } => self.remove_queue_row(item_id),
                     CtlEvent::SteerAdmitted { message_ids } => {
                         // The agent drained its inbox: those messages are in the
                         // transcript now, so their rows stop being pending.
@@ -1954,9 +1933,6 @@ impl App {
                     CtlEvent::SessionSwitchFailed(desc) => {
                         self.session_switch = None;
                         self.transcript.push_notice(NoticeLevel::Warn, desc);
-                        if self.state == RunState::Idle && !self.prompt_pending {
-                            self.dispatch_next_queued(ctl);
-                        }
                     }
                     CtlEvent::AgentCaps { load_session } => {
                         self.load_session = load_session;
@@ -1987,9 +1963,6 @@ impl App {
                         if fresh {
                             self.push_session_tip();
                         }
-                        // A resumed session brings its own unsent queue back
-                        // with it (the store is keyed by session id).
-                        self.restore_queue();
                         // The driver is the source of truth for the bound
                         // session's model: a resumed session keeps its stored
                         // model, and a rejected /model never moves this row.
@@ -2026,12 +1999,6 @@ impl App {
     /// Direct ACP facts and JSON-RPC notifications must take the same path.
     fn apply_ui(&mut self, ui: crate::events::UiEvent) {
         use crate::events::UiEvent as E;
-        // A turn reached its end: a restored queue has waited long enough, and
-        // the next idle status ships its head like any other queued item.
-        if matches!(ui, E::TurnEnd { .. }) {
-            self.queue_hold = false;
-        }
-
         if let E::SubagentStarted {
             parent,
             child,
@@ -4154,17 +4121,19 @@ impl App {
             return;
         };
         self.prompt_queue[index].blocks = blocks;
-        self.persist_queue();
+        let text = match self.prompt_queue[index].blocks.first() {
+            Some(StagedBlock::Text(text)) => text.clone(),
+            _ => String::new(),
+        };
+        let item_id = self.prompt_queue[index].id;
         self.repaint_prompt_echo(index);
+        self.update_queue_row(item_id, crate::bus::QueueAction::Edit(text), ctl);
         self.finish_queue_edit();
         self.show_tip(
             self.locale
                 .tr("queued prompt #{n} updated", "排队消息 #{n} 已更新")
                 .replace("{n}", &(index + 1).to_string()),
         );
-        if self.state == RunState::Idle {
-            self.dispatch_next_queued(ctl);
-        }
     }
 
     /// `ctrl+d` while editing: the first press arms, the second deletes.
@@ -4204,15 +4173,12 @@ impl App {
         };
         self.withdraw_prompt_echo(&prompt.cells);
         self.queued = self.prompt_queue.len();
-        self.persist_queue();
+        self.update_queue_row(prompt.id, crate::bus::QueueAction::Remove, ctl);
         self.show_tip(
             self.locale
                 .tr("queued prompt #{n} deleted", "排队消息 #{n} 已删除")
                 .replace("{n}", &(index + 1).to_string()),
         );
-        if self.state == RunState::Idle {
-            self.dispatch_next_queued(ctl);
-        }
     }
 
     /// `ctrl+d` in the queue picker: the first press arms the highlighted row,
@@ -4251,6 +4217,28 @@ impl App {
     fn withdraw_prompt_echo(&mut self, cells: &[usize]) {
         let shift = self.transcript.remove_cells(cells);
         self.remap_cell_indices(shift, None);
+    }
+
+    /// Repaint a queue row's bubbles from its blocks, replacing the cells the
+    /// old wording owned. Returns the new cell indices.
+    fn repaint_cells(&mut self, blocks: &[StagedBlock], cells: &[usize]) -> Vec<usize> {
+        let echo_blocks: Vec<crate::transcript::EchoBlock<'_>> = blocks
+            .iter()
+            .map(|block| match block {
+                StagedBlock::Text(text) => crate::transcript::EchoBlock::Text(text),
+                StagedBlock::Image(att) => crate::transcript::EchoBlock::Image {
+                    name: &att.name,
+                    path: &att.path,
+                    data: &att.data,
+                },
+            })
+            .collect();
+        let echo = self
+            .transcript
+            .prompt_echo_cells(&echo_blocks, crate::transcript::Delivery::Queued);
+        let (shift, painted) = self.transcript.replace_cells(cells, echo);
+        self.remap_cell_indices(shift, None);
+        painted
     }
 
     /// Repaint one queued prompt's echo after an edit.
@@ -4341,7 +4329,6 @@ impl App {
         if self.queue_edit.is_some() || self.prompt_queue.is_empty() {
             return;
         }
-        self.queue_hold = false;
         let running = matches!(self.state, RunState::Running) || self.prompt_pending;
         if !running {
             self.send_queue_head_now(ctl);
@@ -4367,15 +4354,15 @@ impl App {
         if self.queue_edit.is_some() {
             return;
         }
-        self.queue_hold = false;
         // `turn_busy` counts this non-empty queue itself, so it cannot say
         // whether a turn is in flight; ask the run state directly. Idle (a
         // cancelled edit, a failed turn) sends the head as a plain prompt.
         let running = matches!(self.state, RunState::Running) || self.prompt_pending;
         if !running {
-            // The item leaves the queue before the driver sees it, so a
-            // `/clear` or a session switch can never double-send it.
-            self.deliver_queued(0, ctl);
+            // Nothing is running: the host owns delivery, so the head is
+            // released through the steer channel, which admits it as the next
+            // turn (and takes the row out of the FIFO on the way).
+            self.steer_queued(0, ctl);
             return;
         }
         let Some(prompt) = self.prompt_queue.remove(0) else {
@@ -4768,9 +4755,6 @@ impl App {
                 self.locale
                     .tr("queued prompt edit cancelled", "已取消编辑排队消息"),
             );
-            if self.state == RunState::Idle {
-                self.dispatch_next_queued(ctl);
-            }
             return;
         }
         // A lingering copy highlight is dismissed first (idle only — while
@@ -5509,7 +5493,6 @@ impl App {
             return;
         }
         // The user is driving again: a restored queue no longer needs holding.
-        self.queue_hold = false;
         let running = self.turn_busy();
         let cell = self.transcript.cells.len();
         self.transcript.push_user(
@@ -5521,7 +5504,13 @@ impl App {
             },
         );
         if running {
-            self.enqueue_prompt(vec![StagedBlock::Text(text)], vec![cell]);
+            let id = self.next_prompt_id();
+            self.enqueue_prompt(id, vec![StagedBlock::Text(text.clone())], vec![cell]);
+            ctl.send(Cmd::Queue {
+                session_id: self.session_id.clone(),
+                item_id: id,
+                text,
+            });
             // The tail hint names the escape hatch, which is whichever gesture
             // the busy-Enter preference left free.
             let template = match self.enter {
@@ -5562,103 +5551,117 @@ impl App {
     }
 
     /// Queue one prompt behind the active turn and mark its echo cells.
-    fn enqueue_prompt(&mut self, blocks: Vec<StagedBlock>, cells: Vec<usize>) {
-        let id = self.next_prompt_id();
+    /// Show a row we just asked the host to queue. The driver's snapshot is the
+    /// truth; this only closes the round trip for the picker and the counters.
+    fn enqueue_prompt(&mut self, id: u64, blocks: Vec<StagedBlock>, cells: Vec<usize>) {
         self.prompt_queue
             .push_back(QueuedPrompt { id, blocks, cells });
         self.queued = self.prompt_queue.len();
-        self.persist_queue();
     }
 
-    /// Write this session's FIFO to `$ABYLAB_HOME/queued.json`.
+    /// Fold the driver's queue into the view.
     ///
-    /// The queue is the one thing the driver does not own, so it is also the one
-    /// thing a crash would silently drop: the session snapshot is durable, the
-    /// unsent prompts behind it are not. Persisting them is what
-    /// deepseek-harness gets from keeping its queue in the host process.
-    fn persist_queue(&self) {
-        let items: Vec<Vec<crate::queue_store::Block>> = self
+    /// The host owns the FIFO, so its snapshots are the truth: rows are shown in
+    /// the host's order, a row we have never seen (another client's, or a
+    /// restore) is painted as a queued bubble, and a row the host no longer
+    /// lists loses its echo. Local blocks are kept where we have them — the host
+    /// only knows the wire text, while the composer's own row may carry images.
+    fn fold_queue(&mut self, items: Vec<crate::bus::QueueRow>) {
+        let mut next: VecDeque<QueuedPrompt> = VecDeque::new();
+        for row in items {
+            let existing = self
+                .prompt_queue
+                .iter()
+                .position(|prompt| prompt.id == row.item_id);
+            match existing {
+                Some(index) => {
+                    let mut prompt = self
+                        .prompt_queue
+                        .remove(index)
+                        .expect("index came from a position search");
+                    let text_changed = !matches!(
+                        prompt.blocks.first(),
+                        Some(StagedBlock::Text(text)) if text == &row.text
+                    );
+                    if text_changed {
+                        // The host's text is authoritative (another client may
+                        // have edited it); local image blocks ride along.
+                        let images: Vec<StagedBlock> = std::mem::take(&mut prompt.blocks)
+                            .into_iter()
+                            .filter(|block| matches!(block, StagedBlock::Image(_)))
+                            .collect();
+                        prompt.blocks = vec![StagedBlock::Text(row.text.clone())];
+                        prompt.blocks.extend(images);
+                        let cells = self.repaint_cells(&prompt.blocks, &prompt.cells);
+                        prompt.cells = cells;
+                        next.push_back(prompt);
+                    } else {
+                        next.push_back(prompt);
+                    }
+                }
+                None => {
+                    let blocks = vec![StagedBlock::Text(row.text.clone())];
+                    let cells =
+                        self.paint_staged_echo(&blocks, crate::transcript::Delivery::Queued);
+                    next.push_back(QueuedPrompt {
+                        id: row.item_id,
+                        blocks,
+                        cells,
+                    });
+                }
+            }
+            if row.steering {
+                if let Some(prompt) = next.back() {
+                    self.transcript.mark_prompt_steering(&prompt.cells);
+                }
+            }
+        }
+        // Whatever the host no longer lists is gone: its echo goes with it.
+        let kept = self.prompt_queue.drain(..).collect::<Vec<_>>();
+        for prompt in kept {
+            self.withdraw_prompt_echo(&prompt.cells);
+        }
+        self.prompt_queue = next;
+        self.queued = self.prompt_queue.len();
+    }
+
+    /// The driver delivered one row: its echo is an ordinary user row now.
+    fn claim_queue_row(&mut self, item_id: u64) {
+        if let Some(prompt) = self.take_queue_row(item_id) {
+            self.transcript.mark_prompt_delivered(&prompt.cells);
+        }
+        if let Some(pending) = self.pending_steer_cells.remove(&item_id) {
+            self.transcript.mark_prompt_delivered(&pending.cells);
+        }
+    }
+
+    /// One row left the queue without being delivered: its echo goes with it.
+    /// A pending steering row is not withdrawn — it is being delivered, and the
+    /// steer's own settlement decides what happens to it.
+    fn remove_queue_row(&mut self, item_id: u64) {
+        if let Some(prompt) = self.take_queue_row(item_id) {
+            self.withdraw_prompt_echo(&prompt.cells);
+        }
+    }
+
+    /// Take one row out of the local mirror, if it is still there.
+    fn take_queue_row(&mut self, item_id: u64) -> Option<QueuedPrompt> {
+        let index = self
             .prompt_queue
             .iter()
-            .map(|prompt| prompt.blocks.iter().map(persisted_block).collect())
-            .collect();
-        crate::queue_store::save(&self.cfg.home, &self.session_id, &items);
-    }
-
-    /// Paint the queue stored for this session back into the timeline.
-    ///
-    /// The items are held (`queue_hold`): they were queued behind a turn that
-    /// no longer exists, and spending them without being asked would be the
-    /// app doing work on its own. The next turn (or an explicit enter/chord on
-    /// the queue) releases them in FIFO order.
-    fn restore_queue(&mut self) {
-        let items = crate::queue_store::load(&self.cfg.home, &self.session_id);
-        if items.is_empty() {
-            return;
-        }
-        let count = items.len();
-        for blocks in items {
-            let blocks: Vec<StagedBlock> = blocks.into_iter().map(staged_block).collect();
-            let cells = self.paint_staged_echo(&blocks, crate::transcript::Delivery::Queued);
-            self.enqueue_prompt(blocks, cells);
-        }
-        self.queue_hold = true;
-        self.show_tip(
-            self.locale
-                .tr(
-                    "restored {n} queued — they go out after the next turn · ⌥↑ lists them",
-                    "已恢复 {n} 条排队消息 —— 下一轮结束后送出 · ⌥↑ 查看",
-                )
-                .replace("{n}", &count.to_string()),
-        );
-        self.scroll_up = 0;
-    }
-
-    /// Send the FIFO head — the turn it waited behind has ended. The echo
-    /// bubbles lose their queued tint (they were painted when queued), and the
-    /// item leaves the queue before the driver sees it, so a `/clear` or a
-    /// session switch can never double-send it.
-    fn dispatch_next_queued(&mut self, ctl: &Controller) {
-        if self.session_switch.is_some() {
-            return;
-        }
-        if self.queue_edit.is_some() {
-            // The item under edit keeps its slot and its pre-edit wording.
-            self.state_note = self
-                .locale
-                .tr("queue paused for edit", "队列已暂停 · 正在编辑")
-                .into();
-            return;
-        }
-        if self.queue_hold {
-            // Restored items wait for a turn the user actually ran (or an
-            // explicit enter/chord on the queue).
-            return;
-        }
-        self.deliver_queued(0, ctl);
-    }
-
-    /// Ship one queued item as an ordinary prompt, wherever it sits in the
-    /// FIFO. The item leaves the queue before the driver sees it, so a `/clear`
-    /// or a session switch can never double-send it.
-    fn deliver_queued(&mut self, index: usize, ctl: &Controller) -> bool {
-        let Some(prompt) = self.prompt_queue.remove(index) else {
-            return false;
-        };
+            .position(|prompt| prompt.id == item_id)?;
+        let prompt = self.prompt_queue.remove(index)?;
         self.queued = self.prompt_queue.len();
-        self.persist_queue();
-        self.transcript.mark_prompt_delivered(&prompt.cells);
-        self.prompt_pending = true;
-        self.state = RunState::Starting;
-        self.run_started = Some(Instant::now());
-        self.state_note = self
-            .locale
-            .tr("sending queued followup", "正在发送排队消息")
-            .into();
-        self.scroll_up = 0;
-        let wire = prompt_blocks_from_staged(&prompt.blocks);
-        self.send_wire_prompt(wire, None, ctl);
-        true
+        Some(prompt)
+    }
+
+    /// Ask the host to change one row.
+    fn update_queue_row(&self, item_id: u64, action: crate::bus::QueueAction, ctl: &Controller) {
+        ctl.send(Cmd::UpdateQueue {
+            session_id: self.session_id.clone(),
+            item_id,
+            action,
+        });
     }
 
     /// Steer one queued item into the running turn at its next step boundary.
@@ -5668,18 +5671,10 @@ impl App {
     /// bubble turns into a pending-steering row, and the driver settles it when
     /// the agent takes it (or puts it back when it cannot).
     fn steer_queued(&mut self, index: usize, ctl: &Controller) -> bool {
-        self.queue_hold = false;
-        let running = matches!(self.state, RunState::Running) || self.prompt_pending;
-        if !running {
-            // Nothing to steer into: the item ships as this turn's prompt; the
-            // items ahead of it keep their order and wait their turn.
-            return self.deliver_queued(index, ctl);
-        }
         let Some(prompt) = self.prompt_queue.remove(index) else {
             return false;
         };
         self.queued = self.prompt_queue.len();
-        self.persist_queue();
         self.scroll_up = 0;
         let message_id = prompt.id;
         let wire = prompt_blocks_from_staged(&prompt.blocks);
@@ -5699,31 +5694,44 @@ impl App {
     /// `Cmd::Prompt` (so a `/`-prefixed line still reaches the skill path),
     /// anything carrying images rides the image variants, and a steer carries
     /// its pending-bubble id.
+    /// Hand one message to the host.
+    ///
+    /// Both forms end up in the driver, which owns delivery: `steer` names a
+    /// message the running turn should take at its next step boundary (Send
+    /// Now), anything else joins the session's FIFO and ships when the turn in
+    /// flight ends — or right away, when none is running.
     fn send_wire_prompt(
-        &self,
+        &mut self,
         blocks: Vec<crate::bus::PromptBlock>,
         steer: Option<u64>,
         ctl: &Controller,
     ) {
-        let text = match blocks.as_slice() {
-            [crate::bus::PromptBlock::Text(text)] => Some(text.clone()),
-            _ => None,
-        };
+        // The in-process transport carries text: an image rides the composer's
+        // own echo and chip, exactly as it did before this transport existed.
+        let text = blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::bus::PromptBlock::Text(text) => Some(text.as_str()),
+                crate::bus::PromptBlock::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
         let session_id = self.session_id.clone();
-        ctl.send(match (steer, text) {
-            (Some(message_id), Some(text)) => Cmd::Steer {
+        match steer {
+            Some(message_id) => ctl.send(Cmd::Steer {
                 session_id,
                 message_id,
                 text,
-            },
-            (Some(message_id), None) => Cmd::SteerImages {
-                session_id,
-                message_id,
-                blocks,
-            },
-            (None, Some(text)) => Cmd::Prompt { session_id, text },
-            (None, None) => Cmd::PromptImages { session_id, blocks },
-        });
+            }),
+            None => {
+                let item_id = self.next_prompt_id();
+                ctl.send(Cmd::Queue {
+                    session_id,
+                    item_id,
+                    text,
+                });
+            }
+        }
     }
 
     /// `/image <path> [caption]` — stage a local raster in the composer; it is
@@ -5872,7 +5880,14 @@ impl App {
         let cells = self.paint_staged_echo(&staged, delivery);
         self.scroll_up = 0;
         if delivery == crate::transcript::Delivery::Queued {
-            self.enqueue_prompt(staged, cells);
+            let id = self.next_prompt_id();
+            let text = staged_text(&staged);
+            self.enqueue_prompt(id, staged, cells);
+            ctl.send(Cmd::Queue {
+                session_id: self.session_id.clone(),
+                item_id: id,
+                text,
+            });
             return;
         }
         // The wire form borrows the staged blocks (image payloads are `Arc`
@@ -5894,7 +5909,6 @@ impl App {
     /// Submit path for the staged tray: set run state / queue bookkeeping,
     /// then emit the interleaved prompt.
     fn send_staged(&mut self, staged: Vec<StagedBlock>, ctl: &Controller) {
-        self.queue_hold = false;
         if staged.is_empty() {
             return;
         }
@@ -6311,7 +6325,12 @@ mod resume_tests {
         app.state = RunState::Running;
         app.send_agent_text("queued for old session".into(), &ctl);
         app.load_acp_session("target", &ctl);
-        assert!(matches!(commands.try_recv(), Ok(Cmd::LoadSession { .. })));
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            sent.iter()
+                .any(|cmd| matches!(cmd, Cmd::LoadSession { .. })),
+            "{sent:?}"
+        );
         app.handle(
             AppEvent::Ui(crate::events::UiEvent::SessionStatus {
                 session: previous.clone(),
@@ -6378,8 +6397,8 @@ mod resume_tests {
             &ctl,
         );
         assert_eq!(app.session_id, previous);
-        assert_eq!(app.queued, 0);
-        assert!(commands.try_iter().any(|cmd| matches!(cmd, Cmd::Prompt { session_id, text } if session_id == previous && text == "queued for old session")));
+        assert_eq!(app.queued, 1, "the row is still there to be sent");
+        assert!(commands.try_iter().any(|cmd| matches!(cmd, Cmd::Queue { session_id, text, .. } if session_id == previous && text == "queued for old session")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8072,7 +8091,11 @@ mod mode_tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
         assert_eq!(app.queued, 1);
         assert_eq!(app.prompt_queue.len(), 1);
-        assert!(commands.try_recv().is_err(), "queued, not sent");
+        assert!(
+            matches!(commands.try_recv(), Ok(Cmd::Queue { item_id, text, .. })
+                if text == "later" && item_id == app.prompt_queue[0].id),
+            "queueing is the host's job now: the row rides Cmd::Queue"
+        );
 
         // Plain Enter now steers, since it takes the selected mode.
         app.input.set("now instead".into());
@@ -8091,8 +8114,14 @@ mod mode_tests {
         app.state = RunState::Running;
         app.send_agent_text("first".into(), &ctl);
         app.send_agent_text("second".into(), &ctl);
-        assert_eq!(app.queued, 2, "queued client-side first");
-        assert!(commands.try_recv().is_err());
+        assert_eq!(app.queued, 2, "two rows in the composer's view");
+        let queued: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                Cmd::Queue { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, ["first", "second"], "the host was told about both");
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
 
@@ -8223,207 +8252,6 @@ mod mode_tests {
         }
     }
 
-    /// The queue is the one thing the driver does not own, so it is also the
-    /// one thing a restart would drop: it survives in `$ABYLAB_HOME/queued.json`
-    /// and comes back as queued bubbles.
-    #[test]
-    fn a_queued_prompt_survives_a_restart() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.send_agent_text("first".into(), &ctl);
-        app.send_agent_text("second".into(), &ctl);
-        let home = app.cfg.home.clone();
-        let session = app.session_id.clone();
-
-        let restarted = App::new(
-            crate::theme::Theme::dark(),
-            app.cfg.clone(),
-            session.clone(),
-        );
-
-        assert_eq!(restarted.queued, 2, "both items came back");
-        assert!(restarted.queue_hold, "restored items are held, not spent");
-        let texts: Vec<String> = restarted
-            .prompt_queue
-            .iter()
-            .map(|prompt| match prompt.blocks.first() {
-                Some(StagedBlock::Text(text)) => text.clone(),
-                _ => String::new(),
-            })
-            .collect();
-        assert_eq!(texts, ["first", "second"], "FIFO order");
-        let echoes: Vec<&String> = restarted
-            .transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::User { text, delivery }
-                    if *delivery == crate::transcript::Delivery::Queued =>
-                {
-                    Some(text)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(echoes, [&"first".to_string(), &"second".to_string()]);
-
-        // The store is per session: another session's start sees nothing.
-        let other = App::new(
-            crate::theme::Theme::dark(),
-            app.cfg.clone(),
-            "other-session".into(),
-        );
-        assert_eq!(other.queued, 0);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// Restored items wait: an idle status must not spend them on their own,
-    /// and the user's next move releases them.
-    #[test]
-    fn a_restored_queue_waits_for_a_real_turn() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.send_agent_text("remember me".into(), &ctl);
-        let restarted = {
-            let mut next = App::new(
-                crate::theme::Theme::dark(),
-                app.cfg.clone(),
-                "dsh-test".into(),
-            );
-            next.session_id = "dsh-test".into();
-            next
-        };
-        assert_eq!(restarted.queued, 1);
-
-        // The startup idle status is not an invitation.
-        let (ctl2, commands) = crate::controller::test_controller();
-        let mut app = restarted;
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
-                session: "dsh-test".into(),
-                running: false,
-            }),
-            &ctl2,
-        );
-        assert_eq!(app.queued, 1, "the hold survived the idle status");
-        assert!(commands.try_recv().is_err(), "nothing was sent");
-
-        // A finished turn releases it: this is the case the queue was holding.
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::TurnEnd {
-                session: "dsh-test".into(),
-                kind: "completed".into(),
-            }),
-            &ctl2,
-        );
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
-                session: "dsh-test".into(),
-                running: false,
-            }),
-            &ctl2,
-        );
-        assert_eq!(app.queued, 0, "the release shipped the head");
-        assert!(
-            matches!(commands.try_recv(), Ok(Cmd::Prompt { text, .. }) if text == "remember me"),
-            "the restored prompt went out as an ordinary send"
-        );
-        let _ = std::fs::remove_dir_all(&app.cfg.home);
-    }
-
-    /// Every queue mutation is mirrored to disk; a drained queue leaves no
-    /// entry behind for the next start to resurrect.
-    #[test]
-    fn the_store_follows_the_queue() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, _commands) = crate::controller::test_controller();
-        let home = app.cfg.home.clone();
-        let session = app.session_id.clone();
-        app.state = RunState::Running;
-        app.send_agent_text("first".into(), &ctl);
-        app.send_agent_text("second".into(), &ctl);
-        assert_eq!(crate::queue_store::load(&home, &session).len(), 2);
-
-        // Editing rewrites the stored item, deleting removes it.
-        let head = app.prompt_queue[0].id;
-        app.begin_queue_edit(&head.to_string(), &ctl);
-        app.input.set("first, corrected".into());
-        app.save_queue_edit(&ctl);
-        let stored = crate::queue_store::load(&home, &session);
-        assert_eq!(stored.len(), 2);
-        assert_eq!(
-            stored[0],
-            vec![crate::queue_store::Block::Text {
-                text: "first, corrected".into()
-            }]
-        );
-
-        app.drop_queued_prompt(1, &ctl);
-        assert_eq!(crate::queue_store::load(&home, &session).len(), 1);
-
-        // Steered items leave the queue, so they leave the store too.
-        app.steer_queued(0, &ctl);
-        assert!(
-            crate::queue_store::load(&home, &session).is_empty(),
-            "a drained queue is not stored"
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// A session switch brings the target session's queue back, and the queue
-    /// left behind keeps its own entry.
-    #[test]
-    fn each_session_keeps_its_own_restored_queue() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, _commands) = crate::controller::test_controller();
-        let home = app.cfg.home.clone();
-        app.state = RunState::Running;
-        app.send_agent_text("belongs to dsh-test".into(), &ctl);
-
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "second".into(),
-                notice: None,
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        assert_eq!(app.session_id, "second");
-        assert_eq!(app.queued, 0, "a fresh session starts with an empty queue");
-
-        // Queue it behind that session's own running turn.
-        app.state = RunState::Running;
-        app.send_agent_text("belongs to second".into(), &ctl);
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "dsh-test".into(),
-                notice: None,
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        let texts: Vec<String> = app
-            .prompt_queue
-            .iter()
-            .map(|prompt| match prompt.blocks.first() {
-                Some(StagedBlock::Text(text)) => text.clone(),
-                _ => String::new(),
-            })
-            .collect();
-        assert_eq!(texts, ["belongs to dsh-test"], "the old session's queue");
-        assert_eq!(
-            crate::queue_store::load(&home, "second"),
-            vec![vec![crate::queue_store::Block::Text {
-                text: "belongs to second".into()
-            }]]
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
     /// `ctrl+enter` on the queue list steers the highlighted row and keeps the
     /// list open on the row that took its place — the per-row counterpart of
     /// the empty-draft chord (harness's QueueDock Steer button).
@@ -8489,10 +8317,10 @@ mod mode_tests {
         assert_eq!(steered, ["third", "first"], "the survivors, in list order");
     }
 
-    /// Steering a row with no turn to steer into ships it as an ordinary prompt
-    /// instead of inventing a steer.
+    /// Steering a row with no turn running still rides the steer channel: the
+    /// host admits it as the next turn, and the row leaves the FIFO on the way.
     #[test]
-    fn a_row_steer_without_a_running_turn_is_an_ordinary_send() {
+    fn a_row_steer_with_nothing_running_rides_the_steer_channel() {
         let (mut app, _demo, _rx) = test_app();
         let (ctl, commands) = crate::controller::test_controller();
         app.state = RunState::Running;
@@ -8500,15 +8328,21 @@ mod mode_tests {
         app.send_agent_text("second".into(), &ctl);
         app.handle(AppEvent::Ctl(CtlEvent::Interrupted), &ctl);
         app.state = RunState::Idle;
+        let _ = commands.try_recv();
+        let _ = commands.try_recv();
 
         app.steer_queued(1, &ctl);
 
-        assert_eq!(app.queued, 1);
+        assert_eq!(app.queued, 1, "the row left the client's view");
         assert!(
-            matches!(commands.try_recv(), Ok(Cmd::Prompt { text, .. }) if text == "second"),
-            "an idle queue steer is a plain prompt"
+            matches!(commands.try_recv(), Ok(Cmd::Steer { text, .. }) if text == "second"),
+            "the host decides what a steer means when nothing is running"
         );
-        assert!(app.pending_steer_cells.is_empty());
+        assert_eq!(
+            app.pending_steer_cells.len(),
+            1,
+            "and it awaits the verdict"
+        );
     }
 
     /// `/enter` sets and persists the busy mode, and an unknown argument keeps
@@ -8988,9 +8822,19 @@ mod mode_tests {
             matches!(&app.prompt_queue[1].blocks[..], [StagedBlock::Text(text)] if text == "second followup, revised"),
             "the edit replaced the blocks"
         );
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
         assert!(
-            commands.try_recv().is_err(),
-            "editing a queued prompt never sends anything"
+            sent.iter()
+                .all(|cmd| matches!(cmd, Cmd::Queue { .. } | Cmd::UpdateQueue { .. })),
+            "editing never sends a message: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::UpdateQueue { item_id, action: crate::bus::QueueAction::Edit(text), .. }
+                    if *item_id == kept_id && text == "second followup, revised"
+            )),
+            "the host is told what the row now says: {sent:?}"
         );
     }
 
@@ -9043,9 +8887,16 @@ mod mode_tests {
                 "the queue points at the repainted bubble (cell {cell})"
             );
         }
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
         assert!(
-            commands.try_recv().is_err(),
-            "editing a queued prompt never sends anything"
+            sent.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::UpdateQueue {
+                    action: crate::bus::QueueAction::Edit(text),
+                    ..
+                } if text == "fixed"
+            )),
+            "the host is told what the row now says: {sent:?}"
         );
     }
 
@@ -9085,7 +8936,23 @@ mod mode_tests {
         assert!(app.queue_edit.is_none());
         assert!(app.prompt_queue.is_empty(), "the second press deleted it");
         assert_eq!(app.queued, 0);
-        assert!(commands.try_recv().is_err(), "nothing was sent");
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::UpdateQueue {
+                    action: crate::bus::QueueAction::Remove,
+                    ..
+                }
+            )),
+            "the host is told the row is gone: {sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::Prompt { .. } | Cmd::Steer { .. })),
+            "deleting never sends a message: {sent:?}"
+        );
     }
 
     /// Deleting a queued prompt takes its echo out of the timeline with it: the
@@ -9141,7 +9008,17 @@ mod mode_tests {
                 "the queue still points at its own bubble (cell {cell})"
             );
         }
-        assert!(commands.try_recv().is_err(), "nothing was sent");
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::UpdateQueue {
+                    action: crate::bus::QueueAction::Remove,
+                    ..
+                }
+            )),
+            "the host is told the row is gone: {sent:?}"
+        );
     }
 
     /// The queue list deletes rows itself, without the editor round-trip:
@@ -9218,16 +9095,34 @@ mod mode_tests {
         assert_eq!(app.queued, 0);
         assert!(queued_echoes(&app).is_empty(), "no echo outlives its item");
         assert!(app.picker.is_none(), "an empty list is not a dialog");
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert_eq!(
+            sent.iter()
+                .filter(|cmd| matches!(
+                    cmd,
+                    Cmd::UpdateQueue {
+                        action: crate::bus::QueueAction::Remove,
+                        ..
+                    }
+                ))
+                .count(),
+            3,
+            "every delete told the host: {sent:?}"
+        );
         assert!(
-            commands.try_recv().is_err(),
-            "deleting never sends anything"
+            !sent
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::Prompt { .. } | Cmd::Steer { .. })),
+            "deleting never sends a message: {sent:?}"
         );
     }
 
-    /// While an item is loaded for editing the FIFO holds: a turn end must not
-    /// ship the head out from under the editor.
+    /// Editing a row does not pause the host: the FIFO is the driver's, and it
+    /// drains at its own turn boundaries. A row that is delivered while the
+    /// editor is open leaves the view, and saving the edit says so instead of
+    /// resurrecting it.
     #[test]
-    fn the_queue_pauses_dispatch_while_an_item_is_edited() {
+    fn an_edit_does_not_pause_the_hosts_drain() {
         let (mut app, _demo, _rx) = test_app();
         let (ctl, commands) = crate::controller::test_controller();
         app.state = RunState::Running;
@@ -9244,673 +9139,108 @@ mod mode_tests {
             &ctl,
         );
 
-        assert_eq!(app.queued, 2, "the queue held");
-        assert!(commands.try_recv().is_err(), "nothing went out");
-        assert!(app.state_note.contains("paused"), "{}", app.state_note);
+        assert_eq!(app.queued, 2, "nothing moved the view");
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            sent.iter().all(|cmd| matches!(cmd, Cmd::Queue { .. })),
+            "the client hands nothing to the driver: the host drains the FIFO"
+        );
 
-        // Cancelling the edit ships the head now: the idle status it waited
-        // for was already spent holding the queue back.
+        // The host delivers the head while the editor is open.
+        app.handle(
+            AppEvent::Ctl(CtlEvent::QueueClaimed { item_id: head }),
+            &ctl,
+        );
+        assert_eq!(app.queued, 1, "the delivered row left the view");
+
+        // Saving now finds nothing to edit: the honest answer is a tip, not a
+        // resurrected row.
+        app.input.set("head, revised".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(app.queue_edit.is_none(), "the editor closed");
+        assert_eq!(app.queued, 1, "the delivered row stayed delivered");
+        assert!(
+            app.tip
+                .as_ref()
+                .is_some_and(|(tip, _)| tip.contains("already left the queue")),
+            "{:?}",
+            app.tip
+        );
+    }
+    /// Home stores the `usize::MAX` top sentinel until the next draw clamps
+    /// it; a scroll batched before that draw resolves against the last layout
+    /// instead of casting the sentinel to -1.
+    #[test]
+    fn a_scroll_after_jump_to_top_is_relative_to_the_top() {
+        let (mut app, _demo, _rx) = test_app();
+        app.chat_view.total = 100;
+        app.chat_view.area = ratatui::layout::Rect::new(0, 0, 80, 10);
+
+        app.scroll_up = usize::MAX;
+        app.scroll_by(-2);
+        assert_eq!(app.scroll_up, 88, "the top, minus the delta");
+
+        app.scroll_up = usize::MAX;
+        app.scroll_by(5);
+        assert_eq!(app.scroll_up, 95, "up from the top stays at the top");
+    }
+    fn ask_options() -> Vec<crate::bus::PermissionAskOption> {
+        vec![
+            crate::bus::PermissionAskOption {
+                option_id: "reject".into(),
+                kind: "reject_once".into(),
+                name: "Reject".into(),
+            },
+            crate::bus::PermissionAskOption {
+                option_id: "allow".into(),
+                kind: "allow_once".into(),
+                name: "Allow once".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn acp_permission_ask_enter_selects_option_id() {
+        let (mut app, ctl, _rx) = test_app();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::PermissionAsk {
+                title: "bash".into(),
+                options: ask_options(),
+                reply: tx,
+            },
+            &ctl,
+        );
+        let ask = app.permission_ask.as_ref().expect("overlay opens");
+        assert_eq!(ask.title, "bash");
+        assert_eq!(ask.sel, 1, "allow_once is preselected, not auto-chosen");
+        assert_eq!(ask.options[0].name, "Reject");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(app.permission_ask.is_none());
+        assert_eq!(
+            rx.blocking_recv().expect("reply"),
+            crate::bus::PermissionAskReply::Selected("allow".into())
+        );
+    }
+    #[test]
+    fn acp_permission_ask_esc_cancels() {
+        let (mut app, ctl, _rx) = test_app();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::PermissionAsk {
+                title: "bash".into(),
+                options: ask_options(),
+                reply: tx,
+            },
+            &ctl,
+        );
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
-        assert_eq!(app.queued, 1);
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(Cmd::Prompt { text, .. }) if text == "head"
-        ));
-    }
-
-    /// An empty draft's enter promotes the FIFO head: a steer while the turn
-    /// runs, and it waits for the idle status like any other send otherwise.
-    #[test]
-    fn empty_enter_sends_the_queue_head_now() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.send_agent_text("head".into(), &ctl);
-        app.send_agent_text("tail".into(), &ctl);
-
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
-
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(Cmd::Steer { text, .. }) if text == "head"
-        ));
-        assert_eq!(app.queued, 1, "the tail stays queued");
-        assert_eq!(app.prompt_queue.len(), 1);
-        assert!(
-            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "tail")
-        );
+        assert!(app.permission_ask.is_none());
         assert_eq!(
-            app.pending_steer_cells.len(),
-            1,
-            "the steer awaits settlement"
+            rx.blocking_recv().expect("reply"),
+            crate::bus::PermissionAskReply::Cancelled
         );
     }
-
-    /// An idle client that still holds a queue (a cancelled edit, a failed
-    /// turn) sends the head as a plain prompt on an empty enter — not as a
-    /// steer, which would interrupt a turn that is not running.
-    #[test]
-    fn empty_enter_on_an_idle_queue_goes_out_as_a_plain_prompt() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.send_agent_text("head".into(), &ctl);
-        app.send_agent_text("tail".into(), &ctl);
-        // The turn failed or was interrupted: the queue survives, the client is idle.
-        app.state = RunState::Idle;
-        app.prompt_pending = false;
-
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
-
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(Cmd::Prompt { text, .. }) if text == "head"
-        ));
-        assert_eq!(app.queued, 1, "the tail stays queued");
-        assert!(app.prompt_pending, "the head is now in flight");
-        assert_eq!(app.state, RunState::Starting);
-    }
-
-    /// The idle status is what hands the FIFO head to the driver: it is not
-    /// merely kept (that was the driver-channel queue's job), it goes out —
-    /// exactly one item, whose echo loses the queued tint.
-    #[test]
-    fn an_idle_status_dispatches_the_client_owned_fifo_head() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.send_agent_text("followup".into(), &ctl);
-        assert_eq!(app.queued, 1);
-        assert!(matches!(
-            app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::User {
-                delivery: crate::transcript::Delivery::Queued,
-                ..
-            })
-        ));
-
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
-                session: "dsh-test".into(),
-                running: false,
-            }),
-            &ctl,
-        );
-
-        assert_eq!(app.queued, 0);
-        assert!(app.prompt_queue.is_empty(), "the head left the queue");
-        assert!(matches!(
-            app.transcript.cells.last().map(|cell| &cell.kind),
-            Some(crate::transcript::CellKind::User {
-                delivery: crate::transcript::Delivery::Delivered,
-                ..
-            })
-        ));
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(Cmd::Prompt { text, .. }) if text == "followup"
-        ));
-        assert!(app.prompt_pending, "the dispatched turn is armed");
-    }
-
-    #[test]
-    fn an_idle_status_delivers_exactly_one_queued_prompt_group() {
-        let (mut app, ctl, _rx) = test_app();
-        app.state = RunState::Running;
-        app.send_staged(
-            vec![
-                StagedBlock::Text("look".into()),
-                StagedBlock::Image(crate::attachments::Attachment {
-                    id: crate::attachments::KITTY_ID_BASE + 1,
-                    token: "[image 1]".into(),
-                    name: "shot.png".into(),
-                    path: "clipboard".into(),
-                    media_type: "image/png".into(),
-                    data: std::sync::Arc::from([1_u8, 2, 3]),
-                }),
-            ],
-            &ctl,
-        );
-        app.send_agent_text("after".into(), &ctl);
-
-        assert_eq!(app.queued, 2);
-
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
-                session: "dsh-test".into(),
-                running: false,
-            }),
-            &ctl,
-        );
-        assert_eq!(app.queued, 1, "only the head went out");
-
-        // The driver's own acceptance of a prompt never moves the queue.
-        app.handle(
-            AppEvent::Ctl(CtlEvent::PromptQueued {
-                message_id: "dsh-test".into(),
-            }),
-            &ctl,
-        );
-        assert_eq!(app.queued, 1);
-        let queued = app
-            .transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::User { delivery, .. }
-                | crate::transcript::CellKind::Image { delivery, .. } => Some(*delivery),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            queued,
-            [
-                crate::transcript::Delivery::Delivered,
-                crate::transcript::Delivery::Delivered,
-                crate::transcript::Delivery::Queued
-            ]
-        );
-    }
-
-    #[test]
-    fn ctrl_c_with_a_draft_clears_it_before_starting_a_fresh_double_press_to_quit() {
-        let (mut app, ctl, _rx) = test_app();
-        app.ctrl_c_armed = Some(CtrlCQuitChord {
-            started: Instant::now(),
-            presses: 1,
-            required: 2,
-        });
-        app.input.set("unfinished draft".into());
-
-        app.handle_ctrl_c(&ctl);
-        assert!(app.input.is_empty());
-        assert!(
-            app.ctrl_c_armed.is_none(),
-            "clearing is not the first quit press"
-        );
-        assert!(!app.quit);
-
-        app.handle_ctrl_c(&ctl);
-        assert!(app.ctrl_c_armed.is_some());
-        assert!(!app.quit);
-
-        app.handle_ctrl_c(&ctl);
-        assert!(app.quit);
-    }
-
-    #[test]
-    fn ctrl_c_while_starting_without_a_prompt_quits_after_two_empty_presses() {
-        let (mut app, ctl, _rx) = test_app();
-        app.state = RunState::Starting;
-
-        app.handle_ctrl_c(&ctl);
-        assert!(!app.quit, "the first empty Ctrl+C arms the idle quit chord");
-
-        app.handle_ctrl_c(&ctl);
-        assert!(
-            app.quit,
-            "startup without an active turn uses the two-press chord"
-        );
-    }
-
-    #[test]
-    fn ctrl_c_while_running_never_interrupts_and_two_empty_presses_quit() {
-        let (mut app, _demo_ctl, _rx) = test_app();
-        let (ctl, commands) = crate::controller::test_interruptible_controller();
-        app.state = RunState::Running;
-
-        app.handle_ctrl_c(&ctl);
-        assert!(
-            app.ctrl_c_armed.is_some(),
-            "an empty Ctrl+C should arm quit even while the turn is running"
-        );
-        assert!(!app.quit);
-        assert_eq!(app.state, RunState::Running);
-        assert!(
-            matches!(
-                commands.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ),
-            "Ctrl+C must not send Cmd::Interrupt"
-        );
-
-        app.handle_ctrl_c(&ctl);
-        assert!(app.quit);
-    }
-
-    /// Skills are `/skill`'s business only: the `/` menu lists builtins and
-    /// nothing else, even when the catalog holds a name no builtin claims.
-    #[test]
-    fn skills_stay_out_of_the_slash_menu() {
-        let (mut app, _ctl, _rx) = test_app();
-        app.skills = vec![
-            crate::bus::SkillInfo {
-                name: "commit-helper".into(),
-                description: "draft a commit".into(),
-                input_hint: None,
-                source: None,
-            },
-            crate::bus::SkillInfo {
-                name: "help".into(),
-                description: "shadowed by builtin".into(),
-                input_hint: None,
-                source: None,
-            },
-        ];
-        app.input.set("/".into());
-        let menu = app.slash_matches();
-        assert_eq!(
-            menu.len(),
-            SLASH_COMMANDS.len(),
-            "the bare `/` menu is the builtin list, unmerged"
-        );
-        assert!(
-            !menu.iter().any(|e| e.name == "commit-helper"),
-            "a skill never becomes a `/` row"
-        );
-        // Not even as a prefix: `/commit` matches no builtin, so the menu is
-        // empty and the line is left to ship as a skill prompt instead.
-        app.input.set("/commit".into());
-        assert!(app.slash_matches().is_empty());
-        // The catalog is one command away.
-        app.input.set("/skill ".into());
-        assert_eq!(app.slash_matches().len(), 2, "both skills are candidates");
-    }
-
-    #[test]
-    fn tab_completes_a_slash_argument_without_running_it() {
-        let (mut app, _demo_ctl, _rx) = test_app();
-        let (ctl, commands) = crate::controller::test_controller();
-        app.input.set("/plan o".into());
-
-        let menu = app.slash_matches();
-        assert_eq!(
-            menu.iter()
-                .map(|entry| entry.usage.as_str())
-                .collect::<Vec<_>>(),
-            ["on", "off"]
-        );
-
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctl);
-        assert_eq!(app.input.buf(), "/plan on");
-        assert!(matches!(
-            commands.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-    }
-
-    #[test]
-    fn direct_plan_mode_facts_fold_once_into_client_state() {
-        let (mut app, ctl, _rx) = test_app();
-
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::PlanMode {
-                session: "dsh-test".into(),
-                active: true,
-            }),
-            &ctl,
-        );
-        assert!(app.modes.plan);
-        let cells_after_first = app.transcript.cells.len();
-
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::PlanMode {
-                session: "dsh-test".into(),
-                active: true,
-            }),
-            &ctl,
-        );
-        assert_eq!(
-            app.transcript.cells.len(),
-            cells_after_first,
-            "the same config_option_update is idempotent"
-        );
-    }
-
-    #[test]
-    fn initial_default_plan_mode_does_not_add_an_off_notice() {
-        let (mut app, ctl, _rx) = test_app();
-        let cells_before = app.transcript.cells.len();
-
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::PlanMode {
-                session: "dsh-test".into(),
-                active: false,
-            }),
-            &ctl,
-        );
-
-        assert_eq!(app.transcript.cells.len(), cells_before);
-    }
-
-    /// The direct turn facts still drive the client lifecycle — the queue
-    /// itself is only moved by the idle status now.
-    #[test]
-    fn direct_ui_turn_facts_update_client_lifecycle() {
-        let (mut app, ctl, _rx) = test_app();
-        app.state = RunState::Running;
-        app.run_started = Some(Instant::now());
-        app.state_note = "working".into();
-        app.prompt_queue.push_back(QueuedPrompt {
-            id: 1,
-            blocks: vec![StagedBlock::Text("followup".into())],
-            cells: vec![],
-        });
-        app.queued = 1;
-
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::TurnStart {
-                session: "dsh-test".into(),
-                turn: 1,
-            }),
-            &ctl,
-        );
-        assert_eq!(app.queued, 1, "a turn start never moves the queue");
-        app.handle(
-            AppEvent::Ctl(CtlEvent::PromptQueued {
-                message_id: "dsh-test".into(),
-            }),
-            &ctl,
-        );
-        assert_eq!(app.queued, 1, "acceptance never moves the queue either");
-
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
-                session: "dsh-test".into(),
-                running: false,
-            }),
-            &ctl,
-        );
-        assert_eq!(app.queued, 0, "the idle status dispatched the queued head");
-        assert!(matches!(app.state, RunState::Starting));
-        assert!(app.run_started.is_some(), "the dispatched turn is timed");
-        assert!(app.state_note.contains("queued"), "{}", app.state_note);
-
-        // The next turn end has an empty queue and settles back to idle.
-        app.handle(
-            AppEvent::Ctl(CtlEvent::PromptQueued {
-                message_id: "dsh-test".into(),
-            }),
-            &ctl,
-        );
-        app.handle(
-            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
-                session: "dsh-test".into(),
-                running: false,
-            }),
-            &ctl,
-        );
-        assert!(matches!(app.state, RunState::Idle));
-        assert!(app.run_started.is_none());
-        assert!(app.state_note.is_empty());
-    }
-
-    #[test]
-    fn plan_message_keeps_the_slash_prompt_transport() {
-        let (mut app, ctl, _rx) = test_app();
-        app.skills = vec![crate::bus::SkillInfo {
-            name: "plan".into(),
-            description: "Enter plan mode".into(),
-            input_hint: None,
-            source: None,
-        }];
-
-        app.run_slash("plan", "focus on the parser", &ctl);
-
-        assert!(matches!(app.state, RunState::Starting));
-        assert!(matches!(
-            &app.transcript.cells[0].kind,
-            crate::transcript::CellKind::User { text, .. }
-                if text == "/plan focus on the parser"
-        ));
-    }
-
-    #[test]
-    fn no_key_onboarding_guides_the_platform_and_login() {
-        let (mut app, _ctl, _rx) = test_app();
-        assert!(!app.cfg.has_credentials());
-
-        app.push_no_key_onboarding();
-
-        let cards: Vec<&str> = app
-            .transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::MarkdownNotice { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(cards.len(), 1, "{cards:?}");
-        assert!(
-            cards[0].contains("platform.deepseek.com"),
-            "the platform URL guides the user: {}",
-            cards[0]
-        );
-        assert!(
-            cards[0].contains("/login sk-"),
-            "how to operate: {}",
-            cards[0]
-        );
-        assert!(
-            cards[0].contains("credentials.yaml"),
-            "where the key lands: {}",
-            cards[0]
-        );
-
-        // A key present: the same helper still renders (used by tests only),
-        // but main.rs gates the call on has_credentials — covered upstream.
-    }
-
-    #[test]
-    fn login_without_argument_reports_status_never_the_value() {
-        let (mut app, ctl, _rx) = test_app();
-
-        app.run_slash("login", "", &ctl);
-
-        let notices: Vec<&str> = app
-            .transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::Notice { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices.iter().any(|text| text.contains("usage: /login")),
-            "{notices:?}"
-        );
-    }
-
-    #[test]
-    fn login_stores_the_key_and_rotates_the_running_driver() {
-        let cfg = test_cfg();
-        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
-        let (ctl, commands) = crate::controller::test_controller();
-        let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
-        let key = "sk-abcdefgh1234567890";
-
-        app.run_slash("login", key, &ctl);
-
-        // The driver gets the rotation command.
-        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
-        assert!(
-            sent.iter().any(|cmd| matches!(
-                cmd,
-                crate::bus::Cmd::SetApiKey { key: Some(key) } if key == "sk-abcdefgh1234567890"
-            )),
-            "{sent:?}"
-        );
-
-        // The key landed in the store; the confirmation is redacted.
-        assert_eq!(
-            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
-                .unwrap(),
-            Some("sk-abcdefgh1234567890".into())
-        );
-        let notices: Vec<String> = app
-            .transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices.iter().any(|text| text.contains("sk-…7890")),
-            "redacted descriptor: {notices:?}"
-        );
-        assert!(
-            !notices
-                .iter()
-                .any(|text| text.contains("sk-abcdefgh1234567890")),
-            "the literal key must not appear in the transcript: {notices:?}"
-        );
-        assert_eq!(app.cfg.key_origin, Some(crate::runtime::KeyOrigin::Stored));
-        assert!(app.cfg.has_credentials());
-    }
-
-    #[test]
-    fn login_replaces_a_previously_stored_key() {
-        let (mut app, ctl, _rx) = test_app();
-        app.run_slash("login", "sk-first0000001", &ctl);
-        app.run_slash("login", "sk-second0002", &ctl);
-
-        assert_eq!(
-            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
-                .unwrap(),
-            Some("sk-second0002".into())
-        );
-    }
-
-    #[test]
-    fn logout_removes_the_stored_key_and_clears_the_live_driver() {
-        let cfg = test_cfg();
-        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
-        let (ctl, commands) = crate::controller::test_controller();
-        let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
-        app.run_slash("login", "sk-abcdefgh1234567890", &ctl);
-        let _ = std::iter::from_fn(|| commands.try_recv().ok()).collect::<Vec<_>>();
-
-        app.run_slash("logout", "", &ctl);
-
-        // The stored entry is gone and the driver gets the clear command.
-        assert_eq!(
-            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
-                .unwrap(),
-            None
-        );
-        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
-        assert!(
-            sent.iter()
-                .any(|cmd| matches!(cmd, crate::bus::Cmd::SetApiKey { key: None })),
-            "{sent:?}"
-        );
-        assert_eq!(app.cfg.api_key, None);
-        assert_eq!(app.cfg.key_origin, None);
-        assert!(!app.cfg.has_credentials());
-    }
-
-    #[test]
-    fn logout_when_nothing_is_stored_is_a_quiet_noop() {
-        let (mut app, ctl, _rx) = test_app();
-        assert_eq!(app.cfg.key_origin, None);
-        let cells_before = app.transcript.cells.len();
-
-        app.run_slash("logout", "", &ctl);
-
-        let notices: Vec<&str> = app
-            .transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::Notice { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices.iter().any(|text| text.contains("no stored key")),
-            "{notices:?}"
-        );
-        assert_eq!(app.transcript.cells.len(), cells_before + 1);
-    }
-
-    #[test]
-    fn logout_keeps_an_api_key_override_running() {
-        let cfg = test_cfg();
-        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
-        let (ctl, commands) = crate::controller::test_controller();
-        let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
-        // An older stored key loses to the launch override, so both exist.
-        crate::credentials::store_key(
-            &app.cfg.home,
-            crate::credentials::API_KEY_REF,
-            "sk-stored000001",
-        )
-        .unwrap();
-        app.cfg.api_key = Some("sk-override0001".into());
-        app.cfg.key_origin = Some(crate::runtime::KeyOrigin::Flag);
-
-        app.run_slash("logout", "", &ctl);
-
-        // The stored record is gone, but the run keeps its explicit override…
-        assert_eq!(
-            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
-                .unwrap(),
-            None
-        );
-        assert_eq!(app.cfg.api_key, Some("sk-override0001".into()));
-        assert_eq!(app.cfg.key_origin, Some(crate::runtime::KeyOrigin::Flag));
-        // …and the driver is not disturbed.
-        assert!(
-            std::iter::from_fn(|| commands.try_recv().ok())
-                .collect::<Vec<Cmd>>()
-                .is_empty(),
-            "no SetApiKey may reach the driver for a read-only launch override"
-        );
-        let notices: Vec<String> = app
-            .transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices
-                .iter()
-                .any(|text| text.contains("--api-key flag key keeps running")),
-            "{notices:?}"
-        );
-    }
-
-    /// The menu never rows a skill, but the line still reaches the host: a
-    /// hand-typed `/name` ships as a prompt and the agent injects the body.
-    #[test]
-    fn skill_line_ships_as_prompt_not_unknown_command() {
-        let (mut app, ctl, _rx) = test_app();
-        app.skills = vec![crate::bus::SkillInfo {
-            name: "commit-helper".into(),
-            description: "draft a commit".into(),
-            input_hint: None,
-            source: None,
-        }];
-        app.input.set("/commit-helper for the last change".into());
-        assert!(
-            app.slash_matches().is_empty(),
-            "no completer row — the skill is not a command"
-        );
-        app.submit(&ctl);
-        assert!(
-            matches!(app.state, RunState::Starting),
-            "skill line starts a turn"
-        );
-        assert!(app.input.is_empty());
-    }
-
     /// `/skill` with no argument renders the catalog the agent discovered,
     /// source file and all; its empty state names the directory instead of
     /// reading as "this build has no skills".
@@ -9967,7 +9297,769 @@ mod mode_tests {
             "the home directory is not a skills root any more:\n{frame}"
         );
     }
+    /// `/clear` empties the timeline, so the client's cell indices must go
+    /// with it: a later delete of a queued prompt used to splice whatever cell
+    /// now sat at the stale index.
+    #[test]
+    fn clearing_the_scrollback_forgets_client_cell_indices() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("queued".into(), &ctl);
+        assert_eq!(app.prompt_queue[0].cells.len(), 1);
 
+        app.dispatch(Action::ClearScrollback, &ctl);
+        assert!(
+            app.prompt_queue[0].cells.is_empty(),
+            "the cleared timeline's index is dropped"
+        );
+
+        // New cells land where the old index pointed; deleting the queued
+        // prompt must not touch them.
+        app.transcript
+            .push_user("unrelated".into(), crate::transcript::Delivery::Delivered);
+        let unrelated = app.transcript.cells.len() - 1;
+        app.drop_queued_prompt(0, &ctl);
+        assert_eq!(app.prompt_queue.len(), 0);
+        assert_eq!(app.transcript.cells.len(), 2, "the notice and the bubble");
+        assert!(matches!(
+            &app.transcript.cells[unrelated].kind,
+            crate::transcript::CellKind::User { text, .. } if text == "unrelated"
+        ));
+    }
+    #[test]
+    fn ctrl_c_while_running_never_interrupts_and_two_empty_presses_quit() {
+        let (mut app, _demo_ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_interruptible_controller();
+        app.state = RunState::Running;
+
+        app.handle_ctrl_c(&ctl);
+        assert!(
+            app.ctrl_c_armed.is_some(),
+            "an empty Ctrl+C should arm quit even while the turn is running"
+        );
+        assert!(!app.quit);
+        assert_eq!(app.state, RunState::Running);
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "Ctrl+C must not send Cmd::Interrupt"
+        );
+
+        app.handle_ctrl_c(&ctl);
+        assert!(app.quit);
+    }
+    #[test]
+    fn ctrl_c_while_starting_without_a_prompt_quits_after_two_empty_presses() {
+        let (mut app, ctl, _rx) = test_app();
+        app.state = RunState::Starting;
+
+        app.handle_ctrl_c(&ctl);
+        assert!(!app.quit, "the first empty Ctrl+C arms the idle quit chord");
+
+        app.handle_ctrl_c(&ctl);
+        assert!(
+            app.quit,
+            "startup without an active turn uses the two-press chord"
+        );
+    }
+    #[test]
+    fn ctrl_c_with_a_draft_clears_it_before_starting_a_fresh_double_press_to_quit() {
+        let (mut app, ctl, _rx) = test_app();
+        app.ctrl_c_armed = Some(CtrlCQuitChord {
+            started: Instant::now(),
+            presses: 1,
+            required: 2,
+        });
+        app.input.set("unfinished draft".into());
+
+        app.handle_ctrl_c(&ctl);
+        assert!(app.input.is_empty());
+        assert!(
+            app.ctrl_c_armed.is_none(),
+            "clearing is not the first quit press"
+        );
+        assert!(!app.quit);
+
+        app.handle_ctrl_c(&ctl);
+        assert!(app.ctrl_c_armed.is_some());
+        assert!(!app.quit);
+
+        app.handle_ctrl_c(&ctl);
+        assert!(app.quit);
+    }
+    #[test]
+    fn direct_plan_mode_facts_fold_once_into_client_state() {
+        let (mut app, ctl, _rx) = test_app();
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::PlanMode {
+                session: "dsh-test".into(),
+                active: true,
+            }),
+            &ctl,
+        );
+        assert!(app.modes.plan);
+        let cells_after_first = app.transcript.cells.len();
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::PlanMode {
+                session: "dsh-test".into(),
+                active: true,
+            }),
+            &ctl,
+        );
+        assert_eq!(
+            app.transcript.cells.len(),
+            cells_after_first,
+            "the same config_option_update is idempotent"
+        );
+    }
+    /// The direct turn facts still drive the client lifecycle — the queue
+    /// itself is only moved by the idle status now.
+    #[test]
+    fn direct_ui_turn_facts_update_client_lifecycle() {
+        let (mut app, ctl, _rx) = test_app();
+        app.state = RunState::Running;
+        app.run_started = Some(Instant::now());
+        app.state_note = "working".into();
+        app.prompt_queue.push_back(QueuedPrompt {
+            id: 1,
+            blocks: vec![StagedBlock::Text("followup".into())],
+            cells: vec![],
+        });
+        app.queued = 1;
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::TurnStart {
+                session: "dsh-test".into(),
+                turn: 1,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.queued, 1, "a turn start never moves the queue");
+        app.handle(
+            AppEvent::Ctl(CtlEvent::PromptQueued {
+                message_id: "dsh-test".into(),
+            }),
+            &ctl,
+        );
+        assert_eq!(app.queued, 1, "acceptance never moves the queue either");
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
+        assert_eq!(
+            app.queued, 1,
+            "the idle status leaves the row to the host, which drains it"
+        );
+
+        // The next turn end has an empty queue and settles back to idle.
+        app.handle(
+            AppEvent::Ctl(CtlEvent::PromptQueued {
+                message_id: "dsh-test".into(),
+            }),
+            &ctl,
+        );
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
+        assert!(matches!(app.state, RunState::Idle));
+        assert!(app.run_started.is_none());
+        assert!(app.state_note.is_empty());
+    }
+    #[test]
+    fn draft_split_does_not_append_chips_missing_from_the_draft() {
+        let mut staged = crate::attachments::Staged::default();
+        staged
+            .add(
+                crate::locale::Locale::En,
+                "kept.png".into(),
+                "/tmp/kept.png".into(),
+                "image/png".into(),
+                vec![1],
+            )
+            .unwrap();
+        staged
+            .add(
+                crate::locale::Locale::En,
+                "orphan.png".into(),
+                "/tmp/orphan.png".into(),
+                "image/png".into(),
+                vec![2],
+            )
+            .unwrap();
+        let blocks = split_draft_into_staged_blocks("hello [image 1]", staged.drain());
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], StagedBlock::Text(t) if t == "hello"));
+        assert!(matches!(&blocks[1], StagedBlock::Image(a) if a.name == "kept.png"));
+    }
+    #[test]
+    fn draft_split_keeps_text_and_images_interleaved() {
+        let mut staged = crate::attachments::Staged::default();
+        staged
+            .add(
+                crate::locale::Locale::En,
+                "a.png".into(),
+                "/tmp/a.png".into(),
+                "image/png".into(),
+                vec![1],
+            )
+            .unwrap();
+        staged
+            .add(
+                crate::locale::Locale::En,
+                "b.png".into(),
+                "/tmp/b.png".into(),
+                "image/png".into(),
+                vec![2],
+            )
+            .unwrap();
+        let blocks =
+            split_draft_into_staged_blocks("see [image 1] then [image 2] done", staged.drain());
+        assert_eq!(blocks.len(), 5);
+        assert!(matches!(&blocks[0], StagedBlock::Text(t) if t == "see"));
+        assert!(matches!(&blocks[1], StagedBlock::Image(a) if a.name == "a.png"));
+        assert!(matches!(&blocks[2], StagedBlock::Text(t) if t == " then "));
+        assert!(matches!(&blocks[3], StagedBlock::Image(a) if a.name == "b.png"));
+        assert!(matches!(&blocks[4], StagedBlock::Text(t) if t == "done"));
+        let prompt = prompt_blocks_from_staged(&blocks);
+        assert!(matches!(&prompt[0], crate::bus::PromptBlock::Text(t) if t == "see"));
+        assert!(matches!(&prompt[1], crate::bus::PromptBlock::Image(a) if a.path == "/tmp/a.png"));
+        assert!(matches!(&prompt[2], crate::bus::PromptBlock::Text(t) if t == " then "));
+        assert!(matches!(&prompt[3], crate::bus::PromptBlock::Image(a) if a.path == "/tmp/b.png"));
+        assert!(matches!(&prompt[4], crate::bus::PromptBlock::Text(t) if t == "done"));
+    }
+    /// An empty draft's enter promotes the FIFO head: a steer while the turn
+    /// runs, and it waits for the idle status like any other send otherwise.
+    #[test]
+    fn empty_enter_sends_the_queue_head_now() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("head".into(), &ctl);
+        app.send_agent_text("tail".into(), &ctl);
+        let _ = commands.try_recv(); // the two queue commands
+        let _ = commands.try_recv();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Cmd::Steer { text, .. }) if text == "head"
+        ));
+        assert_eq!(app.queued, 1, "the tail stays queued");
+        assert_eq!(app.prompt_queue.len(), 1);
+        assert!(
+            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "tail")
+        );
+        assert_eq!(
+            app.pending_steer_cells.len(),
+            1,
+            "the steer awaits settlement"
+        );
+    }
+    #[test]
+    fn initial_default_plan_mode_does_not_add_an_off_notice() {
+        let (mut app, ctl, _rx) = test_app();
+        let cells_before = app.transcript.cells.len();
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::PlanMode {
+                session: "dsh-test".into(),
+                active: false,
+            }),
+            &ctl,
+        );
+
+        assert_eq!(app.transcript.cells.len(), cells_before);
+    }
+    /// `/login` resolves in the TUI even when the agent advertises a skill of
+    /// that name — skills add no `/` row, so there is no race to lose.
+    #[test]
+    fn login_is_a_tui_builtin_and_shadows_the_agent_skill() {
+        let (mut app, ctl, _rx) = test_app();
+        app.skills = vec![crate::bus::SkillInfo {
+            name: "login".into(),
+            description: "Save a DeepSeek API key into the harness credential store".into(),
+            input_hint: None,
+            source: None,
+        }];
+        app.input.set("/log".into());
+        let candidates = app.slash_matches();
+        let rows: Vec<&str> = candidates.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            rows,
+            ["login", "logout"],
+            "the two builtins, in table order — the skill adds no rows"
+        );
+        app.input.set("/login sk-test".into());
+        app.submit(&ctl);
+        assert!(
+            !matches!(app.state, RunState::Starting),
+            "the builtin is a local op, never a prompt"
+        );
+        assert_eq!(
+            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
+                .unwrap(),
+            Some("sk-test".into())
+        );
+    }
+    #[test]
+    fn login_replaces_a_previously_stored_key() {
+        let (mut app, ctl, _rx) = test_app();
+        app.run_slash("login", "sk-first0000001", &ctl);
+        app.run_slash("login", "sk-second0002", &ctl);
+
+        assert_eq!(
+            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
+                .unwrap(),
+            Some("sk-second0002".into())
+        );
+    }
+    #[test]
+    fn login_stores_the_key_and_rotates_the_running_driver() {
+        let cfg = test_cfg();
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let (ctl, commands) = crate::controller::test_controller();
+        let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
+        let key = "sk-abcdefgh1234567890";
+
+        app.run_slash("login", key, &ctl);
+
+        // The driver gets the rotation command.
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|cmd| matches!(
+                cmd,
+                crate::bus::Cmd::SetApiKey { key: Some(key) } if key == "sk-abcdefgh1234567890"
+            )),
+            "{sent:?}"
+        );
+
+        // The key landed in the store; the confirmation is redacted.
+        assert_eq!(
+            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
+                .unwrap(),
+            Some("sk-abcdefgh1234567890".into())
+        );
+        let notices: Vec<String> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|text| text.contains("sk-…7890")),
+            "redacted descriptor: {notices:?}"
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|text| text.contains("sk-abcdefgh1234567890")),
+            "the literal key must not appear in the transcript: {notices:?}"
+        );
+        assert_eq!(app.cfg.key_origin, Some(crate::runtime::KeyOrigin::Stored));
+        assert!(app.cfg.has_credentials());
+    }
+    #[test]
+    fn login_without_argument_reports_status_never_the_value() {
+        let (mut app, ctl, _rx) = test_app();
+
+        app.run_slash("login", "", &ctl);
+
+        let notices: Vec<&str> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|text| text.contains("usage: /login")),
+            "{notices:?}"
+        );
+    }
+    /// Both twins stay local ops; the agent's same-named skills are reachable
+    /// only as `/skill login` / `/skill logout`.
+    #[test]
+    fn logout_is_a_tui_builtin_and_shadows_the_agent_skill() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.skills = vec![
+            crate::bus::SkillInfo {
+                name: "logout".into(),
+                description: "sign out".into(),
+                input_hint: None,
+                source: None,
+            },
+            crate::bus::SkillInfo {
+                name: "login".into(),
+                description: "agent login".into(),
+                input_hint: None,
+                source: None,
+            },
+        ];
+        app.input.set("/".into());
+        let menu = app.slash_matches();
+        assert_eq!(
+            menu.len(),
+            SLASH_COMMANDS.len(),
+            "the bare `/` menu is the builtin table, nothing appended"
+        );
+        for row in &menu {
+            assert!(
+                SLASH_COMMANDS.iter().any(|c| c.name == row.name),
+                "{} is not a builtin",
+                row.name
+            );
+        }
+        assert!(menu.iter().any(|e| e.name == "logout"));
+        assert!(menu.iter().any(|e| e.name == "login"));
+        // The skills did not disappear — `/skill ` still offers both.
+        app.input.set("/skill ".into());
+        let candidates = app.slash_matches();
+        let mut catalog: Vec<&str> = candidates.iter().map(|e| e.usage.as_str()).collect();
+        catalog.sort_unstable();
+        assert_eq!(catalog, ["login", "logout"], "the catalog keeps them both");
+    }
+    #[test]
+    fn logout_keeps_an_api_key_override_running() {
+        let cfg = test_cfg();
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let (ctl, commands) = crate::controller::test_controller();
+        let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
+        // An older stored key loses to the launch override, so both exist.
+        crate::credentials::store_key(
+            &app.cfg.home,
+            crate::credentials::API_KEY_REF,
+            "sk-stored000001",
+        )
+        .unwrap();
+        app.cfg.api_key = Some("sk-override0001".into());
+        app.cfg.key_origin = Some(crate::runtime::KeyOrigin::Flag);
+
+        app.run_slash("logout", "", &ctl);
+
+        // The stored record is gone, but the run keeps its explicit override…
+        assert_eq!(
+            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(app.cfg.api_key, Some("sk-override0001".into()));
+        assert_eq!(app.cfg.key_origin, Some(crate::runtime::KeyOrigin::Flag));
+        // …and the driver is not disturbed.
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .collect::<Vec<Cmd>>()
+                .is_empty(),
+            "no SetApiKey may reach the driver for a read-only launch override"
+        );
+        let notices: Vec<String> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices
+                .iter()
+                .any(|text| text.contains("--api-key flag key keeps running")),
+            "{notices:?}"
+        );
+    }
+    #[test]
+    fn logout_removes_the_stored_key_and_clears_the_live_driver() {
+        let cfg = test_cfg();
+        let (_tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let (ctl, commands) = crate::controller::test_controller();
+        let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
+        app.run_slash("login", "sk-abcdefgh1234567890", &ctl);
+        let _ = std::iter::from_fn(|| commands.try_recv().ok()).collect::<Vec<_>>();
+
+        app.run_slash("logout", "", &ctl);
+
+        // The stored entry is gone and the driver gets the clear command.
+        assert_eq!(
+            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
+                .unwrap(),
+            None
+        );
+        let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            sent.iter()
+                .any(|cmd| matches!(cmd, crate::bus::Cmd::SetApiKey { key: None })),
+            "{sent:?}"
+        );
+        assert_eq!(app.cfg.api_key, None);
+        assert_eq!(app.cfg.key_origin, None);
+        assert!(!app.cfg.has_credentials());
+    }
+    #[test]
+    fn logout_when_nothing_is_stored_is_a_quiet_noop() {
+        let (mut app, ctl, _rx) = test_app();
+        assert_eq!(app.cfg.key_origin, None);
+        let cells_before = app.transcript.cells.len();
+
+        app.run_slash("logout", "", &ctl);
+
+        let notices: Vec<&str> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|text| text.contains("no stored key")),
+            "{notices:?}"
+        );
+        assert_eq!(app.transcript.cells.len(), cells_before + 1);
+    }
+    #[test]
+    fn no_key_onboarding_guides_the_platform_and_login() {
+        let (mut app, _ctl, _rx) = test_app();
+        assert!(!app.cfg.has_credentials());
+
+        app.push_no_key_onboarding();
+
+        let cards: Vec<&str> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::MarkdownNotice { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 1, "{cards:?}");
+        assert!(
+            cards[0].contains("platform.deepseek.com"),
+            "the platform URL guides the user: {}",
+            cards[0]
+        );
+        assert!(
+            cards[0].contains("/login sk-"),
+            "how to operate: {}",
+            cards[0]
+        );
+        assert!(
+            cards[0].contains("credentials.yaml"),
+            "where the key lands: {}",
+            cards[0]
+        );
+
+        // A key present: the same helper still renders (used by tests only),
+        // but main.rs gates the call on has_credentials — covered upstream.
+    }
+    #[test]
+    fn plan_message_keeps_the_slash_prompt_transport() {
+        let (mut app, ctl, _rx) = test_app();
+        app.skills = vec![crate::bus::SkillInfo {
+            name: "plan".into(),
+            description: "Enter plan mode".into(),
+            input_hint: None,
+            source: None,
+        }];
+
+        app.run_slash("plan", "focus on the parser", &ctl);
+
+        assert!(matches!(app.state, RunState::Starting));
+        assert!(matches!(
+            &app.transcript.cells[0].kind,
+            crate::transcript::CellKind::User { text, .. }
+                if text == "/plan focus on the parser"
+        ));
+    }
+    /// The host drains the FIFO, so an idle status changes nothing on the
+    /// client: the row keeps its queued look until the driver says it was
+    /// claimed (or removed).
+    #[test]
+    fn an_idle_status_leaves_the_queue_to_the_host() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("followup".into(), &ctl);
+        assert_eq!(app.queued, 1);
+        let _ = commands.try_recv(); // its Cmd::Queue
+
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: "dsh-test".into(),
+                running: false,
+            }),
+            &ctl,
+        );
+
+        assert_eq!(app.queued, 1, "the view waits for the host's snapshot");
+        assert!(matches!(
+            app.transcript.cells.last().map(|cell| &cell.kind),
+            Some(crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Queued,
+                ..
+            })
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "the client does not dispatch what it does not own"
+        );
+
+        // The claim is what settles the echo and the row.
+        let item_id = app.prompt_queue[0].id;
+        app.handle(AppEvent::Ctl(CtlEvent::QueueClaimed { item_id }), &ctl);
+        assert_eq!(app.queued, 0);
+        assert!(app.prompt_queue.is_empty(), "the row left the mirror");
+        assert!(matches!(
+            app.transcript.cells.last().map(|cell| &cell.kind),
+            Some(crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Delivered,
+                ..
+            })
+        ));
+    }
+
+    /// A snapshot from the driver is the queue: unknown rows are painted, its
+    /// order is followed, and a row it no longer lists loses its echo.
+    #[test]
+    fn the_drivers_snapshot_is_the_queue() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("mine".into(), &ctl);
+        let mine = app.prompt_queue[0].id;
+
+        // Another client queued a row we have never seen.
+        app.handle(
+            AppEvent::Ctl(CtlEvent::Queue {
+                items: vec![
+                    crate::bus::QueueRow {
+                        item_id: 77,
+                        text: "from another client".into(),
+                        steering: false,
+                    },
+                    crate::bus::QueueRow {
+                        item_id: mine,
+                        text: "mine".into(),
+                        steering: false,
+                    },
+                ],
+            }),
+            &ctl,
+        );
+
+        assert_eq!(app.queued, 2);
+        assert_eq!(
+            app.prompt_queue
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [77, mine],
+            "the host's order wins"
+        );
+        let echoes: Vec<String> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::User {
+                    text,
+                    delivery: crate::transcript::Delivery::Queued,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            echoes,
+            ["mine", "from another client"],
+            "the timeline keeps paint order; only the queue follows the host"
+        );
+
+        // A steering placement paints as pending, and the row leaving the
+        // snapshot withdraws the echo it owned.
+        app.handle(
+            AppEvent::Ctl(CtlEvent::Queue {
+                items: vec![crate::bus::QueueRow {
+                    item_id: mine,
+                    text: "mine".into(),
+                    steering: true,
+                }],
+            }),
+            &ctl,
+        );
+        assert_eq!(app.queued, 1);
+        assert!(
+            app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::User {
+                    text,
+                    delivery: crate::transcript::Delivery::Steering,
+                } if text == "mine"
+            )),
+            "the steered row is pending"
+        );
+        assert!(
+            !app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::User { text, .. } if text == "from another client"
+            )),
+            "a row the host dropped took its echo with it"
+        );
+    }
+
+    /// A dead runtime's queue is withdrawn one echo at a time: the flattened
+    /// multi-prompt set is not one contiguous run, and a single pass would
+    /// delete the unrelated cell between two echoes.
+    #[test]
+    fn runtime_exit_withdraws_each_queued_echo() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("first".into(), &ctl);
+        app.transcript
+            .push_notice(NoticeLevel::Info, "between".into());
+        app.send_agent_text("second".into(), &ctl);
+
+        app.handle(AppEvent::RuntimeExited(Some(1)), &ctl);
+
+        assert!(app.prompt_queue.is_empty());
+        assert!(
+            app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::Notice { text, .. } if text == "between"
+            )),
+            "the cell between the echoes survives"
+        );
+        assert!(
+            !app.transcript.cells.iter().any(|cell| matches!(
+                &cell.kind,
+                crate::transcript::CellKind::User {
+                    delivery: crate::transcript::Delivery::Queued,
+                    ..
+                }
+            )),
+            "no queued echo is left behind"
+        );
+    }
     /// `/skill <name> [args]` ships the plain `/<name> [args]` line the agent
     /// expands — including for a name a builtin shadows, which is the whole
     /// point of the two-word form.
@@ -10025,32 +10117,67 @@ mod mode_tests {
         app.run_slash("skill", "", &ctl);
         assert!(app.view_overlay.is_some(), "an empty name lists instead");
     }
-
-    /// An unknown name is caught client-side: shipping `/nope` would just ask
-    /// the model about a slash command.
+    /// The menu never rows a skill, but the line still reaches the host: a
+    /// hand-typed `/name` ships as a prompt and the agent injects the body.
     #[test]
-    fn unknown_skill_names_warn_without_shipping() {
-        let (mut app, _ctl, _rx) = test_app();
-        let (ctl, commands) = crate::controller::test_controller();
+    fn skill_line_ships_as_prompt_not_unknown_command() {
+        let (mut app, ctl, _rx) = test_app();
         app.skills = vec![crate::bus::SkillInfo {
-            name: "deploy".into(),
-            description: "ship it".into(),
+            name: "commit-helper".into(),
+            description: "draft a commit".into(),
             input_hint: None,
             source: None,
         }];
-        app.run_slash("skill", "nope now", &ctl);
-        assert!(commands.try_recv().is_err(), "nothing is sent");
-        assert!(matches!(app.state, RunState::Idle));
+        app.input.set("/commit-helper for the last change".into());
         assert!(
-            app.transcript.cells.iter().any(|cell| matches!(
-                &cell.kind,
-                crate::transcript::CellKind::Notice { text, .. }
-                    if text.contains("unknown skill nope")
-            )),
-            "the miss is named"
+            app.slash_matches().is_empty(),
+            "no completer row — the skill is not a command"
         );
+        app.submit(&ctl);
+        assert!(
+            matches!(app.state, RunState::Starting),
+            "skill line starts a turn"
+        );
+        assert!(app.input.is_empty());
     }
-
+    /// Skills are `/skill`'s business only: the `/` menu lists builtins and
+    /// nothing else, even when the catalog holds a name no builtin claims.
+    #[test]
+    fn skills_stay_out_of_the_slash_menu() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.skills = vec![
+            crate::bus::SkillInfo {
+                name: "commit-helper".into(),
+                description: "draft a commit".into(),
+                input_hint: None,
+                source: None,
+            },
+            crate::bus::SkillInfo {
+                name: "help".into(),
+                description: "shadowed by builtin".into(),
+                input_hint: None,
+                source: None,
+            },
+        ];
+        app.input.set("/".into());
+        let menu = app.slash_matches();
+        assert_eq!(
+            menu.len(),
+            SLASH_COMMANDS.len(),
+            "the bare `/` menu is the builtin list, unmerged"
+        );
+        assert!(
+            !menu.iter().any(|e| e.name == "commit-helper"),
+            "a skill never becomes a `/` row"
+        );
+        // Not even as a prefix: `/commit` matches no builtin, so the menu is
+        // empty and the line is left to ship as a skill prompt instead.
+        app.input.set("/commit".into());
+        assert!(app.slash_matches().is_empty());
+        // The catalog is one command away.
+        app.input.set("/skill ".into());
+        assert_eq!(app.slash_matches().len(), 2, "both skills are candidates");
+    }
     /// `/skill ` lists the catalog as argument candidates, filtered by what is
     /// typed, with the hint and the description on the row.
     #[test]
@@ -10112,82 +10239,6 @@ mod mode_tests {
         );
         assert!(commands.try_recv().is_err(), "nothing was sent yet");
     }
-
-    /// `/login` resolves in the TUI even when the agent advertises a skill of
-    /// that name — skills add no `/` row, so there is no race to lose.
-    #[test]
-    fn login_is_a_tui_builtin_and_shadows_the_agent_skill() {
-        let (mut app, ctl, _rx) = test_app();
-        app.skills = vec![crate::bus::SkillInfo {
-            name: "login".into(),
-            description: "Save a DeepSeek API key into the harness credential store".into(),
-            input_hint: None,
-            source: None,
-        }];
-        app.input.set("/log".into());
-        let candidates = app.slash_matches();
-        let rows: Vec<&str> = candidates.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(
-            rows,
-            ["login", "logout"],
-            "the two builtins, in table order — the skill adds no rows"
-        );
-        app.input.set("/login sk-test".into());
-        app.submit(&ctl);
-        assert!(
-            !matches!(app.state, RunState::Starting),
-            "the builtin is a local op, never a prompt"
-        );
-        assert_eq!(
-            crate::credentials::stored_key(&app.cfg.home, crate::credentials::API_KEY_REF,)
-                .unwrap(),
-            Some("sk-test".into())
-        );
-    }
-
-    /// Both twins stay local ops; the agent's same-named skills are reachable
-    /// only as `/skill login` / `/skill logout`.
-    #[test]
-    fn logout_is_a_tui_builtin_and_shadows_the_agent_skill() {
-        let (mut app, _ctl, _rx) = test_app();
-        app.skills = vec![
-            crate::bus::SkillInfo {
-                name: "logout".into(),
-                description: "sign out".into(),
-                input_hint: None,
-                source: None,
-            },
-            crate::bus::SkillInfo {
-                name: "login".into(),
-                description: "agent login".into(),
-                input_hint: None,
-                source: None,
-            },
-        ];
-        app.input.set("/".into());
-        let menu = app.slash_matches();
-        assert_eq!(
-            menu.len(),
-            SLASH_COMMANDS.len(),
-            "the bare `/` menu is the builtin table, nothing appended"
-        );
-        for row in &menu {
-            assert!(
-                SLASH_COMMANDS.iter().any(|c| c.name == row.name),
-                "{} is not a builtin",
-                row.name
-            );
-        }
-        assert!(menu.iter().any(|e| e.name == "logout"));
-        assert!(menu.iter().any(|e| e.name == "login"));
-        // The skills did not disappear — `/skill ` still offers both.
-        app.input.set("/skill ".into());
-        let candidates = app.slash_matches();
-        let mut catalog: Vec<&str> = candidates.iter().map(|e| e.usage.as_str()).collect();
-        catalog.sort_unstable();
-        assert_eq!(catalog, ["login", "logout"], "the catalog keeps them both");
-    }
-
     #[test]
     fn staged_images_send_together_with_token_free_caption() {
         let (mut app, ctl, _rx) = test_app();
@@ -10214,71 +10265,6 @@ mod mode_tests {
             "sending starts the turn"
         );
     }
-
-    #[test]
-    fn draft_split_keeps_text_and_images_interleaved() {
-        let mut staged = crate::attachments::Staged::default();
-        staged
-            .add(
-                crate::locale::Locale::En,
-                "a.png".into(),
-                "/tmp/a.png".into(),
-                "image/png".into(),
-                vec![1],
-            )
-            .unwrap();
-        staged
-            .add(
-                crate::locale::Locale::En,
-                "b.png".into(),
-                "/tmp/b.png".into(),
-                "image/png".into(),
-                vec![2],
-            )
-            .unwrap();
-        let blocks =
-            split_draft_into_staged_blocks("see [image 1] then [image 2] done", staged.drain());
-        assert_eq!(blocks.len(), 5);
-        assert!(matches!(&blocks[0], StagedBlock::Text(t) if t == "see"));
-        assert!(matches!(&blocks[1], StagedBlock::Image(a) if a.name == "a.png"));
-        assert!(matches!(&blocks[2], StagedBlock::Text(t) if t == " then "));
-        assert!(matches!(&blocks[3], StagedBlock::Image(a) if a.name == "b.png"));
-        assert!(matches!(&blocks[4], StagedBlock::Text(t) if t == "done"));
-        let prompt = prompt_blocks_from_staged(&blocks);
-        assert!(matches!(&prompt[0], crate::bus::PromptBlock::Text(t) if t == "see"));
-        assert!(matches!(&prompt[1], crate::bus::PromptBlock::Image(a) if a.path == "/tmp/a.png"));
-        assert!(matches!(&prompt[2], crate::bus::PromptBlock::Text(t) if t == " then "));
-        assert!(matches!(&prompt[3], crate::bus::PromptBlock::Image(a) if a.path == "/tmp/b.png"));
-        assert!(matches!(&prompt[4], crate::bus::PromptBlock::Text(t) if t == "done"));
-    }
-
-    #[test]
-    fn draft_split_does_not_append_chips_missing_from_the_draft() {
-        let mut staged = crate::attachments::Staged::default();
-        staged
-            .add(
-                crate::locale::Locale::En,
-                "kept.png".into(),
-                "/tmp/kept.png".into(),
-                "image/png".into(),
-                vec![1],
-            )
-            .unwrap();
-        staged
-            .add(
-                crate::locale::Locale::En,
-                "orphan.png".into(),
-                "/tmp/orphan.png".into(),
-                "image/png".into(),
-                vec![2],
-            )
-            .unwrap();
-        let blocks = split_draft_into_staged_blocks("hello [image 1]", staged.drain());
-        assert_eq!(blocks.len(), 2);
-        assert!(matches!(&blocks[0], StagedBlock::Text(t) if t == "hello"));
-        assert!(matches!(&blocks[1], StagedBlock::Image(a) if a.name == "kept.png"));
-    }
-
     #[test]
     fn submit_echoes_interleaved_transcript_not_caption_then_images() {
         let (mut app, ctl, _rx) = test_app();
@@ -10321,148 +10307,50 @@ mod mode_tests {
             ]
         );
     }
-
-    fn ask_options() -> Vec<crate::bus::PermissionAskOption> {
-        vec![
-            crate::bus::PermissionAskOption {
-                option_id: "reject".into(),
-                kind: "reject_once".into(),
-                name: "Reject".into(),
-            },
-            crate::bus::PermissionAskOption {
-                option_id: "allow".into(),
-                kind: "allow_once".into(),
-                name: "Allow once".into(),
-            },
-        ]
-    }
-
     #[test]
-    fn acp_permission_ask_enter_selects_option_id() {
-        let (mut app, ctl, _rx) = test_app();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        app.handle(
-            AppEvent::PermissionAsk {
-                title: "bash".into(),
-                options: ask_options(),
-                reply: tx,
-            },
-            &ctl,
-        );
-        let ask = app.permission_ask.as_ref().expect("overlay opens");
-        assert_eq!(ask.title, "bash");
-        assert_eq!(ask.sel, 1, "allow_once is preselected, not auto-chosen");
-        assert_eq!(ask.options[0].name, "Reject");
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
-        assert!(app.permission_ask.is_none());
+    fn tab_completes_a_slash_argument_without_running_it() {
+        let (mut app, _demo_ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.input.set("/plan o".into());
+
+        let menu = app.slash_matches();
         assert_eq!(
-            rx.blocking_recv().expect("reply"),
-            crate::bus::PermissionAskReply::Selected("allow".into())
-        );
-    }
-
-    #[test]
-    fn acp_permission_ask_esc_cancels() {
-        let (mut app, ctl, _rx) = test_app();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        app.handle(
-            AppEvent::PermissionAsk {
-                title: "bash".into(),
-                options: ask_options(),
-                reply: tx,
-            },
-            &ctl,
-        );
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
-        assert!(app.permission_ask.is_none());
-        assert_eq!(
-            rx.blocking_recv().expect("reply"),
-            crate::bus::PermissionAskReply::Cancelled
-        );
-    }
-
-    /// `/clear` empties the timeline, so the client's cell indices must go
-    /// with it: a later delete of a queued prompt used to splice whatever cell
-    /// now sat at the stale index.
-    #[test]
-    fn clearing_the_scrollback_forgets_client_cell_indices() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.send_agent_text("queued".into(), &ctl);
-        assert_eq!(app.prompt_queue[0].cells.len(), 1);
-
-        app.dispatch(Action::ClearScrollback, &ctl);
-        assert!(
-            app.prompt_queue[0].cells.is_empty(),
-            "the cleared timeline's index is dropped"
+            menu.iter()
+                .map(|entry| entry.usage.as_str())
+                .collect::<Vec<_>>(),
+            ["on", "off"]
         );
 
-        // New cells land where the old index pointed; deleting the queued
-        // prompt must not touch them.
-        app.transcript
-            .push_user("unrelated".into(), crate::transcript::Delivery::Delivered);
-        let unrelated = app.transcript.cells.len() - 1;
-        app.drop_queued_prompt(0, &ctl);
-        assert_eq!(app.prompt_queue.len(), 0);
-        assert_eq!(app.transcript.cells.len(), 2, "the notice and the bubble");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.input.buf(), "/plan on");
         assert!(matches!(
-            &app.transcript.cells[unrelated].kind,
-            crate::transcript::CellKind::User { text, .. } if text == "unrelated"
+            commands.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
         ));
     }
-
-    /// A dead runtime's queue is withdrawn one echo at a time: the flattened
-    /// multi-prompt set is not one contiguous run, and a single pass would
-    /// delete the unrelated cell between two echoes.
+    /// An unknown name is caught client-side: shipping `/nope` would just ask
+    /// the model about a slash command.
     #[test]
-    fn runtime_exit_withdraws_each_queued_echo() {
-        let (mut app, _demo, _rx) = test_app();
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.send_agent_text("first".into(), &ctl);
-        app.transcript
-            .push_notice(NoticeLevel::Info, "between".into());
-        app.send_agent_text("second".into(), &ctl);
-
-        app.handle(AppEvent::RuntimeExited(Some(1)), &ctl);
-
-        assert!(app.prompt_queue.is_empty());
+    fn unknown_skill_names_warn_without_shipping() {
+        let (mut app, _ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.skills = vec![crate::bus::SkillInfo {
+            name: "deploy".into(),
+            description: "ship it".into(),
+            input_hint: None,
+            source: None,
+        }];
+        app.run_slash("skill", "nope now", &ctl);
+        assert!(commands.try_recv().is_err(), "nothing is sent");
+        assert!(matches!(app.state, RunState::Idle));
         assert!(
             app.transcript.cells.iter().any(|cell| matches!(
                 &cell.kind,
-                crate::transcript::CellKind::Notice { text, .. } if text == "between"
+                crate::transcript::CellKind::Notice { text, .. }
+                    if text.contains("unknown skill nope")
             )),
-            "the cell between the echoes survives"
+            "the miss is named"
         );
-        assert!(
-            !app.transcript.cells.iter().any(|cell| matches!(
-                &cell.kind,
-                crate::transcript::CellKind::User {
-                    delivery: crate::transcript::Delivery::Queued,
-                    ..
-                }
-            )),
-            "no queued echo is left behind"
-        );
-    }
-
-    /// Home stores the `usize::MAX` top sentinel until the next draw clamps
-    /// it; a scroll batched before that draw resolves against the last layout
-    /// instead of casting the sentinel to -1.
-    #[test]
-    fn a_scroll_after_jump_to_top_is_relative_to_the_top() {
-        let (mut app, _demo, _rx) = test_app();
-        app.chat_view.total = 100;
-        app.chat_view.area = ratatui::layout::Rect::new(0, 0, 80, 10);
-
-        app.scroll_up = usize::MAX;
-        app.scroll_by(-2);
-        assert_eq!(app.scroll_up, 88, "the top, minus the delta");
-
-        app.scroll_up = usize::MAX;
-        app.scroll_by(5);
-        assert_eq!(app.scroll_up, 95, "up from the top stays at the top");
     }
 }
 
