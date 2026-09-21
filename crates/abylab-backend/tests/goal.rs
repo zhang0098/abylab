@@ -169,3 +169,56 @@ fn the_host_controls_the_goal_lifecycle() {
     );
     assert_eq!(run.count(), 1, "pause costs no model request");
 }
+
+/// The round driver owns exactly one idle status: a `running:false` after
+/// every round told the UI the session was idle while the driver was still
+/// inside the goal loop (and it dispatched queued prompts early).
+#[test]
+fn goal_rounds_emit_one_idle_status_after_the_last_round() {
+    let run = common::drive(
+        Scenario::new(
+            "goal-status",
+            vec![
+                Reply::sse(text_body("msg-r1", "still working")),
+                Reply::sse(text_body("msg-r2", "still working")),
+            ],
+        )
+        .goal("@2 make the widget faster"),
+    );
+
+    let statuses: Vec<&String> = run
+        .events
+        .iter()
+        .filter(|event| event.starts_with("status:"))
+        .collect();
+    assert_eq!(
+        statuses.last().map(|status| status.as_str()),
+        Some("status:false"),
+        "the sequence ends idle: {}",
+        run.explain()
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| status.as_str() == "status:false")
+            .count(),
+        1,
+        "one idle status for the whole sequence: {}",
+        run.explain()
+    );
+    let last_end = run
+        .events
+        .iter()
+        .rposition(|event| event.starts_with("turn-end:"))
+        .expect("rounds ended");
+    let last_status = run
+        .events
+        .iter()
+        .rposition(|event| event.starts_with("status:"))
+        .expect("a status");
+    assert!(
+        last_status > last_end,
+        "idle comes after the last round: {}",
+        run.explain()
+    );
+}

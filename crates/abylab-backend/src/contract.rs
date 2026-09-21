@@ -329,8 +329,14 @@ impl Default for CompactionConfig {
 }
 
 impl CompactionConfig {
-    /// Token ceiling that triggers compaction.
+    /// Token ceiling that triggers compaction. `compact_at == 0.0` disables
+    /// the threshold (and with it the prune/condense pass at request
+    /// boundaries), matching the environment knob's documented meaning;
+    /// clamping it to one token would do the opposite.
     pub fn threshold_tokens(&self) -> u64 {
+        if self.compact_at <= 0.0 {
+            return u64::MAX;
+        }
         (self.context_window as f64 * self.compact_at).max(1.0) as u64
     }
 
@@ -381,11 +387,12 @@ pub fn persisted_session_id(
     session_id: &str,
 ) -> Option<String> {
     let store = (SessionStore::at(sessions_root, workspace).ok())?;
-    store
-        .log_path(session_id)
-        .ok()?
-        .exists()
-        .then(|| session_id.to_string())
+    // A log can hold a header and a title with no checkpoint yet (a crash
+    // between `set_title` and the first `append_checkpoint`): resuming it
+    // fails and wedges startup, while `create_new` repairs it. Only a
+    // committed, loadable snapshot resumes.
+    store.load(session_id).ok()?;
+    Some(session_id.to_string())
 }
 
 /// UI → driver commands. The driver serializes turns; a `Prompt` that arrives
