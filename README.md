@@ -31,26 +31,18 @@ abylab 不读 `DEEPSEEK_API_KEY`，也不读任何别的变量；`--api-key <key
 
 4. 任意输入你的命令就开始工作了。
 
-选项：
-
-```
--w, --workspace <dir>     代理工作区（默认：当前目录）
-    --session-root <dir>  会话 JSONL 根目录（默认 $ABYLAB_HOME/sessions）
-    --session-id <id>     恢复/继续一个持久会话 id
-    --model <id>          模型 id（默认 $ABY_MODEL，其次持久化的模型，
-                          最后 deepseek-flash）
-    --base-url <url>      给代理设置 DEEPSEEK_BASE_URL
-    --api-key <key>       只覆盖本次运行的 API key（长期保存用 /login）
-    --theme <dark|light>  明暗模式（默认：持久化的值，其次 dark）
-```
-
-细调没有开关，只用环境变量：`ABY_MAX_REQUESTS`、`ABY_MAX_TOOL_CALLS`、
-`ABY_AUTO_CONTINUE`、`ABY_TURN_TIMEOUT`、`ABY_TOOL_TIMEOUT`、`ABY_CONTEXT_WINDOW`
-（开压缩）、`ABY_COMPACT_AT`、`ABY_KEEP_RECENT`、`ABY_PRUNE_TOOL_OUTPUT`，以及
-`ABYLAB_HOME` 和 `ABY_MODEL`。
-
 你的偏好存在 `$ABYLAB_HOME/settings.json`：界面语言（默认中文）、模型、推理强度、
 权限预设，以及外观（明暗 + 主题包）。命令行开关只覆盖本次运行。
+
+## 按键
+
+enter 发送 / 排队 · ctrl+enter 立即发送 · alt+↑（mac ⌥↑）编辑排队消息 ·
+esc 中断 / 双击清空草稿 · ctrl+c 清空 / 退出 · ↑ 历史 · `/` 命令 · `@` 文件提及 ·
+ctrl+z 撤销 · ctrl+p 模型 · ctrl+t 主题 · shift+tab 权限预设
+
+`alt+↑` 只在有排队消息、草稿为空时打开列表：`↑/↓` 选择 · `enter` 编辑 ·
+`ctrl+enter` 把这条插话进正在跑的轮次 · `ctrl+d` 删除（同一行按两次）。
+完整映射见 TUI 里的 `/keys`。
 
 ## 许可与致谢
 
