@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-21
+
 ### 变更
 
 - ctrl+enter 现在是「插话」而不是「取消重发」：消息进运行中 agent 的收件箱，SDK 在
@@ -49,6 +51,9 @@
 
 - 「已 steer —— 在 Agent 下一步生效」这句提示终于是字面意思：过去 ctrl+enter 实际
   是取消当前段再重发提示词，界面还会顺手报一次中断。
+- 网站和两份 README 的按键行回到和键位表一致：立即发送写的是 ctrl+enter（旧文案
+  写的 ctrl+x 其实是剪切选区），队列列表 `alt+↑`（mac `⌥↑`）也补了上去。0.1.8 里
+  TUI 的提示已经改成了 ctrl+enter，漏的就是站点那两页。
 
 ## [0.1.8] - 2026-09-21
 
@@ -215,7 +220,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/zhang0098/abylab/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/zhang0098/abylab/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6

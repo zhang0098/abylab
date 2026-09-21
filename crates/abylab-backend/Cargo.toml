@@ -1,6 +1,6 @@
 [package]
 name = "abylab-backend"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "abycore-driven agent backend for the abylab TUI"
 license.workspace = true

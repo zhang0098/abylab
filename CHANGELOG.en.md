@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-21
+
 ### Changed
 
 - ctrl+enter steers instead of cancelling and re-sending: the message enters the
@@ -68,6 +70,10 @@ context compaction, session persistence, goal rounds) live in
 - "steered — lands at the next agent step" now means it: the old gesture actually
   cancelled the active segment and re-sent the prompt, and the UI reported an
   interrupt alongside it.
+- The website's key row and both READMEs say what the keymap implements again:
+  send-now is ctrl+enter (the old line promised ctrl+x, which cuts the composer
+  selection), and the queue list's `alt+↑` (mac `⌥↑`) is in them now. 0.1.8 had
+  already fixed the TUI's own hints; the two pages were what it missed.
 
 ## [0.1.8] - 2026-09-21
 
@@ -280,7 +286,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/zhang0098/abylab/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/zhang0098/abylab/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/zhang0098/abylab/compare/v0.1.5...v0.1.6
