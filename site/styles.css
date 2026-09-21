@@ -72,6 +72,7 @@ html { scroll-behavior: smooth; }
 }
 
 .hint code { font-size: 0.8rem; }
+.hint kbd { font-size: 0.8rem; }
 
 /* Sections ----------------------------------------------------------- */
 

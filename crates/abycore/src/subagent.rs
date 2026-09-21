@@ -160,6 +160,34 @@ impl Inbox {
     }
 }
 
+/// Host-facing handle for injecting user text into a live agent.
+///
+/// A message sent here is **not** a new turn and never cancels the running
+/// step: [`Agent::run`](crate::Agent::run) drains it at the next complete
+/// tool-batch boundary (right before the following request), and when the
+/// model has already finished its last step the run continues one more step
+/// instead of ending. An idle agent keeps the message and spends it on the
+/// first request of its next run, so a steer that misses the window degrades
+/// into the next turn rather than failing.
+///
+/// This is the harness's `agent.steer` / `inbox.nextStep` seam; the driver
+/// uses it for the composer's send-now gesture.
+#[derive(Clone)]
+pub struct SteerHandle(pub(crate) Arc<Inbox>);
+
+impl SteerHandle {
+    /// Queue one steering message. Errors only for empty/oversized text or a
+    /// full inbox (32 pending), never because the agent is idle.
+    pub fn send(&self, text: impl Into<String>) -> Result<()> {
+        self.0.send(text.into())
+    }
+
+    /// Whether a message is waiting for the next step boundary.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 pub(crate) struct Parent {
     pub id: String,
     pub depth: usize,

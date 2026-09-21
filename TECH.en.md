@@ -203,6 +203,69 @@ One durable objective per session, with an explicit round allowance:
   turn on its own; the driver here does.
 
 
+## Steering
+
+While a turn is running, your next message takes one of two paths: queue, or
+steer. `/enter` picks which one plain Enter takes and ctrl+enter always takes
+the other; an idle session sends either way. This is deepseek-harness's
+busy-Enter preference (the `ui-conversation` `resolveSubmitMode` policy), and
+the default matches: queue.
+
+A steer **cancels nothing**:
+
+- The message enters the running agent's inbox (abycore `Agent::steer_handle`).
+  The SDK drains that inbox before building each request — the boundary right
+  after a completed tool batch — and appends the text as a user message. When
+  the model had already finished its last step, the run is pulled back for one
+  more step instead of a new turn being opened.
+- The in-flight step's streamed output and its completed tool results all
+  survive; esc remains the only interrupt (it rides the cancellation token on a
+  separate channel from steering).
+- Steering is best-effort: a message that misses the window (the turn ended
+  first) is not a failure, it is delivered as the next waking turn. With no
+  running turn at all (no `/login`, say) the driver answers
+  `SteerSettled{deferred}` and the UI returns the item to the client queue with
+  its queued tint back.
+- An empty draft plus ctrl+enter steers every queued message, in FIFO order.
+  Without a running turn the head goes out as an ordinary prompt and the rest
+  stay queued.
+
+A steer is visible in three states: the bubble carries a `steering` marker from
+ctrl+enter, the inbox drain that spends it fires a checkpoint, and the driver
+reports `SteerAdmitted`, which clears the marker; a rejected or late steer goes
+back to `queued`. Messages the turn has not taken yet are painted as a tail
+section (`⏳ N steering`) — harness's pending-steering rows: they belong after
+the live output, not in the middle of the step they are about to interrupt, and
+they drop back into their chronological slot once the agent takes them.
+
+## The queue
+
+The queue lives in the **driver**, not in a client: `drive` owns a
+`VecDeque<QueuedItem>` and publishes the whole list through `CtlEvent::Queue`
+on every change, so every client (the TUI today, a second process or a web UI
+later) renders the same FIFO. Each row carries a `placement`: `Queued` (waiting
+for the turn in flight to end) or `Steering` (the running turn already has it).
+
+- Delivery order is decided in `next_command`: pending **commands first** (a
+  removal, an edit, a new steer), then rows the turn took (`settle_taken`), and
+  only then is the head shipped as the next prompt. A removal can therefore
+  never lose a race with the boundary that drains the row it changes.
+- Steering rides its own channel (`DriverHandle::steer`): it is the only one a
+  *running* turn reads, taking the message at its next step boundary, while
+  queue commands are read at the idle wait. Clients no longer have to guess
+  whether the agent is busy: the `⌥↑` list's enter / ctrl+enter / ctrl+d just
+  send commands.
+- Taken ids stay in a tombstone set: a client's "queue it, then steer it" pair
+  can be in flight at once, and the late queue command must not turn a delivered
+  row back into a queued one.
+- The queue is process memory while the session snapshot is durable, so every
+  mutation writes `$ABYLAB_HOME/queued/<session>.json` (one file per session,
+  removed when the queue drains). A start or `/resume` reads it back as `held`
+  rows: they were queued behind a turn that no longer exists, so they are not
+  spent unbidden — the first turn this process actually runs releases them, and
+  they ship in FIFO order after it. A missing, malformed or differently shaped
+  file is just an empty queue, exactly like `settings.json`.
+
 ## Packaging and releases
 
 Linux ships one kind of asset: a single musl static binary per architecture

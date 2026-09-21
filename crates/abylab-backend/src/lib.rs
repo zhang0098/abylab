@@ -6,10 +6,12 @@
 pub mod contract;
 pub mod driver;
 mod instructions;
+mod queue_store;
 
 pub use abycore::MIN_PRUNE_BYTES;
 pub use contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
-    PlanStatus, TurnLimits, UiEvent, persisted_session_id,
+    PlanStatus, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits, UiEvent,
+    persisted_session_id,
 };
 pub use driver::DriverHandle;

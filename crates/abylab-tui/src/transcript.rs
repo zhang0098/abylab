@@ -31,11 +31,49 @@ pub enum NoticeLevel {
     Error,
 }
 
+/// How a client-painted user bubble stands with the agent's inbox.
+///
+/// The composer paints its own echo the moment the key is pressed, before any
+/// round trip, so the bubble has to say what it is waiting for: a FIFO item
+/// (queued), a message the running turn has not picked up yet (steering), or
+/// an ordinary part of the conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Delivery {
+    /// The agent has it: an ordinary user row (default).
+    #[default]
+    Delivered,
+    /// Client FIFO item; ships when the running turn ends.
+    Queued,
+    /// Send Now: handed to the running turn's inbox, waiting for the next step
+    /// boundary to append it (deepseek-harness's pending-steering rows).
+    Steering,
+}
+
+impl Delivery {
+    /// The small trailing marker the transcript paints on the first row.
+    fn marker(self) -> Option<&'static str> {
+        match self {
+            Delivery::Delivered => None,
+            Delivery::Queued => Some("queued"),
+            Delivery::Steering => Some("steering"),
+        }
+    }
+
+    /// Marker color: amber for a FIFO item, the brand tone for a steer the
+    /// running turn has not picked up yet.
+    fn tint(self, theme: &crate::theme::Theme) -> ratatui::style::Color {
+        match self {
+            Delivery::Queued => theme.warn_soft(),
+            _ => theme.brand_soft,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CellKind {
     User {
         text: String,
-        queued: bool,
+        delivery: Delivery,
     },
     Image {
         name: String,
@@ -45,7 +83,7 @@ pub enum CellKind {
         /// Encoded raster bytes (PNG for the kitty thumbnail path).
         data: Arc<[u8]>,
         id: u32,
-        queued: bool,
+        delivery: Delivery,
     },
     Reasoning {
         text: String,
@@ -340,13 +378,13 @@ impl Transcript {
     /// block, a thumbnail per image, all still marked queued. Image ids come
     /// from the transcript's own sequence, so a repaint can never collide with
     /// a thumbnail already on screen.
-    pub fn prompt_echo_cells(&mut self, blocks: &[EchoBlock<'_>]) -> Vec<Cell> {
+    pub fn prompt_echo_cells(&mut self, blocks: &[EchoBlock<'_>], delivery: Delivery) -> Vec<Cell> {
         blocks
             .iter()
             .map(|block| match block {
                 EchoBlock::Text(text) => Cell::new(CellKind::User {
                     text: (*text).to_string(),
-                    queued: true,
+                    delivery,
                 }),
                 EchoBlock::Image { name, path, data } => {
                     self.image_seq += 1;
@@ -356,7 +394,7 @@ impl Transcript {
                         path: (*path).to_string(),
                         data: Arc::clone(data),
                         id: self.image_seq,
-                        queued: true,
+                        delivery,
                     })
                 }
             })
@@ -390,8 +428,9 @@ impl Transcript {
         }
     }
 
-    pub fn push_user(&mut self, text: String, queued: bool) {
-        self.cells.push(Cell::new(CellKind::User { text, queued }));
+    pub fn push_user(&mut self, text: String, delivery: Delivery) {
+        self.cells
+            .push(Cell::new(CellKind::User { text, delivery }));
     }
 
     /// Record a user-sent image (bytes kept for the kitty thumbnail path).
@@ -401,7 +440,7 @@ impl Transcript {
         caption: String,
         path: String,
         data: Arc<[u8]>,
-        queued: bool,
+        delivery: Delivery,
     ) {
         self.image_seq += 1;
         let id = self.image_seq;
@@ -411,7 +450,7 @@ impl Transcript {
             path,
             data,
             id,
-            queued,
+            delivery,
         }));
     }
 
@@ -436,26 +475,30 @@ impl Transcript {
 
     /// Mark one client-owned queued prompt group as delivered.
     pub fn mark_prompt_delivered(&mut self, cells: &[usize]) {
-        for &index in cells {
-            let Some(cell) = self.cells.get_mut(index) else {
-                continue;
-            };
-            match &mut cell.kind {
-                CellKind::User { queued, .. } | CellKind::Image { queued, .. } => *queued = false,
-                _ => {}
-            }
-        }
+        self.set_delivery(cells, Delivery::Delivered);
     }
 
     /// Mark a Send Now bubble as a client-owned FIFO item after the agent
     /// rejects concurrent `session/prompt` delivery.
     pub fn mark_prompt_queued(&mut self, cells: &[usize]) {
+        self.set_delivery(cells, Delivery::Queued);
+    }
+
+    /// Mark a queued bubble as handed to the running turn: it is pending
+    /// steering until the agent appends it at a step boundary.
+    pub fn mark_prompt_steering(&mut self, cells: &[usize]) {
+        self.set_delivery(cells, Delivery::Steering);
+    }
+
+    fn set_delivery(&mut self, cells: &[usize], delivery: Delivery) {
         for &index in cells {
             let Some(cell) = self.cells.get_mut(index) else {
                 continue;
             };
             match &mut cell.kind {
-                CellKind::User { queued, .. } | CellKind::Image { queued, .. } => *queued = true,
+                CellKind::User { delivery: at, .. } | CellKind::Image { delivery: at, .. } => {
+                    *at = delivery
+                }
                 _ => {}
             }
         }
@@ -822,7 +865,7 @@ impl Transcript {
                     .push(Cell::new(CellKind::Injected { source, preview }));
             }
             UiEvent::UserMessage { text, .. } => {
-                self.push_user(text, false);
+                self.push_user(text, Delivery::Delivered);
             }
             UiEvent::SessionTitle { title, .. } => {
                 self.push_notice(
@@ -916,6 +959,20 @@ impl Transcript {
         }
     }
 
+    /// Whether this cell is a message the running turn has not taken yet.
+    fn pending_steering(&self, index: usize) -> bool {
+        matches!(
+            self.cells.get(index).map(|cell| &cell.kind),
+            Some(CellKind::User {
+                delivery: Delivery::Steering,
+                ..
+            }) | Some(CellKind::Image {
+                delivery: Delivery::Steering,
+                ..
+            })
+        )
+    }
+
     /// Is any assistant/reasoning cell currently streaming?
     pub fn streaming(&self) -> bool {
         !self.open_assistant.is_empty() || !self.open_reasoning.is_empty()
@@ -943,10 +1000,46 @@ impl Transcript {
         let mut owners: Vec<Option<usize>> = Vec::new();
         let mut images: Vec<ImageShot> = Vec::new();
         let mut users: Vec<UserPromptLine> = Vec::new();
-        for (ci, cell) in self.cells.iter().enumerate() {
+        // Pending steering renders as a tail section, the way deepseek-harness
+        // shows `data-pending-steering` rows: a message the running turn has not
+        // picked up yet belongs *after* the live output, not in the middle of
+        // the step it is about to interrupt. The cell indices (and everything
+        // keyed by them) stay put; only the paint order changes, so the bubble
+        // drops back into its chronological slot the moment it is admitted.
+        let pending: Vec<usize> = (0..self.cells.len())
+            .filter(|ci| self.pending_steering(*ci))
+            .collect();
+        let order: Vec<usize> = (0..self.cells.len())
+            .filter(|ci| !self.pending_steering(*ci))
+            .chain(pending.iter().copied())
+            .collect();
+        let mut in_tail = false;
+        for ci in order {
+            let cell = &self.cells[ci];
+            if !in_tail && self.pending_steering(ci) {
+                in_tail = true;
+                emit(&mut out, &mut owners, Line::default(), None);
+                emit(
+                    &mut out,
+                    &mut owners,
+                    Line::from(Span::styled(
+                        format!(
+                            "⏳ {}",
+                            self.locale
+                                .tr(
+                                    "{n} steering · lands at the next agent step",
+                                    "{n} 条待插话 · Agent 下一步生效",
+                                )
+                                .replace("{n}", &pending.len().to_string())
+                        ),
+                        Style::default().fg(Delivery::Steering.tint(theme)),
+                    )),
+                    None,
+                );
+            }
             let expanded = cell.expanded || self.expand_all;
             match &cell.kind {
-                CellKind::User { text, queued } => {
+                CellKind::User { text, delivery } => {
                     emit(&mut out, &mut owners, Line::default(), None);
                     // Web UI fidelity: the user bubble uses --dsw-specific-bubble.
                     let line = out.len();
@@ -970,11 +1063,13 @@ impl Transcript {
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ];
-                        if i == 0 && *queued {
-                            spans.push(Span::styled(
-                                "  queued".to_string(),
-                                Style::default().fg(theme.warn_soft()),
-                            ));
+                        if i == 0 {
+                            if let Some(marker) = delivery.marker() {
+                                spans.push(Span::styled(
+                                    format!("  {marker}"),
+                                    Style::default().fg(delivery.tint(theme)),
+                                ));
+                            }
                         }
                         emit(&mut out, &mut owners, Line::from(spans), None);
                     }
@@ -990,7 +1085,7 @@ impl Transcript {
                     path,
                     data,
                     id,
-                    queued,
+                    delivery,
                     ..
                 } => {
                     emit(&mut out, &mut owners, Line::default(), None);
@@ -1014,10 +1109,10 @@ impl Transcript {
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ];
-                    if *queued {
+                    if let Some(marker) = delivery.marker() {
                         spans.push(Span::styled(
-                            "  queued".to_string(),
-                            Style::default().fg(theme.warn_soft()),
+                            format!("  {marker}"),
+                            Style::default().fg(delivery.tint(theme)),
                         ));
                     }
                     emit(&mut out, &mut owners, Line::from(spans), None);
@@ -1781,8 +1876,8 @@ mod tests {
         });
         assert_eq!(tr.plan_cell, Some(0));
         assert_eq!(tr.tools.get("c1"), Some(&1));
-        tr.push_user("withdrawn".into(), true);
-        tr.push_user("still queued".into(), true);
+        tr.push_user("withdrawn".into(), Delivery::Queued);
+        tr.push_user("still queued".into(), Delivery::Queued);
 
         // Cell 2 (the withdrawn echo) leaves the timeline.
         let shift = tr.remove_cells(&[2]);
@@ -1797,7 +1892,7 @@ mod tests {
         assert!(matches!(tr.cells[0].kind, CellKind::Plan { .. }));
         assert!(matches!(tr.cells[1].kind, CellKind::Tool { .. }));
         assert!(
-            matches!(&tr.cells[2].kind, CellKind::User { text, queued: true } if text == "still queued"),
+            matches!(&tr.cells[2].kind, CellKind::User { text, delivery: Delivery::Queued } if text == "still queued"),
             "the surviving echo moved into the gap"
         );
     }
@@ -1815,7 +1910,7 @@ mod tests {
             arguments: r#"{"command":"ls"}"#.into(),
         });
         let run: Vec<usize> = (tr.cells.len()..tr.cells.len() + 1).collect();
-        let echo = tr.prompt_echo_cells(&[EchoBlock::Text("before the edit")]);
+        let echo = tr.prompt_echo_cells(&[EchoBlock::Text("before the edit")], Delivery::Queued);
         tr.cells.extend(echo);
         tr.apply(UiEvent::ToolCall {
             session: "s".into(),
@@ -1828,14 +1923,17 @@ mod tests {
 
         // One text bubble becomes an image + text: one cell more than before.
         let image_bytes: Arc<[u8]> = Arc::from(vec![0u8; 4]);
-        let echo = tr.prompt_echo_cells(&[
-            EchoBlock::Image {
-                name: "shot.png",
-                path: "/tmp/shot.png",
-                data: &image_bytes,
-            },
-            EchoBlock::Text("after the edit"),
-        ]);
+        let echo = tr.prompt_echo_cells(
+            &[
+                EchoBlock::Image {
+                    name: "shot.png",
+                    path: "/tmp/shot.png",
+                    data: &image_bytes,
+                },
+                EchoBlock::Text("after the edit"),
+            ],
+            Delivery::Queued,
+        );
         let (shift, painted) = tr.replace_cells(&run, echo);
 
         assert_eq!(painted, [1, 2]);
@@ -1845,10 +1943,10 @@ mod tests {
         assert_eq!(tr.tools.get("c2"), Some(&3));
         assert!(matches!(
             &tr.cells[1].kind,
-            CellKind::Image { name, queued: true, .. } if name == "shot.png"
+            CellKind::Image { name, delivery: Delivery::Queued, .. } if name == "shot.png"
         ));
         assert!(
-            matches!(&tr.cells[2].kind, CellKind::User { text, queued: true } if text == "after the edit"),
+            matches!(&tr.cells[2].kind, CellKind::User { text, delivery: Delivery::Queued } if text == "after the edit"),
             "the repainted run sits where the old one did"
         );
     }
@@ -1958,12 +2056,12 @@ mod tests {
     #[test]
     fn layout_indexes_every_user_prompt_span() {
         let mut tr = t("s");
-        tr.push_user("first prompt".into(), false);
+        tr.push_user("first prompt".into(), Delivery::Delivered);
         tr.apply(UiEvent::TextDelta {
             session: "s".into(),
             text: "an answer".into(),
         });
-        tr.push_user("second\nprompt".into(), false);
+        tr.push_user("second\nprompt".into(), Delivery::Delivered);
 
         let layout = tr.layout(&Theme::dark(), 40, '⠋', false);
         assert_eq!(layout.users.len(), 2);
@@ -2318,7 +2416,7 @@ mod tests {
     #[test]
     fn render_smoke() {
         let mut tr = t("s");
-        tr.push_user("hi".into(), false);
+        tr.push_user("hi".into(), Delivery::Delivered);
         tr.apply(UiEvent::TextDelta {
             session: "s".into(),
             text: "yo".into(),
@@ -2334,7 +2432,7 @@ mod tests {
     #[test]
     fn a_wrapped_user_bubble_never_exceeds_the_viewport_width() {
         let mut tr = t("s");
-        tr.push_user("x".repeat(200), false);
+        tr.push_user("x".repeat(200), Delivery::Delivered);
         let theme = Theme::dark();
         let width = 40u16;
         let layout = tr.layout(&theme, width, ' ', false);
@@ -2372,9 +2470,9 @@ mod tests {
             total: 1,
         });
         match &tr.cells[0].kind {
-            CellKind::User { text, queued } => {
+            CellKind::User { text, delivery } => {
                 assert_eq!(text, "hello from load");
-                assert!(!*queued);
+                assert_eq!(*delivery, Delivery::Delivered);
             }
             other => panic!("expected user cell, got {other:?}"),
         }
@@ -2530,7 +2628,7 @@ mod tests {
             "look".into(),
             "/tmp/pic.png".into(),
             std::sync::Arc::from(png.clone()),
-            false,
+            Delivery::Delivered,
         );
         let theme = Theme::dark();
 
@@ -2708,5 +2806,81 @@ mod tests {
         assert_eq!(tr.stats.steps, 1);
         assert_eq!(tr.stats.ttft_count, 1, "only the first delta samples TTFT");
         assert!(tr.stats.tool_millis <= tr.stats.turn_millis);
+    }
+
+    /// A pending steer is painted after the live output, under its own header,
+    /// and falls back into its chronological slot once the agent takes it —
+    /// deepseek-harness's `data-pending-steering` tail rows.
+    #[test]
+    fn pending_steering_renders_as_a_tail_section() {
+        let mut tr = Transcript::new("s".into());
+        tr.set_locale(Locale::En);
+        let paint = |tr: &Transcript| -> (String, Vec<String>) {
+            let lines: Vec<String> = tr
+                .lines(&Theme::dark(), 40, '⠋')
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
+            (lines.join("\n"), lines)
+        };
+        tr.push_user("typed first".into(), Delivery::Delivered);
+        tr.apply(crate::events::UiEvent::AssistantFinal {
+            session: "s".into(),
+            text: "streaming answer".into(),
+            model: None,
+        });
+        tr.push_user("change course".into(), Delivery::Steering);
+        // Newer timeline content: a pending steer floats past it to the tail.
+        tr.push_notice(NoticeLevel::Info, "later output".into());
+
+        let (joined, lines) = paint(&tr);
+        let header = lines
+            .iter()
+            .position(|line| line.contains("steering · lands"))
+            .expect("the tail section names itself");
+        let bubble = lines
+            .iter()
+            .position(|line| line.contains("change course"))
+            .expect("the pending bubble");
+        let answer = lines
+            .iter()
+            .position(|line| line.contains("streaming answer"))
+            .expect("the live output");
+        let later = lines
+            .iter()
+            .position(|line| line.contains("later output"))
+            .expect("newer content");
+        assert!(header < bubble, "the header opens the section:\n{joined}");
+        assert!(
+            answer < bubble && later < bubble,
+            "the pending steer sits below everything else:\n{joined}"
+        );
+        assert!(
+            joined.contains("1 steering"),
+            "the header counts them:\n{joined}"
+        );
+        assert!(
+            lines[bubble].contains("steering"),
+            "the row still names its own state:\n{joined}"
+        );
+        // The chronological row kept its place: only the pending one moved.
+        let first = lines
+            .iter()
+            .position(|line| line.contains("typed first"))
+            .expect("the admitted row");
+        assert!(first < answer, "an admitted row stays where it was typed");
+
+        // Admitted: the bubble returns to its slot and the section disappears.
+        tr.mark_prompt_delivered(&[2]);
+        let (after, _) = paint(&tr);
+        assert!(!after.contains("steering · lands"), "{after}");
+        let bubble = after.find("change course").expect("bubble");
+        let later = after.find("later output").expect("newer content");
+        assert!(bubble < later, "back in its chronological slot:\n{after}");
     }
 }

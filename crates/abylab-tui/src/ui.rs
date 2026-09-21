@@ -726,7 +726,10 @@ fn status_title(app: &App) -> Line<'static> {
 /// Contextual shortcut hints — a tiny state machine over (run state ×
 /// draft): what Enter does *right now*, how to interrupt, how to steer
 /// immediately. Idle+empty falls back to the `^K keys` discovery hint.
-fn context_hints(app: &App) -> Vec<Span<'static>> {
+///
+/// `pub(crate)` so the composer's app tests can assert the pair the busy-Enter
+/// preference installed actually reaches the hint row.
+pub(crate) fn context_hints(app: &App) -> Vec<Span<'static>> {
     let theme = app.theme;
     let key = Style::default()
         .fg(theme.fg_tertiary)
@@ -741,13 +744,18 @@ fn context_hints(app: &App) -> Vec<Span<'static>> {
             ("esc", app.locale.tr("interrupt", "中断")),
         ],
         (true, true) => vec![("esc", app.locale.tr("interrupt", "中断"))],
-        // Working with a draft: enter queues; ctrl+⏎ steers without
-        // cancellation (ctrl+x cuts the selection instead).
-        (true, false) => vec![
-            ("⏎", app.locale.tr("queue", "排队")),
-            ("ctrl+⏎", "steer"),
-            ("esc", app.locale.tr("interrupt", "中断")),
-        ],
+        // Working with a draft: enter does what `/enter` selected and the
+        // accelerated chord does the other one — neither cancels the turn
+        // (ctrl+x cuts the selection instead).
+        (true, false) => {
+            let enter = app.enter.label(app.locale);
+            let chord = app.enter.flipped().label(app.locale);
+            vec![
+                ("⏎", enter),
+                ("ctrl+⏎", chord),
+                ("esc", app.locale.tr("interrupt", "中断")),
+            ]
+        }
         // Idle, empty: nothing to hint at. The `^K keys` discovery chip that
         // used to sit here crowded the model id for no new information.
         (false, true) => Vec::new(),
@@ -1414,13 +1422,19 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                 .locale
                 .tr("describe what you want to build…", "描述你想构建的内容…")
                 .to_string(),
-            _ => app
-                .locale
-                .tr(
-                    "queue a follow-up — ctrl+enter steers now",
-                    "输入后续消息 — ctrl+enter 立即 steer",
-                )
-                .to_string(),
+            _ => {
+                // The draft's own gesture pair: Enter follows `/enter`, the
+                // accelerated chord does the other one.
+                let enter = app.enter.label(app.locale);
+                let chord = app.enter.flipped().label(app.locale);
+                app.locale
+                    .tr(
+                        "next message — ⏎ {enter} · ctrl+⏎ {chord}",
+                        "后续消息 —— ⏎ {enter} · ctrl+⏎ {chord}",
+                    )
+                    .replace("{enter}", enter)
+                    .replace("{chord}", chord)
+            }
         };
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -2409,8 +2423,14 @@ mod tests {
         use ratatui::Terminal;
         use std::time::Duration;
         let mut app = test_app();
-        app.transcript.push_user("first prompt".into(), false);
-        app.transcript.push_user("second prompt".into(), false);
+        app.transcript.push_user(
+            "first prompt".into(),
+            crate::transcript::Delivery::Delivered,
+        );
+        app.transcript.push_user(
+            "second prompt".into(),
+            crate::transcript::Delivery::Delivered,
+        );
         let layout = app.transcript.layout(&app.theme, 78, app.spinner(), false);
         let target = layout.users[0];
         app.prompt_flash = Some((target.cell, Instant::now() + Duration::from_secs(5)));
@@ -3465,7 +3485,8 @@ mod tests {
     fn the_scroll_chip_records_the_cell_it_is_drawn_on() {
         let mut app = test_app();
         for i in 0..40 {
-            app.transcript.push_user(format!("line {i}"), false);
+            app.transcript
+                .push_user(format!("line {i}"), crate::transcript::Delivery::Delivered);
         }
         let _ = dump_frame(&mut app, 100, 14);
         assert!(
@@ -3512,7 +3533,8 @@ mod tests {
     fn scroll_up_survives_draw_and_shows_indicator() {
         let mut app = test_app();
         for i in 0..40 {
-            app.transcript.push_user(format!("line {i}"), false);
+            app.transcript
+                .push_user(format!("line {i}"), crate::transcript::Delivery::Delivered);
         }
         app.scroll_by(20);
         let frame = dump_frame(&mut app, 100, 14);
@@ -3526,8 +3548,10 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut app = test_app();
-        app.transcript
-            .push_user("hello selection world".into(), false);
+        app.transcript.push_user(
+            "hello selection world".into(),
+            crate::transcript::Delivery::Delivered,
+        );
         let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         // First draw fills chat_view; then select and draw again.

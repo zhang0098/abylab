@@ -180,8 +180,13 @@ curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-
 
 ## 改内容
 
-- 文案只在两个 `index.html` 里，改中文别忘了 `en/index.html`；命令列表、按键、
-  体积这些数字以站点为唯一出处（README 只留快速开始），改动时两版页面一起改。
+- 文案只在两个 `index.html` 里，改中文别忘了 `en/index.html`；命令列表、体积这些
+  数字以站点为唯一出处（README 只留快速开始和一段按键），改动时两版页面一起改。
+- 按键不归站点管：真值是 `crates/abylab-tui/src/input/keymap.rs` 的 `KEY_ROWS` ——
+  `/keys` 由它渲染（测试保证每个 Action 都有一行、每个写出来的键都真能解析回那个
+  Action），`/help` 是手写的同一份清单。站点上那行键位、两份 README 的「按键」段
+  都只是手抄本：改键位以 keymap 为准，顺手把这四处一起同步。`ctrl+x` 从「立即
+  发送」漂到「剪切选区」，就是只改了 TUI、站点没人管的下场。
 - `styles.css` 只做 Pico 变量之外的一点点事；能靠 Pico classless 解决的样式就
   别往这儿加。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。

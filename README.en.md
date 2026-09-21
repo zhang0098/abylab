@@ -27,29 +27,19 @@ never come from the environment: abylab does not read `DEEPSEEK_API_KEY` or any
 other variable, and `--api-key <key>` is only a one-run override that is never
 persisted.
 
-Options:
-
-```
--w, --workspace <dir>     agent workspace (default: cwd)
-    --session-root <dir>  session JSONL root (default: $ABYLAB_HOME/sessions)
-    --session-id <id>     resume/continue a durable session id
-    --model <id>          model id (default: $ABY_MODEL, else the persisted
-                          model, else deepseek-flash)
-    --base-url <url>      sets DEEPSEEK_BASE_URL for the agent
-    --api-key <key>       override the agent API key for this run
-                          (/login persists one instead)
-    --theme <dark|light>  appearance mode (default: persisted, else dark)
-```
-
-There are no flags for the fine tuning — just set the environment:
-`ABY_MAX_REQUESTS`, `ABY_MAX_TOOL_CALLS`, `ABY_AUTO_CONTINUE`,
-`ABY_TURN_TIMEOUT`, `ABY_TOOL_TIMEOUT`, `ABY_CONTEXT_WINDOW` (enables
-compaction), `ABY_COMPACT_AT`, `ABY_KEEP_RECENT`, `ABY_PRUNE_TOOL_OUTPUT`,
-plus `ABYLAB_HOME` and `ABY_MODEL`.
-
 Your preferences live in `$ABYLAB_HOME/settings.json`: interface language
 (Chinese by default), model, reasoning effort, permission preset, and
 appearance (mode + palette). Flags override them for that run only.
+
+## Keys
+
+enter send / queue · ctrl+enter send now · alt+↑ (mac ⌥↑) edit queued prompt ·
+esc interrupt / 2× clear draft · ctrl+c clear / quit · ↑ history · `/` commands ·
+`@` file mention · ctrl+z undo · ctrl+p model · ctrl+t theme · shift+tab permission preset
+
+`alt+↑` opens the list only when prompts are waiting and the draft is empty:
+`↑/↓` select · `enter` edit · `ctrl+enter` steer that one into the running turn ·
+`ctrl+d` delete it (twice on the same row). The full map lives in `/keys`.
 
 ## License and credits
 
