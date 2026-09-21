@@ -112,6 +112,50 @@ impl Cell {
     }
 }
 
+/// One block of a client-owned prompt, as the timeline echoes it
+/// ([`Transcript::prompt_echo_cells`]).
+pub enum EchoBlock<'a> {
+    Text(&'a str),
+    Image {
+        name: &'a str,
+        path: &'a str,
+        data: &'a Arc<[u8]>,
+    },
+}
+
+/// What an edit did to the timeline's cell indices: the run `[start, end)` now
+/// holds `len` cells. Every index at or after `end` moves by the difference,
+/// and every index inside the run is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellShift {
+    start: usize,
+    end: usize,
+    len: usize,
+}
+
+impl CellShift {
+    /// An edit that changed nothing.
+    fn none() -> Self {
+        CellShift {
+            start: 0,
+            end: 0,
+            len: 0,
+        }
+    }
+
+    /// Where an index the caller held lives now; `None` when the edit removed
+    /// it.
+    pub fn map(self, index: usize) -> Option<usize> {
+        if index < self.start {
+            Some(index)
+        } else if index < self.end {
+            None
+        } else {
+            Some(index + self.len - (self.end - self.start))
+        }
+    }
+}
+
 /// One image the UI should render as a kitty-graphics thumbnail, positioned
 /// by its reserved line range (`line` is relative to the transcript layout;
 /// the chat pane adds its banner offset).
@@ -253,6 +297,86 @@ impl Transcript {
         self.tool_args.clear();
         self.plan_cell = None;
         self.last_finish = None;
+    }
+
+    /// Drop cells from the timeline and report what moved, so callers holding
+    /// cell indices of their own can remap them.
+    ///
+    /// The transcript's own open-card indices are remapped here, so a stream or
+    /// a plan cell below the cut keeps pointing at its cell.
+    pub fn remove_cells(&mut self, cells: &[usize]) -> CellShift {
+        self.replace_cells(cells, Vec::new()).0
+    }
+
+    /// Replace a run of client-owned cells — a queued prompt's echo — in place,
+    /// and report the new indices next to the shift.
+    ///
+    /// A repaint keeps the echo where it was in the timeline instead of moving
+    /// it to the tail: the queue's FIFO order is what the transcript shows, and
+    /// the `⌥↑` list numbers its rows the same way. `run` is the contiguous,
+    /// ascending chain the caller painted (`cells.len()` is how many cells the
+    /// run has, `cells[0]` where it starts); a run past the end of the timeline
+    /// does nothing.
+    pub fn replace_cells(&mut self, run: &[usize], cells: Vec<Cell>) -> (CellShift, Vec<usize>) {
+        let Some(&start) = run.first() else {
+            return (CellShift::none(), Vec::new());
+        };
+        if start > self.cells.len() {
+            return (CellShift::none(), Vec::new());
+        }
+        let end = (start + run.len()).min(self.cells.len());
+        let shift = CellShift {
+            start,
+            end,
+            len: cells.len(),
+        };
+        let painted = (start..start + cells.len()).collect();
+        self.cells.splice(start..end, cells);
+        self.remap_indices(|index| shift.map(index));
+        (shift, painted)
+    }
+
+    /// The echo cells for one client-owned prompt: a `User` bubble per text
+    /// block, a thumbnail per image, all still marked queued. Image ids come
+    /// from the transcript's own sequence, so a repaint can never collide with
+    /// a thumbnail already on screen.
+    pub fn prompt_echo_cells(&mut self, blocks: &[EchoBlock<'_>]) -> Vec<Cell> {
+        blocks
+            .iter()
+            .map(|block| match block {
+                EchoBlock::Text(text) => Cell::new(CellKind::User {
+                    text: (*text).to_string(),
+                    queued: true,
+                }),
+                EchoBlock::Image { name, path, data } => {
+                    self.image_seq += 1;
+                    Cell::new(CellKind::Image {
+                        name: (*name).to_string(),
+                        caption: String::new(),
+                        path: (*path).to_string(),
+                        data: Arc::clone(data),
+                        id: self.image_seq,
+                        queued: true,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// Move the transcript's own bookkeeping — the open assistant/reasoning
+    /// cells, the tool cards, the plan digest — onto a new numbering. An index
+    /// the edit removed drops its entry.
+    fn remap_indices(&mut self, map: impl Fn(usize) -> Option<usize>) {
+        let remap = |entries: HashMap<String, usize>| -> HashMap<String, usize> {
+            entries
+                .into_iter()
+                .filter_map(|(key, index)| map(index).map(|at| (key, at)))
+                .collect()
+        };
+        self.open_assistant = remap(std::mem::take(&mut self.open_assistant));
+        self.open_reasoning = remap(std::mem::take(&mut self.open_reasoning));
+        self.tools = remap(std::mem::take(&mut self.tools));
+        self.plan_cell = self.plan_cell.and_then(&map);
     }
 
     fn agent_label(&self, session: &str) -> Option<String> {
@@ -1384,6 +1508,12 @@ pub fn tool_title(name: &str, arguments: &str) -> String {
             }
             _ => {}
         }
+        // A call with no arguments takes no title: `{}` is noise the tool name
+        // already answers for (`get_goal`), and the result below carries the
+        // content.
+        if v.as_object().is_some_and(|object| object.is_empty()) {
+            return String::new();
+        }
         // generic: compact json
         return one_line(&v.to_string());
     }
@@ -1624,6 +1754,101 @@ mod tests {
         Transcript::new(session.to_string())
     }
 
+    /// Dropping cells shifts every index above the cut, so the transcript's own
+    /// open-card and plan indices have to move with them — a tool card below a
+    /// withdrawn echo must stay its own, and its click must still find it.
+    #[test]
+    fn removing_cells_remaps_the_transcripts_own_indices() {
+        let mut tr = t("s");
+        tr.apply(UiEvent::Plan {
+            session: "s".into(),
+            summary: "1 of 2 done".into(),
+            todos: Vec::new(),
+            active: None,
+            active_extra: 0,
+            completed: 1,
+            total: 2,
+        });
+        tr.apply(UiEvent::ToolCall {
+            session: "s".into(),
+            call_id: "c1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        });
+        assert_eq!(tr.plan_cell, Some(0));
+        assert_eq!(tr.tools.get("c1"), Some(&1));
+        tr.push_user("withdrawn".into(), true);
+        tr.push_user("still queued".into(), true);
+
+        // Cell 2 (the withdrawn echo) leaves the timeline.
+        let shift = tr.remove_cells(&[2]);
+
+        assert_eq!(shift.map(0), Some(0));
+        assert_eq!(shift.map(1), Some(1));
+        assert_eq!(shift.map(2), None, "the withdrawn echo is gone");
+        assert_eq!(shift.map(3), Some(2));
+        assert_eq!(tr.cells.len(), 3);
+        assert_eq!(tr.plan_cell, Some(0), "the plan cell keeps its index");
+        assert_eq!(tr.tools.get("c1"), Some(&1), "so does the tool card");
+        assert!(matches!(tr.cells[0].kind, CellKind::Plan { .. }));
+        assert!(matches!(tr.cells[1].kind, CellKind::Tool { .. }));
+        assert!(
+            matches!(&tr.cells[2].kind, CellKind::User { text, queued: true } if text == "still queued"),
+            "the surviving echo moved into the gap"
+        );
+    }
+
+    /// An edited echo is repainted in place: the empty prompt run becoming an
+    /// image and a text keeps them where the queue's order put them, and the
+    /// tool card under the run follows the shift.
+    #[test]
+    fn replacing_a_run_repaints_it_in_place_and_shifts_the_tail() {
+        let mut tr = t("s");
+        tr.apply(UiEvent::ToolCall {
+            session: "s".into(),
+            call_id: "c1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        });
+        let run: Vec<usize> = (tr.cells.len()..tr.cells.len() + 1).collect();
+        let echo = tr.prompt_echo_cells(&[EchoBlock::Text("before the edit")]);
+        tr.cells.extend(echo);
+        tr.apply(UiEvent::ToolCall {
+            session: "s".into(),
+            call_id: "c2".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"pwd"}"#.into(),
+        });
+        assert_eq!(tr.tools.get("c1"), Some(&0));
+        assert_eq!(tr.tools.get("c2"), Some(&2));
+
+        // One text bubble becomes an image + text: one cell more than before.
+        let image_bytes: Arc<[u8]> = Arc::from(vec![0u8; 4]);
+        let echo = tr.prompt_echo_cells(&[
+            EchoBlock::Image {
+                name: "shot.png",
+                path: "/tmp/shot.png",
+                data: &image_bytes,
+            },
+            EchoBlock::Text("after the edit"),
+        ]);
+        let (shift, painted) = tr.replace_cells(&run, echo);
+
+        assert_eq!(painted, [1, 2]);
+        assert_eq!(shift.map(0), Some(0), "the first card never moved");
+        assert_eq!(shift.map(1), None, "the old bubble is gone");
+        assert_eq!(shift.map(2), Some(3), "the second card follows the growth");
+        assert_eq!(tr.tools.get("c2"), Some(&3));
+        assert!(matches!(
+            &tr.cells[1].kind,
+            CellKind::Image { name, queued: true, .. } if name == "shot.png"
+        ));
+        assert!(
+            matches!(&tr.cells[2].kind, CellKind::User { text, queued: true } if text == "after the edit"),
+            "the repainted run sits where the old one did"
+        );
+    }
+
     /// Timeline chrome follows the interface language: the notices, the plan
     /// divider, the reasoning heading and the tool-card footer all speak the
     /// locale `App` sets, while payload text (a session title) stays as it
@@ -1808,6 +2033,17 @@ mod tests {
             }
             other => panic!("unexpected cell {other:?}"),
         }
+    }
+
+    /// A call that takes no arguments titles nothing: `{}` would sit after the
+    /// tool name saying nothing, and the answer belongs in the card's body.
+    #[test]
+    fn no_argument_tool_calls_title_nothing() {
+        assert_eq!(tool_title("get_goal", "{}"), "");
+        assert_eq!(tool_title("get_goal", " {} "), "");
+        assert_eq!(tool_title("get_goal", ""), "");
+        // Anything an argument-free call does carry still shows.
+        assert_eq!(tool_title("get_goal", r#"{"note":"x"}"#), r#"{"note":"x"}"#);
     }
 
     #[test]

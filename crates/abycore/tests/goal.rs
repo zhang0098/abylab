@@ -145,6 +145,99 @@ async fn model_tools_create_read_and_complete_the_goal() {
     assert_eq!(goal.revision, 2, "an accepted update bumps the revision");
 }
 
+/// The read is answered by the agent, not by the stateless tool: the result a
+/// host displays is the committed one, never the tool's empty placeholder.
+#[tokio::test]
+async fn the_host_sees_the_committed_goal_read() {
+    let server = Server::start(vec![
+        Reply::sse(response("r1", vec![call("c1", "get_goal", "{}")])),
+        Reply::sse(response("r2", vec![message("m2", "read it")])),
+    ])
+    .await;
+    let mut agent = agent(&server);
+    let goal = agent.set_goal("ship the release", Some(3)).unwrap();
+    let finished = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = finished.clone();
+    agent
+        .run("what is the goal?", RunOptions::default(), move |event| {
+            if let AgentEvent::ToolFinished { call_id, output } = event {
+                captured.lock().unwrap().push((call_id, output));
+            }
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+    let seen = finished.lock().unwrap().clone();
+    let [(call_id, output)] = seen.as_slice() else {
+        panic!("one read finished: {seen:?}")
+    };
+    assert_eq!(call_id, "c1");
+    assert!(!output.is_error);
+    // The snapshot the model read, so the card and the transcript agree.
+    assert!(
+        output.content.contains(r#""objective":"ship the release""#),
+        "{}",
+        output.content
+    );
+    assert!(
+        output.content.contains(r#""revision":1"#),
+        "{}",
+        output.content
+    );
+    let committed = agent
+        .snapshot()
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == "c1" => Some(output.clone()),
+            _ => None,
+        })
+        .expect("the read is committed");
+    assert_eq!(committed, output.content);
+
+    // A mutation reports what the agent committed (`goal → …`), not the
+    // tool's proposal.
+    let server = Server::start(vec![
+        Reply::sse(response(
+            "r3",
+            vec![call(
+                "c3",
+                "update_goal",
+                &format!(
+                    r#"{{"goal_id":"{}","revision":{},"status":"complete","note":"shipped"}}"#,
+                    goal.id, goal.revision
+                ),
+            )],
+        )),
+        Reply::sse(response("r4", vec![message("m4", "done")])),
+    ])
+    .await;
+    let mut agent = Agent::restore(server.client(), agent.snapshot()).unwrap();
+    agent.register_tool(UpdateGoalTool).unwrap();
+    let finished = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = finished.clone();
+    agent
+        .run("complete it", RunOptions::default(), move |event| {
+            if let AgentEvent::ToolFinished { call_id, output } = event {
+                captured.lock().unwrap().push((call_id, output));
+            }
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+    let seen = finished.lock().unwrap().clone();
+    let [(_, output)] = seen.as_slice() else {
+        panic!("one mutation finished: {seen:?}")
+    };
+    assert_eq!(
+        output.content,
+        "goal → ship the release · complete · round 0/3 · shipped"
+    );
+}
+
 /// A stale revision is refused and leaves the stored goal untouched.
 #[tokio::test]
 async fn a_stale_revision_is_refused() {

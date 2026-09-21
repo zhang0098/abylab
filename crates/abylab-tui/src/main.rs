@@ -469,6 +469,10 @@ fn main() -> Result<()> {
 
     controller.send(Cmd::Shutdown);
     restore_terminal();
+    // Back on the normal screen: the session id and how to return to it. The
+    // app owns the wording (locale + the session it ended on), the shell writes
+    // it, so it survives the alternate screen (see `App::exit_notice`).
+    println!("{}", app.exit_notice());
     run
 }
 
