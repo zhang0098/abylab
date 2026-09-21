@@ -19,10 +19,11 @@ context compaction, session persistence, goal rounds) live in
   dialog. The key is in the dialog's title, in `/help` and in `/keys`, and popups
   now widen to fit their title instead of clipping the hint.
 - Quitting prints the session id and the way back: once the alternate screen is
-  restored, the shell gets `Session id: aby-…` and
-  `Resume it later: abylab --session-id aby-…`, with `/resume` named as the
-  in-app route. The id is the session that was on screen at exit — a mid-run
-  `/resume` switch moves it — and each interface language words it its own way.
+  restored, the shell gets three lines — `Session id: aby-…`,
+  `Resume it later: abylab --session-id aby-…` and `Or pick it with /resume in
+  the app`. One idea per line, so the resume command can be selected on its own.
+  The id is the session that was on screen at exit — a mid-run `/resume` switch
+  moves it — and each interface language words it its own way.
 
 ### Fixed
 

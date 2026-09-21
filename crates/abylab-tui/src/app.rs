@@ -1245,8 +1245,10 @@ impl App {
             .push_markdown(format!("- **{label}** · {hint}"));
     }
 
-    /// The two lines the shell gets once the alternate screen is gone: the
-    /// session id and the ways back into it.
+    /// The three lines the shell gets once the alternate screen is gone: which
+    /// session this was, the command that picks it up again, and the in-app way
+    /// to it. One idea per line, and the command stands alone so selecting it
+    /// takes only that line.
     ///
     /// The id is the one on screen at exit — a `/resume` switch moves it — so a
     /// session entered mid-run is the one named. Both routes need the launch's
@@ -1256,10 +1258,10 @@ impl App {
         let id = &self.session_id;
         match self.locale {
             Locale::En => format!(
-                "Session id: {id}\nResume it later: abylab --session-id {id} · or pick it with /resume"
+                "Session id: {id}\nResume it later: abylab --session-id {id}\nOr pick it with /resume in the app"
             ),
             Locale::Zh => format!(
-                "会话 id：{id}\n下次继续：abylab --session-id {id} · 也可以在程序里用 /resume 选择"
+                "会话 id：{id}\n下次继续：abylab --session-id {id}\n或在程序里用 /resume 选择"
             ),
         }
     }
@@ -5733,7 +5735,8 @@ mod resume_tests {
     }
 
     /// Leaving prints the session that was on screen — a `/resume` switch moves
-    /// the id — plus the two ways back, in the interface language.
+    /// the id — plus the two ways back, in the interface language. One line
+    /// each, so the resume command can be selected on its own.
     #[test]
     fn the_exit_notice_names_the_session_and_the_way_back() {
         let root = tmp_root("exit-notice");
@@ -5747,8 +5750,8 @@ mod resume_tests {
             let notice = app.exit_notice();
             assert_eq!(
                 notice.lines().count(),
-                2,
-                "the id, then the way back: {notice}"
+                3,
+                "the id, the command, the in-app way: {notice}"
             );
             assert!(notice.contains(id), "{notice}");
             assert!(
