@@ -4,14 +4,16 @@
 //! `<root>/<workspace-slug>`).
 //!
 //! Only newline-terminated records are committed. Readers ignore an unfinished
-//! final record; writers validate complete records and durably remove the tail
-//! under an exclusive lock before appending. Corrupt or unsupported complete
-//! records are errors, never a reason to restore an older checkpoint.
+//! final record; corrupt or unsupported complete records are errors, never a
+//! reason to restore an older checkpoint.
 //!
-//! The log appears on the first append. Each append is synced, with failed
-//! writes rolled back before the writer can be reused. Discovery reads the
-//! header and a disposable summary index bound to the log's metadata. Missing
-//! or stale indexes are rebuilt by one streaming scan.
+//! The log holds the header, the newest title and the newest checkpoint;
+//! snapshots are replaced through a synced temp file plus an atomic rename, so
+//! a crash leaves either the previous log or the new one — never a torn
+//! snapshot. Reopening adopts an existing log, repairs an unfinished tail and
+//! rewrites legacy multi-snapshot logs to this compact form on the next append.
+//! Discovery reads the header and a disposable summary index bound to the
+//! log's metadata. Missing or stale indexes are rebuilt by one streaming scan.
 
 mod index;
 mod log;
@@ -27,6 +29,8 @@ use std::{
 };
 
 const PERSIST_VERSION: u32 = 1;
+/// Anchor once every this many delta records so resume reads stay bounded.
+const DELTAS_PER_ANCHOR: u32 = 64;
 
 /// Immutable identity and configuration recorded when the log materializes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -187,8 +191,10 @@ impl SessionStore {
         self.log_file(id)
     }
 
-    /// Append a validated snapshot. Several checkpoints may share a run sequence;
-    /// the last committed record is the state returned by `load`.
+    /// Record the newest checkpoint. The writer decides between an incremental
+    /// delta record (appended, the common case) and a full anchor rewrite that
+    /// also discards accumulated deltas. Several checkpoints may share a run
+    /// sequence; the folded last record is the state returned by `load`.
     pub fn append_checkpoint(
         &self,
         writer: &mut SessionWriter,
@@ -196,11 +202,9 @@ impl SessionStore {
         snapshot: &SessionSnapshot,
     ) -> Result<()> {
         snapshot.validate()?;
-        let line =
-            serde_json::json!({"type":"snapshot", "seq":seq, "snapshot":snapshot}).to_string();
         let mut discovery = writer.discovery.clone();
         discovery.observe(snapshot);
-        writer.append(&line, discovery)
+        writer.commit_snapshot(seq, snapshot, discovery)
     }
 
     /// Read headers and summary indexes, ordered by log modification time.
@@ -322,10 +326,7 @@ impl SessionStore {
     pub fn set_title(&self, writer: &mut SessionWriter, title: &str) -> Result<()> {
         let mut discovery = writer.discovery.clone();
         discovery.title = Some(title.into());
-        writer.append(
-            &serde_json::json!({"type":"title", "title":title}).to_string(),
-            discovery,
-        )
+        writer.commit_title(&discovery)
     }
 
     /// Encode UTF-8 bytes; reserve the complete `.` and `..` segments too.
@@ -348,8 +349,10 @@ impl SessionStore {
     }
 }
 
-/// An exclusive append handle. A successful append is durable even if its
-/// disposable discovery index could not be refreshed.
+/// An exclusive log handle. The log holds one header, one title, one anchor
+/// and appended deltas. Anchor commits rewrite it through a synced temp file
+/// and an atomic rename; delta commits append one record. A failed rewrite
+/// never damages the previous state.
 #[derive(Debug)]
 pub struct SessionWriter {
     id: String,
@@ -358,6 +361,14 @@ pub struct SessionWriter {
     header: SessionHeader,
     len: u64,
     discovery: Discovery,
+    /// The most recent committed state: the delta baseline and the source for
+    /// anchor rewrites.
+    state: Option<SessionSnapshot>,
+    deltas_since_anchor: u32,
+    /// Byte length of the newest anchor record, including its newline; 0 when
+    /// the log has no anchor yet. Deltas larger than half of this are
+    /// demoted to anchors.
+    anchor_bytes: usize,
     log: Option<fs::File>,
     lock: fs::File,
     poisoned: bool,
@@ -387,6 +398,9 @@ impl SessionWriter {
             header,
             len: 0,
             discovery: Discovery::default(),
+            state: None,
+            deltas_since_anchor: 0,
+            anchor_bytes: 0,
             log: None,
             lock,
             poisoned: false,
@@ -413,73 +427,237 @@ impl SessionWriter {
         &self.file
     }
 
-    /// Append one valid title or snapshot record, adding its newline.
-    /// Invalid JSON, unknown records and invalid snapshots are rejected before I/O.
+    /// Commit one valid title or snapshot record. Invalid JSON, unknown
+    /// records, invalid snapshots and delta records are rejected before I/O:
+    /// deltas are writer-internal; external callers express full state.
     pub fn append_line(&mut self, line: &str) -> Result<()> {
         if line.contains('\n') {
             return Err(invalid("session log lines must not contain newlines"));
         }
-        let event = log::Event::parse(line.as_bytes())?;
-        let mut discovery = self.discovery.clone();
-        discovery.apply(&event);
-        self.append(line, discovery)
+        match log::Event::parse(line.as_bytes())? {
+            log::Event::Title { title, .. } => {
+                let mut discovery = self.discovery.clone();
+                discovery.title = Some(title);
+                self.commit_title(&discovery)
+            }
+            log::Event::Snapshot { _seq, snapshot, .. } => {
+                let mut discovery = self.discovery.clone();
+                discovery.observe(&snapshot);
+                self.commit_snapshot(_seq, &snapshot, discovery)
+            }
+            log::Event::Delta { .. } => Err(invalid(
+                "session log delta records are writer-internal; append a full snapshot instead",
+            )),
+        }
     }
 
-    fn append(&mut self, line: &str, discovery: Discovery) -> Result<()> {
+    /// Decide between an appended delta record and a full anchor rewrite.
+    fn commit_snapshot(
+        &mut self,
+        seq: u64,
+        snapshot: &SessionSnapshot,
+        discovery: Discovery,
+    ) -> Result<()> {
         if self.poisoned {
             return Err(invalid(
-                "session writer requires reopening after an I/O failure",
+                "session writer requires reopening after a validation failure",
             ));
         }
-        if self.log.is_none() {
-            match fs::OpenOptions::new()
-                .read(true)
-                .append(true)
-                .create_new(true)
-                .open(&self.file)
-            {
-                Ok(file) => self.log = Some(file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.log = Some(
-                        fs::OpenOptions::new()
-                            .read(true)
-                            .append(true)
-                            .open(&self.file)
-                            .map_err(|e| io_error("open session log", e))?,
-                    );
-                    self.truncate_to_last_line()?;
-                }
-                Err(error) => return Err(io_error("create session log", error)),
+        let must_anchor = match &self.state {
+            None => true,
+            Some(state) => {
+                snapshot.items.len() < state.items.len()
+                    || snapshot.requests.len() < state.requests.len()
+                    || self.deltas_since_anchor >= DELTAS_PER_ANCHOR
             }
+        };
+        if must_anchor {
+            return self.commit_anchor(seq, snapshot, discovery);
         }
-        let mut data = Vec::new();
-        if self.len == 0 {
-            data.extend_from_slice(self.header.to_line().as_bytes());
-            data.push(b'\n');
+        let base = self
+            .state
+            .as_ref()
+            .expect("the anchor decision above guarantees a baseline");
+        // Tail replacement: everything from the first divergent record onward
+        // is re-sent, so in-place updates of committed records (usage fields
+        // filling in after a dispatch) survive the fold.
+        let items_from = diverge_point(&base.items, &snapshot.items);
+        let requests_from = diverge_point(&base.requests, &snapshot.requests);
+        let delta = serde_json::json!({
+            "type":"delta", "seq":seq, "time":now_ms(),
+            "items":{"from":items_from, "added": &snapshot.items[items_from..]},
+            "requests":{"from":requests_from, "added": &snapshot.requests[requests_from..]},
+            "pending":snapshot.pending,
+            "needs_response":snapshot.needs_response,
+            "run_sequence":snapshot.run_sequence,
+            "todos":snapshot.todos,
+            "compactions":snapshot.compactions,
+            "prune":snapshot.prune,
+            "goal":snapshot.goal,
+        })
+        .to_string();
+        if self.anchor_bytes > 0 && delta.len() > self.anchor_bytes / 2 {
+            // The new items dwarf the baseline: an anchor is the cheaper
+            // representation and it also resets the replay window.
+            return self.commit_anchor(seq, snapshot, discovery);
         }
-        data.extend_from_slice(line.as_bytes());
-        data.push(b'\n');
-        let file = self.log.as_mut().expect("opened log");
-        if let Err(error) = file
-            .write_all(&data)
-            .and_then(|_| file.sync_all())
-            .and_then(|_| sync_dir(&self.dir))
+        self.append_delta(&delta, snapshot.clone(), discovery)
+    }
+
+    /// Append one delta record and advance the in-memory baseline.
+    fn append_delta(
+        &mut self,
+        line: &str,
+        state: SessionSnapshot,
+        discovery: Discovery,
+    ) -> Result<()> {
+        if self.log.is_none()
+            && let Err(error) = self.adopt_existing_log()
         {
+            return Err(error);
+        }
+        let mut data = line.as_bytes().to_vec();
+        data.push(b'\n');
+        let file = self.log.as_mut().expect("delta append requires the log");
+        let previous = self.len;
+        if let Err(error) = file.write_all(&data).and_then(|_| file.sync_all()) {
             if file
-                .set_len(self.len)
+                .set_len(previous)
                 .and_then(|_| file.sync_all())
                 .is_err()
             {
                 self.poisoned = true;
             }
-            return Err(io_error("append session checkpoint", error));
+            return Err(io_error("append session delta", error));
         }
+        // An existing file entry cannot change; only the file's own fsync
+        // matters, so the directory sync that anchors pay is skipped here.
         self.len += data.len() as u64;
+        self.deltas_since_anchor += 1;
+        self.state = Some(state);
         self.discovery = discovery;
         if let Ok(metadata) = file.metadata() {
             let _ = index::write(&self.dir, &metadata, &self.discovery);
         }
         Ok(())
+    }
+
+    /// Materialize a title update. With committed state the rewrite re-anchors
+    /// it: accumulated deltas fold into the new anchor and the title stays.
+    fn commit_title(&mut self, discovery: &Discovery) -> Result<()> {
+        if self.poisoned {
+            return Err(invalid(
+                "session writer requires reopening after a validation failure",
+            ));
+        }
+        let anchor = self.state.as_ref().map(|state| {
+            serde_json::json!({"type":"snapshot", "seq":state.run_sequence, "time":now_ms(), "snapshot":state})
+                .to_string()
+        });
+        self.rewrite(discovery.clone(), anchor.map(|anchor| (anchor, None)))
+    }
+
+    /// Rewrite the log to a full anchor from the given snapshot.
+    fn commit_anchor(
+        &mut self,
+        seq: u64,
+        snapshot: &SessionSnapshot,
+        discovery: Discovery,
+    ) -> Result<()> {
+        let anchor =
+            serde_json::json!({"type":"snapshot", "seq":seq, "time":now_ms(), "snapshot":snapshot}).to_string();
+        self.rewrite(discovery, Some((anchor, Some(snapshot.clone()))))
+    }
+
+    /// Rewrite the log to `header, title?, anchor?` via a synced temp file and
+    /// an atomic rename. `anchor: Some` re-baselines the writer: the folded
+    /// deltas become the new anchor, the delta baseline resets to that state
+    /// (`Some(state)`) or is dropped to a stateless writer (`None`, the
+    /// title-only materialization). A failure before the rename leaves the
+    /// previous log untouched; a failure after the rename (directory sync)
+    /// leaves the new content committed.
+    fn rewrite(
+        &mut self,
+        discovery: Discovery,
+        anchor: Option<(String, Option<SessionSnapshot>)>,
+    ) -> Result<()> {
+        if self.log.is_none()
+            && let Err(error) = self.adopt_existing_log()
+        {
+            return Err(error);
+        }
+        let mut body = Vec::with_capacity(256);
+        body.extend_from_slice(self.header.to_line().as_bytes());
+        body.push(b'\n');
+        if let Some(title) = &discovery.title {
+            body.extend_from_slice(
+                serde_json::json!({"type":"title", "title":title, "time":now_ms()}).to_string().as_bytes(),
+            );
+            body.push(b'\n');
+        }
+        if let Some((anchor_line, _)) = &anchor {
+            body.extend_from_slice(anchor_line.as_bytes());
+            body.push(b'\n');
+        }
+
+        let temp = tempfile::NamedTempFile::new_in(&self.dir)
+            .map_err(|e| io_error("create session log temp file", e))?;
+        {
+            let mut file = temp.as_file();
+            file.write_all(&body)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| io_error("write session log", e))?;
+        }
+        temp.persist(&self.file)
+            .map_err(|error| io_error("replace session log", error.error))?;
+        let synced = sync_dir(&self.dir);
+        if let Some((anchor_line, state)) = anchor {
+            self.deltas_since_anchor = 0;
+            self.anchor_bytes = anchor_line.len() + 1;
+            self.state = state;
+        }
+        self.discovery = discovery;
+        self.len = body.len() as u64;
+        self.refresh_log();
+        if let Ok(metadata) = fs::metadata(&self.file) {
+            let _ = index::write(&self.dir, &metadata, &self.discovery);
+        }
+        synced.map_err(|e| io_error("sync session directory", e))
+    }
+
+    /// Open an externally created log and adopt its validated state. A corrupt
+    /// complete record poisons the writer: retrying the commit must keep
+    /// failing until the file is repaired. A missing log is not an error:
+    /// the first commit materializes it.
+    fn adopt_existing_log(&mut self) -> Result<()> {
+        match fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.file)
+        {
+            Ok(file) => {
+                self.log = Some(file);
+                self.truncate_to_last_line()?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("open session log", error)),
+        }
+    }
+
+    /// Reopen the in-memory handle onto the current log file so later delta
+    /// appends and tail repairs address the replaced inode, not the retired
+    /// one. A failed reopen drops the stale handle; the next append adopts
+    /// the current file instead of writing into the retired inode.
+    fn refresh_log(&mut self) {
+        match fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.file)
+        {
+            Ok(file) => self.log = Some(file),
+            Err(_) => self.log = None,
+        }
     }
 
     /// Validate committed records and durably remove only an unterminated tail.
@@ -505,6 +683,14 @@ impl SessionWriter {
         if let Some(header) = scanned.header {
             self.header = header;
         }
+        if let Some(snapshot) = &scanned.snapshot {
+            // The folded state becomes the delta baseline; a corrupt fold must
+            // poison the writer like any other complete corruption.
+            snapshot.validate()?;
+        }
+        self.state = scanned.snapshot;
+        self.deltas_since_anchor = scanned.deltas_since_anchor;
+        self.anchor_bytes = scanned.anchor_bytes;
         self.discovery = scanned.discovery;
         self.poisoned = false;
         Ok(self.len)
@@ -521,6 +707,25 @@ impl Drop for SessionWriter {
 
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Index of the first record where `next` leaves the committed `base` — the
+/// replace-from point for a delta. Equal prefixes (the common append case)
+/// yield `base.len()`.
+fn diverge_point<T: PartialEq>(base: &[T], next: &[T]) -> usize {
+    let mut index = 0;
+    let shared = base.len().min(next.len());
+    while index < shared && base[index] == next[index] {
+        index += 1;
+    }
+    index
 }
 
 fn canonical_workspace(workspace: impl AsRef<Path>) -> Result<PathBuf> {
