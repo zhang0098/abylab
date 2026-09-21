@@ -1191,6 +1191,9 @@ fn turn_error_text(err: &abycore::Error, limits: TurnLimits) -> String {
         ErrorKind::Transport | ErrorKind::StreamClosed => {
             "connection lost — the turn is unfinished; send a message to continue it / 连接中断：回合未完成，继续输入可续跑"
         }
+        ErrorKind::EmptyResponse => {
+            "the provider returned an empty response — the turn is unfinished; send a message to continue it / 返回了空响应：回合未完成，继续输入可续跑"
+        }
         ErrorKind::Protocol => "protocol error — likely a gateway incompatibility / 协议不兼容",
         _ => "turn failed",
     };
@@ -2039,6 +2042,7 @@ fn resumable_failure(err: &abycore::Error) -> bool {
             | ErrorKind::StreamClosed
             | ErrorKind::Server
             | ErrorKind::RateLimit
+            | ErrorKind::EmptyResponse
     )
 }
 
@@ -2067,6 +2071,11 @@ fn continuation_notice(err: &abycore::Error, round: usize, rounds: usize) -> Str
     if err.kind == ErrorKind::Timeout {
         return format!(
             "timed out — continuing the unfinished turn ({round}/{rounds}) / 超时，自动续跑（{round}/{rounds}）"
+        );
+    }
+    if err.kind == ErrorKind::EmptyResponse {
+        return format!(
+            "empty response — retrying the unfinished step ({round}/{rounds}) / 空响应，正在同一回合内重试（{round}/{rounds}）"
         );
     }
     let (en, zh) = match err.kind {

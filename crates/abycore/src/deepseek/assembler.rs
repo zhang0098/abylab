@@ -291,18 +291,30 @@ impl Assembler {
             let usage = usage
                 .as_object()
                 .ok_or_else(|| Error::protocol("Messages usage must be an object"))?;
-            for key in [
-                "input_tokens",
-                "output_tokens",
-                "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-            ] {
-                if usage.get(key).is_some_and(|v| v.as_u64().is_none()) {
-                    return Err(Error::protocol("invalid Messages token counter"));
+            let mut accepted = serde_json::Map::new();
+            for (key, entry) in usage {
+                let known = matches!(
+                    key.as_str(),
+                    "input_tokens"
+                        | "output_tokens"
+                        | "cache_read_input_tokens"
+                        | "cache_creation_input_tokens"
+                );
+                if known {
+                    // A present-but-null counter reads as absent, exactly like
+                    // the non-streaming decoder (`Usage::from_wire`); only a
+                    // non-null, non-integer value violates the protocol.
+                    if entry.is_null() {
+                        continue;
+                    }
+                    if entry.as_u64().is_none() {
+                        return Err(Error::protocol("invalid Messages token counter"));
+                    }
                 }
+                accepted.insert(key.clone(), entry.clone());
             }
             // Cumulative fields replace previous values; absent fields retain starts.
-            self.usage.as_object_mut().unwrap().extend(usage.clone());
+            self.usage.as_object_mut().unwrap().extend(accepted);
         }
         Ok(())
     }

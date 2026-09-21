@@ -248,7 +248,10 @@ pub(super) fn settle(response: &mut Response, reason: &str) -> Result<()> {
     }
     if response.status == ResponseStatus::Completed {
         if response.output.is_empty() {
-            return Err(Error::protocol("completed message has no content"));
+            return Err(Error::new(
+                ErrorKind::EmptyResponse,
+                "completed message has no content",
+            ));
         }
         if (reason == "tool_use") != !calls.is_empty() {
             return Err(Error::protocol("stop reason disagrees with tool calls"));

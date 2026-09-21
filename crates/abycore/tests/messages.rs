@@ -137,6 +137,48 @@ async fn native_stream_preserves_interleaving_signatures_arguments_and_cumulativ
     assert_eq!(usage.reasoning_tokens, None);
 }
 
+/// Providers send `null` for counters that do not apply (`cache_read_input_tokens`
+/// on an uncached request). The non-streaming decoder reads those as absent;
+/// the streaming path must not abort the whole response over one.
+#[tokio::test]
+async fn null_usage_counters_read_as_absent_and_do_not_fail_the_stream() {
+    let events = vec![
+        json!({"type":"message_start","message":{"type":"message","role":"assistant","id":"msg","model":"fixture-model","content":[],
+            "usage":{"input_tokens":7,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"output_tokens":null}}}),
+        block_start(0, message("m", "hi")),
+        block_stop(0),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":null,"output_tokens":6}}),
+        json!({"type":"message_stop"}),
+    ];
+    let server = Server::start(vec![Reply::events(events)]).await;
+    let output = collect(&server).await.unwrap();
+    let StreamEvent::Finished { response, .. } = output.last().unwrap() else {
+        panic!("missing final message")
+    };
+    assert_eq!(response.output_text(), "hi");
+    let usage = response
+        .usage
+        .as_ref()
+        .expect("usage survives null counters");
+    assert_eq!(usage.input_tokens, Some(7));
+    assert_eq!(usage.output_tokens, Some(6));
+}
+
+/// A completed response with no content blocks is a transient provider defect
+/// (harness's EMPTY_RESPONSE), not a gateway protocol violation: the kind is
+/// what lets the host retry it inside the open turn.
+#[tokio::test]
+async fn an_empty_completed_response_is_classified_as_retryable() {
+    let events = vec![
+        message_start("msg"),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}),
+        json!({"type":"message_stop"}),
+    ];
+    let server = Server::start(vec![Reply::events(events)]).await;
+    let error = collect(&server).await.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::EmptyResponse);
+}
+
 #[tokio::test]
 async fn malformed_streams_never_report_success_or_retry() {
     let start = message_start("m");
@@ -415,7 +457,6 @@ async fn nonstream_decode_rejects_wrong_protocol_blocks_and_stop_reasons() {
     let mut invalid = vec![json!({"id":"r","status":"completed","output":[]})];
     for patch in [
         json!({"role":"user"}),
-        json!({"content":[]}),
         json!({"stop_reason":null}),
         json!({"stop_reason":"tool_use"}),
         json!({"content":[{"type":"redacted_thinking","data":"x"}]}),
@@ -441,6 +482,20 @@ async fn nonstream_decode_rejects_wrong_protocol_blocks_and_stop_reasons() {
             ErrorKind::Protocol
         );
     }
+    // An empty completed response is a transient provider defect, not a
+    // protocol violation: its own kind lets the host retry it inside the turn.
+    let mut empty = valid.clone();
+    empty["content"] = json!([]);
+    let server = Server::start(vec![Reply::json(empty)]).await;
+    assert_eq!(
+        server
+            .client()
+            .complete(MessageRequest::new("hi"), RequestOptions::default())
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::EmptyResponse
+    );
     for (reason, status) in [
         ("end_turn", ResponseStatus::Completed),
         ("stop_sequence", ResponseStatus::Completed),

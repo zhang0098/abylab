@@ -785,6 +785,7 @@ impl App {
             ErrorKind::ContextLimitExceeded => "上下文超出预算，SDK 不会自动压缩；请用 /new",
             ErrorKind::Timeout => "超过时限；可用 --run-timeout / --tool-timeout 调整",
             ErrorKind::Transport => "网络或代理错误",
+            ErrorKind::EmptyResponse => "模型返回空响应，SDK 会在同一回合内重试",
             ErrorKind::Configuration => "配置错误，检查 --base-url 与模型名",
             ErrorKind::NeedsResolution => "工具副作用无法确认，已交由宿主处理",
             ErrorKind::Session => "会话协议或快照问题",
