@@ -23,6 +23,10 @@ context compaction, session persistence, goal rounds) live in
   `⌥↑` half appears only when the selector would really open (empty draft, no
   staged image), because the list needs a free composer — chrome should not
   advertise a key that would refuse.
+- A launch no longer trails a usage hint: the splash keeps the wordmark, the
+  project URL and the four launch facts (version, working directory, permission,
+  model), and the timeline starts there. The hints themselves stay — `/new`
+  still greets a session with one, cycling through the seven of them.
 
 ## [0.1.11] - 2026-09-22
 

@@ -345,15 +345,15 @@ fn main() -> Result<()> {
             .unwrap_or("dark"),
     );
     let mut app = App::new(theme, cfg, session_id);
-    // The launch splash: wordmark + project URL, then one usage hint. `/new`
-    // re-greets with the next hint only — the mark belongs to the launch.
+    // The launch splash: the wordmark, the project URL and the launch facts,
+    // and nothing after them. The usage hint that used to trail the splash now
+    // waits for a session the user opens (`/new`).
     app.push_banner();
     // No key at boot: guide the user to the platform and /login before the
     // first prompt (the driver's own error line stays as the short fact).
     if !app.cfg.has_credentials() {
         app.push_no_key_onboarding();
     }
-    app.push_session_tip();
     // Kitty-graphics image thumbnails in the chat scrollback (PNG only).
     let mut thumbnails = pet::Thumbnails::new();
 

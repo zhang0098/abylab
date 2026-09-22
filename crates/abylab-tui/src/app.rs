@@ -1267,12 +1267,14 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Greet a new session with one usage hint.
+    /// Greet a session the user opens (`/new`) with one usage hint.
     ///
     /// The hint rotation used to live in the composer cap row, competing with
     /// the draft and the todo checklist for the same line; it lands in the
     /// timeline once per session instead, and the index cycles so a user who
-    /// keeps starting sessions still walks the whole set.
+    /// keeps starting sessions still walks the whole set. The launch is not a
+    /// caller: the splash's facts stand alone (`main`), and the hint waits for
+    /// the first session the reader asks for.
     pub fn push_session_tip(&mut self) {
         let hint = self.locale.session_tip(self.session_tip_idx);
         self.session_tip_idx = (self.session_tip_idx + 1) % crate::locale::TIP_COUNT;
