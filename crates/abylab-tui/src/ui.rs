@@ -749,8 +749,12 @@ fn status_title(app: &App) -> Line<'static> {
 }
 
 /// Contextual shortcut hints — a tiny state machine over (run state ×
-/// draft): what Enter does *right now*, how to interrupt, how to steer
-/// immediately. Idle+empty falls back to the `^K keys` discovery hint.
+/// draft): what Enter does *right now*, how to interrupt. Idle+empty shows
+/// nothing at all.
+///
+/// The queue is never restated here: its count and the selector's chord live on
+/// the meta row's chip, which outlives every state this row is tied to (what an
+/// empty enter does with a queue waiting — ship its head — stays in `/keys`).
 ///
 /// `pub(crate)` so the composer's app tests can assert the pair the busy-Enter
 /// preference installed actually reaches the hint row.
@@ -762,12 +766,7 @@ pub(crate) fn context_hints(app: &App) -> Vec<Span<'static>> {
     let lbl = Style::default().fg(theme.caption);
     let running = !matches!(app.state, RunState::Idle);
     let pairs: Vec<(&str, &str)> = match (running, app.input.is_empty()) {
-        // Working, nothing typed: stop it — or, with a queue waiting, ship
-        // its head now (plain enter promotes the FIFO head).
-        (true, true) if app.queued > 0 => vec![
-            ("⏎", app.locale.tr("send queue head", "发送队首")),
-            ("esc", app.locale.tr("interrupt", "中断")),
-        ],
+        // Working, nothing typed: stop it — and nothing else.
         (true, true) => vec![("esc", app.locale.tr("interrupt", "中断"))],
         // Working with a draft: enter does what `/enter` selected and the
         // accelerated chord does the other one — neither cancels the turn
@@ -3214,6 +3213,14 @@ mod tests {
         let s = flat(context_hints(&app));
         assert!(s.contains("esc interrupt"), "{s}");
         assert!(!s.contains("⏎"), "{s}");
+        // …and a FIFO waiting does not change that: the queue is the meta row's
+        // chip, so this row never restates it (an empty enter shipping the head
+        // is `/keys`' line).
+        app.queued = 3;
+        let s = flat(context_hints(&app));
+        assert!(s.contains("esc interrupt"), "{s}");
+        assert!(!s.contains("⏎") && !s.contains("queue head"), "{s}");
+        app.queued = 0;
         // running · draft → queue + send-now + interrupt
         app.input.set("follow-up".into());
         let s = flat(context_hints(&app));

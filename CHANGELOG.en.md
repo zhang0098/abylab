@@ -22,7 +22,9 @@ context compaction, session persistence, goal rounds) live in
   seconds. The count no longer depends on the draft, so it is always there; the
   `⌥↑` half appears only when the selector would really open (empty draft, no
   staged image), because the list needs a free composer — chrome should not
-  advertise a key that would refuse.
+  advertise a key that would refuse. With the chip in place the `⏎ send queue
+  head` hint is gone from the row: it no longer restates the queue, since an
+  empty enter still ships the head and `/keys` documents that.
 - A launch no longer trails a usage hint: the splash keeps the wordmark, the
   project URL and the four launch facts (version, working directory, permission,
   model), and the timeline starts there. The hints themselves stay — `/new`
