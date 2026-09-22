@@ -282,9 +282,8 @@ impl KeyGroup {
 
 /// One documented keybinding.
 pub struct KeyRow {
-    /// Documentation anchor; consumed by the anti-drift tests (the renderer
-    /// only needs the display fields, so non-test builds see this unused).
-    #[allow(dead_code)]
+    /// Documentation anchor: read by the anti-drift tests and by
+    /// [`primary_chord`], which lets chrome look a row up by action.
     pub action: Action,
     pub group: KeyGroup,
     /// Display spellings; the platform set is picked at render time.
@@ -307,6 +306,16 @@ impl KeyRow {
             self.chords_other
         }
     }
+}
+
+/// The chord chrome outside `/keys` spells for an action (the meta row's queue
+/// chip), resolved from the table itself: a chip cannot name a key the keymap
+/// does not bind, and it follows the platform spelling `/keys` prints.
+pub fn primary_chord(action: Action, mac: bool) -> Option<&'static str> {
+    KEY_ROWS
+        .iter()
+        .find(|row| row.action == action)
+        .and_then(|row| row.chords(mac).first().copied())
 }
 
 /// Mouse affordances live in the app event path, not `classify`, so they

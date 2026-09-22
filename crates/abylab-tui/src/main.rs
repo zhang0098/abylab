@@ -345,15 +345,15 @@ fn main() -> Result<()> {
             .unwrap_or("dark"),
     );
     let mut app = App::new(theme, cfg, session_id);
-    // The launch splash: wordmark + project URL, then one usage hint. `/new`
-    // re-greets with the next hint only — the mark belongs to the launch.
+    // The launch splash: the wordmark, the project URL and the launch facts,
+    // and nothing after them. The usage hint that used to trail the splash now
+    // waits for a session the user opens (`/new`).
     app.push_banner();
     // No key at boot: guide the user to the platform and /login before the
     // first prompt (the driver's own error line stays as the short fact).
     if !app.cfg.has_credentials() {
         app.push_no_key_onboarding();
     }
-    app.push_session_tip();
     // Kitty-graphics image thumbnails in the chat scrollback (PNG only).
     let mut thumbnails = pet::Thumbnails::new();
 
@@ -469,10 +469,13 @@ fn main() -> Result<()> {
 
     controller.send(Cmd::Shutdown);
     restore_terminal();
-    // Back on the normal screen: the session id and how to return to it. The
-    // app owns the wording (locale + the session it ended on), the shell writes
-    // it, so it survives the alternate screen (see `App::exit_notice`).
-    println!("{}", app.exit_notice());
+    // Back on the normal screen: the session id and the two ways back, in a
+    // ruled band. The app owns the wording (locale + the session it ended on),
+    // the shell writes it, so it survives the alternate screen (see
+    // `App::exit_notice`). The width is still the terminal's — this is the last
+    // chance to ask before the process is gone.
+    let width = crossterm::terminal::size().map_or(48, |(w, _)| w as usize);
+    println!("{}", app.exit_notice(width));
     run
 }
 

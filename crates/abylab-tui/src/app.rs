@@ -764,10 +764,6 @@ pub struct App {
     /// What plain Enter does while busy (`/enter`); the accelerated chord
     /// always does the other one (harness's `busyEnter` preference).
     pub enter: crate::locale::EnterBehavior,
-    /// Which usage hint the next new session opens with. The composer cap row
-    /// no longer rotates hints live; a session start shows one instead, so the
-    /// index advances per session and cycles the whole set over time.
-    session_tip_idx: usize,
     ctrl_c_armed: Option<CtrlCQuitChord>,
     /// The queued prompt whose `ctrl+d` in the queue picker already asked: the
     /// id of the armed row, cleared when the highlight moves or the list is
@@ -1166,7 +1162,6 @@ impl App {
             key_debug: std::env::var("ABYLAB_KEYDEBUG").is_ok_and(|v| v == "1"),
             vim: crate::input::VimState::default(),
             enter,
-            session_tip_idx: 0,
             ctrl_c_armed: None,
             queue_delete_armed: None,
             session_id,
@@ -1267,37 +1262,28 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Greet a new session with one usage hint.
-    ///
-    /// The hint rotation used to live in the composer cap row, competing with
-    /// the draft and the todo checklist for the same line; it lands in the
-    /// timeline once per session instead, and the index cycles so a user who
-    /// keeps starting sessions still walks the whole set.
-    pub fn push_session_tip(&mut self) {
-        let hint = self.locale.session_tip(self.session_tip_idx);
-        self.session_tip_idx = (self.session_tip_idx + 1) % crate::locale::TIP_COUNT;
-        let label = self.locale.tr("Tip", "提示");
-        self.transcript
-            .push_markdown(format!("- **{label}** · {hint}"));
-    }
-
-    /// The three lines the shell gets once the alternate screen is gone: which
-    /// session this was, the command that picks it up again, and the in-app way
-    /// to it. One idea per line, and the command stands alone so selecting it
-    /// takes only that line.
+    /// The band the shell gets once the alternate screen is gone: a ruled line
+    /// naming the session, the command that picks it up again, and the in-app
+    /// way to it. The command sits alone on its line, so selecting that line
+    /// copies the command and nothing else; `width` is the terminal's (clamped)
+    /// so the rules match the window they were printed into rather than a magic
+    /// 80 columns.
     ///
     /// The id is the one on screen at exit — a `/resume` switch moves it — so a
     /// session entered mid-run is the one named. Both routes need the launch's
     /// workspace and session root: resume from the same directory, or use
     /// `/resume`, which lists exactly the sessions this one can still open.
-    pub fn exit_notice(&self) -> String {
+    pub fn exit_notice(&self, width: usize) -> String {
         let id = &self.session_id;
+        let rule = "─".repeat(width.clamp(24, 72));
         match self.locale {
             Locale::En => format!(
-                "Session id: {id}\nResume it later: abylab --session-id {id}\nOr pick it with /resume in the app"
+                "{rule}\nabylab · session closed · {id}\n\nResume it later:\n\
+                 abylab --session-id {id}\n\nOr pick it with /resume in the app\n{rule}"
             ),
             Locale::Zh => format!(
-                "会话 id：{id}\n下次继续：abylab --session-id {id}\n或在程序里用 /resume 选择"
+                "{rule}\nabylab · 会话已结束 · {id}\n\n下次继续：\n\
+                 abylab --session-id {id}\n\n或在程序里用 /resume 选择\n{rule}"
             ),
         }
     }
@@ -1948,8 +1934,6 @@ impl App {
                             Some(SessionSwitch::Resume(target)) => *target == session_id,
                             None => false,
                         };
-                        let fresh =
-                            switched && matches!(self.session_switch, Some(SessionSwitch::New));
                         if switched || (self.session_bound && self.session_id != session_id) {
                             self.session_switch = None;
                             self.reset_session_ui();
@@ -1960,9 +1944,6 @@ impl App {
                         self.session_id = session_id.clone();
                         self.transcript.set_root_session(session_id);
                         self.session_bound = true;
-                        if fresh {
-                            self.push_session_tip();
-                        }
                         // The driver is the source of truth for the bound
                         // session's model: a resumed session keeps its stored
                         // model, and a rejected /model never moves this row.
@@ -5036,34 +5017,44 @@ impl App {
     /// Startup guidance when no API key was detected: where to get one and
     /// how to store it. `/login` takes effect immediately (the driver
     /// rebuilds from its snapshot), so no restart is needed.
+    ///
+    /// The shape is the message: one sentence, the command alone in a fenced
+    /// block (the renderer frames it into a card, which is the only thing the
+    /// reader has to *do*), then a rule and the two storage facts as a footer.
     pub fn push_no_key_onboarding(&mut self) {
         let text = if self.locale == Locale::Zh {
             "\
-## 尚未检测到 API key
+## 还没有 API key
 
-1. 打开 <https://platform.deepseek.com/> → API keys，创建并复制你的 key
-2. 在输入框输入（保存后立刻生效，无需重启）：
+去 <https://platform.deepseek.com/> → API keys 创建一个并复制，然后粘进输入框
+（存下立刻生效，不用重启）：
 
-   /login sk-xxxxxxxx
+```
+/login sk-xxxxxxxx
+```
 
-3. key 保存在 `~/.abylab/.credentials.yaml`（0600，仅本用户可读）；
-   `/status` 查看凭据来源 · `/logout` 删除已保存的 key
+---
 
-本次运行也可以用 `--api-key <key>` 临时覆盖（不落盘）。"
+key 落在 `~/.abylab/.credentials.yaml`（0600，仅本用户可读）
+
+`/status` 看它的来源 · `/logout` 删掉它 · `--api-key <key>` 只覆盖本次运行，不落盘"
                 .to_string()
         } else {
             "\
-## No API key detected
+## No API key yet
 
-1. Open <https://platform.deepseek.com/> → API keys, create and copy a key
-2. Enter in the composer (takes effect immediately — no restart needed):
+Create one at <https://platform.deepseek.com/> → API keys and paste it into the
+composer (stored on the spot, no restart needed):
 
-   /login sk-xxxxxxxx
+```
+/login sk-xxxxxxxx
+```
 
-3. The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only);
-   `/status` shows its source · `/logout` removes the stored key
+---
 
-`--api-key <key>` can override for this run only (never persisted)."
+The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
+
+`/status` shows its source · `/logout` removes it · `--api-key <key>` overrides this run only"
                 .to_string()
         };
         self.transcript.push_markdown(text);
@@ -6150,8 +6141,9 @@ mod resume_tests {
     }
 
     /// Leaving prints the session that was on screen — a `/resume` switch moves
-    /// the id — plus the two ways back, in the interface language. One line
-    /// each, so the resume command can be selected on its own.
+    /// the id — plus the two ways back, in the interface language, inside a
+    /// ruled band. The resume command sits alone on its line, so selecting that
+    /// line copies the command and nothing else.
     #[test]
     fn the_exit_notice_names_the_session_and_the_way_back() {
         let root = tmp_root("exit-notice");
@@ -6162,19 +6154,42 @@ mod resume_tests {
         ] {
             app.locale = locale;
             app.session_id = id.into();
-            let notice = app.exit_notice();
+            let notice = app.exit_notice(80);
+            // 80 columns of terminal become a 72-cell rule (the cap keeps a
+            // wide window from drawing a line across the whole screen).
+            let rule = "─".repeat(72);
             assert_eq!(
-                notice.lines().count(),
-                3,
-                "the id, the command, the in-app way: {notice}"
+                notice.lines().next(),
+                Some(rule.as_str()),
+                "the band opens with a rule: {notice}"
+            );
+            assert_eq!(
+                notice.lines().last(),
+                Some(rule.as_str()),
+                "…and closes with one: {notice}"
             );
             assert!(notice.contains(id), "{notice}");
             assert!(
-                notice.contains(&format!("abylab --session-id {id}")),
-                "the resume command carries the exact id: {notice}"
+                notice
+                    .lines()
+                    .any(|line| line == format!("abylab --session-id {id}")),
+                "the resume command is alone on its line: {notice}"
             );
             assert!(notice.contains("/resume"), "{notice}");
         }
+
+        // The rule follows the window, and keeps a floor on absurdly narrow
+        // ones (24 cells) so a one-column band still reads as a band.
+        assert_eq!(
+            app.exit_notice(30).lines().next(),
+            Some("─".repeat(30).as_str()),
+            "a narrow terminal gets a shorter rule"
+        );
+        assert_eq!(
+            app.exit_notice(10).lines().next(),
+            Some("─".repeat(24).as_str()),
+            "a tiny one gets the floor"
+        );
     }
 
     #[test]
@@ -9864,6 +9879,11 @@ mod mode_tests {
             cards[0]
         );
         assert!(
+            cards[0].contains("```\n/login sk-xxxxxxxx\n```"),
+            "the command stands alone in a fence — the renderer frames it: {}",
+            cards[0]
+        );
+        assert!(
             cards[0].contains("credentials.yaml"),
             "where the key lands: {}",
             cards[0]
@@ -10805,54 +10825,40 @@ mod right_slot_tests {
         assert_eq!(app.slash_matches()[0].desc, "状态、模型和实时用量统计");
     }
 
-    /// A new session greets with one usage hint in the timeline — the line the
-    /// composer cap row used to rotate live — and the next `/new` walks on to
-    /// the following hint instead of repeating the first.
+    /// A new session opens on an empty timeline: the usage hint it used to
+    /// greet with is gone (`/keys` and `/help` carry those lines), so the first
+    /// cell of a session the user opens is the prompt they type.
     #[test]
-    fn new_session_greets_with_the_next_usage_hint() {
+    fn a_new_session_opens_on_an_empty_timeline() {
         let (mut app, ctl, _rx) = test_app();
-        app.locale = Locale::En;
         app.transcript.push_user(
             "a previous prompt".into(),
             crate::transcript::Delivery::Delivered,
         );
-        let greeting = |app: &App| -> String {
-            let first = app.transcript.cells.first().expect("greeting cell");
-            let crate::transcript::CellKind::MarkdownNotice { text } = &first.kind else {
-                panic!("the greeting should be markdown, got {:?}", first.kind);
-            };
-            text.clone()
+        let bind = |app: &mut App, ctl: &Controller, session_id: &str| {
+            app.handle(
+                AppEvent::Ctl(CtlEvent::SessionBound {
+                    session_id: session_id.into(),
+                    notice: None,
+                    model: None,
+                    effort: None,
+                }),
+                ctl,
+            );
         };
 
         app.run_slash("new", "", &ctl);
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "first-new".into(),
-                notice: None,
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        assert_eq!(
-            greeting(&app),
-            "- **Tip** · esc interrupts a running turn — your draft survives"
+        bind(&mut app, &ctl, "first-new");
+        assert!(
+            app.transcript.cells.is_empty(),
+            "nothing greets a new session: {:?}",
+            app.transcript.cells.first().map(|cell| &cell.kind)
         );
 
+        // The next `/new` is just as silent: no rotation, no counter.
         app.run_slash("new", "", &ctl);
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "second-new".into(),
-                notice: None,
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        assert_eq!(
-            greeting(&app),
-            "- **Tip** · enter queues a follow-up; ctrl+enter steers it — /enter swaps the pair"
-        );
+        bind(&mut app, &ctl, "second-new");
+        assert!(app.transcript.cells.is_empty());
     }
 }
 

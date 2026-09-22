@@ -10,6 +10,37 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+### Changed
+
+- The status bar carries the queue count now: while prompts are waiting, the
+  meta row (the composer's bottom border) leads with `· 2 queued`, plus the `⌥↑`
+  chord whenever the composer is free. Until now "how many are queued" showed up
+  in three places, and each one vanished exactly when it was needed: the
+  transcript's tail line skips its own `· N queued` while the model streams
+  (which is when most queuing happens), the `⏎ send queue head` hint only exists
+  while a turn runs with an empty draft, and the tip at enqueue time lives for 4
+  seconds. The count no longer depends on the draft, so it is always there; the
+  `⌥↑` half appears only when the selector would really open (empty draft, no
+  staged image), because the list needs a free composer — chrome should not
+  advertise a key that would refuse. With the chip in place the `⏎ send queue
+  head` hint is gone from the row: it no longer restates the queue, since an
+  empty enter still ships the head and `/keys` documents that.
+- The timeline has no usage hints any more: a launch keeps the wordmark, the
+  project URL and the four launch facts (version, working directory, permission,
+  model), and `/new` no longer greets a session with one either. The seven-hint
+  rotation (`esc` interrupts, `enter` queues, `@` mentions a file, …) went with
+  the counter that walked it — the keys and commands themselves are unchanged,
+  and `/keys`, `/help` and the slash menu still list them.
+- The no-key onboarding reads differently: one sentence, the `/login sk-xxxxxxxx`
+  command alone in a framed code block (it is the only thing the reader has to
+  *do*), then a rule with the storage path and the key-management commands under
+  it. The numbered steps it replaces tucked the command into prose.
+- The lines printed on exit are a ruled band now: a `─` rule above and below
+  (as wide as the terminal, capped at 72 columns), `abylab · session closed ·
+  <session id>` inside, the `abylab --session-id <id>` command alone on its line
+  (selecting that line copies the command), and the `/resume` route underneath.
+  The three flat `label: value` lines it replaces are gone.
+
 ## [0.1.11] - 2026-09-22
 
 ### Changed
