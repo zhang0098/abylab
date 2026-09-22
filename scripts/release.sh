@@ -204,6 +204,13 @@ if [ "$pushed" = 0 ]; then
 \`abylab --version\` prints \`abylab $VERSION\`, which is what release.yml's tag gate compares against \`$TAG\`. Merging this is what the tag goes on; the tag push is what publishes the release." |
         tail -n1)"
     say "   $pr"
+    # `gh pr checks --watch` exits 1 with "no checks reported" when it runs
+    # before the workflow registers its jobs, which is a coin flip right after
+    # `gh pr create`. Wait for a row with a tab-separated state first.
+    for _ in $(seq 1 40); do
+        gh pr checks "$pr" 2>/dev/null | grep -q "$(printf '\t')" && break
+        sleep 5
+    done
     gh pr checks "$pr" --watch --interval 20
     gh pr merge "$pr" --merge --delete-branch
     git switch main
