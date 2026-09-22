@@ -1262,23 +1262,28 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// The three lines the shell gets once the alternate screen is gone: which
-    /// session this was, the command that picks it up again, and the in-app way
-    /// to it. One idea per line, and the command stands alone so selecting it
-    /// takes only that line.
+    /// The band the shell gets once the alternate screen is gone: a ruled line
+    /// naming the session, the command that picks it up again, and the in-app
+    /// way to it. The command sits alone on its line, so selecting that line
+    /// copies the command and nothing else; `width` is the terminal's (clamped)
+    /// so the rules match the window they were printed into rather than a magic
+    /// 80 columns.
     ///
     /// The id is the one on screen at exit — a `/resume` switch moves it — so a
     /// session entered mid-run is the one named. Both routes need the launch's
     /// workspace and session root: resume from the same directory, or use
     /// `/resume`, which lists exactly the sessions this one can still open.
-    pub fn exit_notice(&self) -> String {
+    pub fn exit_notice(&self, width: usize) -> String {
         let id = &self.session_id;
+        let rule = "─".repeat(width.clamp(24, 72));
         match self.locale {
             Locale::En => format!(
-                "Session id: {id}\nResume it later: abylab --session-id {id}\nOr pick it with /resume in the app"
+                "{rule}\nabylab · session closed · {id}\n\nResume it later:\n\
+                 abylab --session-id {id}\n\nOr pick it with /resume in the app\n{rule}"
             ),
             Locale::Zh => format!(
-                "会话 id：{id}\n下次继续：abylab --session-id {id}\n或在程序里用 /resume 选择"
+                "{rule}\nabylab · 会话已结束 · {id}\n\n下次继续：\n\
+                 abylab --session-id {id}\n\n或在程序里用 /resume 选择\n{rule}"
             ),
         }
     }
@@ -6136,8 +6141,9 @@ mod resume_tests {
     }
 
     /// Leaving prints the session that was on screen — a `/resume` switch moves
-    /// the id — plus the two ways back, in the interface language. One line
-    /// each, so the resume command can be selected on its own.
+    /// the id — plus the two ways back, in the interface language, inside a
+    /// ruled band. The resume command sits alone on its line, so selecting that
+    /// line copies the command and nothing else.
     #[test]
     fn the_exit_notice_names_the_session_and_the_way_back() {
         let root = tmp_root("exit-notice");
@@ -6148,19 +6154,42 @@ mod resume_tests {
         ] {
             app.locale = locale;
             app.session_id = id.into();
-            let notice = app.exit_notice();
+            let notice = app.exit_notice(80);
+            // 80 columns of terminal become a 72-cell rule (the cap keeps a
+            // wide window from drawing a line across the whole screen).
+            let rule = "─".repeat(72);
             assert_eq!(
-                notice.lines().count(),
-                3,
-                "the id, the command, the in-app way: {notice}"
+                notice.lines().next(),
+                Some(rule.as_str()),
+                "the band opens with a rule: {notice}"
+            );
+            assert_eq!(
+                notice.lines().last(),
+                Some(rule.as_str()),
+                "…and closes with one: {notice}"
             );
             assert!(notice.contains(id), "{notice}");
             assert!(
-                notice.contains(&format!("abylab --session-id {id}")),
-                "the resume command carries the exact id: {notice}"
+                notice
+                    .lines()
+                    .any(|line| line == format!("abylab --session-id {id}")),
+                "the resume command is alone on its line: {notice}"
             );
             assert!(notice.contains("/resume"), "{notice}");
         }
+
+        // The rule follows the window, and keeps a floor on absurdly narrow
+        // ones (24 cells) so a one-column band still reads as a band.
+        assert_eq!(
+            app.exit_notice(30).lines().next(),
+            Some("─".repeat(30).as_str()),
+            "a narrow terminal gets a shorter rule"
+        );
+        assert_eq!(
+            app.exit_notice(10).lines().next(),
+            Some("─".repeat(24).as_str()),
+            "a tiny one gets the floor"
+        );
     }
 
     #[test]

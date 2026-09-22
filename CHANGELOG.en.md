@@ -35,6 +35,11 @@ context compaction, session persistence, goal rounds) live in
   command alone in a framed code block (it is the only thing the reader has to
   *do*), then a rule with the storage path and the key-management commands under
   it. The numbered steps it replaces tucked the command into prose.
+- The lines printed on exit are a ruled band now: a `─` rule above and below
+  (as wide as the terminal, capped at 72 columns), `abylab · session closed ·
+  <session id>` inside, the `abylab --session-id <id>` command alone on its line
+  (selecting that line copies the command), and the `/resume` route underneath.
+  The three flat `label: value` lines it replaces are gone.
 
 ## [0.1.11] - 2026-09-22
 
