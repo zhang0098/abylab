@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-22
+
 ### Changed
 
 - The system prompt now names the tool split **and the shell command each read
@@ -302,7 +304,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/zhang0098/abylab/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/zhang0098/abylab/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/zhang0098/abylab/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
