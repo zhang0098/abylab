@@ -670,15 +670,37 @@ fn state_line(app: &App) -> Option<Line<'static>> {
     Some(Line::from(spans))
 }
 
-/// Meta row, left side: the session's mode chips only (run state lives at
-/// the transcript tail). Chips lead with a plain dot instead of emoji —
-/// the color carries the meaning (permission turns warn under full access).
+/// Meta row, left side: the queue chip and the session's mode chips. Chips lead
+/// with a plain dot instead of emoji — the color carries the meaning (permission
+/// turns warn under full access).
+///
+/// The queue chip is the only always-on sight of a waiting FIFO: the run-state
+/// line at the transcript tail drops its own `· N queued` while the model
+/// streams (`state_line`), and the 4s tip is long gone by the time the reader
+/// looks. It leads the row because it must survive the pre-bind window too —
+/// a second prompt can already be queued while the first one is starting — and
+/// it carries the `⌥↑` chord only when the selector would really open: the
+/// chord needs a free composer (`App::open_queue_selector`), so a busy draft
+/// gets the count alone instead of a key that would refuse.
 fn status_title(app: &App) -> Line<'static> {
-    if !app.session_bound {
-        return Line::default();
-    }
     let theme = app.theme;
     let mut spans: Vec<Span> = Vec::new();
+    if app.queued > 0 {
+        let mut chip = format!("· {} {}", app.queued, app.locale.tr("queued", "条排队中"));
+        if app.input.is_empty() && app.pending_images.is_empty() {
+            if let Some(chord) = crate::input::keymap::primary_chord(
+                crate::input::Action::EditQueuedPrompt,
+                cfg!(target_os = "macos"),
+            ) {
+                chip.push(' ');
+                chip.push_str(chord);
+            }
+        }
+        spans.push(Span::styled(chip, Style::default().fg(theme.warn_soft())));
+    }
+    if !app.session_bound {
+        return Line::from(spans);
+    }
     // The label stands alone: the `shift+tab` hint that used to follow it is
     // gone (the `/help` card and `/permission` still document the binding).
     // Mode chips: folded from the durable event stream (same facts as the
@@ -700,8 +722,11 @@ fn status_title(app: &App) -> Line<'static> {
     } else {
         crate::app::permission_label(&perm)
     };
+    // The queue chip above may already own the row's first cell: the mode chips
+    // keep their `· ` lead and space themselves in behind it.
+    let lead = if spans.is_empty() { "" } else { " " };
     spans.push(Span::styled(
-        format!("· {label}"),
+        format!("{lead}· {label}"),
         Style::default().fg(if perm == "danger-full-access" {
             theme.warn_soft()
         } else {
@@ -3036,6 +3061,100 @@ mod tests {
         assert!(
             !value_spans[0].style.add_modifier.contains(Modifier::BOLD),
             "no emphasis on the label"
+        );
+    }
+
+    /// The queue count is chrome, not a state line: it stays on the meta row for
+    /// as long as a prompt waits — the run-state line drops its own copy while
+    /// the model streams, and the 4s tip is gone by the time the reader looks.
+    #[test]
+    fn the_meta_row_keeps_the_queue_count_on_screen() {
+        let flat = |line: &Line| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let mut app = test_app();
+        app.modes.permission = Some("workspace-write".into());
+        // Nothing waiting: the row is the mode chip alone.
+        let idle = flat(&status_title(&app));
+        assert_eq!(idle, "· Workspace Write", "{idle}");
+
+        app.queued = 2;
+        let ready = status_title(&app);
+        let text = flat(&ready);
+        assert!(text.starts_with("· 2 queued "), "{text}");
+        assert!(text.ends_with("· Workspace Write"), "{text}");
+        assert_eq!(
+            ready.spans[0].style.fg,
+            Some(app.theme.warn_soft()),
+            "a waiting FIFO reads as warn chrome"
+        );
+
+        app.locale = crate::locale::Locale::Zh;
+        let zh = flat(&status_title(&app));
+        assert!(zh.starts_with("· 2 条排队中 "), "{zh}");
+
+        // The count outlives the session-bound gate the mode chips sit behind: a
+        // second prompt can be queued while the first one is still starting.
+        app.session_bound = false;
+        let prebind = flat(&status_title(&app));
+        assert!(prebind.starts_with("· 2 条排队中"), "{prebind}");
+        assert!(!prebind.contains("工作区"), "{prebind}");
+    }
+
+    /// The chip names the `⌥↑` chord only while the selector would really open:
+    /// the chord needs a free composer (`App::open_queue_selector`), and chrome
+    /// must not advertise a key that would refuse.
+    #[test]
+    fn the_queue_chip_offers_the_chord_only_while_it_opens() {
+        use crate::input::keymap::primary_chord;
+        let flat = |line: &Line| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let action = crate::input::Action::EditQueuedPrompt;
+        // The chip spells whatever `/keys` prints, per platform: the table stays
+        // the one source for the chord's spelling.
+        assert_eq!(primary_chord(action, false), Some("alt+↑"));
+        assert_eq!(primary_chord(action, true), Some("⌥↑"));
+        let chord =
+            primary_chord(action, cfg!(target_os = "macos")).expect("the chord is tabulated");
+
+        let mut app = test_app();
+        app.modes.permission = Some("workspace-write".into());
+        app.queued = 2;
+        assert_eq!(
+            flat(&status_title(&app)),
+            format!("· 2 queued {chord} · Workspace Write")
+        );
+
+        // A draft closes the selector: the count stays, the chord goes.
+        app.input.set("half a thought".into());
+        assert_eq!(
+            flat(&status_title(&app)),
+            "· 2 queued · Workspace Write",
+            "no chord over a busy draft"
+        );
+
+        // A staged image over an empty draft is a busy composer too.
+        app.input.set(String::new());
+        app.pending_images
+            .add(
+                app.locale,
+                "shot.png".into(),
+                "/tmp/shot.png".into(),
+                "image/png".into(),
+                vec![0x89, b'P', b'N', b'G'],
+            )
+            .expect("one image stages");
+        assert_eq!(
+            flat(&status_title(&app)),
+            "· 2 queued · Workspace Write",
+            "no chord while an image waits in the composer"
         );
     }
 

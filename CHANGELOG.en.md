@@ -10,6 +10,20 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+### Changed
+
+- The status bar carries the queue count now: while prompts are waiting, the
+  meta row (the composer's bottom border) leads with `· 2 queued`, plus the `⌥↑`
+  chord whenever the composer is free. Until now "how many are queued" showed up
+  in three places, and each one vanished exactly when it was needed: the
+  transcript's tail line skips its own `· N queued` while the model streams
+  (which is when most queuing happens), the `⏎ send queue head` hint only exists
+  while a turn runs with an empty draft, and the tip at enqueue time lives for 4
+  seconds. The count no longer depends on the draft, so it is always there; the
+  `⌥↑` half appears only when the selector would really open (empty draft, no
+  staged image), because the list needs a free composer — chrome should not
+  advertise a key that would refuse.
+
 ## [0.1.11] - 2026-09-22
 
 ### Changed
