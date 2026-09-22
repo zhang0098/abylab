@@ -10,6 +10,22 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+### Changed
+
+- The built-in `glob` and `grep` tools are gone: workspace search is bash again
+  (`rg`/`grep`/`find`), which also drops about 1.6KB from every request prefix
+  and one more pair of search semantics to maintain. What sank them was the
+  output contract: `grep` returns line numbers with matching lines capped at
+  100 and no count, so counting or listing files means shelling out anyway, and
+  `glob` lists files only — never directories, no size, no time beyond a
+  modification-time order. The paired probe had already shown the model
+  preferring the shell: bash was 16.7% of calls, more than half of them
+  searching or paging files. The cost, stated plainly: under `read-only` and
+  `workspace-write` every search now asks for approval, since `read` is the only
+  read tool left that never does; `danger-full-access` is unaffected. The
+  system prompt follows: it no longer names glob/grep, it names `rg`, `grep` and
+  `find` instead.
+
 ## [0.1.10] - 2026-09-22
 
 ### Changed

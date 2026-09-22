@@ -38,16 +38,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   durable inbox (a prompt sent mid-turn queues behind the active turn),
   per-run budgets (`max_requests`, `max_tool_calls`), run/tool deadlines, and
   cooperative cancellation through `CancellationToken`.
-- **Local tool bundle** — `LocalTools` registers `read`, `write`, `edit`,
-  `bash`, `glob` and `grep` atomically, or individually:
+- **Local tool bundle** — `LocalTools` registers `read`, `write`, `edit` and
+  `bash` atomically, or individually:
   - `read`/`write`/`edit` run on a cap-std directory capability with version
     guards (stale files are rejected), atomic staging + publication, and
     byte/line caps.
   - `bash` spawns sandboxed children (Landlock + seccomp on Linux), supports
     background jobs with incremental output, and saves overflowing output.
-  - `glob` and `grep` are in-process ports of harness's search tools, built on
-    the ripgrep-family crates (`ignore`, `grep-regex`, `grep-searcher`): no
-    external binary, gitignore-aware discovery, binary-safe line scanning.
   - Every tool call passes `AgentHooks::authorize`; three permission presets
     (`read-only`, `workspace-write`, `danger-full-access`) gate mutations.
 - **Subagents** — one `Subagents` owner spawns or forks children

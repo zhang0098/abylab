@@ -36,15 +36,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Agent 循环** — 基于流式 Messages 响应的多步骤回合；持久收件箱（回合进行中
   到达的提示词会排队跟在其后）、每轮预算（`max_requests`、`max_tool_calls`）、
   回合/工具截止时间，以及通过 `CancellationToken` 的协作式取消。
-- **本地工具包** — `LocalTools` 原子注册 `read`、`write`、`edit`、`bash`、
-  `glob`、`grep` 六个工具，也可单独注册：
+- **本地工具包** — `LocalTools` 原子注册 `read`、`write`、`edit`、`bash`
+  四个工具，也可单独注册：
   - `read`/`write`/`edit` 基于 cap-std 目录能力运行：版本守卫（拒绝改动已过期
     文件）、staging 目录原子发布、字节/行数上限。
   - `bash` 生成沙箱化子进程（Linux 上用 Landlock + seccomp），支持增量读取
     输出的后台任务，溢出输出自动落盘。
-  - `glob` 与 `grep` 是 harness 搜索工具的进程内 Rust 移植，构建于 ripgrep
-    家族 crate（`ignore`、`grep-regex`、`grep-searcher`）之上：无外部二进制、
-    遵循 .gitignore、对二进制文件安全。
   - 每次工具调用都要经过 `AgentHooks::authorize`；三档权限
     （`read-only`、`workspace-write`、`danger-full-access`）约束变更操作。
 - **子代理** — 一个 `Subagents` 负责人 spawn 或 fork 子代理

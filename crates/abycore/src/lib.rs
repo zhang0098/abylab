@@ -48,8 +48,7 @@ pub use goal::{
 pub use hooks::{AgentHooks, CheckpointKind, ToolDecision};
 pub use local_tools::{
     BashJob, BashJobOutput, BashJobStatus, BashOutputCursor, BashResult, BashStreamOutput,
-    BashTool, EditTool, GlobTool, GrepTool, LocalToolConfig, LocalTools, PermissionMode, ReadTool,
-    WriteTool,
+    BashTool, EditTool, LocalToolConfig, LocalTools, PermissionMode, ReadTool, WriteTool,
 };
 pub use persist::{SessionStore, SessionSummary, SessionWriter};
 pub use session::{PendingCall, PendingState, SessionSnapshot};

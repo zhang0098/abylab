@@ -511,10 +511,11 @@ impl AgentHooks for UiHooks {
         // already enforce the selected root policy, so safe reads and
         // workspace-scoped mutations do not need a second prompt. Bash and
         // unknown tools still go through approval in sandboxed modes.
-        // `glob`/`grep` are workspace-rooted reads, exactly like `read`.
+        // `read` is the only workspace read left: searching happens through
+        // `bash`, which asks in both sandboxed presets.
         // `todo_write` only updates the in-memory checklist, so it never asks.
         if self.permission_mode == PermissionMode::FullAccess
-            || matches!(call.name.as_str(), "read" | "glob" | "grep")
+            || call.name == "read"
             || call.name == "todo_write"
             // Goal tools only read and update session metadata, exactly like
             // the checklist: they never touch the workspace or the network.
@@ -1727,10 +1728,9 @@ struct AgentContext<'a> {
 }
 
 /// The session system prompt: one clause per decision the model would
-/// otherwise get wrong. Each read or search names the shell command it
-/// replaces, the way harness's per-tool prompt sections do, so piping command
-/// output stays legitimate while paging and searching files does not.
-pub(crate) const SYSTEM_PROMPT: &str = "You are abylab, a coding agent in the user's terminal. Keep answers tight. Read files with read — not cat or sed. Search them with glob and grep — not shell find or rg; all three are workspace-rooted reads that never need approval. Change files with write and edit, and run commands and tests with bash. Plan multi-step work with todo_write and keep the list current.";
+/// otherwise get wrong. Sessions ship no search tool, so the prompt names the
+/// shell commands that do the searching and the one file tool that reads.
+pub(crate) const SYSTEM_PROMPT: &str = "You are abylab, a coding agent in the user's terminal. Keep answers tight. Read files with read — not cat or sed. Change them with write and edit. Search, list and run with bash: `rg`, `grep` and `find` are how you look around the workspace. Plan multi-step work with todo_write and keep the list current.";
 
 /// A fresh session reserves its id before it is published to the UI.
 fn fresh_agent(
@@ -3239,10 +3239,10 @@ mod tests {
             .expect("authorization succeeds");
         assert_eq!(workspace_write, ToolDecision::Allow);
 
-        // Read-only file tools never ask, in either sandboxed preset: glob and
-        // grep are workspace-rooted reads like `read`.
+        // Reads never ask, in either sandboxed preset. Searching is bash's job
+        // now, and bash asks in both.
         for mode in [PermissionMode::ReadOnly, PermissionMode::WorkspaceWrite] {
-            for name in ["read", "glob", "grep", "todo_write"] {
+            for name in ["read", "todo_write"] {
                 let decision = hooks(mode)
                     .authorize(pending(name))
                     .await
@@ -3252,25 +3252,28 @@ mod tests {
         }
     }
 
-    /// The prompt steers reads and searches to the tools the policy above
-    /// auto-allows, and names the shell command each one replaces — harness's
-    /// per-tool prompt-section shape — so the model stops paging files through
-    /// shell pipelines without giving up piping command output.
+    /// The prompt names the tools that exist and the shell commands that do the
+    /// searching, and it does not promise a search tool the session no longer
+    /// registers: a prompt that names `glob` would send the model after a tool
+    /// that is not in its list.
     #[test]
-    fn the_system_prompt_names_the_no_approval_read_tools() {
-        for name in ["read", "glob", "grep"] {
+    fn the_system_prompt_names_the_tools_that_exist() {
+        for name in ["read", "write", "edit", "bash", "todo_write"] {
             assert!(
                 SYSTEM_PROMPT.contains(name),
                 "the system prompt must name `{name}`"
             );
         }
-        assert!(SYSTEM_PROMPT.contains("never need approval"));
-        for replaced in ["not cat or sed", "not shell find or rg"] {
+        for shell in ["rg", "grep", "find", "not cat or sed"] {
             assert!(
-                SYSTEM_PROMPT.contains(replaced),
-                "the system prompt must name the shell command each read tool replaces: `{replaced}`"
+                SYSTEM_PROMPT.contains(shell),
+                "the system prompt must name `{shell}`"
             );
         }
+        assert!(
+            !SYSTEM_PROMPT.contains("glob"),
+            "the system prompt must not name the removed search tool `glob`"
+        );
     }
 
     #[test]
