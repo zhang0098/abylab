@@ -12,6 +12,10 @@
 
 ### 变更
 
+- `--help` 不再列调优用的环境变量：末尾那段 `ENVIRONMENT (advanced tuning; no flags):`
+  （`ABYLAB_HOME`、`ABY_MODEL`、`ABY_MAX_REQUESTS`、`ABY_CONTEXT_WINDOW`……）整块删掉，帮助
+  止于选项表。这些变量只有高级调优会碰，日常用到的都是它们对应的选项；`$ABYLAB_HOME`、
+  `$ABY_MODEL` 这类默认值仍在选项表里点名，压缩和超时那几个仍在 [TECH.md](TECH.md) 里逐个交代。
 - 状态栏常驻一条排队计数：只要有排队消息，meta 行（composer 下边框）左侧就一直显示
   `· 2 条排队中`，草稿为空时再带上 `⌥↑`。此前"队列里有几条"只在三处出现，且每一处都会
   消失：时间线尾行的 `· N 条排队中` 在模型流式输出时整行被跳过（那正是排队最多的时候）、

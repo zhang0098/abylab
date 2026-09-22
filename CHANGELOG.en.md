@@ -12,6 +12,13 @@ context compaction, session persistence, goal rounds) live in
 
 ### Changed
 
+- `--help` no longer lists the tuning environment variables: the trailing
+  `ENVIRONMENT (advanced tuning; no flags):` block (`ABYLAB_HOME`, `ABY_MODEL`,
+  `ABY_MAX_REQUESTS`, `ABY_CONTEXT_WINDOW`, …) is gone, so the help ends at the
+  option table. Those variables are advanced tuning only, and what a day-to-day
+  run touches is the matching option; the defaults the flags read (`$ABYLAB_HOME`,
+  `$ABY_MODEL`) are still named in the table, and the compaction and timeout
+  knobs are still documented one by one in [TECH.en.md](TECH.en.md).
 - The status bar carries the queue count now: while prompts are waiting, the
   meta row (the composer's bottom border) leads with `· 2 queued`, plus the `⌥↑`
   chord whenever the composer is free. Until now "how many are queued" showed up
