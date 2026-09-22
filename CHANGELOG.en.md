@@ -31,6 +31,10 @@ context compaction, session persistence, goal rounds) live in
   rotation (`esc` interrupts, `enter` queues, `@` mentions a file, …) went with
   the counter that walked it — the keys and commands themselves are unchanged,
   and `/keys`, `/help` and the slash menu still list them.
+- The no-key onboarding reads differently: one sentence, the `/login sk-xxxxxxxx`
+  command alone in a framed code block (it is the only thing the reader has to
+  *do*), then a rule with the storage path and the key-management commands under
+  it. The numbered steps it replaces tucked the command into prose.
 
 ## [0.1.11] - 2026-09-22
 

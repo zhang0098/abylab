@@ -5012,34 +5012,44 @@ impl App {
     /// Startup guidance when no API key was detected: where to get one and
     /// how to store it. `/login` takes effect immediately (the driver
     /// rebuilds from its snapshot), so no restart is needed.
+    ///
+    /// The shape is the message: one sentence, the command alone in a fenced
+    /// block (the renderer frames it into a card, which is the only thing the
+    /// reader has to *do*), then a rule and the two storage facts as a footer.
     pub fn push_no_key_onboarding(&mut self) {
         let text = if self.locale == Locale::Zh {
             "\
-## 尚未检测到 API key
+## 还没有 API key
 
-1. 打开 <https://platform.deepseek.com/> → API keys，创建并复制你的 key
-2. 在输入框输入（保存后立刻生效，无需重启）：
+去 <https://platform.deepseek.com/> → API keys 创建一个并复制，然后粘进输入框
+（存下立刻生效，不用重启）：
 
-   /login sk-xxxxxxxx
+```
+/login sk-xxxxxxxx
+```
 
-3. key 保存在 `~/.abylab/.credentials.yaml`（0600，仅本用户可读）；
-   `/status` 查看凭据来源 · `/logout` 删除已保存的 key
+---
 
-本次运行也可以用 `--api-key <key>` 临时覆盖（不落盘）。"
+key 落在 `~/.abylab/.credentials.yaml`（0600，仅本用户可读）
+
+`/status` 看它的来源 · `/logout` 删掉它 · `--api-key <key>` 只覆盖本次运行，不落盘"
                 .to_string()
         } else {
             "\
-## No API key detected
+## No API key yet
 
-1. Open <https://platform.deepseek.com/> → API keys, create and copy a key
-2. Enter in the composer (takes effect immediately — no restart needed):
+Create one at <https://platform.deepseek.com/> → API keys and paste it into the
+composer (stored on the spot, no restart needed):
 
-   /login sk-xxxxxxxx
+```
+/login sk-xxxxxxxx
+```
 
-3. The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only);
-   `/status` shows its source · `/logout` removes the stored key
+---
 
-`--api-key <key>` can override for this run only (never persisted)."
+The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
+
+`/status` shows its source · `/logout` removes it · `--api-key <key>` overrides this run only"
                 .to_string()
         };
         self.transcript.push_markdown(text);
@@ -9837,6 +9847,11 @@ mod mode_tests {
         assert!(
             cards[0].contains("/login sk-"),
             "how to operate: {}",
+            cards[0]
+        );
+        assert!(
+            cards[0].contains("```\n/login sk-xxxxxxxx\n```"),
+            "the command stands alone in a fence — the renderer frames it: {}",
             cards[0]
         );
         assert!(
