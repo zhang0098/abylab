@@ -32,7 +32,7 @@ jobs:
       - name: install.sh and site/install.sh are in sync
         run: |
           set -euo pipefail
-          bash -n install.sh scripts/stage-site.sh
+          bash -n install.sh scripts/stage-site.sh scripts/release.sh
           if ! diff -u install.sh site/install.sh; then
             echo "::error::site/install.sh is stale — fix with: cp install.sh site/install.sh"
             exit 1
