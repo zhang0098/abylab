@@ -13,18 +13,27 @@
 #      and `abylab --version` (the string release.yml's tag gate compares).
 #   4. commit `Release <version>`, whose body inlines the English changelog
 #      section this version just closed.
-#   5. publish — push to main, or, when branch protection refuses it, push a
-#      `release/<version>` branch, open the PR, wait for its checks, merge it,
-#      and tag the merge commit. Either way the annotated tag `v<version>` is
-#      what starts the release workflow, so nothing ships before this step.
+#   5. publish — push main with the release deploy key, then tag the merged
+#      commit. Fall back to a `release/<version>` branch plus a PR (waiting for
+#      its checks) when the key is missing or cannot push. Either way the
+#      annotated tag `v<version>` is what starts the release workflow, so
+#      nothing ships before this step.
 #
-# Tightening the flow to one push is a repository setting, not a script change:
-# with `enforce_admins` off (or a ruleset that bypasses the maintainer), step 5
-# takes the direct path and the whole release is one command and one CI cycle.
-# The tag gate in release.yml still runs fmt + clippy + test on the tagged
-# commit, so a release cannot ship untested either way.
+# The split this script assumes: main's ruleset requires a pull request and the
+# five CI checks, and its only bypass actor is the repository's deploy key —
+# not a human. So ordinary work goes through a PR and cannot skip CI, while a
+# release (step 5) pushes straight to main with the key. Registering that key
+# once, per clone or machine:
 #
-# usage: scripts/release.sh <version> [--dry-run]
+#   ssh-keygen -t ed25519 -N "" -C abylab-release -f ~/.ssh/abylab-release
+#   gh api -X POST repos/<owner>/<repo>/keys \
+#       -f title="abylab release (ruleset bypass)" \
+#       -f key="$(cat ~/.ssh/abylab-release.pub)" -F read_only=false
+#
+# Override the path with ABYLAB_RELEASE_KEY. The tag push itself is not
+# protected, so it uses the ordinary remote.
+#
+# usage: scripts/release.sh <version> [--dry-run|--no-publish]
 set -euo pipefail
 
 say() { printf '%s\n' "$*"; }
@@ -146,14 +155,39 @@ say "   committed $(git log --oneline -1)"
 
 if [ "$NO_PUBLISH" = 1 ]; then
     say "   --no-publish: stopping before the push (the commit and $TAG are yours to inspect)"
-    say "   finish with: git push origin HEAD:main && git tag -a $TAG -m $TAG && git push origin $TAG"
+    say "   finish with: GIT_SSH_COMMAND=\"ssh -i ${ABYLAB_RELEASE_KEY:-$HOME/.ssh/abylab-release} -o IdentitiesOnly=yes\" git push git@github.com:<owner>/<repo>.git HEAD:main"
+    say "   then: git tag -a $TAG -m $TAG && git push origin $TAG"
     exit 0
 fi
 
-if git push origin HEAD:main 2>/dev/null; then
-    say "   pushed to main"
+# The release deploy key is the ruleset's only bypass actor, so this push is
+# the one write to main that does not need a pull request. Derive the SSH URL
+# from the ordinary remote: the key works over git@github.com regardless of
+# whether the clone itself is HTTPS.
+RELEASE_KEY="${ABYLAB_RELEASE_KEY:-$HOME/.ssh/abylab-release}"
+REMOTE_URL="$(git remote get-url origin)"
+case "$REMOTE_URL" in
+    https://github.com/*) SLUG="${REMOTE_URL#https://github.com/}" ;;
+    git@github.com:*) SLUG="${REMOTE_URL#git@github.com:}" ;;
+    *) SLUG="" ;;
+esac
+SLUG="${SLUG%.git}"
+
+pushed=0
+if [ -n "$SLUG" ] && [ -f "$RELEASE_KEY" ]; then
+    if GIT_SSH_COMMAND="ssh -i $RELEASE_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+        git push "git@github.com:$SLUG.git" HEAD:main; then
+        pushed=1
+        say "   pushed to main with $RELEASE_KEY (ruleset bypass)"
+    else
+        say "   the release key could not push to main"
+    fi
 else
-    say "   main refused the push (branch protection); going through a PR"
+    say "   no release key at $RELEASE_KEY (see the header to register one)"
+fi
+
+if [ "$pushed" = 0 ]; then
+    say "   going through a pull request instead"
     git switch -c "release/$VERSION"
     git push -u origin "release/$VERSION"
     pr="$(gh pr create --base main --head "release/$VERSION" --title "Release $VERSION" \
