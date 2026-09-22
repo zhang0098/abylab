@@ -262,7 +262,7 @@ pub(super) struct Operation {
 }
 impl Operation {
     /// Whether cancellation or the deadline has already fired. Callers that
-    /// cannot return a `ToolError` (the grep reader wrapper) use this to abort
+    /// cannot return a `ToolError` use this to abort
     /// the work they are inside instead of letting it outlive the call.
     pub fn interrupted(&self) -> bool {
         self.cancellation.is_cancelled() || Instant::now() >= self.deadline

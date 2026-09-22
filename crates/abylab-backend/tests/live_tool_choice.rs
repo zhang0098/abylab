@@ -6,6 +6,11 @@
 //! The per-tool counters and the bash classifier mirror the offline analysis of
 //! `~/.abylab/sessions`, so the two are directly comparable.
 //!
+//! Since the search tools were removed, the question this probe answers is how
+//! much of the work lands on `read` versus shelling out — the bash marks below
+//! count how many of those shell calls are searching or paging files, which is
+//! the behavior the shared prompt now asks for.
+//!
 //! Run one arm:
 //!
 //! ```sh
@@ -31,7 +36,7 @@ use std::time::{Duration, Instant};
 /// wording throughout — no tool name, no shell command.
 const PROMPTS: [&str; 5] = [
     "这个仓库里哪些文件提到了 ABY_TOOL_TIMEOUT？列出文件路径，不要改任何文件。",
-    "crates/abycore/src/local_tools/search.rs 里 glob 和 grep 的结果上限分别是多少？给出具体数值和对应的代码位置。",
+    "crates/abycore/src/local_tools.rs 里，LocalToolConfig 的 max_read_bytes 和 max_output_bytes 默认值分别是多少？给出具体数值。",
     "crates/abylab-backend/src/instructions.rs 里，工作区指令是从哪些文件名里发现的？用两三句话说明。",
     "crates/abycore/src/local_tools/bash.rs 里后台作业（run_in_background）是怎么实现的？简要说明关键函数。",
     "README.md 里的按键说明一节列了哪些键？把原文抄给我。",
@@ -180,13 +185,10 @@ fn which_tools_the_model_reaches_for() {
         );
     }
     println!("    bash marks (of {bash_total}): {bash_marks:?}");
-    let read_search: usize = ["read", "glob", "grep"]
-        .iter()
-        .filter_map(|name| totals.get(*name))
-        .sum();
+    let reads = totals.get("read").copied().unwrap_or(0);
     println!(
-        "    read+glob+grep share: {read_search}/{total} = {:.1}%",
-        read_search as f64 * 100.0 / total.max(1) as f64
+        "    read share: {reads}/{total} = {:.1}%",
+        reads as f64 * 100.0 / total.max(1) as f64
     );
     println!("    system prompt in force: {}", prompt_in_force(&store));
     let _ = std::fs::remove_dir_all(&store);

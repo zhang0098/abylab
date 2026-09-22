@@ -6,7 +6,6 @@ mod jobs;
 #[cfg(unix)]
 mod output;
 mod read;
-mod search;
 mod workspace;
 
 use crate::{Agent, Error, ErrorKind, Result, Tool};
@@ -16,7 +15,6 @@ pub use files::{EditTool, ReadTool, WriteTool};
 pub use jobs::{
     BashJob, BashJobOutput, BashJobStatus, BashOutputCursor, BashResult, BashStreamOutput,
 };
-pub use search::{GlobTool, GrepTool};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -86,12 +84,6 @@ pub struct LocalToolConfig {
     pub save_bash_output: bool,
     /// Maximum bytes per stream log; overflowing logs are discarded.
     pub max_bash_log_bytes: usize,
-    /// Inline cap on `glob` result paths, newest first by modification time.
-    pub glob_max_results: usize,
-    /// Inline cap on `grep` matches; the walk stops one match past it.
-    pub grep_max_matches: usize,
-    /// Maximum bytes of one retained `grep` matched-line preview.
-    pub grep_max_line_bytes: usize,
     /// Inherit the parent environment after credential-name filtering (default true).
     pub inherit_env: bool,
     /// Explicit additions/overrides; values are omitted from Debug.
@@ -118,9 +110,6 @@ impl LocalToolConfig {
             max_command_bytes: 64 * 1024,
             save_bash_output: true,
             max_bash_log_bytes: 64 * 1024 * 1024,
-            glob_max_results: search::GLOB_MAX_RESULTS_DEFAULT,
-            grep_max_matches: search::GREP_MAX_MATCHES_DEFAULT,
-            grep_max_line_bytes: search::GREP_MAX_LINE_BYTES_DEFAULT,
             inherit_env: true,
             env: BTreeMap::new(),
         }
@@ -147,9 +136,6 @@ impl fmt::Debug for LocalToolConfig {
             .field("max_command_bytes", &self.max_command_bytes)
             .field("save_bash_output", &self.save_bash_output)
             .field("max_bash_log_bytes", &self.max_bash_log_bytes)
-            .field("glob_max_results", &self.glob_max_results)
-            .field("grep_max_matches", &self.grep_max_matches)
-            .field("grep_max_line_bytes", &self.grep_max_line_bytes)
             .field("inherit_env", &self.inherit_env)
             .field("env", &"[REDACTED]")
             .finish()
@@ -177,9 +163,6 @@ impl LocalTools {
             || config.max_output_bytes < 64
             || config.max_command_bytes == 0
             || config.max_bash_log_bytes == 0
-            || config.glob_max_results == 0
-            || config.grep_max_matches == 0
-            || config.grep_max_line_bytes == 0
             || config.bash_path.as_os_str().is_empty()
             || config.bash_timeout.is_zero()
             || config.bash_max_timeout.is_zero()
@@ -267,16 +250,6 @@ impl LocalTools {
             jobs: self.jobs.clone(),
         }
     }
-    pub fn glob(&self) -> GlobTool {
-        GlobTool {
-            workspace: self.workspace.clone(),
-        }
-    }
-    pub fn grep(&self) -> GrepTool {
-        GrepTool {
-            workspace: self.workspace.clone(),
-        }
-    }
 
     pub fn permission_mode(&self) -> PermissionMode {
         self.workspace.config.permission_mode
@@ -313,7 +286,7 @@ impl LocalTools {
         self.jobs.shutdown().await;
     }
 
-    /// Register all six tools atomically. To grant fewer capabilities, register individual tools.
+    /// Register all four tools atomically. To grant fewer capabilities, register individual tools.
     pub fn register(&self, agent: &mut Agent) -> Result<()> {
         agent.register_tools(self.tools())
     }
@@ -324,14 +297,12 @@ impl LocalTools {
         agent.replace_tools(self.tools())
     }
 
-    fn tools(&self) -> [Arc<dyn Tool>; 6] {
-        let tools: [Arc<dyn Tool>; 6] = [
+    fn tools(&self) -> [Arc<dyn Tool>; 4] {
+        let tools: [Arc<dyn Tool>; 4] = [
             Arc::new(self.read()),
             Arc::new(self.write()),
             Arc::new(self.edit()),
             Arc::new(self.bash()),
-            Arc::new(self.glob()),
-            Arc::new(self.grep()),
         ];
         tools
     }
@@ -339,7 +310,5 @@ impl LocalTools {
 
 #[cfg(test)]
 mod enhancement_tests;
-#[cfg(test)]
-mod search_tests;
 #[cfg(test)]
 mod tests;
