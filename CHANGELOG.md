@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-22
+
 ### 变更
 
 - 删掉了 `glob` 和 `grep` 两个内置工具：工作区搜索回到 bash（`rg`/`grep`/`find`），
@@ -245,7 +247,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/zhang0098/abylab/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/zhang0098/abylab/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/zhang0098/abylab/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/zhang0098/abylab/compare/v0.1.7...v0.1.8
