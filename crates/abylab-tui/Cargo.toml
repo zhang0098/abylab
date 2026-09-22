@@ -1,6 +1,6 @@
 [package]
 name = "abylab-tui"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "abylab terminal UI — ratatui canvas over the abycore harness"
 license.workspace = true

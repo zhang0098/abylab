@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-22
+
 ### 变更
 
 - 系统提示点明了工具分工，并且**点名要替代的 shell 命令**（照 harness 每个工具一段提示的
@@ -232,7 +234,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/zhang0098/abylab/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/zhang0098/abylab/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/zhang0098/abylab/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/zhang0098/abylab/compare/v0.1.6...v0.1.7
