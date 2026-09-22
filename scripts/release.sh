@@ -174,11 +174,19 @@ esac
 SLUG="${SLUG%.git}"
 
 pushed=0
+TAGGED=""
 if [ -n "$SLUG" ] && [ -f "$RELEASE_KEY" ]; then
     if GIT_SSH_COMMAND="ssh -i $RELEASE_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
         git push "git@github.com:$SLUG.git" HEAD:main; then
         pushed=1
         say "   pushed to main with $RELEASE_KEY (ruleset bypass)"
+        # That push named an explicit URL, so the clone's remote-tracking ref
+        # still points at the previous main: refresh it before anything reads
+        # `origin/main`, and tag the commit we just pushed. Tagging the stale
+        # ref put v0.1.11 on the pre-release commit and the workflow's version
+        # gate failed ten seconds later with nothing built.
+        git fetch origin main --quiet
+        TAGGED="$(git rev-parse HEAD)"
     else
         say "   the release key could not push to main"
     fi
@@ -200,9 +208,17 @@ if [ "$pushed" = 0 ]; then
     gh pr merge "$pr" --merge --delete-branch
     git switch main
     git fetch origin main --quiet
+    TAGGED="$(git rev-parse origin/main)"
 fi
 
-git tag -a "$TAG" -m "$TAG" "$(git rev-parse origin/main)"
+# The tag has to land on a commit whose crates carry this version: release.yml
+# opens with that comparison, so a tag on any other commit fails ten seconds in
+# with every build skipped and no hint about which commit was wrong.
+[ -n "$TAGGED" ] || die "no commit to tag"
+git show "$TAGGED:crates/abylab-tui/Cargo.toml" | grep -q "^version = \"$VERSION\"$" ||
+    die "commit $TAGGED does not carry version $VERSION; refusing to tag it"
+say "   tagging $TAGGED ($(git log --oneline -1 --format=%h "$TAGGED"))"
+git tag -a "$TAG" -m "$TAG" "$TAGGED"
 git push origin "$TAG"
 say "== $TAG pushed; the release workflow is building it"
 say "   gh run list --workflow Release --limit 1"
