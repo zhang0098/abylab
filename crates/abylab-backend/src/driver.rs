@@ -1726,6 +1726,12 @@ struct AgentContext<'a> {
     host: &'a HostPolicy,
 }
 
+/// The session system prompt: one clause per decision the model would
+/// otherwise get wrong. Each read or search names the shell command it
+/// replaces, the way harness's per-tool prompt sections do, so piping command
+/// output stays legitimate while paging and searching files does not.
+pub(crate) const SYSTEM_PROMPT: &str = "You are abylab, a coding agent in the user's terminal. Keep answers tight. Read files with read — not cat or sed. Search them with glob and grep — not shell find or rg; all three are workspace-rooted reads that never need approval. Change files with write and edit, and run commands and tests with bash. Plan multi-step work with todo_write and keep the list current.";
+
 /// A fresh session reserves its id before it is published to the UI.
 fn fresh_agent(
     ctx: &AgentContext<'_>,
@@ -1733,7 +1739,7 @@ fn fresh_agent(
     effort: ReasoningEffort,
 ) -> abycore::Result<SessionAgent> {
     let snapshot = abycore::SessionSnapshot::new(
-        "You are abylab, a coding agent in the user's terminal. Keep answers tight; use the provided tools to read, write, edit and run things in the workspace. Plan multi-step work with todo_write and keep the list current.",
+        SYSTEM_PROMPT,
         ModelOptions {
             model: model.to_string(),
             reasoning: effort,
@@ -3243,6 +3249,27 @@ mod tests {
                     .expect("authorization succeeds");
                 assert_eq!(decision, ToolDecision::Allow, "{name} in {mode:?}");
             }
+        }
+    }
+
+    /// The prompt steers reads and searches to the tools the policy above
+    /// auto-allows, and names the shell command each one replaces — harness's
+    /// per-tool prompt-section shape — so the model stops paging files through
+    /// shell pipelines without giving up piping command output.
+    #[test]
+    fn the_system_prompt_names_the_no_approval_read_tools() {
+        for name in ["read", "glob", "grep"] {
+            assert!(
+                SYSTEM_PROMPT.contains(name),
+                "the system prompt must name `{name}`"
+            );
+        }
+        assert!(SYSTEM_PROMPT.contains("never need approval"));
+        for replaced in ["not cat or sed", "not shell find or rg"] {
+            assert!(
+                SYSTEM_PROMPT.contains(replaced),
+                "the system prompt must name the shell command each read tool replaces: `{replaced}`"
+            );
         }
     }
 

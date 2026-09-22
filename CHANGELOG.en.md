@@ -10,6 +10,22 @@ context compaction, session persistence, goal rounds) live in
 
 ## [Unreleased]
 
+### Changed
+
+- The system prompt now names the tool split **and the shell command each read
+  tool replaces** (harness's one-section-per-tool shape): "Read files with read
+  — not cat or sed. Search them with glob and grep — not shell find or rg". It
+  previously named only read/write/edit/todo_write — "search" never appeared —
+  so the model reached for bash by default (measured on this machine: bash was
+  78% of 2112 tool calls across 15 sessions, with 781 `| head` and 453
+  `sed -n`/`awk` used as a pager, against 2 `glob` and 15 `grep` calls). Naming
+  the commands rather than a vague "no pipelines" keeps command-output piping
+  legitimate (`cargo test | tail -20`) while paging and searching files is not.
+  The three named read tools are workspace-rooted and never ask for approval,
+  while bash asks every time under read-only / workspace-write. New sessions
+  only: a session restored with `/resume` or `--session-id` keeps the prompt it
+  was created with.
+
 ## [0.1.9] - 2026-09-21
 
 ### Changed
