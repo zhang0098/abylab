@@ -159,7 +159,9 @@ GitHub Releases 慢或被墙的网络留一条路：
   拿得到预览域名。）
 - **只留最新版**：快照语义决定老的 `downloads/v0.1.1/` 在下一次发布时就没了，
   所以镜像只有 `latest`（job 里也会比对最新 release，避免回填旧 tag 时把新版
-  覆盖掉）。指定 `--version v0.1.1` 的安装仍然走 GitHub Releases。
+  覆盖掉）。GitHub Releases 同样只留最新：`publish` job 每次上传完就把其余
+  release 删掉（tag 全保留，CHANGELOG 的 compare 链接照旧可用），所以
+  `--version <旧 tag>` 取不到资产——钉版本的安装只对当前这一版有效。
 
 需要 `CLOUDFLARE_API_TOKEN`（Pages: Edit）和 `CLOUDFLARE_ACCOUNT_ID` 两个
 secret；没配时 job 跳过，并在 run summary 里写出补配方法。配好之后回填某次发布：

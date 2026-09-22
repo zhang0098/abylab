@@ -243,6 +243,36 @@ jobs:
           gh release upload "$TAG" --clobber dist/*
           gh release view "$TAG" --json url --jq .url
 
+      # One release is kept, so the asset list means "the current build" and
+      # nothing else. Tags stay: the changelog's compare links resolve through
+      # them and every clone already has them. The only thing this costs is
+      # `install.sh --version <old tag>`, which downloads that tag's assets;
+      # the mirror never served those anyway.
+      - name: Prune older releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A backfill re-run of an older tag must not delete the newest
+          # release: the same guard the mirror job uses.
+          newest=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          if [ "$newest" != "$TAG" ]; then
+            echo "::notice::$TAG is not the latest release ($newest) — nothing pruned"
+            exit 0
+          fi
+          stale=$(gh release list --limit 100 --json tagName --jq '.[].tagName' |
+            grep -vx "$TAG" || true)
+          if [ -z "$stale" ]; then
+            echo "no older releases to prune"
+            exit 0
+          fi
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            gh release delete "$tag" --yes
+            echo "deleted release $tag (tag kept)"
+          done <<< "$stale"
+
   # Copy the tarballs onto the site, so abylab.ai/downloads/ serves installs for
   # networks where GitHub Releases is slow or blocked. Same Pages project as
   # site.yml; see SITE.md for the layout and the secrets.

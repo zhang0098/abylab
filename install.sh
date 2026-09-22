@@ -13,7 +13,8 @@
 # GitHub Releases when it is missing or fails.
 #
 # Options:
-#   -v, --version <tag>   release to install (default: latest, e.g. v0.1.0)
+#   -v, --version <tag>   release to install (default: latest, e.g. v0.1.0;
+#                        only the newest release ships assets)
 #       --bin-dir <dir>   where to put the binary (default: ~/.local/bin)
 #       --path-file <f>   startup file to put that directory on PATH in
 #                         (default: the one your shell actually reads)
@@ -82,7 +83,8 @@ and installs that one file. A plain "latest" install tries the mirror on
 abylab.ai first and falls back to GitHub Releases.
 
 Options:
-  -v, --version <tag>   release to install (default: latest, e.g. v0.1.0)
+  -v, --version <tag>   release to install (default: latest, e.g. v0.1.0;
+                        only the newest release ships assets)
       --bin-dir <dir>   where to put the binary (default: ~/.local/bin)
       --path-file <f>   startup file to put that directory on PATH in
                         (default: the one your shell actually reads)
@@ -252,7 +254,9 @@ resolve_tag() {
 # The tag the mirror carries at downloads/latest/, or non-zero when the mirror
 # cannot serve this install. Only a plain "latest" can come from the mirror: it
 # holds a single version (a Pages deployment replaces the whole site), so an
-# explicit --version goes to GitHub Releases, which keeps every tag.
+# explicit --version goes to GitHub Releases — which keeps the tags but only
+# the newest release, because release.yml prunes the older ones after every
+# publish. A pinned install therefore works for whatever is current.
 mirror_tag() {
     local tag
     [ "$MIRROR_ON" = 1 ] || return 1
