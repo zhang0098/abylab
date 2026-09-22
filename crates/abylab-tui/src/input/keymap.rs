@@ -829,8 +829,11 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_mac: &["shift+tab"],
         chords_other: &["shift+tab"],
         ctx: CtxNote::Always,
-        desc_en: "cycle permission preset (/permission)",
-        desc_zh: "轮换权限预设（/permission）",
+        // The ring, not a toggle: three presets, and the first press from the
+        // launch default lands on read only. `/help` carries the wait — a turn
+        // holds the switch to its end — and points at `/permission`.
+        desc_en: "cycle permission: read only → workspace write → full access",
+        desc_zh: "轮换权限：只读 → 工作区可写 → 完全访问",
         probes: &[p(KeyCode::BackTab, NONE, false)],
     },
     KeyRow {

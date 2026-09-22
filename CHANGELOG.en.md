@@ -12,6 +12,39 @@ context compaction, session persistence, goal rounds) live in
 
 ### Changed
 
+- `shift+tab` says when a permission switch is waiting. The driver serializes
+  turns — it reads its command channel only between them — so a switch taken
+  mid-turn lands at the turn's end rather than failing. Until now the chord went
+  quiet after the ask: the chip cannot move before the host's durable echo, so a
+  busy session showed no tip and no change, and the key read as broken. It now
+  prints `permission → Read Only · applies after this turn` (a switch staged
+  before the first prompt keeps `permission → Read Only …`), and the tip spells
+  the preset the way the chip does instead of leaking the wire id.
+- `shift+tab` steps from the last *request* instead of the chip. Two presses
+  inside one turn used to compute the same target — the second one died in the
+  driver's equal-preset branch, so N presses moved the cycle one step, and the
+  harder you pressed the less it moved. Every press now advances one step and the
+  host applies them in order; asking twice for the same preset (say `/permission`
+  naming the one already on its way) no longer re-sends it, which would have
+  rebuilt the local tools a second time at the boundary. The docs were wrong
+  too: `/help` and `/keys` said "workspace-write ⇄ full access", but the chord
+  walks all three presets, and the first press from the `danger-full-access`
+  default lands on read only — the parenthetical that made that press look lost.
+- The permission chip no longer highlights `Full access`: the chip on the meta
+  row's left now paints all three presets in one tone (`fg_tertiary`), the same
+  one the approval chip behind it uses. `danger-full-access` used to go warn
+  (amber), but a trusted-directory session sits in that preset all day — a colour
+  that is always on carries nothing, and it drowned out the queue count on the
+  same row, which does change and uses warn too. The label still follows the
+  preset (Read Only / Workspace Write / Full access), and the preset's full
+  description still lives in the `/permission` picker and `/status`.
+- `--help` no longer lists the tuning environment variables: the trailing
+  `ENVIRONMENT (advanced tuning; no flags):` block (`ABYLAB_HOME`, `ABY_MODEL`,
+  `ABY_MAX_REQUESTS`, `ABY_CONTEXT_WINDOW`, …) is gone, so the help ends at the
+  option table. Those variables are advanced tuning only, and what a day-to-day
+  run touches is the matching option; the defaults the flags read (`$ABYLAB_HOME`,
+  `$ABY_MODEL`) are still named in the table, and the compaction and timeout
+  knobs are still documented one by one in [TECH.en.md](TECH.en.md).
 - The status bar carries the queue count now: while prompts are waiting, the
   meta row (the composer's bottom border) leads with `· 2 queued`, plus the `⌥↑`
   chord whenever the composer is free. Until now "how many are queued" showed up

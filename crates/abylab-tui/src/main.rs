@@ -59,13 +59,6 @@ OPTIONS:
       --theme <dark|light>  DeepSeek Web UI palette (default: persisted, else dark)
   -V, --version             print version
   -h, --help                this help
-
-ENVIRONMENT (advanced tuning; no flags):
-  ABYLAB_HOME, ABY_MODEL, DEEPSEEK_BASE_URL
-  ABY_MAX_REQUESTS, ABY_MAX_TOOL_CALLS, ABY_AUTO_CONTINUE,
-  ABY_TURN_TIMEOUT, ABY_TOOL_TIMEOUT
-  ABY_CONTEXT_WINDOW (enables compaction), ABY_COMPACT_AT,
-  ABY_KEEP_RECENT, ABY_PRUNE_TOOL_OUTPUT
 ";
 
 struct Args {
