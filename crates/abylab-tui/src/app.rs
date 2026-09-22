@@ -764,10 +764,6 @@ pub struct App {
     /// What plain Enter does while busy (`/enter`); the accelerated chord
     /// always does the other one (harness's `busyEnter` preference).
     pub enter: crate::locale::EnterBehavior,
-    /// Which usage hint the next new session opens with. The composer cap row
-    /// no longer rotates hints live; a session start shows one instead, so the
-    /// index advances per session and cycles the whole set over time.
-    session_tip_idx: usize,
     ctrl_c_armed: Option<CtrlCQuitChord>,
     /// The queued prompt whose `ctrl+d` in the queue picker already asked: the
     /// id of the armed row, cleared when the highlight moves or the list is
@@ -1166,7 +1162,6 @@ impl App {
             key_debug: std::env::var("ABYLAB_KEYDEBUG").is_ok_and(|v| v == "1"),
             vim: crate::input::VimState::default(),
             enter,
-            session_tip_idx: 0,
             ctrl_c_armed: None,
             queue_delete_armed: None,
             session_id,
@@ -1265,22 +1260,6 @@ impl App {
     pub fn show_tip(&mut self, text: impl Into<String>) {
         self.tip = Some((text.into(), Instant::now()));
         self.needs_redraw = true;
-    }
-
-    /// Greet a session the user opens (`/new`) with one usage hint.
-    ///
-    /// The hint rotation used to live in the composer cap row, competing with
-    /// the draft and the todo checklist for the same line; it lands in the
-    /// timeline once per session instead, and the index cycles so a user who
-    /// keeps starting sessions still walks the whole set. The launch is not a
-    /// caller: the splash's facts stand alone (`main`), and the hint waits for
-    /// the first session the reader asks for.
-    pub fn push_session_tip(&mut self) {
-        let hint = self.locale.session_tip(self.session_tip_idx);
-        self.session_tip_idx = (self.session_tip_idx + 1) % crate::locale::TIP_COUNT;
-        let label = self.locale.tr("Tip", "提示");
-        self.transcript
-            .push_markdown(format!("- **{label}** · {hint}"));
     }
 
     /// The three lines the shell gets once the alternate screen is gone: which
@@ -1950,8 +1929,6 @@ impl App {
                             Some(SessionSwitch::Resume(target)) => *target == session_id,
                             None => false,
                         };
-                        let fresh =
-                            switched && matches!(self.session_switch, Some(SessionSwitch::New));
                         if switched || (self.session_bound && self.session_id != session_id) {
                             self.session_switch = None;
                             self.reset_session_ui();
@@ -1962,9 +1939,6 @@ impl App {
                         self.session_id = session_id.clone();
                         self.transcript.set_root_session(session_id);
                         self.session_bound = true;
-                        if fresh {
-                            self.push_session_tip();
-                        }
                         // The driver is the source of truth for the bound
                         // session's model: a resumed session keeps its stored
                         // model, and a rejected /model never moves this row.
@@ -10807,54 +10781,40 @@ mod right_slot_tests {
         assert_eq!(app.slash_matches()[0].desc, "状态、模型和实时用量统计");
     }
 
-    /// A new session greets with one usage hint in the timeline — the line the
-    /// composer cap row used to rotate live — and the next `/new` walks on to
-    /// the following hint instead of repeating the first.
+    /// A new session opens on an empty timeline: the usage hint it used to
+    /// greet with is gone (`/keys` and `/help` carry those lines), so the first
+    /// cell of a session the user opens is the prompt they type.
     #[test]
-    fn new_session_greets_with_the_next_usage_hint() {
+    fn a_new_session_opens_on_an_empty_timeline() {
         let (mut app, ctl, _rx) = test_app();
-        app.locale = Locale::En;
         app.transcript.push_user(
             "a previous prompt".into(),
             crate::transcript::Delivery::Delivered,
         );
-        let greeting = |app: &App| -> String {
-            let first = app.transcript.cells.first().expect("greeting cell");
-            let crate::transcript::CellKind::MarkdownNotice { text } = &first.kind else {
-                panic!("the greeting should be markdown, got {:?}", first.kind);
-            };
-            text.clone()
+        let bind = |app: &mut App, ctl: &Controller, session_id: &str| {
+            app.handle(
+                AppEvent::Ctl(CtlEvent::SessionBound {
+                    session_id: session_id.into(),
+                    notice: None,
+                    model: None,
+                    effort: None,
+                }),
+                ctl,
+            );
         };
 
         app.run_slash("new", "", &ctl);
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "first-new".into(),
-                notice: None,
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        assert_eq!(
-            greeting(&app),
-            "- **Tip** · esc interrupts a running turn — your draft survives"
+        bind(&mut app, &ctl, "first-new");
+        assert!(
+            app.transcript.cells.is_empty(),
+            "nothing greets a new session: {:?}",
+            app.transcript.cells.first().map(|cell| &cell.kind)
         );
 
+        // The next `/new` is just as silent: no rotation, no counter.
         app.run_slash("new", "", &ctl);
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "second-new".into(),
-                notice: None,
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        assert_eq!(
-            greeting(&app),
-            "- **Tip** · enter queues a follow-up; ctrl+enter steers it — /enter swaps the pair"
-        );
+        bind(&mut app, &ctl, "second-new");
+        assert!(app.transcript.cells.is_empty());
     }
 }
 

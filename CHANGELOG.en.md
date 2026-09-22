@@ -25,10 +25,12 @@ context compaction, session persistence, goal rounds) live in
   advertise a key that would refuse. With the chip in place the `⏎ send queue
   head` hint is gone from the row: it no longer restates the queue, since an
   empty enter still ships the head and `/keys` documents that.
-- A launch no longer trails a usage hint: the splash keeps the wordmark, the
+- The timeline has no usage hints any more: a launch keeps the wordmark, the
   project URL and the four launch facts (version, working directory, permission,
-  model), and the timeline starts there. The hints themselves stay — `/new`
-  still greets a session with one, cycling through the seven of them.
+  model), and `/new` no longer greets a session with one either. The seven-hint
+  rotation (`esc` interrupts, `enter` queues, `@` mentions a file, …) went with
+  the counter that walked it — the keys and commands themselves are unchanged,
+  and `/keys`, `/help` and the slash menu still list them.
 
 ## [0.1.11] - 2026-09-22
 

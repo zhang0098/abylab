@@ -1034,9 +1034,9 @@ struct CapLine {
 
 /// Priority: transient action feedback (a few seconds) → the live todo
 /// checklist. The rotating usage hints that used to fall through here are
-/// gone — a new session greets with one in the timeline instead
-/// (`App::push_session_tip`) — so an idle cap line stays empty and only the
-/// workspace title on the right marks the row.
+/// gone, and nothing greets a session in their place (`/keys` and `/help`
+/// carry them), so an idle cap line stays empty and only the workspace title
+/// on the right marks the row.
 fn cap_line(app: &App) -> CapLine {
     let theme = app.theme;
     if let Some((text, _)) = &app.tip {
@@ -2541,7 +2541,7 @@ mod tests {
 
     /// Transient action feedback owns the cap row for its TTL, then the todo
     /// checklist reclaims it; with neither, the row goes blank — the usage
-    /// hints it used to rotate now greet a new session in the timeline.
+    /// hints it used to rotate are gone for good.
     #[test]
     fn composer_cap_prefers_feedback_then_the_todo_checklist() {
         let mut app = test_app();

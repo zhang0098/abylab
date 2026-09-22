@@ -66,36 +66,7 @@ impl Locale {
             _ => fallback,
         }
     }
-
-    /// The usage hint a new session opens with (`App::push_session_tip`).
-    /// `index` cycles the set — one hint per session, not a live rotation.
-    pub fn session_tip(self, index: usize) -> &'static str {
-        const EN: [&str; 7] = [
-            "esc interrupts a running turn — your draft survives",
-            "enter queues a follow-up; ctrl+enter steers it — /enter swaps the pair",
-            "click a tool to expand it · wheel always scrolls the conversation",
-            "token usage + cache hit rate live in /status · it also names the session",
-            "answers render markdown: headings, code, links, and images",
-            "@ mentions a workspace file · the file browser filters as you type",
-            "/new starts a fresh session · /theme switches packs · ctrl+t toggles dark/light",
-        ];
-        const ZH: [&str; 7] = [
-            "esc 可中断当前轮次，草稿会保留",
-            "enter 会排队后续消息，ctrl+enter 立即插话 —— /enter 可对调两者",
-            "点击工具可展开 · 滚轮始终滚动对话",
-            "token 用量和缓存命中率见 /status · 会话身份也在那里",
-            "回答支持 Markdown：标题、代码、链接和图片",
-            "@ 可引用工作区文件 · 输入时文件浏览器实时过滤",
-            "/new 新建会话 · /theme 切换主题包 · ctrl+t 切换明暗模式",
-        ];
-        match self {
-            Self::En => EN[index % EN.len()],
-            Self::Zh => ZH[index % ZH.len()],
-        }
-    }
 }
-
-pub const TIP_COUNT: usize = 7;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
