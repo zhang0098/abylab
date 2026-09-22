@@ -12,6 +12,24 @@ context compaction, session persistence, goal rounds) live in
 
 ### Changed
 
+- `shift+tab` says when a permission switch is waiting. The driver serializes
+  turns — it reads its command channel only between them — so a switch taken
+  mid-turn lands at the turn's end rather than failing. Until now the chord went
+  quiet after the ask: the chip cannot move before the host's durable echo, so a
+  busy session showed no tip and no change, and the key read as broken. It now
+  prints `permission → Read Only · applies after this turn` (a switch staged
+  before the first prompt keeps `permission → Read Only …`), and the tip spells
+  the preset the way the chip does instead of leaking the wire id.
+- `shift+tab` steps from the last *request* instead of the chip. Two presses
+  inside one turn used to compute the same target — the second one died in the
+  driver's equal-preset branch, so N presses moved the cycle one step, and the
+  harder you pressed the less it moved. Every press now advances one step and the
+  host applies them in order; asking twice for the same preset (say `/permission`
+  naming the one already on its way) no longer re-sends it, which would have
+  rebuilt the local tools a second time at the boundary. The docs were wrong
+  too: `/help` and `/keys` said "workspace-write ⇄ full access", but the chord
+  walks all three presets, and the first press from the `danger-full-access`
+  default lands on read only — the parenthetical that made that press look lost.
 - The permission chip no longer highlights `Full access`: the chip on the meta
   row's left now paints all three presets in one tone (`fg_tertiary`), the same
   one the approval chip behind it uses. `danger-full-access` used to go warn

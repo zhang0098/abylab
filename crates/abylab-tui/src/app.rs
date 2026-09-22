@@ -706,6 +706,13 @@ pub struct App {
     /// Chip index under the mouse pointer (grok-style hover preview).
     pub hover_att: Option<usize>,
     pub modes: Modes,
+    /// The permission preset the user last asked for and the host has not
+    /// echoed yet. The driver serializes turns — it reads its command channel
+    /// only between them — so a switch sent while a turn runs lands at that
+    /// turn's end: this records the ask, `shift+tab` steps from it, and the tip
+    /// row can say what is waiting on what. It survives an unrelated failure on
+    /// purpose, because it is what was asked for, not what the host reports.
+    pending_permission: Option<String>,
     /// User-invocable host skills (`available_commands_update`). They never
     /// join the `/` menu — `/skill ` is their one listing surface, and a bare
     /// `/name` line still ships as a prompt the host expands.
@@ -1171,6 +1178,7 @@ impl App {
             selected_model: None,
             session_bound: true,
             session_switch: None,
+            pending_permission: None,
             quit: false,
             queued: 0,
             prompt_queue: VecDeque::new(),
@@ -2064,6 +2072,13 @@ impl App {
             }
             E::PermissionPreset { session, preset } if *session == self.session_id => {
                 self.modes.permission = Some(preset.clone());
+                // The request is only spent by the echo of the preset it asked
+                // for. A host that answers an earlier request first (the driver
+                // applies queued switches in order) would otherwise drop a newer
+                // one on the floor, and `shift+tab` would step from the chip.
+                if self.pending_permission.as_deref() == Some(preset.as_str()) {
+                    self.pending_permission = None;
+                }
                 apply_to_transcript = false;
             }
             E::SessionTitle { session, title } if *session == self.session_id => {
@@ -4482,6 +4497,9 @@ impl App {
         self.queue_edit = None;
         self.pending_steer_cells.clear();
         self.prompt_pending = false;
+        // A different session reports its own preset; nothing of the old one's
+        // request is in flight behind it.
+        self.pending_permission = None;
         self.sel = None;
         self.state = RunState::Idle;
         self.run_started = None;
@@ -4621,11 +4639,21 @@ impl App {
     }
 
     /// grok: Shift+Tab cycles the permission preset.
+    ///
+    /// The step is measured from the last *request* (`pending_permission`), not
+    /// the last ack. A turn holds the driver's command channel, so while one
+    /// runs every press aims at a preset the host has not applied yet; stepping
+    /// from the folded chip would make two presses inside one turn name the same
+    /// target, and the driver drops the repeat as a no-op — the cycle would
+    /// stall exactly when the reader is pressing it.
     fn cycle_permission(&mut self, ctl: &Controller) {
-        let current = self.current_permission().to_string();
+        let base = self
+            .pending_permission
+            .clone()
+            .unwrap_or_else(|| self.current_permission().to_string());
         let idx = PERMISSION_PRESETS
             .iter()
-            .position(|(p, _)| *p == current)
+            .position(|(p, _)| *p == base)
             .unwrap_or(0);
         let next = PERMISSION_PRESETS[(idx + 1) % PERMISSION_PRESETS.len()]
             .0
@@ -4643,18 +4671,46 @@ impl App {
             .unwrap_or("danger-full-access")
     }
 
+    /// A preset as the chips spell it, in the reader's locale. One place, so
+    /// the meta row, `/status` and the tips cannot drift apart on the same
+    /// preset.
+    pub fn permission_text(&self, preset: &str) -> String {
+        if self.locale == Locale::Zh {
+            match preset {
+                "read-only" => return "只读".to_string(),
+                "workspace-write" => return "工作区可写".to_string(),
+                "danger-full-access" => return "完全访问".to_string(),
+                _ => {}
+            }
+        }
+        permission_label(preset)
+    }
+
     /// Ask the host to switch this session's permission preset; the durable
     /// `permission/preset` event echoes back and folds the ⛨ chip, which is
     /// the whole confirmation — the switch itself stays out of the timeline.
     /// Before the first prompt the host stages the switch and applies it when
     /// the session is created; until a session is bound the chips are hidden,
     /// so a staged switch borrows the tip line to stay visible.
+    ///
+    /// A switch that has to wait says so. The chip cannot move until the echo
+    /// lands, and a turn holds the channel to its end (`DriverHandle`), so a
+    /// press taken mid-turn would otherwise look like a key that did nothing.
     fn set_permission(&mut self, preset: String, ctl: &Controller) {
-        if self.modes.permission.as_deref() == Some(preset.as_str()) {
+        let label = self.permission_text(&preset);
+        // Already asked for: the request is on its way and the host answers in
+        // order, so a second one would only name the same preset again.
+        if self.pending_permission.as_deref() == Some(preset.as_str()) {
+            self.show_permission_tip(&label);
+            return;
+        }
+        if self.pending_permission.is_none()
+            && self.modes.permission.as_deref() == Some(preset.as_str())
+        {
             self.show_tip(
                 self.locale
                     .tr("permission already {n}", "权限已经是 {n}")
-                    .replace("{n}", &preset),
+                    .replace("{n}", &label),
             );
             return;
         }
@@ -4662,11 +4718,28 @@ impl App {
             session_id: self.session_id.clone(),
             preset: preset.clone(),
         });
-        if !self.session_bound {
+        self.pending_permission = Some(preset.clone());
+        self.show_permission_tip(&label);
+    }
+
+    /// The one line a waiting switch gets: plain when the host can answer right
+    /// away (the echo is the confirmation, so a bound idle session needs no
+    /// tip), and named with its reason when it cannot.
+    fn show_permission_tip(&mut self, label: &str) {
+        if !matches!(self.state, RunState::Idle) {
+            self.show_tip(
+                self.locale
+                    .tr(
+                        "permission → {n} · applies after this turn",
+                        "权限 → {n} · 这轮结束后生效",
+                    )
+                    .replace("{n}", label),
+            );
+        } else if !self.session_bound {
             self.show_tip(
                 self.locale
                     .tr("permission → {n} …", "权限 → {n} …")
-                    .replace("{n}", &preset),
+                    .replace("{n}", label),
             );
         }
     }
@@ -5073,7 +5146,7 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 中断（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
-- shift+tab · 轮换权限预设 · /permission 打开选择器
+- shift+tab · 轮换权限预设（只读 → 工作区可写 → 完全访问，一轮结束后生效）· /permission 打开选择器
 - ctrl+p · 打开模型选择器，然后选择推理强度
 - /lang · 切换界面语言：/lang zh 或 /lang en
 - /login · 保存 API key 到 aby 主目录，不回显明文
@@ -5103,7 +5176,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · interrupt (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
-- shift+tab · cycle permission (workspace-write ⇄ full access) · /permission opens the preset picker
+- shift+tab · cycle permission (read only → workspace write → full access, takes effect after a turn) · /permission opens the preset picker
 - ctrl+p · model picker → effort picker
 - /effort · reasoning effort · /permission preset · /plan plan mode
 - /vim · toggle vim modal editing (/vim on|off, off by default)
@@ -5184,16 +5257,7 @@ context, subagent lifecycles, token usage (incl. cache hits), end reason."
             .clone()
             .or_else(|| self.modes.sandbox.clone())
             .unwrap_or_else(|| self.current_permission().to_string());
-        let perm_label = if self.locale == Locale::Zh {
-            match perm.as_str() {
-                "read-only" => "只读".to_string(),
-                "workspace-write" => "工作区可写".to_string(),
-                "danger-full-access" => "完全访问".to_string(),
-                _ => permission_label(&perm),
-            }
-        } else {
-            permission_label(&perm)
-        };
+        let perm_label = self.permission_text(&perm);
         let effort_line = self
             .modes
             .effort
@@ -6223,6 +6287,13 @@ mod resume_tests {
         assert!(
             frame.contains("shift+tab") && frame.contains("permission"),
             "permission binding missing:\n{frame}"
+        );
+        // The row names the whole ring. The chord is not a two-state toggle
+        // (`PERMISSION_PRESETS` walks three), so a reader told
+        // "workspace-write ⇄ full access" reads the 只读 press as a lost one.
+        assert!(
+            frame.contains("read only → workspace write → full access"),
+            "the permission row must name every preset it cycles through:\n{frame}"
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
@@ -7753,17 +7824,124 @@ mod mode_tests {
             "assumed default"
         );
 
-        // shift+tab sends the preset; the ack event folds the mode.
+        // shift+tab sends the preset; the ack event folds the mode and spends
+        // the request that asked for it.
         for expected in ["read-only", "workspace-write", "danger-full-access"] {
             app.cycle_permission(&ctl);
-            app.handle(
-                AppEvent::Ui(crate::events::UiEvent::PermissionPreset {
-                    session: app.session_id.clone(),
-                    preset: expected.into(),
-                }),
-                &ctl,
+            assert_eq!(
+                app.pending_permission.as_deref(),
+                Some(expected),
+                "asked for"
             );
+            app.handle(permission_echo(&app, expected), &ctl);
             assert_eq!(app.current_permission(), expected);
+            assert!(
+                app.pending_permission.is_none(),
+                "the matching echo spends the request"
+            );
+        }
+    }
+
+    /// A turn holds the driver's command channel to its end (`DriverHandle`:
+    /// turns serialize inside the driver), so a chord taken mid-turn waits for
+    /// the boundary. Two things follow. The press has to say it is waiting,
+    /// because the chip cannot move until the echo lands; and the next press has
+    /// to step from the preset that was *asked* for — measuring from the chip
+    /// would name the same target twice, and the driver drops a repeat as a
+    /// no-op, so the cycle would stall exactly while the reader is pressing it.
+    #[test]
+    fn a_mid_turn_switch_waits_and_the_next_press_steps_from_the_request() {
+        let (ctl, commands) = crate::controller::test_controller();
+        let mut app = App::new(Theme::dark(), test_cfg(), "dsh-test".into());
+        app.locale = crate::locale::Locale::En;
+        app.modes.permission = Some("workspace-write".into());
+        app.state = RunState::Running;
+
+        app.cycle_permission(&ctl);
+        assert_eq!(next_permission_switch(&commands), "danger-full-access");
+        assert_eq!(
+            app.tip.as_ref().map(|(text, _)| text.as_str()),
+            Some("permission → Full access · applies after this turn"),
+            "a waiting switch names itself and its reason"
+        );
+
+        app.cycle_permission(&ctl);
+        assert_eq!(
+            next_permission_switch(&commands),
+            "read-only",
+            "one step per press, not the same ask twice"
+        );
+
+        // The driver applies queued switches in order and echoes each one, so a
+        // newer request survives the echo of the older one.
+        app.handle(permission_echo(&app, "danger-full-access"), &ctl);
+        assert_eq!(
+            app.pending_permission.as_deref(),
+            Some("read-only"),
+            "an older echo must not spend a newer request"
+        );
+        app.handle(permission_echo(&app, "read-only"), &ctl);
+        assert!(app.pending_permission.is_none());
+        assert_eq!(app.current_permission(), "read-only");
+    }
+
+    /// The tick that lands the waiting switch: `/permission` names an absolute
+    /// preset, so it can name the one already on its way. Asking again would
+    /// buy a second rebuild of the local tools at the turn boundary, and a
+    /// preset the host already reports needs no request at all.
+    #[test]
+    fn asking_twice_for_the_same_preset_asks_the_host_once() {
+        let (ctl, commands) = crate::controller::test_controller();
+        let mut app = App::new(Theme::dark(), test_cfg(), "dsh-test".into());
+        app.locale = crate::locale::Locale::En;
+        app.modes.permission = Some("workspace-write".into());
+        app.state = RunState::Running;
+
+        app.set_permission("read-only".into(), &ctl);
+        assert_eq!(next_permission_switch(&commands), "read-only");
+        app.set_permission("read-only".into(), &ctl);
+        assert!(
+            commands.try_recv().is_err(),
+            "a repeat of the request in flight is a no-op"
+        );
+        assert_eq!(
+            app.tip.as_ref().map(|(text, _)| text.as_str()),
+            Some("permission → Read Only · applies after this turn"),
+            "the waiting line still stands"
+        );
+
+        // Once the host reports it, the same ask is just the current preset.
+        app.handle(permission_echo(&app, "read-only"), &ctl);
+        app.set_permission("read-only".into(), &ctl);
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            app.tip.as_ref().map(|(text, _)| text.as_str()),
+            Some("permission already Read Only")
+        );
+    }
+
+    /// A switch the host can answer right away keeps the tip row quiet: the
+    /// durable echo folding the chip is the whole confirmation, and a bound
+    /// idle session gets that echo before a tip could be read.
+    #[test]
+    fn a_bound_idle_switch_leaves_the_tip_row_alone() {
+        let (mut app, ctl, _rx) = test_app();
+        app.modes.permission = Some("workspace-write".into());
+        app.cycle_permission(&ctl);
+        assert!(app.tip.is_none(), "no waiting line when nothing waits");
+    }
+
+    fn permission_echo(app: &App, preset: &str) -> AppEvent {
+        AppEvent::Ui(crate::events::UiEvent::PermissionPreset {
+            session: app.session_id.clone(),
+            preset: preset.into(),
+        })
+    }
+
+    fn next_permission_switch(commands: &Receiver<Cmd>) -> String {
+        match commands.try_recv() {
+            Ok(Cmd::SetPermission { preset, .. }) => preset,
+            other => panic!("expected a permission switch, got {other:?}"),
         }
     }
 

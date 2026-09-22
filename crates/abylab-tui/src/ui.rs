@@ -712,16 +712,7 @@ fn status_title(app: &App) -> Line<'static> {
         .clone()
         .or_else(|| app.modes.sandbox.clone())
         .unwrap_or_else(|| app.current_permission().to_string());
-    let label = if app.locale == crate::locale::Locale::Zh {
-        match perm.as_str() {
-            "read-only" => "只读".to_string(),
-            "workspace-write" => "工作区可写".to_string(),
-            "danger-full-access" => "完全访问".to_string(),
-            _ => crate::app::permission_label(&perm),
-        }
-    } else {
-        crate::app::permission_label(&perm)
-    };
+    let label = app.permission_text(&perm);
     // The queue chip above may already own the row's first cell: the mode chips
     // keep their `· ` lead and space themselves in behind it.
     //
