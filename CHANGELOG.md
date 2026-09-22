@@ -10,6 +10,18 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 系统提示点明了工具分工，并且**点名要替代的 shell 命令**（照 harness 每个工具一段提示的
+  形状）："Read files with read — not cat or sed. Search them with glob and grep — not
+  shell find or rg"。此前那句提示只点了 read/write/edit/todo_write，"搜索"从未出现，
+  模型于是习惯拿 bash 一把梭（实测你机器上 15 个会话 2112 次工具调用里 bash 占 78%，
+  其中 781 次 `| head`、453 次 `sed -n`/`awk` 都在当分页器用，而 glob 只有 2 次、
+  grep 15 次）。点名到命令而不是笼统说"别用管道"，是为了留住合法用法：裁**命令输出**
+  （`cargo test | tail -20`）仍然可以，翻文件/搜文件不行。被点名的三个读工具在工作区根
+  内、任何权限预设下都不弹审批，bash 在 read-only / workspace-write 下每次都要问。
+  只影响新会话：`/resume` 或 `--session-id` 载入的旧会话仍用创建时存下的那句提示。
+
 ## [0.1.9] - 2026-09-21
 
 ### 变更
