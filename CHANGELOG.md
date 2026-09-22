@@ -12,6 +12,11 @@
 
 ### 变更
 
+- 权限 chip 不再给 `完全访问` 加亮：meta 行左侧那个 chip 现在是三种预设共用一个色调
+  （`fg_tertiary`），和它后面的 approval chip 一致。此前 `danger-full-access` 走 warn 色
+  （琥珀），可是信任目录的会话整天就停在这个预设上——一直亮着的颜色不携带信息，反而把
+  同一行里真的会变的排队计数（也用 warn）盖过去。标签照旧随预设变（只读 / 工作区可写 /
+  完全访问），预设的完整说明仍写在 `/permission` 选择器和 `/status` 里。
 - `--help` 不再列调优用的环境变量：末尾那段 `ENVIRONMENT (advanced tuning; no flags):`
   （`ABYLAB_HOME`、`ABY_MODEL`、`ABY_MAX_REQUESTS`、`ABY_CONTEXT_WINDOW`……）整块删掉，帮助
   止于选项表。这些变量只有高级调优会碰，日常用到的都是它们对应的选项；`$ABYLAB_HOME`、

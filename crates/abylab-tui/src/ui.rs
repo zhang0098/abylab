@@ -671,8 +671,8 @@ fn state_line(app: &App) -> Option<Line<'static>> {
 }
 
 /// Meta row, left side: the queue chip and the session's mode chips. Chips lead
-/// with a plain dot instead of emoji — the color carries the meaning (permission
-/// turns warn under full access).
+/// with a plain dot instead of emoji — the dot is the marker, the label is the
+/// fact, and the tone is chrome rather than a verdict on the preset.
 ///
 /// The queue chip is the only always-on sight of a waiting FIFO: the run-state
 /// line at the transcript tail drops its own `· N queued` while the model
@@ -724,14 +724,15 @@ fn status_title(app: &App) -> Line<'static> {
     };
     // The queue chip above may already own the row's first cell: the mode chips
     // keep their `· ` lead and space themselves in behind it.
+    //
+    // Every preset paints the same tone. Full access used to turn warn here,
+    // which made the loudest chip on the row the state a trusted-directory run
+    // sits in all day — a colour that always shows carries no signal, and the
+    // preset is already named in the `/permission` picker and `/status`.
     let lead = if spans.is_empty() { "" } else { " " };
     spans.push(Span::styled(
         format!("{lead}· {label}"),
-        Style::default().fg(if perm == "danger-full-access" {
-            theme.warn_soft()
-        } else {
-            theme.fg_tertiary
-        }),
+        Style::default().fg(theme.fg_tertiary),
     ));
     if let Some(approval) = &app.modes.approval {
         spans.push(Span::styled(
@@ -3061,6 +3062,46 @@ mod tests {
             !value_spans[0].style.add_modifier.contains(Modifier::BOLD),
             "no emphasis on the label"
         );
+    }
+
+    /// The chip is one tone for every preset. Full access used to turn warn,
+    /// which made the loudest cell on the row the state a trusted-directory run
+    /// sits in all day — a colour that is always on carries nothing, and the
+    /// preset is already spelled out in the `/permission` picker and `/status`.
+    /// The label still switches per preset, so the fact survives the flat tone.
+    #[test]
+    fn every_permission_preset_gets_the_same_chip_tone() {
+        let flat = |line: &Line| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let mut app = test_app();
+        let plain = app.theme.fg_tertiary;
+        assert_ne!(
+            plain,
+            app.theme.warn_soft(),
+            "the check below only means something while the plain tone differs from warn"
+        );
+
+        for (preset, zh, en) in [
+            ("read-only", "· 只读", "· Read Only"),
+            ("workspace-write", "· 工作区可写", "· Workspace Write"),
+            ("danger-full-access", "· 完全访问", "· Full access"),
+        ] {
+            app.modes.permission = Some(preset.into());
+
+            app.locale = crate::locale::Locale::Zh;
+            let zh_line = status_title(&app);
+            assert_eq!(flat(&zh_line), zh, "{preset}");
+            assert_eq!(zh_line.spans[0].style.fg, Some(plain), "{preset} in zh");
+
+            app.locale = crate::locale::Locale::En;
+            let en_line = status_title(&app);
+            assert_eq!(flat(&en_line), en, "{preset}");
+            assert_eq!(en_line.spans[0].style.fg, Some(plain), "{preset} in en");
+        }
     }
 
     /// The queue count is chrome, not a state line: it stays on the meta row for

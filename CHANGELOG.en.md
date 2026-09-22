@@ -12,6 +12,14 @@ context compaction, session persistence, goal rounds) live in
 
 ### Changed
 
+- The permission chip no longer highlights `Full access`: the chip on the meta
+  row's left now paints all three presets in one tone (`fg_tertiary`), the same
+  one the approval chip behind it uses. `danger-full-access` used to go warn
+  (amber), but a trusted-directory session sits in that preset all day — a colour
+  that is always on carries nothing, and it drowned out the queue count on the
+  same row, which does change and uses warn too. The label still follows the
+  preset (Read Only / Workspace Write / Full access), and the preset's full
+  description still lives in the `/permission` picker and `/status`.
 - `--help` no longer lists the tuning environment variables: the trailing
   `ENVIRONMENT (advanced tuning; no flags):` block (`ABYLAB_HOME`, `ABY_MODEL`,
   `ABY_MAX_REQUESTS`, `ABY_CONTEXT_WINDOW`, …) is gone, so the help ends at the
