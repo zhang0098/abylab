@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-09-24
+
 ### Added
 
 - `ask_user_question` lets the agent pause during a task for a Yes/No choice, a single or multiple selection, or a written answer. The same turn continues after the answer; `esc` cancels the question.
@@ -510,7 +512,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/zhang0098/abylab/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/zhang0098/abylab/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/zhang0098/abylab/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/zhang0098/abylab/compare/v0.1.10...v0.1.11

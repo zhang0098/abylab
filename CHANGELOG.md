@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-09-24
+
 ### 新增
 
 - 任务执行中可以通过 `ask_user_question` 向用户提问；终端弹窗支持是/否、单选、多选和文字回答，提交后同一轮任务继续。按 `esc` 可取消问题。
@@ -373,7 +375,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/zhang0098/abylab/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/zhang0098/abylab/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/zhang0098/abylab/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/zhang0098/abylab/compare/v0.1.10...v0.1.11
