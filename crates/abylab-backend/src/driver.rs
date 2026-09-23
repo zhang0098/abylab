@@ -24,6 +24,7 @@ use crate::contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
     PlanStatus, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits, UiEvent,
 };
+use crate::user_questions::AskUserQuestionTool;
 
 const SERVER_LABEL: &str = "abycore · deepseek-responses";
 
@@ -256,8 +257,8 @@ struct RepeatGuard {
 impl RepeatGuard {
     /// Repeat counts that trigger a reminder (the harness default).
     const THRESHOLDS: [usize; 3] = [3, 5, 8];
-    /// Calls whose repeats are legitimate work: an idempotent checklist rewrite.
-    const EXCLUDED: [&'static str; 1] = ["todo_write"];
+    /// Checklist updates and human questions can legitimately repeat.
+    const EXCLUDED: [&'static str; 2] = ["todo_write", "ask_user_question"];
     /// Arguments preview cap (the harness `argumentsPreviewChars` default).
     const PREVIEW_CHARS: usize = 500;
 
@@ -517,6 +518,7 @@ impl AgentHooks for UiHooks {
         if self.permission_mode == PermissionMode::FullAccess
             || call.name == "read"
             || call.name == "todo_write"
+            || call.name == "ask_user_question"
             // Goal tools only read and update session metadata, exactly like
             // the checklist: they never touch the workspace or the network.
             || matches!(call.name.as_str(), "get_goal" | "create_goal" | "update_goal")
@@ -1800,6 +1802,7 @@ fn build_agent(
     let mut inner = Agent::restore(client, snapshot)?;
     ctx.local.register(&mut inner)?;
     inner.register_tool(TodoWriteTool::new(false))?;
+    inner.register_tool(AskUserQuestionTool::new(Arc::clone(&ctx.host.sink)))?;
     inner.register_tool(abycore::GetGoalTool)?;
     inner.register_tool(abycore::CreateGoalTool)?;
     inner.register_tool(abycore::UpdateGoalTool)?;
@@ -3256,7 +3259,7 @@ mod tests {
         // Reads never ask, in either sandboxed preset. Searching is bash's job
         // now, and bash asks in both.
         for mode in [PermissionMode::ReadOnly, PermissionMode::WorkspaceWrite] {
-            for name in ["read", "todo_write"] {
+            for name in ["read", "todo_write", "ask_user_question"] {
                 let decision = hooks(mode)
                     .authorize(pending(name))
                     .await

@@ -7,6 +7,7 @@ pub mod contract;
 pub mod driver;
 mod instructions;
 mod queue_store;
+mod user_questions;
 
 pub use abycore::MIN_PRUNE_BYTES;
 pub use contract::{
@@ -14,4 +15,5 @@ pub use contract::{
     PlanStatus, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits, UiEvent,
     persisted_session_id,
 };
+pub use contract::{UserQuestion, UserQuestionOption, UserQuestionReply};
 pub use driver::DriverHandle;

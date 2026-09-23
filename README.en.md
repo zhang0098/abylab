@@ -43,6 +43,10 @@ esc interrupt / 2× clear draft · ctrl+c clear / quit · ↑ history · `/` com
 `↑/↓` select · `enter` edit · `ctrl+enter` steer that one into the running turn ·
 `ctrl+d` delete it (twice on the same row). The full map lives in `/keys`.
 
+During a task, abylab can pause to ask a question. Choose Yes/No, one or several
+options, or type a custom answer. Use `↑/↓` to move, space to toggle multiple
+choices, `enter` to answer, and `esc` to cancel the question.
+
 ## License and credits
 
 Copyright and license: [MIT License](LICENSE) (© 2025 zhang@qimiao.org).

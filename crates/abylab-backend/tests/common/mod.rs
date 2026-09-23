@@ -408,6 +408,7 @@ fn captured_sink(events: Captured) -> impl Fn(Event) + Send + Sync + 'static {
                 _ => return,
             },
             Event::PermissionAsk { title, .. } => format!("permission-ask:{title}"),
+            Event::UserQuestion { question, .. } => format!("user-question:{}", question.id),
         };
         events.lock().expect("event lock").push(summary);
     }
