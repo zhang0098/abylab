@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-09-23
+
 ### Added
 
 - `abylab --uninstall` uninstalls abylab: it lists one plan in two
@@ -458,7 +460,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/zhang0098/abylab/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/zhang0098/abylab/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/zhang0098/abylab/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/zhang0098/abylab/compare/v0.1.9...v0.1.10
