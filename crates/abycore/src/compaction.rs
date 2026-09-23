@@ -297,7 +297,10 @@ impl ContextEstimate {
 #[derive(Clone, Debug)]
 pub struct SummarizeOptions {
     pub cancellation: CancellationToken,
-    pub timeout: Duration,
+    /// Optional no-progress window for this call, like
+    /// [`crate::RunOptions::timeout`]; `None` leaves the summary to the
+    /// transport's own timeouts.
+    pub timeout: Option<Duration>,
     /// Output cap; `None` keeps the session model's configured cap.
     pub max_tokens: Option<u32>,
     /// Replace the default [`SUMMARIZE_INSTRUCTION`].
@@ -308,7 +311,7 @@ impl Default for SummarizeOptions {
     fn default() -> Self {
         Self {
             cancellation: CancellationToken::new(),
-            timeout: Duration::from_secs(300),
+            timeout: None,
             max_tokens: None,
             instruction: None,
         }

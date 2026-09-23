@@ -286,11 +286,24 @@ pub struct TurnLimits {
     /// `dsh-llm-retry` re-runs a failed step in the same open turn). `0`
     /// disables it, so every failure ends the turn.
     pub continuations: usize,
-    /// Whole-segment deadline. Harness has no turn deadline at all; this is
-    /// abylab's own bound. Expiry can grant a fresh segment while continuation
-    /// headroom remains; it does not immediately end a long, unfinished turn.
-    pub run_timeout: std::time::Duration,
-    /// Per-tool deadline (a tool that ignores cancellation can exceed it).
+    /// An optional cap on how long one run segment may go **without progress**
+    /// — no bytes from the provider, no request or tool call finishing, no
+    /// committed step — before the failure surfaces. It is a gap between two
+    /// moments of work, never a cap on the segment's total duration.
+    ///
+    /// `None`, the default and what abylab's own front end uses, sets no such
+    /// bound: a run is bounded by its requests (the transport's connect,
+    /// first-byte and stream-idle timeouts), its tool calls (each one's budget)
+    /// and its budgets above, exactly like harness's agent loop, which has no
+    /// deadline over a step. A host that wants a run which stops moving to fail
+    /// on its own sets `Some`.
+    pub run_timeout: Option<std::time::Duration>,
+    /// The backstop for one tool call that declares no budget of its own
+    /// (`Tool::call_budget`): a `bash` call that names its `timeoutMs`, or a
+    /// delegation waiting out a child turn, answers with its own value instead.
+    /// The expiry is answered with a tool result the model can read, so it never
+    /// ends the turn; a tool that ignores cancellation still loses its future
+    /// once this budget and its own cleanup grace run out.
     pub tool_timeout: std::time::Duration,
 }
 
@@ -307,8 +320,10 @@ impl TurnLimits {
             max_requests: 1000,
             max_tool_calls: 1000,
             continuations: 3,
-            // abycore's SDK defaults: ten minutes per segment, one per tool.
-            run_timeout: std::time::Duration::from_secs(600),
+            // No run window: the transport timeouts and each tool's budget are
+            // what bound work, and a minute is the backstop for a tool call that
+            // declares no budget of its own.
+            run_timeout: None,
             tool_timeout: std::time::Duration::from_secs(60),
         }
     }

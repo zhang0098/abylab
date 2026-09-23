@@ -22,7 +22,8 @@ pub struct SearchConfig {
     pub max_uses: u32,
     pub max_results: usize,
     pub max_queries: usize,
-    /// Whole search batch timeout, also bounded by the caller's deadline.
+    /// How long the batch may go without a result before it fails, whichever is
+    /// shorter with the caller's own window.
     pub timeout: Duration,
 }
 
@@ -155,7 +156,11 @@ impl DeepSeekWebSearch {
     pub async fn search(&self, query: &str, options: RequestOptions) -> Result<SearchResult> {
         let context = RequestContext::new(
             options.cancellation,
-            options.timeout.min(self.timeout),
+            Some(
+                options
+                    .timeout
+                    .map_or(self.timeout, |timeout| timeout.min(self.timeout)),
+            ),
             usize::MAX,
             Arc::new(Mutex::new(vec![])),
         )?;
@@ -282,9 +287,14 @@ impl DeepSeekWebSearch {
     ) -> Result<SearchOutput> {
         let mut batch = context.clone();
         batch.cancellation = context.cancellation.child_token();
-        batch.deadline = batch
-            .deadline
-            .min(tokio::time::Instant::now() + self.timeout);
+        // The batch gets its own stall window, at most the caller's: a search
+        // that stops answering fails, without capping how long a large batch may
+        // take while it keeps producing results.
+        batch.window = Some(
+            batch
+                .window
+                .map_or(self.timeout, |window| window.min(self.timeout)),
+        );
         // Dropping the tool also cancels the whole batch; no tasks are detached.
         let _guard = batch.cancellation.clone().drop_guard();
         let mut pending = FuturesUnordered::new();

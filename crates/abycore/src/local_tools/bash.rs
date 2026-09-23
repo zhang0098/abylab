@@ -3,7 +3,7 @@ use super::{
     jobs::Jobs,
     workspace::{ToolResult, Workspace, failed, parse},
 };
-use crate::{Result, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
+use crate::{CallBudget, Result, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -63,6 +63,17 @@ impl BashTool {
         }
         Ok(input)
     }
+
+    /// How long one foreground command may run: the caller's `timeoutMs` when
+    /// it gave one, else the configured `bash_timeout`, both capped by
+    /// `bash_max_timeout`.
+    fn command_timeout(&self, timeout_ms: Option<f64>) -> Duration {
+        let cap = self.workspace.config.bash_max_timeout;
+        timeout_ms
+            .map(|ms| Duration::from_secs_f64((ms / 1000.0).min(cap.as_secs_f64())))
+            .unwrap_or(self.workspace.config.bash_timeout)
+            .min(cap)
+    }
 }
 impl Tool for BashTool {
     fn cleanup_grace(&self) -> Duration {
@@ -71,6 +82,17 @@ impl Tool for BashTool {
             .bash_grace
             .saturating_mul(2)
             .saturating_add(Duration::from_secs(1))
+    }
+    /// The model's `timeoutMs` is this call's budget: the executor's per-call
+    /// backstop must not clip a command the caller deliberately gave more time,
+    /// and the command is killed and reported by this tool, not by the executor.
+    fn call_budget(&self, value: &Value) -> CallBudget {
+        match self.input(value) {
+            Ok(input) => input.timeout_ms.map_or(CallBudget::Backstop, |ms| {
+                CallBudget::Own(self.command_timeout(Some(ms)))
+            }),
+            Err(_) => CallBudget::Backstop,
+        }
     }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -153,12 +175,7 @@ impl Tool for BashTool {
                     Ok(output)
                 } else {
                     let limit = self.workspace.output_limit(&context);
-                    let cap = self.workspace.config.bash_max_timeout;
-                    let timeout = input
-                        .timeout_ms
-                        .map(|ms| Duration::from_secs_f64((ms / 1000.0).min(cap.as_secs_f64())))
-                        .unwrap_or(self.workspace.config.bash_timeout)
-                        .min(cap);
+                    let timeout = self.command_timeout(input.timeout_ms);
                     let spec = Spec {
                         command: input.command,
                         workdir,

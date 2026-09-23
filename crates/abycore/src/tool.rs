@@ -33,6 +33,10 @@ impl ToolDefinition {
 pub struct ToolContext {
     pub call_id: String,
     pub cancellation: CancellationToken,
+    /// When this call's budget runs out. A call with no budget of its own
+    /// ([`CallBudget::Unbounded`]) carries [`NO_DEADLINE`] instead: nothing arms
+    /// that horizon, so a tool reading `remaining()` should treat it as "no
+    /// deadline" rather than a very generous one.
     pub deadline: Instant,
     pub max_output_bytes: usize,
     #[cfg_attr(not(feature = "web-search"), allow(dead_code))]
@@ -40,6 +44,11 @@ pub struct ToolContext {
     pub(crate) local_session: std::sync::Arc<crate::local_tools::LocalSession>,
     pub(crate) parent: Option<std::sync::Arc<crate::subagent::Parent>>,
 }
+
+/// The horizon [`ToolContext::deadline`] carries for a call with no budget: far
+/// beyond any real work, close enough that the timer wheel can represent it
+/// (tokio's ceiling is a little over two years).
+pub const NO_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 impl ToolContext {
     pub fn remaining(&self) -> Duration {
@@ -119,12 +128,38 @@ pub enum ToolError {
 
 pub type ToolFuture<'a> = BoxFuture<'a, std::result::Result<ToolOutput, ToolError>>;
 
+/// How one tool call is bounded, as the tool itself declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallBudget {
+    /// The tool declares nothing: the deployment's backstop applies
+    /// ([`crate::RunOptions::tool_timeout`]).
+    Backstop,
+    /// The tool's own budget for these arguments, the way deepseek-harness's
+    /// `ToolDefinition.timeoutMs` belongs to the tool.
+    Own(Duration),
+    /// No timer at all: the work itself is what bounds the call, because it has
+    /// its own limits (a delegation waits out a child turn that runs under the
+    /// child's budgets). Only cancellation ends it.
+    Unbounded,
+}
+
 /// Validation must check the schema and business rules without side effects.
 /// Execute is never automatically retried. Cancellation drops its future.
 pub trait Tool: Send + Sync {
     /// Extra time for orderly cleanup after the tool's execution deadline.
+    /// Cancellation comes first: the call is asked to stop, then given this long
+    /// to settle, and only a tool that still will not settle is dropped.
     fn cleanup_grace(&self) -> Duration {
         Duration::ZERO
+    }
+    /// What bounds this call. A declaration belongs to the tool — the model's
+    /// `timeoutMs` for `bash`, a delegation that waits as long as its child runs
+    /// — and the executor enforces it by answering the expiry with a tool result
+    /// the model can read, so the turn continues. The backstop applies only to
+    /// calls that declare nothing.
+    fn call_budget(&self, arguments: &Value) -> CallBudget {
+        let _ = arguments;
+        CallBudget::Backstop
     }
     fn definition(&self) -> ToolDefinition;
     fn validate(&self, arguments: &Value) -> std::result::Result<(), ToolError>;

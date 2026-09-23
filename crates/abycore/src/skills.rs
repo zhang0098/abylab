@@ -665,17 +665,13 @@ mod tests {
     /// The tool never touches the context; one bare context serves every call.
     fn tool_context() -> ToolContext {
         let cancellation = CancellationToken::new();
-        let request = RequestContext::new(
-            cancellation.clone(),
-            Duration::from_secs(30),
-            16,
-            Arc::new(Mutex::new(vec![])),
-        )
-        .unwrap();
+        let request =
+            RequestContext::new(cancellation.clone(), None, 16, Arc::new(Mutex::new(vec![])))
+                .unwrap();
         ToolContext {
             call_id: "skill-test".into(),
             cancellation,
-            deadline: request.deadline,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             max_output_bytes: 64 * 1024,
             request,
             local_session: Arc::default(),

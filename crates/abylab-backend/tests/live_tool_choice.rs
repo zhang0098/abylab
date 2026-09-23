@@ -123,7 +123,7 @@ fn which_tools_the_model_reaches_for() {
                     max_requests: 12,
                     max_tool_calls: 24,
                     continuations: 1,
-                    run_timeout: Duration::from_secs(300),
+                    run_timeout: Some(Duration::from_secs(300)),
                     tool_timeout: Duration::from_secs(60),
                 },
                 compaction: None,

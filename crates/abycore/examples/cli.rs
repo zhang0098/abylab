@@ -92,7 +92,7 @@ struct Args {
     permission: PermissionMode,
     show_reasoning: bool,
     color: ColorChoice,
-    run_timeout: Duration,
+    run_timeout: Option<Duration>,
     tool_timeout: Duration,
     max_requests: usize,
 }
@@ -114,7 +114,7 @@ impl Default for Args {
             permission: PermissionMode::WorkspaceWrite,
             show_reasoning: false,
             color: ColorChoice::Auto,
-            run_timeout: Duration::from_secs(600),
+            run_timeout: None,
             tool_timeout: Duration::from_secs(60),
             max_requests: 16,
         }
@@ -142,7 +142,7 @@ abycore CLI 示例 —— 终端里的 DeepSeek agent
       --no-tools              不注册 read/write/edit/bash
       --permission <模式>     read-only | workspace-write | full-access（默认 workspace-write）
       --show-reasoning        把思考增量以暗色写入 stderr
-      --run-timeout <秒>      单个回合总时限（默认 600）
+      --run-timeout <秒>      回合无进展多久算卡住（默认 0 = 不限）
       --tool-timeout <秒>     单个工具时限（默认 60）
       --max-requests <N>      单个回合 HTTP 请求上限（默认 16）
       --color <模式>          auto | always | never（默认 auto，遵循 NO_COLOR）
@@ -229,7 +229,10 @@ abycore CLI 示例 —— 终端里的 DeepSeek agent
                     }
                 }
                 "--show-reasoning" => args.show_reasoning = true,
-                "--run-timeout" => args.run_timeout = seconds(&value(&mut index, &name)?, &name)?,
+                "--run-timeout" => {
+                    let secs = positive(&value(&mut index, &name)?, &name)?;
+                    args.run_timeout = (secs > 0).then(|| Duration::from_secs(secs));
+                }
                 "--tool-timeout" => args.tool_timeout = seconds(&value(&mut index, &name)?, &name)?,
                 "--max-requests" => {
                     args.max_requests = positive_usize(&value(&mut index, &name)?, &name)?
@@ -783,7 +786,9 @@ impl App {
             ErrorKind::RateLimit => "触发限流，SDK 已按退避策略重试",
             ErrorKind::Cancelled => "回合已取消；输入 /continue 继续该回合，或 /new 开始新会话",
             ErrorKind::ContextLimitExceeded => "上下文超出预算，SDK 不会自动压缩；请用 /new",
-            ErrorKind::Timeout => "超过时限；可用 --run-timeout / --tool-timeout 调整",
+            ErrorKind::Timeout => {
+                "请求或工具调用超过自身时限；工具预算可用 --tool-timeout 调整，回合无进展上限用 --run-timeout"
+            }
             ErrorKind::Transport => "网络或代理错误",
             ErrorKind::EmptyResponse => "模型返回空响应，SDK 会在同一回合内重试",
             ErrorKind::Configuration => "配置错误，检查 --base-url 与模型名",

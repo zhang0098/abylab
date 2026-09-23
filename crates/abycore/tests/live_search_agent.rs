@@ -58,7 +58,7 @@ async fn search_tool_and_snapshot_live() {
         .run(
             r#"Call web_search exactly once with {"queries":["DeepSeek official API documentation","DeepSeek Anthropic API compatibility documentation"]}. Then summarize the documentation in at most two sentences with a source link."#,
             RunOptions {
-                timeout: Duration::from_secs(120),
+                timeout: Some(Duration::from_secs(120)),
                 max_requests: 4,
                 max_tool_calls: 1,
                 ..Default::default()
@@ -151,7 +151,7 @@ async fn search_tool_and_snapshot_live() {
     let continued = restored.run(
         "Using only the existing web_search tool result, repeat its first source URL as a markdown link. Copy the URL byte-for-byte, including any query string and fragment; do not clean or normalize it. Do not search again or call any tools. Return only that markdown link.",
         RunOptions {
-            timeout: Duration::from_secs(60),
+            timeout: Some(Duration::from_secs(60)),
             max_requests: 1,
             max_tool_calls: 1,
             ..Default::default()

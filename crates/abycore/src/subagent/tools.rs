@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
+use crate::{CallBudget, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
 use serde_json::{Value, json};
 use std::sync::Weak;
 
@@ -62,6 +62,17 @@ fn failed(error: Error) -> ToolError {
 }
 
 impl Tool for DelegationTool {
+    /// Waiting on a child has no timer: the child's turn is what ends it, and
+    /// the child runs under its own request, tool and budget limits. A minute —
+    /// the deployment's backstop for a call that declares nothing — would cut off
+    /// most of the work the child was asked to do. The child keeps running after
+    /// a cancelled wait; `interrupt_agent` is the only thing that stops it.
+    fn call_budget(&self, _: &Value) -> CallBudget {
+        match self.name {
+            "subagent" | "subagent_fork" | "wait_agent" => CallBudget::Unbounded,
+            _ => CallBudget::Backstop,
+        }
+    }
     fn definition(&self) -> ToolDefinition {
         let (description, properties, required) = match self.name {
             "subagent" | "subagent_fork" => (
@@ -93,7 +104,7 @@ impl Tool for DelegationTool {
                 json!(["agent_id"]),
             ),
             _ => (
-                "Wait for your direct child's current turn and return its final answer and stop reason. This wait follows the calling tool's deadline; cancelling the wait does not stop background work.",
+                "Wait for your direct child's current turn and return its final answer and stop reason. The wait lasts as long as the child's turn does; cancelling the wait does not stop background work.",
                 json!({"agent_id":{"type":"string","minLength":1}}),
                 json!(["agent_id"]),
             ),

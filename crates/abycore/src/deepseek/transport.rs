@@ -204,8 +204,14 @@ impl Transport {
             let result = context
                 .timed(self.config.first_byte_timeout, request.send())
                 .await;
+            // Any answer — success or provider error — is the run moving.
+            if matches!(result, Ok(Ok(_))) {
+                context.touch();
+            }
             let error = match result {
-                Ok(Ok(response)) if response.status().is_success() => return Ok((response, index)),
+                Ok(Ok(response)) if response.status().is_success() => {
+                    return Ok((response, index));
+                }
                 Ok(Ok(response)) => self.http_error(response, context).await,
                 Ok(Err(error)) => Error::new(
                     if error.is_timeout() {
@@ -238,11 +244,12 @@ impl Transport {
             let delay = error
                 .retry_after
                 .map_or(jitter, |minimum| minimum.max(jitter));
+            // Waiting longer than a whole window cannot help — the run has to
+            // move within one — and a run that has already gone quiet belongs to
+            // the host's continuation, not to another silent attempt here.
             if delay > self.config.retry.max_delay
-                || delay
-                    >= context
-                        .deadline
-                        .saturating_duration_since(tokio::time::Instant::now())
+                || context.window().is_some_and(|window| delay >= window)
+                || context.stalled()
             {
                 return Err(error);
             }
@@ -264,6 +271,8 @@ impl Transport {
         {
             let chunk =
                 chunk.map_err(|_| Error::new(ErrorKind::Transport, "HTTP body interrupted"))?;
+            // Bytes on the wire are progress, however slowly they arrive.
+            context.touch();
             if chunk.len() > self.config.max_response_bytes.saturating_sub(bytes.len()) {
                 return Err(Error::protocol("response size limit exceeded"));
             }

@@ -503,6 +503,13 @@ pub struct Scenario {
 #[derive(Clone, Debug)]
 pub enum Step {
     Prompt(String),
+    /// Send `text`, then Esc once `marker` shows up among the events; the step is
+    /// done when the turn ends. The marker keeps the interrupt timed to a known
+    /// point inside the turn instead of a guess.
+    Interrupted {
+        text: String,
+        marker: String,
+    },
     Compact,
     /// `/goal <arg>`: the driver settles the whole goal run before the next step.
     Goal(String),
@@ -555,6 +562,16 @@ impl Scenario {
     /// `/goal <arg>` as one scripted step.
     pub fn goal(mut self, arg: impl Into<String>) -> Self {
         self.steps.push(Step::Goal(arg.into()));
+        self
+    }
+
+    /// Send `text` and Esc as soon as `marker` appears in the event stream
+    /// (e.g. `tool-started:call-1`).
+    pub fn interrupted(mut self, text: impl Into<String>, marker: impl Into<String>) -> Self {
+        self.steps.push(Step::Interrupted {
+            text: text.into(),
+            marker: marker.into(),
+        });
         self
     }
 
@@ -628,6 +645,36 @@ pub fn drive(scenario: Scenario) -> Run {
                         .filter(|event| event.starts_with("turn-end:"))
                         .count()
                         >= expected
+                });
+            }
+            Step::Interrupted { text, marker } => {
+                handle.send(Cmd::Prompt { text: text.clone() });
+                // `file:<name>` waits for a workspace side effect instead of an
+                // event: a tool that has already written something is
+                // unambiguously mid-execution, while "started" is not.
+                if let Some(name) = marker.strip_prefix("file:") {
+                    let path = workspace.join(name);
+                    wait_until(deadline, &format!("{name} to appear"), || path.exists());
+                } else {
+                    wait_for(&events, deadline, "the interrupt marker", |events| {
+                        events
+                            .iter()
+                            .any(|event| event.starts_with(marker.as_str()))
+                    });
+                }
+                let ended = events
+                    .lock()
+                    .expect("event lock")
+                    .iter()
+                    .filter(|event| event.starts_with("turn-end:"))
+                    .count();
+                handle.interrupt();
+                wait_for(&events, deadline, "the interrupted turn", |events| {
+                    events
+                        .iter()
+                        .filter(|event| event.starts_with("turn-end:"))
+                        .count()
+                        > ended
                 });
             }
             Step::Compact => {
@@ -705,6 +752,17 @@ fn wait_for(events: &Captured, deadline: Instant, what: &str, ready: impl Fn(&[S
             "{what} never settled: {:?}",
             events.lock().expect("event lock")
         );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Poll a condition that is not an event (a file a tool has to write first).
+fn wait_until(deadline: Instant, what: &str, ready: impl Fn() -> bool) {
+    loop {
+        if ready() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what} never happened");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
