@@ -266,6 +266,63 @@ for the turn in flight to end) or `Steering` (the running turn already has it).
   they ship in FIFO order after it. A missing, malformed or differently shaped
   file is just an empty queue, exactly like `settings.json`.
 
+## Reset (`/reset`)
+
+`/reset` (TUI) and `abylab --reset` (shell) are two doors into the same move:
+delete what *this program* saved under `$ABYLAB_HOME`, and nothing else. Both
+share `reset::scan` / `reset::wipe`; only the confirmation follows each
+surface's own conventions.
+
+- **The list is a whitelist, not a directory scan**: `settings.json`,
+  `abylab-modes.json`, `.credentials.yaml`, `sessions/`, `queued/`, plus the
+  session store `--session-root` points at when it lies inside the home (the
+  default `sessions/` is one of them; entries are deduped by path). Anything
+  else in the home is not on it — and two cases are named as kept instead of
+  silently skipped: a hand-written `AGENTS.md` (the workspace instructions
+  abycore reads out of the home, which belongs to the user) and a session store
+  `--session-root` put outside the home (the command cleans ABYHOME). The home
+  itself is never a target, not even when someone points `--session-root` at
+  it — that path is reported as kept, with the reason.
+- **Measure first, then execute that list**: `scan` counts files and bytes with
+  `lstat` (a symlink counts as the link itself, which is what `remove_dir_all`
+  will unlink; one entry walks at most `MAX_WALK` files and then reads `N+`, so
+  a directory someone filled by hand cannot stall the dialog). The dialog and
+  the CLI print exactly that measurement and `wipe` deletes exactly it — what
+  was shown is what goes. A path that refuses to go is reported per path; one
+  that vanished since the scan is not a failure.
+- **Two confirmations**: in the TUI the first Enter only arms the card (the
+  border turns warn and the title changes its wording) and the second one
+  deletes; any other key in between, a scroll included, takes the arm back, so
+  the press that deletes is always one the user meant. The CLI asks `[y/N]` on
+  `/dev/tty` (never on stdin, which may be carrying something else), `--yes` is
+  the explicit way to skip it, and no terminal to ask on is an error — never a
+  silent yes.
+- **After the wipe**: a key that came from `/login` stops being used (the
+  `/login`/`/logout` rule; a `--api-key` override is not saved data and keeps
+  running). The app then sends `Cmd::NewSession`: the current session's log was
+  just deleted, its old writer would keep appending to an unlinked inode, and
+  an anchor rewrite would fail on the missing directory — a fresh session is
+  the clean end (the driver recreates its directory on demand, and the new log
+  still lands at its first checkpoint). The model, effort and permission preset
+  stay live for this run — they belong to the process, not to the files — and
+  the next launch reads the defaults, which is where "back to the initial
+  state" actually lands.
+- **The report is written on the far side of the switch**: binding a session
+  clears the timeline (`reset_session_ui`), so the numbers — and the `/login`
+  card a keyless run needs — are held in `App::pending_reset` and written by
+  `App::flush_reset_report` on `SessionBound` (or on `SessionSwitchFailed`,
+  where the old session stays on screen and the report lands there beside the
+  failure). A tip says a session is being bound while the switch is in flight.
+- **One extra line on the CLI side**: when another abylab is running, the plan
+  says to quit it first — it writes `settings.json` back on its next preference
+  change, and an in-app `/reset` cannot see other processes.
+
+In the TUI, `/reset` also requires an idle session (`RunState::Idle`, with no
+first prompt handed over but not yet at the ACP request) and refuses while a
+session switch is on the wire: the driver reads commands between turns, so a
+switch asked for mid-turn waits for that turn, while the turn keeps
+checkpointing into the log that was just deleted.
+
 ## Packaging and releases
 
 Linux ships one kind of asset: a single musl static binary per architecture

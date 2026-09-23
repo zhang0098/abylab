@@ -5,10 +5,47 @@
 What each abylab release changed, from the user's side. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/). Internals (workspace instructions,
-context compaction, session persistence, goal rounds) live in
+context compaction, session persistence, goal rounds, reset) live in
 [TECH.en.md](TECH.en.md); day-to-day usage is in [README.en.md](README.en.md).
 
 ## [Unreleased]
+
+### Added
+
+- `/reset` puts ABYHOME back to its just-installed state: it deletes everything
+  this program saved under `$ABYLAB_HOME` — `settings.json` (language, model,
+  effort, permission preset, appearance), `abylab-modes.json` (the per-workspace
+  mode cache), `.credentials.yaml` (the key `/login` stored), `sessions/` (the
+  session logs) and `queued/` (prompts that were waiting) — and starts a new
+  session, so the timeline begins blank and the next launch reads defaults.
+  Nothing goes before the card has listed every entry with its size, and it
+  takes two Enters: the first only asks again (the border turns warn and the
+  title says so), and any other key in between — a scroll included — takes the
+  question back, so the press that deletes is always the one you meant. The
+  report names the entry, file and byte counts; what the command does not own is
+  listed as kept instead: a hand-written `~/.abylab/AGENTS.md` (your file —
+  abylab only reads it), and a session store `--session-root` put outside the
+  aby home (the command cleans the home, and leaves that one alone).
+- The same thing from a shell is `abylab --reset`: it prints the plan line by
+  line (each `remove` and `keep` row with its size and file count), then asks
+  `[y/N]` on the terminal — never on stdin, which may be carrying something
+  else — and refuses to run at all when there is no terminal to ask on, so
+  saying yes takes an explicit `--yes`. The wipe reports per path and exits
+  non-zero if anything refused to go. The flag never opens the UI and ignores
+  the other launch options: only `--session-root` matters, because it names the
+  store being checked. Another abylab still running is called out in the plan —
+  it writes its settings and session log back, so quit it first.
+- `/reset` only runs on an idle session: the driver reads its command channel
+  between turns, so a switch asked for mid-turn would land at the turn's end
+  while that turn kept checkpointing into the log that was just deleted (an
+  anchor rewrite even fails when the directory is gone) — interrupt with `esc`
+  first. Three things follow the wipe on the spot: a key that came from
+  `/login` stops being used (the `/logout` rule — a `--api-key` override is not
+  saved data and keeps running), the UI binds a fresh session (its log is the
+  one that just went), and no key left brings the first-launch `/login` card
+  back. The model, effort and permission preset stay live for this run — they
+  belong to the process, not to the files — and the defaults take over on the
+  next launch.
 
 ## [0.1.12] - 2026-09-23
 

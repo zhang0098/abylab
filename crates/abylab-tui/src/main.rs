@@ -13,6 +13,7 @@ mod input;
 mod locale;
 mod markdown;
 mod pet;
+mod reset;
 mod runtime;
 mod slots;
 mod theme;
@@ -20,6 +21,7 @@ mod transcript;
 mod ui;
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -57,6 +59,12 @@ OPTIONS:
       --api-key <key>       override the agent API key for this run
                             (/login persists one instead)
       --theme <dark|light>  DeepSeek Web UI palette (default: persisted, else dark)
+      --reset               delete everything abylab saved under $ABYLAB_HOME
+                            (settings, stored key, session logs, queued prompts)
+                            and exit; lists what goes and asks on the terminal
+                            first. Other launch options are ignored, except
+                            --session-root, which names the store it checks
+      --yes                 with --reset: do not ask
   -V, --version             print version
   -h, --help                this help
 ";
@@ -70,6 +78,10 @@ struct Args {
     api_key: Option<String>,
     /// `--theme` override; absent falls back to the persisted appearance.
     theme: Option<String>,
+    /// `--reset`: wipe the saved state under the aby home and exit.
+    reset: bool,
+    /// `--yes`: skip `--reset`'s terminal prompt.
+    yes: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -85,6 +97,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
         base_url: None,
         api_key: None,
         theme: None,
+        reset: false,
+        yes: false,
     };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -99,6 +113,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--base-url" => args_out.base_url = Some(take("--base-url")?),
             "--api-key" => args_out.api_key = Some(take("--api-key")?),
             "--theme" => args_out.theme = Some(take("--theme")?),
+            "--reset" => args_out.reset = true,
+            "--yes" => args_out.yes = true,
             "-V" | "--version" => {
                 println!("abylab {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -109,6 +125,9 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             }
             other => bail!("unknown argument {other} (see --help)"),
         }
+    }
+    if args_out.yes && !args_out.reset {
+        bail!("--yes only means something with --reset (see --help)");
     }
     Ok(args_out)
 }
@@ -154,6 +173,143 @@ fn build_config(args: &Args) -> Result<RuntimeConfig> {
         api_key,
         key_origin,
     })
+}
+
+/// `abylab --reset`: the CLI side of `/reset`, for a shell that never opened
+/// the TUI (a script, an upgrade, a machine being handed on).
+///
+/// It lists what it would remove — the plan is the prompt — and removes
+/// nothing before a "y" at the terminal, unless `--yes` says the caller
+/// already asked (uninstall.sh's shape, for the same reason). The report is
+/// English, like every other line this binary prints before the TUI starts.
+fn run_reset(args: &Args, home: &Path) -> Result<()> {
+    let sessions_root = args
+        .sessions_root
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_sessions_root);
+    let plan = reset::scan(home, &sessions_root);
+    print!("{}", reset_plan_text(&plan));
+    if plan.is_empty() {
+        println!(
+            "\nnothing to remove — {} holds nothing this program saved\n",
+            home.display()
+        );
+        return Ok(());
+    }
+    if !args.yes && !confirm_on_terminal(home)? {
+        println!("\nnothing removed\n");
+        return Ok(());
+    }
+    let outcome = reset::wipe(&plan);
+    print!("{}", reset_outcome_text(&outcome));
+    if outcome.failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "reset did not finish — {} path(s) could not be removed (see above)",
+        outcome.failures.len()
+    );
+}
+
+/// The plan as the terminal reads it: one `remove` row per entry with what is
+/// inside, then the paths this command does *not* own. Anything not listed
+/// here is not touched either — the list is the contract.
+fn reset_plan_text(plan: &reset::ResetPlan) -> String {
+    use crate::reset::{human_bytes, human_files};
+
+    let mut out = format!(
+        "abylab reset — everything this program saved under {}\n\n",
+        plan.home.display()
+    );
+    for item in &plan.items {
+        let files = human_files(item.files, item.truncated);
+        let plural = if item.files == 1 { "file" } else { "files" };
+        out.push_str(&format!(
+            "  remove  {}  ({} · {files} {plural} · {})\n",
+            item.path.display(),
+            item.what.label(crate::locale::Locale::En),
+            human_bytes(item.bytes),
+        ));
+    }
+    for keep in &plan.kept {
+        out.push_str(&format!(
+            "  keep    {}  ({})\n",
+            keep.path.display(),
+            keep.why.note(crate::locale::Locale::En),
+        ));
+    }
+    if !plan.is_empty() && other_instance_running() {
+        out.push_str(
+            "  note    another abylab is running — quit it first, or it writes its\n\
+             \x20         settings and session log back after this\n",
+        );
+    }
+    out
+}
+
+/// What the wipe did, with every path that refused to go named on its own
+/// line: a partial reset is reported, never rounded up to a success.
+fn reset_outcome_text(outcome: &reset::ResetOutcome) -> String {
+    let plural =
+        |count: u64, one: &str, many: &str| if count == 1 { one } else { many }.to_string();
+    let mut out = format!(
+        "\nremoved {} {} — {} {} · {}\n",
+        outcome.removed,
+        plural(outcome.removed as u64, "entry", "entries"),
+        outcome.files,
+        plural(outcome.files, "file", "files"),
+        reset::human_bytes(outcome.bytes),
+    );
+    for (path, reason) in &outcome.failures {
+        out.push_str(&format!(
+            "warning could not remove {} ({reason})\n",
+            path.display()
+        ));
+    }
+    out
+}
+
+/// Ask on the terminal (not stdin: a caller may pipe something into abylab,
+/// and the prompt must not eat it). No terminal to ask on is an error, not a
+/// silent "yes".
+fn confirm_on_terminal(home: &Path) -> Result<bool> {
+    let reader: Box<dyn std::io::BufRead> = match std::fs::File::open("/dev/tty") {
+        Ok(tty) => Box::new(std::io::BufReader::new(tty)),
+        Err(error) if cfg!(unix) => bail!(
+            "there is no terminal to ask on ({error}) — re-run with --yes if {} should \
+             be emptied without a prompt",
+            home.display()
+        ),
+        Err(_) => Box::new(std::io::BufReader::new(std::io::stdin())),
+    };
+    eprint!("\nRemove everything above? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    let mut reader = reader;
+    reader.read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Another abylab on this machine holds the home open and writes to it again
+/// on its next preference change; the removal would half-undo itself. Best
+/// effort: `pgrep` absent (or another process error) simply means no note.
+fn other_instance_running() -> bool {
+    let Ok(output) = std::process::Command::new("pgrep")
+        .arg("-x")
+        .arg("abylab")
+        .output()
+    else {
+        return false;
+    };
+    let me = std::process::id();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .any(|pid| pid != me)
 }
 
 /// Resolve the per-turn limits: environment > abylab default.
@@ -307,6 +463,13 @@ fn main() -> Result<()> {
     }
 
     let args = parse_args()?;
+
+    // `--reset` never reaches the screen: it lists what it would delete, takes
+    // the answer on the terminal and exits (the TUI's `/reset` does the same
+    // inside the app).
+    if args.reset {
+        return run_reset(&args, &aby_home());
+    }
 
     let cfg = build_config(&args)?;
     let limits = resolve_limits()?;
@@ -656,6 +819,126 @@ mod cli_args_tests {
         let err = compaction_policy(1000, 0.5, 0.8, 4096)
             .expect_err("retention must stay below the threshold");
         assert!(err.to_string().contains("ABY_KEEP_RECENT"), "{err:#}");
+    }
+
+    /// `--reset` is a mode of its own, `--yes` only belongs to it, and the
+    /// help names both (the only place a user learns the flag exists).
+    #[test]
+    fn reset_flags_parse_and_only_pair_with_each_other() {
+        assert!(HELP.contains("--reset") && HELP.contains("--yes"), "{HELP}");
+        let args = parse_args_from(["--reset".into()]).expect("--reset parses");
+        assert!(args.reset && !args.yes, "the prompt is the default");
+        let args = parse_args_from(["--reset".into(), "--yes".into()]).expect("both parse");
+        assert!(args.reset && args.yes);
+        let args = parse_args_from([
+            "--reset".into(),
+            "--session-root".into(),
+            "/srv/store".into(),
+        ])
+        .expect("the store can be named");
+        assert_eq!(args.sessions_root.as_deref(), Some("/srv/store"));
+        // `--yes` alone is a typo, not a mode: it must not read as a launch.
+        let err = match parse_args_from(["--yes".into()]) {
+            Ok(_) => panic!("--yes without --reset must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--yes"), "{err:#}");
+    }
+
+    /// The plan reads as a contract: one `remove` row per entry with what is
+    /// inside, then the paths this command does not own.
+    #[test]
+    fn the_cli_plan_names_what_goes_and_what_stays() {
+        let home = reset_home("plan");
+        let plan = reset::scan(&home, &home.join("sessions"));
+        let text = reset_plan_text(&plan);
+        assert!(
+            text.contains(&format!("under {}", home.display())),
+            "the home is named: {text}"
+        );
+        assert!(
+            text.contains("remove") && text.contains("settings.json"),
+            "{text}"
+        );
+        assert!(
+            text.contains("settings · 1 file · 17 B"),
+            "the size is part of the prompt: {text}"
+        );
+        assert!(
+            text.contains("keep") && text.contains("AGENTS.md"),
+            "the hand-written file is reported: {text}"
+        );
+
+        // An outside store is reported as kept instead of removed.
+        let outside = std::env::temp_dir().join(format!("aby-cli-store-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&outside);
+        let text = reset_plan_text(&reset::scan(&home, &outside));
+        assert!(text.contains(&outside.display().to_string()), "{text}");
+        assert!(
+            text.contains("session store outside the aby home"),
+            "{text}"
+        );
+
+        // A partial wipe is reported per path, never rounded up.
+        let outcome = reset::ResetOutcome {
+            removed: 1,
+            files: 1,
+            bytes: 27,
+            failures: vec![(
+                home.join("sessions"),
+                "Permission denied (os error 13)".into(),
+            )],
+        };
+        let text = reset_outcome_text(&outcome);
+        assert!(text.contains("removed 1 entry — 1 file · 27 B"), "{text}");
+        assert!(text.contains("could not remove"), "{text}");
+        assert!(text.contains("Permission denied"), "{text}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// `--yes` is the scripted path: no terminal, no question, and every entry
+    /// the plan listed is gone while the rest of the home stays.
+    #[test]
+    fn a_yes_reset_wipes_without_a_terminal() {
+        let home = reset_home("yes");
+        let mut args = parse_args_from(["--reset".into(), "--yes".into()]).expect("args");
+        args.sessions_root = Some(home.join("sessions").to_string_lossy().into_owned());
+        run_reset(&args, &home).expect("--yes does not ask");
+        for name in [
+            "settings.json",
+            "abylab-modes.json",
+            ".credentials.yaml",
+            "sessions",
+            "queued",
+        ] {
+            assert!(!home.join(name).exists(), "{name} should be gone");
+        }
+        assert!(home.join("AGENTS.md").exists(), "the home's own file stays");
+        assert!(home.exists(), "the home itself stays");
+
+        // A second run has nothing to do and still exits clean.
+        run_reset(&args, &home).expect("an empty home is not an error");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A home with every entry this program owns, plus one file it does not.
+    fn reset_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "aby-cli-reset-{tag}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("sessions/ws-abc/aby-1")).expect("home");
+        std::fs::write(home.join("settings.json"), "{\"language\":\"en\"}").expect("settings");
+        std::fs::write(home.join("abylab-modes.json"), "{}").expect("modes");
+        std::fs::write(home.join(".credentials.yaml"), "version: 1\n").expect("key");
+        std::fs::write(home.join("sessions/ws-abc/aby-1/session.jsonl"), "log").expect("log");
+        std::fs::write(home.join("AGENTS.md"), "be terse").expect("instructions");
+        home
     }
 
     /// The harness analogy: its agent loop has no turn budget, and the caps it
