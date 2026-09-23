@@ -46,6 +46,9 @@ ctrl+z 撤销 · ctrl+p 模型 · ctrl+t 主题 · shift+tab 权限预设
 `ctrl+enter` 把这条插话进正在跑的轮次 · `ctrl+d` 删除（同一行按两次）。
 完整映射见 TUI 里的 `/keys`。
 
+任务执行中，abylab 可以弹出问题并等待你的回答。问题可以是是/否、多个选项的单选或多选，
+也可以直接输入文字；用 `↑/↓` 选择、空格切换多选、`enter` 提交、`esc` 取消。
+
 ## 许可与致谢
 
 版权与许可：[MIT License](LICENSE)（© 2025 zhang@qimiao.org）。

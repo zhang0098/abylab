@@ -591,6 +591,16 @@ pub struct PermissionAskOverlay {
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<PermissionAskReply>>,
 }
 
+/// The answer is sent exactly once; dropping the overlay cancels the ask.
+pub struct UserQuestionOverlay {
+    pub question: abylab_backend::UserQuestion,
+    pub sel: usize,
+    pub selected: Vec<bool>,
+    pub custom: String,
+    pub(crate) reply:
+        Option<tokio::sync::oneshot::Sender<Option<abylab_backend::UserQuestionReply>>>,
+}
+
 impl Drop for PermissionAskOverlay {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
@@ -692,6 +702,7 @@ pub struct App {
     file_menu_dismissed: Option<String>,
     /// ACP tool permission ask (separate from `/permission` session modes).
     pub permission_ask: Option<PermissionAskOverlay>,
+    pub user_question: Option<UserQuestionOverlay>,
     /// Read-only modal rendered from a semantic TuiNode tree. Builtin chrome
     /// such as `/keys` uses this surface.
     pub view_overlay: Option<ViewOverlay>,
@@ -1142,6 +1153,7 @@ impl App {
             file_menu: None,
             file_menu_dismissed: None,
             permission_ask: None,
+            user_question: None,
             view_overlay: None,
             pending_images: crate::attachments::Staged::default(),
             att_chips: Vec::new(),
@@ -1981,6 +1993,19 @@ impl App {
             } => {
                 self.open_permission_ask(title, options, reply);
             }
+            AppEvent::UserQuestion { question, reply } => {
+                if reply.is_closed() {
+                    return;
+                }
+                self.user_question = Some(UserQuestionOverlay {
+                    selected: vec![false; question.options.len()],
+                    sel: 0,
+                    custom: String::new(),
+                    question,
+                    reply: Some(reply),
+                });
+                self.needs_redraw = true;
+            }
         }
     }
 
@@ -2111,6 +2136,7 @@ impl App {
                     self.prompt_pending = false;
                     self.run_started = None;
                     self.state_note.clear();
+                    self.user_question = None;
                 }
             }
         }
@@ -2130,6 +2156,17 @@ impl App {
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Resize(..) => self.needs_redraw = true,
             Event::Paste(text) => {
+                if let Some(ask) = self.user_question.as_mut() {
+                    ask.sel = ask.question.options.len();
+                    for ch in text.chars().filter(|ch| *ch != '\r' && *ch != '\n') {
+                        if ask.custom.chars().count() >= 2000 {
+                            break;
+                        }
+                        ask.custom.push(ch);
+                    }
+                    self.needs_redraw = true;
+                    return;
+                }
                 if let Some(keys) = decode_leaked_csi_u_keys(&text) {
                     for key in keys {
                         if key.kind != KeyEventKind::Release {
@@ -2439,6 +2476,7 @@ impl App {
         self.todo_dialog.is_some()
             || self.view_overlay.is_some()
             || self.permission_ask.is_some()
+            || self.user_question.is_some()
             || self.picker.is_some()
     }
 
@@ -3104,6 +3142,10 @@ impl App {
             self.handle_permission_ask_key(key);
             return;
         }
+        if self.user_question.is_some() {
+            self.handle_user_question_key(key);
+            return;
+        }
 
         if self.todo_dialog.is_some() {
             self.handle_todo_dialog_key(key);
@@ -3662,6 +3704,76 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_user_question_key(&mut self, key: KeyEvent) {
+        let Some(ask) = self.user_question.as_mut() else {
+            return;
+        };
+        let count = ask.question.options.len();
+        match key.code {
+            KeyCode::Esc => self.finish_user_question(None),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.finish_user_question(None);
+            }
+            KeyCode::Up => ask.sel = ask.sel.checked_sub(1).unwrap_or(count),
+            KeyCode::Down => ask.sel = (ask.sel + 1) % (count + 1),
+            KeyCode::Char(' ') if ask.question.multi_select && ask.sel < count => {
+                ask.selected[ask.sel] = !ask.selected[ask.sel];
+            }
+            KeyCode::Backspace if ask.sel == count => {
+                ask.custom.pop();
+            }
+            KeyCode::Enter => {
+                let selected: Vec<String> = if ask.question.multi_select {
+                    let mut labels: Vec<String> = ask
+                        .question
+                        .options
+                        .iter()
+                        .zip(&ask.selected)
+                        .filter(|(_, selected)| **selected)
+                        .map(|(option, _)| option.label.clone())
+                        .collect();
+                    if labels.is_empty() && ask.sel < count {
+                        labels.push(ask.question.options[ask.sel].label.clone());
+                    }
+                    labels
+                } else if ask.sel < count {
+                    vec![ask.question.options[ask.sel].label.clone()]
+                } else {
+                    Vec::new()
+                };
+                let custom = (ask.sel == count && !ask.custom.trim().is_empty())
+                    .then(|| ask.custom.trim().to_string());
+                if selected.is_empty() && custom.is_none() {
+                    return;
+                }
+                self.finish_user_question(Some(abylab_backend::UserQuestionReply {
+                    selected,
+                    custom,
+                }));
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                ask.sel = count;
+                if ask.custom.chars().count() < 2000 {
+                    ask.custom.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_user_question(&mut self, answer: Option<abylab_backend::UserQuestionReply>) {
+        if let Some(mut ask) = self.user_question.take() {
+            if let Some(reply) = ask.reply.take() {
+                let _ = reply.send(answer);
+            }
+        }
+        self.needs_redraw = true;
     }
 
     fn open_permission_ask(
@@ -9390,6 +9502,100 @@ mod mode_tests {
                 name: "Allow once".into(),
             },
         ]
+    }
+
+    fn user_question(options: &[&str], multi_select: bool) -> abylab_backend::UserQuestion {
+        abylab_backend::UserQuestion {
+            id: "choice".into(),
+            question: "What should I do?".into(),
+            header: Some("Choose".into()),
+            options: options
+                .iter()
+                .map(|label| abylab_backend::UserQuestionOption {
+                    label: (*label).into(),
+                    description: None,
+                })
+                .collect(),
+            multi_select,
+        }
+    }
+
+    #[test]
+    fn task_question_answers_yes_no_and_multi_select() {
+        let (mut app, ctl, _rx) = test_app();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&["Yes", "No"], false),
+                reply: tx,
+            },
+            &ctl,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap().selected, ["No"]);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&["A", "B"], true),
+                reply: tx,
+            },
+            &ctl,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap().selected, ["A", "B"]);
+    }
+
+    #[test]
+    fn task_question_accepts_text_and_cancel() {
+        let (mut app, ctl, _rx) = test_app();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&[], false),
+                reply: tx,
+            },
+            &ctl,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('好'), KeyModifiers::NONE), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(
+            rx.blocking_recv().unwrap().unwrap().custom.as_deref(),
+            Some("好")
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&["Yes", "No"], false),
+                reply: tx,
+            },
+            &ctl,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert_eq!(rx.blocking_recv().unwrap(), None);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&["Yes", "No"], false),
+                reply: tx,
+            },
+            &ctl,
+        );
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: app.session_id.clone(),
+                running: false,
+            }),
+            &ctl,
+        );
+        assert!(app.user_question.is_none());
+        assert!(rx.blocking_recv().is_err());
     }
 
     #[test]

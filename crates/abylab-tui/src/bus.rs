@@ -23,6 +23,11 @@ pub enum AppEvent {
         options: Vec<PermissionAskOption>,
         reply: tokio::sync::oneshot::Sender<PermissionAskReply>,
     },
+    /// A model-requested task question, answered without leaving the turn.
+    UserQuestion {
+        question: abylab_backend::UserQuestion,
+        reply: tokio::sync::oneshot::Sender<Option<abylab_backend::UserQuestionReply>>,
+    },
 }
 
 /// One option from `session/request_permission` — re-exported from the

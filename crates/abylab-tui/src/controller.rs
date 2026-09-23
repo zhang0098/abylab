@@ -320,6 +320,9 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
             options,
             reply,
         }],
+        abylab_backend::Event::UserQuestion { question, reply } => {
+            vec![AppEvent::UserQuestion { question, reply }]
+        }
     }
 }
 

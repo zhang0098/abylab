@@ -10,6 +10,10 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Added
+
+- `ask_user_question` lets the agent pause during a task for a Yes/No choice, a single or multiple selection, or a written answer. The same turn continues after the answer; `esc` cancels the question.
+
 ## [0.1.13] - 2026-09-23
 
 ### Added

@@ -183,6 +183,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_view_overlay(f, app, cards);
     draw_todo_dialog(f, app, cards);
     draw_permission_ask(f, app, cards);
+    draw_user_question(f, app, cards);
 }
 
 /// Outer breathing room for the modal cards (pickers, `/keys`, `/help`, the
@@ -2017,6 +2018,149 @@ fn draw_permission_ask(f: &mut Frame, app: &App, screen: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_user_question(f: &mut Frame, app: &App, screen: Rect) {
+    let Some(ask) = &app.user_question else {
+        return;
+    };
+    let theme = app.theme;
+    let screen = dialog_area(screen);
+    let w = screen
+        .width
+        .saturating_sub(2)
+        .min(76)
+        .max(DIALOG_MIN_W.min(screen.width));
+    let text_w = w.saturating_sub(4).max(4) as usize;
+    let mut lines = Vec::new();
+    for text in wrap(&ask.question.question, text_w).into_iter().take(4) {
+        lines.push(Line::styled(text, Style::default().fg(theme.fg)));
+    }
+    lines.push(Line::raw(""));
+    let mut selected_row = lines.len();
+    for (index, option) in ask.question.options.iter().enumerate() {
+        if ask.sel == index {
+            selected_row = lines.len();
+        }
+        let cursor = if ask.sel == index { "▸" } else { " " };
+        let check = if ask.question.multi_select {
+            if ask.selected[index] {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+        } else {
+            "   "
+        };
+        let label = format!("{cursor} {check} {}", option.label);
+        let label = wrap(&label, text_w).into_iter().next().unwrap_or_default();
+        lines.push(Line::styled(
+            label,
+            Style::default()
+                .fg(if ask.sel == index {
+                    theme.brand
+                } else {
+                    theme.fg_secondary
+                })
+                .add_modifier(if ask.sel == index {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+        if let Some(description) = &option.description {
+            let description = wrap(&format!("      {description}"), text_w)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            lines.push(Line::styled(
+                description,
+                Style::default().fg(theme.caption),
+            ));
+        }
+    }
+    if ask.sel == ask.question.options.len() {
+        selected_row = lines.len();
+    }
+    let other = app.locale.tr("Other: ", "其他：");
+    let custom = if ask.custom.is_empty() {
+        app.locale.tr("type an answer", "输入回答").to_string()
+    } else {
+        ask.custom.clone()
+    };
+    let custom = wrap(
+        &format!(
+            "{} {other}{custom}",
+            if ask.sel == ask.question.options.len() {
+                "▸"
+            } else {
+                " "
+            }
+        ),
+        text_w,
+    )
+    .into_iter()
+    .last()
+    .unwrap_or_default();
+    lines.push(Line::styled(
+        custom,
+        Style::default().fg(if ask.sel == ask.question.options.len() {
+            theme.brand
+        } else {
+            theme.fg_secondary
+        }),
+    ));
+    lines.push(Line::styled(
+        app.locale.tr(
+            "↑/↓ choose · space toggle · enter answer · esc cancel",
+            "↑/↓ 选择 · 空格切换 · enter 回答 · esc 取消",
+        ),
+        Style::default().fg(theme.caption),
+    ));
+    let h = (lines.len() as u16 + 2)
+        .min(screen.height)
+        .max(DIALOG_MIN_H.min(screen.height));
+    let x = screen.x + (screen.width.saturating_sub(w)) / 2;
+    let y = screen.y + (screen.height.saturating_sub(h)) / 3;
+    let area = Rect::new(x, y, w, h);
+    let visible = h.saturating_sub(2) as usize;
+    let start = selected_row
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(lines.len().saturating_sub(visible));
+    let header = ask
+        .question
+        .header
+        .as_deref()
+        .unwrap_or_else(|| app.locale.tr(" question ", " 提问 "));
+    let title = wrap(
+        &format!("{header} · {}", ask.question.question),
+        w.saturating_sub(4) as usize,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.brand))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(theme.caption),
+        ))
+        .style(Style::default().bg(theme.panel));
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(start)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        )
+        .block(block),
+        area,
+    );
+}
+
 fn shorten_home(path: &str) -> String {
     match std::env::var("HOME") {
         Ok(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
@@ -3778,6 +3922,44 @@ mod tests {
         assert!(
             allow_row.contains("▸"),
             "selection on allow_once: {allow_row}"
+        );
+    }
+
+    #[test]
+    fn task_question_overlay_shows_choices_and_custom_answer() {
+        use crate::app::UserQuestionOverlay;
+        let mut app = test_app();
+        app.user_question = Some(UserQuestionOverlay {
+            question: abylab_backend::UserQuestion {
+                id: "confirm".into(),
+                question: "Proceed with the update?".into(),
+                header: Some("Confirm".into()),
+                options: vec![
+                    abylab_backend::UserQuestionOption {
+                        label: "Yes".into(),
+                        description: Some("Apply it".into()),
+                    },
+                    abylab_backend::UserQuestionOption {
+                        label: "No".into(),
+                        description: None,
+                    },
+                ],
+                multi_select: false,
+            },
+            sel: 0,
+            selected: vec![false, false],
+            custom: String::new(),
+            reply: None,
+        });
+        let frame = dump_frame(&mut app, 90, 30);
+        assert!(frame.contains("Proceed with the update?"), "{frame}");
+        assert!(frame.contains("Yes"), "{frame}");
+        assert!(frame.contains("No"), "{frame}");
+        assert!(frame.contains("Other:"), "{frame}");
+        let compact = dump_frame(&mut app, 40, 12);
+        assert!(
+            compact.contains("Proceed"),
+            "question remains visible: {compact}"
         );
     }
 

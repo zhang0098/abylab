@@ -259,6 +259,36 @@ pub enum PermissionReply {
     Cancelled,
 }
 
+/// One model-requested question shown while the current turn is paused.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserQuestion {
+    pub id: String,
+    pub question: String,
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub options: Vec<UserQuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserQuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A human answer. The tool adds the matching question id to its result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UserQuestionReply {
+    pub selected: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<String>,
+}
+
 /// Per-turn execution limits for the in-process agent.
 ///
 /// deepseek-harness — the design abylab mirrors — has **no built-in turn
@@ -586,5 +616,10 @@ pub enum Event {
         title: String,
         options: Vec<AskOption>,
         reply: oneshot::Sender<PermissionReply>,
+    },
+    /// An ordinary task question. The tool waits for the UI's answer.
+    UserQuestion {
+        question: UserQuestion,
+        reply: oneshot::Sender<Option<UserQuestionReply>>,
     },
 }
