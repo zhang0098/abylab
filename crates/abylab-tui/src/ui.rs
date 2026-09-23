@@ -182,6 +182,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_model_picker(f, app, cards);
     draw_view_overlay(f, app, cards);
     draw_todo_dialog(f, app, cards);
+    draw_reset_dialog(f, app, cards);
     draw_permission_ask(f, app, cards);
 }
 
@@ -370,6 +371,206 @@ fn todo_dialog_lines(
                 Span::styled(row, text_style),
             ]));
         }
+    }
+    lines
+}
+
+/// The `/reset` confirmation card: what the command would remove, with the
+/// size of each entry, what it leaves alone, and the confirmation state — the
+/// card itself is the second confirmation, so the footer has to say where in
+/// the two-press sequence the reader is. Nothing is deleted by looking at it.
+///
+/// It uses the same inset and scroll affordances as the todo dialog and the
+/// review panes, and the border turns warn when the next Enter deletes.
+fn draw_reset_dialog(f: &mut Frame, app: &mut App, screen: Rect) {
+    let theme = app.theme;
+    let Some(prompt) = app.reset_prompt.as_ref() else {
+        return;
+    };
+    let armed = prompt.armed;
+    let plan = prompt.plan.clone();
+    let locale = app.locale;
+    let screen = dialog_area(screen);
+    let width = screen
+        .width
+        .saturating_sub(4)
+        .min((screen.width.saturating_mul(2) / 3).max(64))
+        .max(24);
+    let inner_width = width.saturating_sub(2) as usize;
+    let lines = reset_dialog_lines(&plan, &theme, inner_width, locale, armed);
+    let height = (lines.len() as u16 + 2)
+        .min(screen.height.saturating_sub(4))
+        .max(4);
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    // Clamp the scroll to the content, so a wheel overscroll stops at the end
+    // instead of showing blank rows below the plan (same rule as `/status`).
+    let max_scroll = lines
+        .len()
+        .saturating_sub(area.height.saturating_sub(2) as usize);
+    if let Some(prompt) = app.reset_prompt.as_mut() {
+        prompt.scroll = prompt.scroll.min(max_scroll);
+    }
+    let scroll = app.reset_prompt.as_ref().map_or(0, |p| p.scroll) as u16;
+    f.render_widget(Clear, area);
+    let title = if armed {
+        format!(
+            " /reset · {} ",
+            locale.tr("press enter again to delete", "再按一次 enter 删除")
+        )
+    } else {
+        format!(
+            " /reset · {} ",
+            locale.tr(
+                "enter asks again · esc cancels",
+                "enter 再确认一次 · esc 取消"
+            )
+        )
+    };
+    let border = if armed { theme.warn } else { theme.brand };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(title, Style::default().fg(theme.fg)))
+        .style(Style::default().bg(theme.panel).fg(theme.fg));
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), area);
+}
+
+/// The reset card's body: one row per entry the command removes (label, path,
+/// size), then what it does not touch, then the state of the confirmation.
+fn reset_dialog_lines(
+    plan: &crate::reset::ResetPlan,
+    theme: &Theme,
+    width: usize,
+    locale: crate::locale::Locale,
+    armed: bool,
+) -> Vec<Line<'static>> {
+    use crate::reset::{human_bytes, human_files};
+
+    let mut lines: Vec<Line<'static>> = wrap(
+        locale.tr(
+            "delete everything abylab saved under the aby home:",
+            "删除 aby 主目录下本程序保存的数据：",
+        ),
+        width,
+    )
+    .into_iter()
+    .map(|row| {
+        Line::from(Span::styled(
+            row,
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ))
+    })
+    .collect();
+    let total = locale
+        .tr(
+            "{items} entries · {files} files · {size} in total",
+            "共 {items} 项 · {files} 个文件 · {size}",
+        )
+        .replace("{items}", &plan.items.len().to_string())
+        .replace("{files}", &human_files(plan.files(), false))
+        .replace("{size}", &human_bytes(plan.bytes()));
+    for row in wrap(&total, width) {
+        lines.push(Line::from(Span::styled(
+            row,
+            Style::default().fg(theme.fg_tertiary),
+        )));
+    }
+    lines.push(Line::default());
+    // A label column wide enough for the longest label, so the paths line up.
+    let label_col = plan
+        .items
+        .iter()
+        .map(|item| item.what.label(locale).width())
+        .max()
+        .unwrap_or(0)
+        .max(6);
+    for item in &plan.items {
+        let detail = format!(
+            "  · {} {} · {}",
+            human_files(item.files, item.truncated),
+            locale.tr("files", "个文件"),
+            human_bytes(item.bytes),
+        );
+        // The label column aligns the paths; whatever room is left over goes
+        // to the path, which ellipsizes in the middle (`~/.abylab/…json`) the
+        // way the composer cap shortens a workspace — a path that does not fit
+        // the row must not run under the card's border.
+        let budget = width
+            .saturating_sub(2 + label_col + 1 + detail.width())
+            .max(1);
+        let path = compact_workspace(&item.path.to_string_lossy(), budget);
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                pad_to_width(&format!("{} ", item.what.label(locale)), label_col + 1),
+                Style::default().fg(theme.fg_secondary),
+            ),
+            Span::styled(path, Style::default().fg(theme.fg)),
+            Span::styled(detail, Style::default().fg(theme.caption)),
+        ]));
+    }
+    if !plan.kept.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            locale.tr("kept:", "保留：").to_string(),
+            Style::default().fg(theme.fg_secondary),
+        )));
+        for keep in &plan.kept {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    compact_workspace(&keep.path.to_string_lossy(), width.saturating_sub(2)),
+                    Style::default().fg(theme.fg),
+                ),
+            ]));
+            for row in wrap(keep.why.note(locale), width.saturating_sub(2)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {row}"),
+                    Style::default().fg(theme.caption),
+                )));
+            }
+        }
+    }
+    lines.push(Line::default());
+    // Two facts the files cannot say for themselves: the session on screen
+    // ends, and what stays live until the next launch.
+    let note = locale.tr(
+        "This session ends here and a new one starts. The model, effort and permission preset \
+         stay live until the next launch — the files that launch would have read are gone.",
+        "当前会话到此结束，另开一个新会话。模型、推理强度和权限预设这次运行内保持不变 —— 下次启动本来要读的那些文件已经删掉了。",
+    );
+    for row in wrap(note, width) {
+        lines.push(Line::from(Span::styled(
+            row,
+            Style::default().fg(theme.fg_secondary),
+        )));
+    }
+    lines.push(Line::default());
+    let (footer, style) = if armed {
+        (
+            locale.tr(
+                "press enter again — this one deletes; any other key asks again",
+                "再按一次 enter 即删除；按任意其它键回到第一次确认",
+            ),
+            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            locale.tr(
+                "enter asks once more — nothing is deleted yet; esc keeps everything",
+                "enter 只是再确认一次 —— 现在还没有删任何东西；esc 全部保留",
+            ),
+            Style::default().fg(theme.caption),
+        )
+    };
+    for row in wrap(footer, width) {
+        lines.push(Line::from(Span::styled(row, style)));
     }
     lines
 }
@@ -2101,6 +2302,102 @@ mod tests {
         let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
         app.locale = crate::locale::Locale::En;
         app
+    }
+
+    /// A plan with one entry of every kind, sized so the card has to shrink a
+    /// long path instead of running under its own border.
+    fn reset_plan_fixture() -> crate::reset::ResetPlan {
+        let home = std::path::PathBuf::from("/Users/someone-with-a-long-name/.abylab");
+        let item = |name: &str, what: crate::reset::ResetWhat, bytes: u64, files: u64| {
+            crate::reset::ResetItem {
+                what,
+                path: home.join(name),
+                files,
+                bytes,
+                truncated: false,
+            }
+        };
+        crate::reset::ResetPlan {
+            home: home.clone(),
+            items: vec![
+                item("settings.json", crate::reset::ResetWhat::Settings, 27, 1),
+                item("abylab-modes.json", crate::reset::ResetWhat::Modes, 2, 1),
+                item(
+                    ".credentials.yaml",
+                    crate::reset::ResetWhat::Credentials,
+                    11,
+                    1,
+                ),
+                item("sessions", crate::reset::ResetWhat::Sessions, 2_500_000, 18),
+                item("queued", crate::reset::ResetWhat::Queue, 2, 1),
+            ],
+            kept: vec![crate::reset::ResetKeep {
+                path: home.join("AGENTS.md"),
+                why: crate::reset::ResetKeepWhy::HandWritten,
+            }],
+        }
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The reset card never lets a row run into its border — the path gives
+    /// way (middle-ellipsized, leaf kept) so the sizes the reader is deciding
+    /// on survive — and both confirmation states say which press does what.
+    #[test]
+    fn the_reset_card_fits_its_border() {
+        let plan = reset_plan_fixture();
+        let theme = Theme::dark();
+        let locales = [crate::locale::Locale::En, crate::locale::Locale::Zh];
+        for width in [40usize, 64, 100] {
+            for locale in locales {
+                for armed in [false, true] {
+                    let lines = reset_dialog_lines(&plan, &theme, width, locale, armed);
+                    for line in &lines {
+                        let row = line_text(line);
+                        assert!(
+                            row.width() <= width,
+                            "width {width} {locale:?}: {row:?} overflows"
+                        );
+                    }
+                }
+            }
+        }
+        // Room for both ends of the row: the path keeps its leaf (the file the
+        // reader recognizes) and the sizes stay whole — the total, which is
+        // what the decision is about, survives even at 40 columns.
+        for width in [64usize, 100] {
+            for locale in locales {
+                let lines = reset_dialog_lines(&plan, &theme, width, locale, false);
+                let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+                for needle in ["settings.json", "sessions", "queued", "AGENTS.md"] {
+                    assert!(text.contains(needle), "width {width} {locale:?}: {text}");
+                }
+                let sessions_row = match locale {
+                    crate::locale::Locale::En => "18 files",
+                    crate::locale::Locale::Zh => "18 个文件",
+                };
+                assert!(
+                    text.contains(sessions_row),
+                    "width {width} {locale:?}: {text}"
+                );
+            }
+        }
+        // The two presses are told apart on sight, in both languages.
+        for locale in locales {
+            let read = |armed| {
+                reset_dialog_lines(&plan, &theme, 80, locale, armed)
+                    .iter()
+                    .map(line_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert_ne!(read(false), read(true), "the two presses read differently");
+        }
     }
 
     fn live_test_app() -> App {

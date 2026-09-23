@@ -31,6 +31,12 @@ Your preferences live in `$ABYLAB_HOME/settings.json`: interface language
 (Chinese by default), model, reasoning effort, permission preset, and
 appearance (mode + palette). Flags override them for that run only.
 
+To get back to an as-installed state, `/reset` deletes everything this program
+saved under `$ABYLAB_HOME` (settings, API key, session logs, queued prompts) and
+starts a new session — two Enters confirm it. The same wipe from a shell is
+`abylab --reset`. A hand-written `AGENTS.md` and a session store that
+`--session-root` put outside the aby home are not part of it.
+
 ## Keys
 
 enter send / queue · ctrl+enter send now · alt+↑ (mac ⌥↑) edit queued prompt ·
