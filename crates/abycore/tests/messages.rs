@@ -30,6 +30,37 @@ async fn collect(server: &Server) -> Result<Vec<StreamEvent>> {
 }
 
 #[tokio::test]
+async fn user_image_blocks_reach_the_messages_request_in_order() {
+    let server = Server::start(vec![Reply::json(response("r", vec![message("m", "ok")]))]).await;
+    let mut request = MessageRequest::new("unused");
+    request.history = vec![Item::user_parts(vec![
+        ContentPart::InputText {
+            text: "before".into(),
+        },
+        ContentPart::InputImage {
+            media_type: "image/png".into(),
+            data: "YWJj".into(),
+        },
+        ContentPart::InputText {
+            text: "after".into(),
+        },
+    ])];
+    server
+        .client()
+        .complete(request, RequestOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        server.captured()[0].body["messages"][0]["content"],
+        json!([
+            {"type":"text","text":"before"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"YWJj"}},
+            {"type":"text","text":"after"}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn native_stream_preserves_interleaving_signatures_arguments_and_cumulative_usage() {
     let mut events = vec![
         message_start("msg"),

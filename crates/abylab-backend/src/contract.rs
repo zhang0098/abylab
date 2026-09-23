@@ -5,6 +5,7 @@
 
 use tokio::sync::oneshot;
 
+pub use abycore::ContentPart as PromptPart;
 use abycore::SessionStore;
 
 /// One semantic UI fact, mirroring the subset of the TUI's `UiEvent` the
@@ -489,6 +490,7 @@ pub struct QueueRow {
     pub item_id: u64,
     /// The wire form the driver will send when the item's turn comes.
     pub text: String,
+    pub parts: Option<Vec<PromptPart>>,
     pub placement: QueuePlacement,
 }
 
@@ -503,6 +505,10 @@ pub enum QueueAction {
     Remove,
     /// Replace the item's text (the `⌥↑` editor).
     Edit(String),
+    EditParts {
+        text: String,
+        parts: Vec<PromptPart>,
+    },
 }
 
 /// One Send Now request on its own channel, so a running turn can take it
@@ -516,6 +522,8 @@ pub struct SteerRequest {
     /// The composer's optimistic echo, settled by [`CtlEvent::SteerSettled`].
     pub message_id: u64,
     pub text: String,
+    /// Ordered image and text blocks, when this is a multimodal prompt.
+    pub parts: Option<Vec<PromptPart>>,
 }
 
 /// UI → driver commands. The driver serializes turns; a `Prompt` that arrives
@@ -524,6 +532,9 @@ pub struct SteerRequest {
 pub enum Cmd {
     Prompt {
         text: String,
+    },
+    PromptParts {
+        parts: Vec<PromptPart>,
     },
     /// Reject a prompt if a queued session switch changed its intended owner.
     PromptForSession {
@@ -539,6 +550,12 @@ pub enum Cmd {
         session_id: String,
         item_id: u64,
         text: String,
+    },
+    QueuePartsForSession {
+        session_id: String,
+        item_id: u64,
+        text: String,
+        parts: Vec<PromptPart>,
     },
     /// Change one queued item (steer it, remove it, edit its text).
     UpdateQueue {
@@ -560,6 +577,7 @@ pub enum Cmd {
         /// [`CtlEvent::SteerSettled`].
         message_id: u64,
         text: String,
+        parts: Option<Vec<PromptPart>>,
     },
     /// Switch model/effort. Applied only while the session has no history;
     /// otherwise the driver refuses with a `TuiOpFailed`.

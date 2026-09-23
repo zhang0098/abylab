@@ -130,6 +130,7 @@ pub(super) fn launch(
                 } else {
                     let message = input
                         .take()
+                        .map(|text| vec![crate::ContentPart::InputText { text }])
                         .or_else(|| {
                             entry
                                 .inbox
@@ -139,7 +140,9 @@ pub(super) fn launch(
                                 .pop_front()
                         })
                         .ok_or_else(|| invalid("subagent has no input"))?;
-                    agent.run(message, options.clone(), &mut observe).await
+                    agent
+                        .run_parts(message, options.clone(), &mut observe)
+                        .await
                 }
             };
             let result = AssertUnwindSafe(async {

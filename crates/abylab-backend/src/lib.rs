@@ -12,8 +12,8 @@ mod user_questions;
 pub use abycore::MIN_PRUNE_BYTES;
 pub use contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
-    PlanStatus, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits, UiEvent,
-    persisted_session_id,
+    PlanStatus, PromptPart, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits,
+    UiEvent, persisted_session_id,
 };
 pub use contract::{UserQuestion, UserQuestionOption, UserQuestionReply};
 pub use driver::DriverHandle;

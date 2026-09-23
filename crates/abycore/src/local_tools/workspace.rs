@@ -380,7 +380,7 @@ pub(super) fn read_file_limited(
             break;
         }
         workspace.check_size(bytes.len().saturating_add(count))?;
-        if limit.is_some_and(|limit| bytes.len().saturating_add(count) >= limit) {
+        if limit.is_some_and(|limit| bytes.len().saturating_add(count) > limit) {
             return Err(failed("file exceeds the configured size limit"));
         }
         bytes.extend_from_slice(&buffer[..count]);

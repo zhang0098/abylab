@@ -57,6 +57,10 @@ pub enum QueueAction {
     Remove,
     /// The `⌥↑` editor saved new text for the row.
     Edit(String),
+    EditParts {
+        text: String,
+        blocks: Vec<PromptBlock>,
+    },
 }
 
 /// One row of the session's host-owned queue, as the driver publishes it.
@@ -64,6 +68,7 @@ pub enum QueueAction {
 pub struct QueueRow {
     pub item_id: u64,
     pub text: String,
+    pub parts: Option<Vec<abylab_backend::PromptPart>>,
     /// `true` while the running turn has the message and has not appended it
     /// yet (the composer paints those as pending steering).
     pub steering: bool,
@@ -161,7 +166,7 @@ pub struct SkillInfo {
 }
 /// One staged image on its way to the host (base64 payload).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // the in-process driver prompt currently carries text only
+#[allow(dead_code)]
 pub struct ImagePart {
     pub data: String,
     pub media_type: String,
@@ -172,7 +177,7 @@ pub struct ImagePart {
 
 /// One content block of a composer prompt, in draft (chip) order.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // the image arm lands once the driver carries image input
+#[allow(dead_code)]
 pub enum PromptBlock {
     Text(String),
     Image(ImagePart),
@@ -196,6 +201,12 @@ pub enum Cmd {
         item_id: u64,
         text: String,
     },
+    QueueParts {
+        session_id: String,
+        item_id: u64,
+        text: String,
+        blocks: Vec<PromptBlock>,
+    },
     /// Change one queued row (remove it, or save edited text).
     UpdateQueue {
         session_id: String,
@@ -210,6 +221,12 @@ pub enum Cmd {
         session_id: String,
         message_id: u64,
         text: String,
+    },
+    SteerParts {
+        session_id: String,
+        message_id: u64,
+        text: String,
+        blocks: Vec<PromptBlock>,
     },
     /// Interrupt the active turn over ACP.
     Interrupt {

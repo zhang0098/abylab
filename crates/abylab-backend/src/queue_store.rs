@@ -3,27 +3,74 @@
 //! The queue lives in the driver, so a client reload or a second client never
 //! loses it — but the driver is still a process, and a crash would take the
 //! unsent prompts with it (the session snapshot survives, they would not). So
-//! every queue mutation writes the session's FIFO under
-//! `$ABYLAB_HOME/queued/<session>.json`, and the next start of that session
-//! reads it back as held items.
+//! every queue mutation writes the session's FIFO under a workspace-specific
+//! path in `$ABYLAB_HOME/queued`, and the next start reads it as held items.
 //!
-//! One file per session: two drivers on different sessions never touch the same
-//! file, and a drained queue removes its file instead of leaving an empty entry
-//! behind. Only the wire form is stored (what the driver will send), which is
-//! text today.
-//!
-//! The file is a convenience, never a requirement: an absent, unreadable or
-//! malformed store reads as an empty queue, exactly like `settings.json`.
+//! A drained queue removes its file. Records preserve text and image blocks.
+//! Missing stores are empty; damaged stores are reported to the caller.
 
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-/// Where one session's queue lives. The session id is user-supplied
-/// (`--session-id`), so anything that could name a directory is folded to `_`.
-pub fn path(home: &str, session: &str) -> PathBuf {
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QueuedRecord {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<abycore::ContentPart>>,
+}
+
+impl QueuedRecord {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            parts: None,
+        }
+    }
+}
+
+impl From<&str> for QueuedRecord {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<String> for QueuedRecord {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+/// Queues are isolated by workspace and losslessly escaped session id.
+pub fn path(home: &str, workspace: &str, session: &str) -> PathBuf {
+    let workspace_hash = Sha256::digest(workspace.as_bytes());
+    let workspace_key: String = workspace_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let safe: String = session
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                (byte as char).to_string()
+            } else {
+                format!("~{byte:02X}")
+            }
+        })
+        .collect();
+    std::path::Path::new(home)
+        .join("queued")
+        .join(workspace_key)
+        .join(format!("{safe}.json"))
+}
+
+fn legacy_path(home: &str, session: &str) -> PathBuf {
     let safe: String = session
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
                 c
             } else {
                 '_'
@@ -36,48 +83,102 @@ pub fn path(home: &str, session: &str) -> PathBuf {
 }
 
 /// The items waiting behind `session`'s turn, oldest first.
-pub fn load(cfg: &crate::contract::DriverConfig, session: &str) -> Vec<String> {
+pub fn load_checked(
+    cfg: &crate::contract::DriverConfig,
+    session: &str,
+) -> Result<Vec<QueuedRecord>, String> {
     let Some(home) = cfg.home.as_deref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Ok(text) = std::fs::read_to_string(path(home, session)) else {
-        return Vec::new();
+    let file = path(home, &cfg.workspace, session);
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let legacy = legacy_path(home, session);
+            if legacy.exists() {
+                return Err(format!(
+                    "legacy queue found at {}; its workspace cannot be determined, so move it to {} after checking its contents",
+                    legacy.display(),
+                    file.display()
+                ));
+            }
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(format!("queue load failed ({}): {error}", file.display())),
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    // A file in another shape (or from a future version) is not guessed at.
-    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Vec::new();
-    }
-    value
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| row.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+    parse_store(&text, &file)
 }
 
-/// Replace `session`'s queue with `texts`. An empty list removes the file, so a
+fn parse_store(text: &str, file: &Path) -> Result<Vec<QueuedRecord>, String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("queue file is invalid ({}): {error}", file.display()))?;
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    if !matches!(version, Some(1 | 2)) {
+        return Err(format!("unsupported queue version ({})", file.display()));
+    }
+    let rows = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("queue file has no items array ({})", file.display()))?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| match version {
+            Some(1) => row
+                .as_str()
+                .map(QueuedRecord::text)
+                .ok_or_else(|| format!("queue item {index} is invalid ({})", file.display())),
+            Some(2) => serde_json::from_value::<QueuedRecord>(row.clone()).map_err(|error| {
+                format!(
+                    "queue item {index} is invalid ({}): {error}",
+                    file.display()
+                )
+            }),
+            _ => unreachable!("version checked above"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub fn load(cfg: &crate::contract::DriverConfig, session: &str) -> Vec<QueuedRecord> {
+    load_checked(cfg, session).unwrap_or_default()
+}
+
+/// Replace `session`'s queue with `items`. An empty list removes the file, so a
 /// drained queue leaves nothing behind for the next start to resurrect.
-pub fn save(home: &str, session: &str, texts: &[String]) {
-    let path = path(home, session);
-    if texts.is_empty() {
-        let _ = std::fs::remove_file(path);
-        return;
+pub fn save(
+    home: &str,
+    workspace: &str,
+    session: &str,
+    items: &[QueuedRecord],
+) -> std::io::Result<()> {
+    let path = path(home, workspace, session);
+    // A malformed existing store may still be recoverable by hand. Refuse to
+    // replace or delete it while accepting later queue mutations.
+    match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            parse_store(&existing, &path)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if items.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
     }
     // Versioned so a future shape can migrate instead of reinterpreting.
-    let store = serde_json::json!({ "version": 1, "items": texts });
-    let Ok(text) = serde_json::to_string_pretty(&store) else {
-        return;
-    };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(path, text);
+    let store = serde_json::json!({ "version": 2, "items": items });
+    let text = serde_json::to_vec_pretty(&store)?;
+    let dir = path.parent().expect("queue path has a parent");
+    std::fs::create_dir_all(dir)?;
+    let mut stage = tempfile::NamedTempFile::new_in(dir)?;
+    stage.write_all(&text)?;
+    stage.as_file().sync_all()?;
+    stage.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -112,12 +213,15 @@ mod tests {
 
     fn read(home: &str, session: &str) -> Vec<String> {
         load(&cfg(home), session)
+            .into_iter()
+            .map(|record| record.text)
+            .collect()
     }
 
     #[test]
     fn a_saved_queue_reads_back_in_order() {
         let home = home("roundtrip");
-        save(&home, "aby-1", &["first".into(), "second".into()]);
+        save(&home, "/tmp", "aby-1", &["first".into(), "second".into()]).unwrap();
         assert_eq!(read(&home, "aby-1"), vec!["first", "second"]);
         assert!(read(&home, "aby-2").is_empty(), "another session is empty");
     }
@@ -125,12 +229,12 @@ mod tests {
     #[test]
     fn draining_a_queue_removes_its_file() {
         let home = home("drain");
-        save(&home, "aby-1", &["only".into()]);
-        assert!(path(&home, "aby-1").exists());
-        save(&home, "aby-1", &[]);
+        save(&home, "/tmp", "aby-1", &["only".into()]).unwrap();
+        assert!(path(&home, "/tmp", "aby-1").exists());
+        save(&home, "/tmp", "aby-1", &[]).unwrap();
         assert!(read(&home, "aby-1").is_empty());
         assert!(
-            !path(&home, "aby-1").exists(),
+            !path(&home, "/tmp", "aby-1").exists(),
             "the file went with the queue"
         );
     }
@@ -138,30 +242,82 @@ mod tests {
     #[test]
     fn a_session_id_cannot_escape_the_store_directory() {
         let home = home("escape");
-        save(&home, "../outside", &["nope".into()]);
-        let dir = std::path::Path::new(&home).join("queued");
-        let files: Vec<String> = std::fs::read_dir(&dir)
-            .expect("store dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(files, vec!["___outside.json".to_string()]);
+        save(&home, "/tmp", "../outside", &["nope".into()]).unwrap();
+        let file = path(&home, "/tmp", "../outside");
+        assert!(file.starts_with(std::path::Path::new(&home).join("queued")));
+        assert_eq!(file.file_name().unwrap(), "~2E~2E~2Foutside.json");
         assert_eq!(read(&home, "../outside"), vec!["nope"]);
     }
 
     #[test]
-    fn a_malformed_or_unknown_store_reads_as_empty() {
+    fn queues_do_not_collide_across_workspaces_or_session_spellings() {
+        let home = home("isolation");
+        save(&home, "/one", "a/b", &["one".into()]).unwrap();
+        save(&home, "/one", "a_b", &["two".into()]).unwrap();
+        save(&home, "/two", "a/b", &["three".into()]).unwrap();
+        assert_ne!(path(&home, "/one", "a/b"), path(&home, "/one", "a_b"));
+        assert_ne!(path(&home, "/one", "a/b"), path(&home, "/two", "a/b"));
+        let mut config = cfg(&home);
+        config.workspace = "/one".into();
+        assert_eq!(load(&config, "a/b"), vec![QueuedRecord::text("one")]);
+        assert_eq!(load(&config, "a_b"), vec![QueuedRecord::text("two")]);
+        config.workspace = "/two".into();
+        assert_eq!(load(&config, "a/b"), vec![QueuedRecord::text("three")]);
+    }
+
+    #[test]
+    fn a_malformed_or_unknown_store_is_reported() {
         let home = home("malformed");
-        let file = path(&home, "aby-1");
+        let file = path(&home, "/tmp", "aby-1");
         std::fs::create_dir_all(file.parent().expect("store dir")).expect("store dir");
         std::fs::write(&file, "{ not json").expect("write garbage");
-        assert!(read(&home, "aby-1").is_empty());
+        assert!(load_checked(&cfg(&home), "aby-1").is_err());
         // A file from another shape (or another version) is not guessed at.
         std::fs::write(&file, "[[{\"kind\":\"text\",\"text\":\"old shape\"}]]").expect("write old");
-        assert!(read(&home, "aby-1").is_empty());
-        save(&home, "aby-1", &["recovered".into()]);
+        assert!(load_checked(&cfg(&home), "aby-1").is_err());
+        assert!(save(&home, "/tmp", "aby-1", &["recovered".into()]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[[{\"kind\":\"text\",\"text\":\"old shape\"}]]"
+        );
+        std::fs::remove_file(&file).unwrap();
+        save(&home, "/tmp", "aby-1", &["recovered".into()]).unwrap();
         assert_eq!(read(&home, "aby-1"), vec!["recovered"]);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_text_rows_and_image_blocks_restore() {
+        let home = home("versions");
+        let file = path(&home, "/tmp", "aby-1");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, r#"{"version":1,"items":["first","second"]}"#).unwrap();
+        assert_eq!(read(&home, "aby-1"), vec!["first", "second"]);
+        let record = QueuedRecord {
+            text: "look".into(),
+            parts: Some(vec![
+                abycore::ContentPart::InputText {
+                    text: "look".into(),
+                },
+                abycore::ContentPart::InputImage {
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                },
+            ]),
+        };
+        save(&home, "/tmp", "aby-1", std::slice::from_ref(&record)).unwrap();
+        assert_eq!(load_checked(&cfg(&home), "aby-1").unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn legacy_queue_is_reported_instead_of_silently_dropped() {
+        let home = home("legacy-location");
+        let legacy = legacy_path(&home, "aby-1");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"version":1,"items":["unsent"]}"#).unwrap();
+        let error = load_checked(&cfg(&home), "aby-1").unwrap_err();
+        assert!(error.contains("legacy queue found"));
+        assert!(error.contains(&legacy.display().to_string()));
     }
 
     #[test]
