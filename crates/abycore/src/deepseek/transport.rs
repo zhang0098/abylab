@@ -247,7 +247,9 @@ impl Transport {
             // Waiting longer than a whole window cannot help — the run has to
             // move within one — and a run that has already gone quiet belongs to
             // the host's continuation, not to another silent attempt here.
-            if delay > self.config.retry.max_delay || delay >= context.window() || context.stalled()
+            if delay > self.config.retry.max_delay
+                || context.window().is_some_and(|window| delay >= window)
+                || context.stalled()
             {
                 return Err(error);
             }

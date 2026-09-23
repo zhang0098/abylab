@@ -485,6 +485,11 @@ fn other_instance_running() -> bool {
 /// budget values follow deepseek-harness's "runaway-loop backstop" idiom and
 /// accept `0` as *no cap* — abycore's `RunOptions::validate` rejects a literal
 /// zero, so unlimited maps onto `usize::MAX` here.
+///
+/// There is no run-level timeout to resolve: a turn is bounded by each request's
+/// transport timeouts, each tool call's budget (`ABY_TOOL_TIMEOUT` for a tool
+/// that declares none) and the budgets above, and a long turn that keeps working
+/// is exactly what a run should do. Esc ends one at any point.
 fn resolve_limits() -> Result<abylab_backend::TurnLimits> {
     let defaults = abylab_backend::TurnLimits::default();
     Ok(abylab_backend::TurnLimits {
@@ -503,11 +508,7 @@ fn resolve_limits() -> Result<abylab_backend::TurnLimits> {
             std::env::var("ABY_AUTO_CONTINUE").ok(),
             defaults.continuations,
         )?,
-        run_timeout: Duration::from_secs(pick_positive(
-            "ABY_TURN_TIMEOUT",
-            std::env::var("ABY_TURN_TIMEOUT").ok(),
-            defaults.run_timeout.as_secs(),
-        )?),
+        run_timeout: defaults.run_timeout,
         tool_timeout: Duration::from_secs(pick_positive(
             "ABY_TOOL_TIMEOUT",
             std::env::var("ABY_TOOL_TIMEOUT").ok(),
@@ -949,24 +950,26 @@ mod cli_args_tests {
         assert_eq!(cap_or_unlimited(7), 7);
     }
 
-    /// The two timeouts abylab exposes: a run's no-progress window and the
-    /// backstop for a tool call that declares no budget of its own.
+    /// The one timeout abylab exposes is the backstop for a tool call that
+    /// declares no budget of its own; a zero one is refused here rather than by
+    /// abycore, and a run has no window at all.
     #[test]
-    fn deadlines_resolve_from_env_with_zero_refused() {
-        assert_eq!(
-            pick_positive("ABY_TURN_TIMEOUT", Some("120".into()), 600).unwrap(),
-            120
-        );
+    fn the_tool_backstop_resolves_from_env_with_zero_refused() {
         assert_eq!(pick_positive("ABY_TOOL_TIMEOUT", None, 60).unwrap(), 60);
+        assert_eq!(
+            pick_positive("ABY_TOOL_TIMEOUT", Some("600".into()), 60).unwrap(),
+            600
+        );
         assert!(
-            pick_positive("ABY_TURN_TIMEOUT", Some("0".into()), 600).is_err(),
-            "a zero deadline is refused before abycore sees it"
+            pick_positive("ABY_TOOL_TIMEOUT", Some("0".into()), 60).is_err(),
+            "a zero backstop is refused before abycore sees it"
         );
         assert_eq!(
             abylab_backend::TurnLimits::default().run_timeout,
-            Duration::from_secs(600),
-            "abycore's SDK default stays the fallback"
+            None,
+            "no run window: requests, tool budgets and the caps above bound a turn"
         );
+        assert_eq!(resolve_limits().unwrap().run_timeout, None);
     }
 
     /// The harness defaults: condense at 80% of the window and keep the newest

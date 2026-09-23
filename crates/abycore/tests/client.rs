@@ -267,7 +267,7 @@ async fn cancellation_first_byte_idle_timeouts_and_the_run_window() {
         };
         let mut options = RequestOptions::default();
         if window {
-            options.timeout = Duration::from_millis(30);
+            options.timeout = Some(Duration::from_millis(30));
         }
         let mut stream = DeepSeekClient::new(config)
             .unwrap()
@@ -294,7 +294,7 @@ async fn cancellation_first_byte_idle_timeouts_and_the_run_window() {
         .stream(
             MessageRequest::new("x"),
             RequestOptions {
-                timeout: Duration::from_millis(30),
+                timeout: Some(Duration::from_millis(30)),
                 ..Default::default()
             },
         )

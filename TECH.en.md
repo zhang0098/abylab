@@ -117,8 +117,9 @@ verbatim):
   verbatim. Summaries are built from the current visible history, including
   existing checkpoints and pruned outputs. Repeated compaction merges older
   checkpoints instead of stacking overlapping spans. Automatic summary calls
-  share the run's cancellation, deadline and request budget, and honor the
-  summary output cap.
+  share the run's cancellation and request budget, and honor the summary output
+  cap; a summary is an ordinary request, so the transport's own timeouts bound
+  it.
 - A provider-confirmed context overflow (`context_length_exceeded`, or abycore's
   own input-budget refusal) doesn't end the turn: abylab condenses hard — keeping
   only the current turn — and retries the same open turn. Only if that fails does
@@ -130,8 +131,8 @@ verbatim):
   items all stay complete. The SDK refuses a span that would split a tool call
   from its result or an existing checkpoint, and it rejects truncated summaries,
   tool-call replies and summaries that don't shrink the current view. An ordinary
-  summary failure leaves the view unchanged; cancellation, deadline and
-  request-budget exhaustion stop the run. Automatic view changes pass a
+  summary failure leaves the view unchanged; cancellation, a request reaching
+  its own deadline, and request-budget exhaustion stop the run. Automatic view changes pass a
   persistence barrier before the next model request.
 
 Defaults: `ABY_COMPACT_AT=0.8`, `ABY_KEEP_RECENT=0.16`, `ABY_PRUNE_TOOL_OUTPUT=4096`,
@@ -140,40 +141,51 @@ measurement when there is one, otherwise estimated at 3 bytes per token. A view
 change invalidates the old measurement; restoring an already-compacted session
 conservatively waits for a new one.
 
-Where abylab is stricter than harness, both backstops exist to keep a turn from
-hanging, never to keep it from working.
+There is exactly one time limit, and it is a backstop rather than a budget:
+`ABY_TOOL_TIMEOUT` (60 seconds by default) for a tool call that **declares no
+budget of its own**.
 
-`ABY_TURN_TIMEOUT` (600 seconds by default) is the limit on a segment making **no
-progress** — no bytes arriving, no request or tool call finishing, no committed
-step — not a limit on how long the segment may take. A run that keeps working
-takes as long as it needs: every stream chunk and every committed tool result
-re-arms the clock, and each wake-up of a pending await re-reads the whole gap, so
-a long answer or a long tool sequence is never cut off. What actually kills a
-dead network is the transport's own timeouts (15s connect, 120s first byte, 60s
-stream idle), so the window only fires when the whole run has stopped moving; a
-stalled request is not retried at the transport either — it goes straight to the
-driver's continuation.
+There is no turn-level timeout. A turn does not exist on DeepSeek's side — the
+API sees stateless requests one at a time while tools run locally — so "how long
+this turn has been running" was never its rule, and it is not abylab's either:
+harness's agent loop has no deadline over a step, and abylab sets none. What can
+actually get stuck each has an owner:
 
-`ABY_TOOL_TIMEOUT` (60 seconds by default) is the backstop for a tool call that
-**declares no budget of its own**; a declared budget wins, which is how harness
-works too (each tool's own `timeoutMs`, not one host-wide number). A `bash` call
-carrying `timeoutMs` runs under it (`bash_max_timeout` caps it, 600 seconds by
-default), and a foreground delegation or `wait_agent` waits out the child's run
-window. When a call reaches its budget it is asked to stop, gets its own
-`cleanup_grace` to settle, and answers with a tool error the model can read
-(saying it was stopped and that its result is unverified); the turn continues —
-the same answer `dsh-tool-call-timeout-policy` gives, instead of failing the turn.
+- Every request belongs to the transport: 15s connect, 120s first byte, 60s
+  stream idle (`ClientConfig`). The provider can only affect a *single* request —
+  `max_tokens` truncation (a number we send), `Retry-After` on a 429, 5xx, or a
+  gateway cutting one stream — and each of those becomes one failed request that
+  `ABY_AUTO_CONTINUE` resumes inside the same turn.
+- Every tool call belongs to its own budget: a `bash` call carrying `timeoutMs`
+  runs under it (`bash_max_timeout` caps it, 600 seconds by default), a foreground
+  delegation or `wait_agent` has no timer at all — the child turn ends on its own,
+  so the wait simply lasts that long. Tools that declare nothing (`read`, `write`,
+  `edit`) get `ABY_TOOL_TIMEOUT`.
+- A runaway loop belongs to `ABY_MAX_REQUESTS` / `ABY_MAX_TOOL_CALLS` (1000 each
+  by default, `0` for no cap).
+- The user can press Esc at any point: it interrupts both execution and the wait
+  between segments.
 
-A genuinely stalled segment, or a request or tool call reaching its own deadline,
-waits one second and continues the same open turn, sharing the `ABY_AUTO_CONTINUE`
-allowance with budget stops and transient failures (default 3; `0` stops on the
-first failure). Completed tool results survive; a tool truncated mid-execution is
-marked "unverified — check before repeating" and never replayed. Only once that
-allowance is spent does the error surface, listing the current limits; another
-message continues the session, and Esc interrupts both execution and the wait
-between segments. (These budgets and windows are abylab's own backstops, not
-DeepSeek limits — usage is billed as usual.) Serialized input has its own 4 MiB
-cap. The byte estimate is not a guaranteed upper bound.
+When a call reaches its budget it is asked to stop, gets its own `cleanup_grace`
+to settle, and answers with a tool error the model can read (saying it was
+stopped and that its result is unverified); the turn continues — the same answer
+`dsh-tool-call-timeout-policy` gives, instead of failing the turn. A request or
+tool call reaching its own deadline waits one second and continues the same open
+turn, sharing the `ABY_AUTO_CONTINUE` allowance with budget stops and transient
+failures (default 3; `0` stops on the first failure). Completed tool results
+survive; a tool truncated mid-execution is marked "unverified — check before
+repeating" and never replayed. Only once that allowance is spent does the error
+surface, listing the current limits, and another message continues the session.
+(These budgets and limits are abylab's own backstops, not DeepSeek limits —
+usage is billed as usual.)
+
+A host that wants a run which stops moving to fail on its own still has the
+window (`RunOptions::timeout: Option<Duration>`, `TurnLimits::run_timeout`): it
+measures a **lack of progress** — no bytes arriving, no request or tool call
+finishing, no committed step, with every stream chunk and committed tool result
+re-arming it. abylab's own front end sets none, because leaving your seat for ten
+minutes should not turn an open permission ask into an error. Serialized input
+has its own 4 MiB cap. The byte estimate is not a guaranteed upper bound.
 
 ## Session persistence
 

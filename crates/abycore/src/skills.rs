@@ -665,13 +665,9 @@ mod tests {
     /// The tool never touches the context; one bare context serves every call.
     fn tool_context() -> ToolContext {
         let cancellation = CancellationToken::new();
-        let request = RequestContext::new(
-            cancellation.clone(),
-            Duration::from_secs(30),
-            16,
-            Arc::new(Mutex::new(vec![])),
-        )
-        .unwrap();
+        let request =
+            RequestContext::new(cancellation.clone(), None, 16, Arc::new(Mutex::new(vec![])))
+                .unwrap();
         ToolContext {
             call_id: "skill-test".into(),
             cancellation,

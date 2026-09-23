@@ -1,5 +1,5 @@
 use crate::{
-    AgentEvent, AgentHooks, CheckpointKind, Compaction, ContentPart, ContextEstimate,
+    AgentEvent, AgentHooks, CallBudget, CheckpointKind, Compaction, ContentPart, ContextEstimate,
     DeepSeekClient, Error, ErrorKind, Item, MessageRequest, MessageRole, ModelOptions, PendingCall,
     PendingState, Prune, RequestPurpose, Response, ResponseStatus, Result, RunOptions, RunOutcome,
     SessionSnapshot, StopReason, StreamEvent, SummarizeOptions, SummarizeOutcome, Tool,
@@ -1055,14 +1055,17 @@ impl Agent {
                                 let budget = call_budget(&*tool, &arguments, options);
                                 let mut tool_request = context.clone();
                                 tool_request.cancellation = cancellation.clone();
-                                let deadline = tokio::time::Instant::now() + budget;
+                                let deadline = budget.map_or(
+                                    tokio::time::Instant::now() + crate::NO_DEADLINE,
+                                    |budget| tokio::time::Instant::now() + budget,
+                                );
                                 let tool_context = ToolContext { call_id: call.call_id.clone(), cancellation: cancellation.clone(), deadline, max_output_bytes: options.max_tool_output_bytes, request: tool_request, local_session: self.local_session.clone(), parent: parent.clone() };
                                 match run_tool(tool, arguments, tool_context, context, cancellation, budget).await? {
                                     // The call's budget expired: the model is told, and the
                                     // turn goes on with the rest of the batch.
                                     ToolRun::TimedOut => ToolOutput::error(format!(
                                         "the tool call timed out after {} and was stopped; whatever it already did is unverified — check the workspace before repeating it",
-                                        budget_label(budget)
+                                        budget.map_or_else(|| "its budget".into(), budget_label)
                                     )),
                                     ToolRun::Settled(Ok(output)) => output,
                                     ToolRun::Settled(Err(ToolError::Failed(message))) => ToolOutput::error(message),
@@ -1234,19 +1237,20 @@ where
 }
 
 /// One tool call's budget: what the tool declares for these arguments, else the
-/// deployment's backstop.
+/// deployment's backstop. `None` means the call has no timer at all.
 ///
 /// The declaration wins because it is the tool's own contract — the harness
 /// reads the same value from the tool definition rather than capping every call
 /// at one host-wide number, so a `bash` call that asks for ten minutes gets ten
 /// minutes and a `read` that asks for nothing still cannot hang the turn.
-fn call_budget(tool: &dyn Tool, arguments: &Value, options: &RunOptions) -> Duration {
+fn call_budget(tool: &dyn Tool, arguments: &Value, options: &RunOptions) -> Option<Duration> {
     /// Past this a declaration is not a limit but a mistake: clamping keeps one
     /// from turning a single call into an unbounded wait inside the turn.
     const MAX_CALL_BUDGET: Duration = Duration::from_secs(60 * 60);
-    match tool.call_timeout(arguments) {
-        Some(declared) => declared.min(MAX_CALL_BUDGET),
-        None => options.tool_timeout,
+    match tool.call_budget(arguments) {
+        CallBudget::Backstop => Some(options.tool_timeout),
+        CallBudget::Own(declared) => Some(declared.min(MAX_CALL_BUDGET)),
+        CallBudget::Unbounded => None,
     }
 }
 
@@ -1268,7 +1272,8 @@ enum ToolRun {
     TimedOut,
 }
 
-/// Drive one tool call under its own budget, inside the run's cancellation.
+/// Drive one tool call under its budget (`None`: no timer), inside the run's
+/// cancellation.
 ///
 /// On expiry the call's token is cancelled — a compliant tool stops and reports
 /// what it managed to do — and it gets its cleanup grace to settle. A tool that
@@ -1282,10 +1287,20 @@ async fn run_tool(
     tool_context: ToolContext,
     context: &RequestContext,
     cancellation: crate::CancellationToken,
-    budget: Duration,
+    budget: Option<Duration>,
 ) -> Result<ToolRun> {
     let grace = tool.cleanup_grace();
     let mut call = std::pin::pin!(tool.execute(arguments, tool_context));
+    let Some(budget) = budget else {
+        // No timer of its own: the work bounds the call, cancellation ends it.
+        return tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled() => {
+                Err(Error::new(ErrorKind::Cancelled, "operation cancelled"))
+            }
+            result = &mut call => Ok(ToolRun::Settled(result)),
+        };
+    };
     let mut stop_at = tokio::time::Instant::now() + budget;
     let mut stopping = false;
     loop {

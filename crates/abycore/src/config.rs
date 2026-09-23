@@ -135,14 +135,16 @@ impl ModelOptions {
 #[derive(Clone, Debug)]
 pub struct RequestOptions {
     pub cancellation: CancellationToken,
-    pub timeout: Duration,
+    /// How long this call may go without progress. `None` leaves it to the
+    /// transport's own timeouts, which is where a stalled request belongs.
+    pub timeout: Option<Duration>,
 }
 
 impl Default for RequestOptions {
     fn default() -> Self {
         Self {
             cancellation: CancellationToken::new(),
-            timeout: Duration::from_secs(600),
+            timeout: None,
         }
     }
 }
@@ -150,26 +152,27 @@ impl Default for RequestOptions {
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub cancellation: CancellationToken,
-    /// How long one run segment may go **without progress** before it fails
-    /// with [`ErrorKind::Timeout`](crate::ErrorKind::Timeout): no bytes from the
-    /// provider, no request or tool call finishing, no checkpoint. It is a gap
-    /// between two moments of work, not a cap on the segment's total duration —
-    /// a segment that keeps working runs for as long as it needs, the way
-    /// deepseek-harness's agent loop has no deadline over a step at all.
+    /// An optional cap on how long a run may go **without progress**: no bytes
+    /// from the provider, no request or tool call finishing, no committed step.
+    /// It is a gap between two moments of work, never a cap on the segment's
+    /// total duration.
     ///
-    /// Every operation that owns a tighter deadline (a request's first-byte and
-    /// stream-idle timeouts, a tool call's budget) suspends this window instead
-    /// of racing it.
-    pub timeout: Duration,
+    /// `None` — the default — adds nothing, matching deepseek-harness's agent
+    /// loop, which has no deadline over a step at all. What bounds a run then:
+    /// each request under the transport's own connect/first-byte/stream-idle
+    /// timeouts, each tool call under its budget (declared, or
+    /// [`RunOptions::tool_timeout`]), and the request/tool budgets above. A host
+    /// that wants a stalled run to fail on its own can set one here.
+    pub timeout: Option<Duration>,
     /// This agent turn's HTTP dispatches, including retries and auxiliary searches.
     /// Subagent turns have independent budgets configured by `SubagentConfig`.
     pub max_requests: usize,
     pub max_tool_calls: usize,
     /// The backstop for one tool call that declares no budget of its own:
-    /// [`Tool::call_timeout`](crate::Tool::call_timeout) is what a tool that
-    /// knows its own work (a command with `timeoutMs`, a delegation waiting on a
-    /// child) answers with, and that value is the call's budget. Expiry is
-    /// reported to the model as a tool error, not as a failed turn.
+    /// [`Tool::call_budget`](crate::Tool::call_budget) is what a tool that knows
+    /// its own work (a command with `timeoutMs`, a delegation waiting on a child)
+    /// answers with, and that value is the call's budget. Expiry is reported to
+    /// the model as a tool error, not as a failed turn.
     pub tool_timeout: Duration,
     pub max_tool_output_bytes: usize,
     /// Serialized input budget in bytes, not an estimate of model tokens.
@@ -180,7 +183,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             cancellation: CancellationToken::new(),
-            timeout: Duration::from_secs(600),
+            timeout: None,
             max_requests: 16,
             max_tool_calls: 32,
             tool_timeout: Duration::from_secs(60),
@@ -192,7 +195,7 @@ impl Default for RunOptions {
 
 impl RunOptions {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.timeout.is_zero()
+        if self.timeout.is_some_and(|timeout| timeout.is_zero())
             || self.tool_timeout.is_zero()
             || self.max_requests == 0
             || self.max_tool_calls == 0

@@ -54,13 +54,21 @@ impl Tool for Echo {
 }
 /// The same tool with a budget of its own, the way `bash` reads `timeoutMs`:
 /// its declaration, not the deployment's backstop, is what the call runs under.
+/// `unbounded` swaps that for the other declaration a tool can make — none at
+/// all, for work that is bounded by what it does (a delegation waiting on a
+/// child turn).
 struct DeclaredEcho {
     delay: Duration,
     budget: Duration,
+    unbounded: bool,
 }
 impl Tool for DeclaredEcho {
-    fn call_timeout(&self, _: &Value) -> Option<Duration> {
-        Some(self.budget)
+    fn call_budget(&self, _: &Value) -> CallBudget {
+        if self.unbounded {
+            CallBudget::Unbounded
+        } else {
+            CallBudget::Own(self.budget)
+        }
     }
     fn cleanup_grace(&self) -> Duration {
         Duration::from_secs(1)
@@ -472,6 +480,7 @@ async fn a_tool_that_declares_its_own_budget_is_not_clipped_by_the_backstop() {
         .register_tool(DeclaredEcho {
             delay: Duration::from_millis(300),
             budget: Duration::from_secs(5),
+            unbounded: false,
         })
         .unwrap();
     // The backstop is ten times shorter than the call: a tool that knows how long
@@ -492,6 +501,43 @@ async fn a_tool_that_declares_its_own_budget_is_not_clipped_by_the_backstop() {
         })
         .expect("the call is answered");
     assert_eq!(output, "slow but allowed");
+}
+
+/// A call with no budget of its own is not silently given the backstop: the work
+/// is what bounds it, so a wait that outlives the backstop still answers.
+#[tokio::test]
+async fn a_tool_with_no_budget_is_not_clipped_by_the_backstop() {
+    let server = Server::start(vec![
+        Reply::sse(response(
+            "r1",
+            vec![call("c", "echo", r#"{"text":"waiting is the work"}"#)],
+        )),
+        Reply::sse(response("r2", vec![message("m", "done")])),
+    ])
+    .await;
+    let mut agent = agent(&server);
+    agent
+        .register_tool(DeclaredEcho {
+            delay: Duration::from_millis(300),
+            budget: Duration::from_secs(5),
+            unbounded: true,
+        })
+        .unwrap();
+    let options = RunOptions {
+        tool_timeout: Duration::from_millis(30),
+        ..Default::default()
+    };
+    let outcome = agent.run("start", options, ignore).await.unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    let output = outcome
+        .new_items
+        .iter()
+        .find_map(|item| match item {
+            Item::FunctionCallOutput { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("the call is answered");
+    assert_eq!(output, "waiting is the work");
 }
 
 #[tokio::test]

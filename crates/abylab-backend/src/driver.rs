@@ -1558,14 +1558,24 @@ fn turn_error_text(err: &abycore::Error, limits: TurnLimits) -> String {
             return "context limit reached — /compact condenses the history, /new starts a fresh session / 上下文已达上限：/compact 压缩历史，/new 开新会话".into();
         }
         ErrorKind::Timeout => {
+            // A host may have set a run window; without one, every timeout here
+            // belongs to a single request or tool call.
+            let stalled = limits
+                .run_timeout
+                .map(|window| {
+                    format!(
+                        "the run stalled with no progress for its {}s window, or ",
+                        window.as_secs()
+                    )
+                })
+                .unwrap_or_default();
             return format!(
-                "timed out — the run stalled with no progress for ABY_TURN_TIMEOUT={} seconds, or one \
-                 request or tool call reached a deadline of its own (a tool that declares no budget \
-                 stops at ABY_TOOL_TIMEOUT={} seconds; ABY_AUTO_CONTINUE={}) \
-                 — the turn is unfinished; send a message to continue it or adjust these environment \
-                 variables / 超时：运行停滞，或单个请求／工具调用到达自身时限，回合未完成，继续输入可续跑；\
+                "timed out — {stalled}a request or tool call reached a deadline of its own \
+                 (a tool that declares no budget stops at ABY_TOOL_TIMEOUT={} seconds; \
+                 ABY_AUTO_CONTINUE={}) — the turn is unfinished; send a message to continue it \
+                 or adjust these environment variables \
+                 / 超时：请求或工具调用到达自身时限，回合未完成，继续输入可续跑；\
                  可调整上述环境变量中的时限和自动续跑次数{detail}",
-                limits.run_timeout.as_secs(),
                 limits.tool_timeout.as_secs(),
                 limits.continuations,
             );
@@ -2178,11 +2188,10 @@ async fn compact_view(
                 .map(|policy| policy.max_tokens)
                 .unwrap_or_else(|| CompactionConfig::default().max_tokens),
         ),
-        // Forced compaction is an explicit recovery operation with its own
-        // no-progress window (five minutes of silence is a failed summary, while
-        // a long one keeps going) and the driver's active interrupt signal.
+        // Forced compaction is an explicit recovery operation: it carries the
+        // driver's active interrupt signal, and the summary request itself is
+        // bounded by the transport's own timeouts like any other request.
         cancellation,
-        timeout: Duration::from_secs(300),
         ..Default::default()
     };
     let summary = agent.summarize_span(0, end, options).await?.summary;

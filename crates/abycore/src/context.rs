@@ -11,15 +11,16 @@ use tokio::time::Instant;
 
 pub(crate) type Ledger = Arc<Mutex<Vec<RequestRecord>>>;
 
-/// The stall clock a run segment is watched by: the last moment it
-/// demonstrably moved.
+/// The stall clock an optional run window is measured by: the last moment the
+/// run demonstrably moved.
 ///
 /// deepseek-harness has no deadline over a whole step: it bounds the network
 /// (per-request first-byte and stream-idle timeouts), each tool's own budget and
 /// the request budget, and otherwise lets a step run as long as it keeps doing
-/// something. `RunOptions::timeout` is the same kind of backstop — a run that
-/// keeps streaming, dispatching or committing work stays alive however long it
-/// takes; a run that stops moving fails instead of hanging forever.
+/// something. abylab defaults to the same shape; [`crate::RunOptions::timeout`]
+/// is available for a host that wants a run which stops moving to fail instead
+/// of waiting forever, and a window set that way never cuts work that keeps
+/// going.
 #[derive(Debug)]
 struct Progress {
     /// Last moment the run moved: bytes arrived, a request finished, a tool
@@ -31,8 +32,8 @@ struct Progress {
 #[derive(Clone)]
 pub(crate) struct RequestContext {
     pub cancellation: CancellationToken,
-    /// How long the run may go without progress.
-    pub window: Duration,
+    /// How long the run may go without progress; `None` sets no such bound.
+    pub window: Option<Duration>,
     progress: Arc<Progress>,
     count: Arc<AtomicUsize>,
     max_requests: usize,
@@ -42,21 +43,24 @@ pub(crate) struct RequestContext {
 impl RequestContext {
     pub fn new(
         cancellation: CancellationToken,
-        window: Duration,
+        window: Option<Duration>,
         max_requests: usize,
         ledger: Ledger,
     ) -> Result<Self> {
-        if window.is_zero() {
-            return Err(Error::new(
-                ErrorKind::Configuration,
-                "timeout must be positive",
-            ));
+        if let Some(window) = window {
+            if window.is_zero() {
+                return Err(Error::new(
+                    ErrorKind::Configuration,
+                    "timeout must be positive",
+                ));
+            }
+            // A window this far out cannot be represented as a deadline at all;
+            // it is not a limit, so reject it rather than silently treating it
+            // as one.
+            Instant::now()
+                .checked_add(window)
+                .ok_or_else(|| Error::new(ErrorKind::Configuration, "timeout is too large"))?;
         }
-        // A window this far out cannot be represented as a deadline at all; it
-        // is not a limit, so reject it rather than silently treating it as one.
-        Instant::now()
-            .checked_add(window)
-            .ok_or_else(|| Error::new(ErrorKind::Configuration, "timeout is too large"))?;
         Ok(Self {
             cancellation,
             window,
@@ -78,15 +82,16 @@ impl RequestContext {
 
     /// The stall window itself, for callers pacing a retry: waiting longer than
     /// a whole window cannot be useful, because the run must move within one.
-    pub(crate) fn window(&self) -> Duration {
+    pub(crate) fn window(&self) -> Option<Duration> {
         self.window
     }
 
     /// Whether the run has already gone quiet for a whole window. Callers that
     /// were about to wait again ask this instead: a stalled run is handed to the
-    /// host, never retried behind its back.
+    /// host, never retried behind its back. Always false without a window.
     pub(crate) fn stalled(&self) -> bool {
-        self.stalled_for() >= self.window
+        self.window
+            .is_some_and(|window| self.stalled_for() >= window)
     }
 
     fn stalled_for(&self) -> Duration {
@@ -98,8 +103,11 @@ impl RequestContext {
         if self.cancellation.is_cancelled() {
             return Err(Error::new(ErrorKind::Cancelled, "operation cancelled"));
         }
+        let Some(window) = self.window else {
+            return Ok(());
+        };
         let stalled = self.stalled_for();
-        if stalled >= self.window {
+        if stalled >= window {
             let gap = if stalled.as_secs() > 0 {
                 format!("{}s", stalled.as_secs())
             } else {
@@ -113,7 +121,8 @@ impl RequestContext {
         Ok(())
     }
 
-    /// Await host or provider work under cancellation and the stall window.
+    /// Await host or provider work under cancellation, and under the stall
+    /// window when the host set one.
     ///
     /// The window is a *gap* between two moments of progress, not a total
     /// duration: every wake-up re-reads it, so work that keeps moving re-arms
@@ -122,7 +131,14 @@ impl RequestContext {
         let mut future = std::pin::pin!(future);
         loop {
             self.check()?;
-            let until = Instant::now() + self.window;
+            let Some(window) = self.window else {
+                return tokio::select! {
+                    biased;
+                    _ = self.cancellation.cancelled() => Err(Error::new(ErrorKind::Cancelled, "operation cancelled")),
+                    result = &mut future => Ok(result),
+                };
+            };
+            let until = Instant::now() + window;
             tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "operation cancelled")),
@@ -134,9 +150,10 @@ impl RequestContext {
     }
 
     /// Await one operation that owns a deadline of its own (a request under the
-    /// transport's timeouts, a tool call under its budget). The stall window
-    /// still applies: an operation that produces nothing for a whole window is
-    /// exactly what the window is looking for, whichever bound fires first.
+    /// transport's timeouts, a tool call under its budget). The run's window
+    /// still applies when the host set one: an operation that produces nothing
+    /// for a whole window is exactly what the window is looking for, whichever
+    /// bound fires first.
     pub async fn timed<T>(&self, duration: Duration, future: impl Future<Output = T>) -> Result<T> {
         self.wait(tokio::time::timeout(duration, future))
             .await?

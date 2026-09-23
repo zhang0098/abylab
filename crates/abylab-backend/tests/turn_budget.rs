@@ -28,7 +28,7 @@ fn a_request_budget_stop_continues_the_turn_instead_of_ending_it() {
             max_requests: 1,
             max_tool_calls: 4,
             continuations: 2,
-            run_timeout: std::time::Duration::from_secs(600),
+            run_timeout: Some(Duration::from_secs(600)),
             tool_timeout: std::time::Duration::from_secs(60),
         },
         vec![
@@ -67,7 +67,7 @@ fn a_tool_budget_stop_settles_the_pending_batch_and_continues() {
             max_requests: 4,
             max_tool_calls: 1,
             continuations: 2,
-            run_timeout: std::time::Duration::from_secs(600),
+            run_timeout: Some(Duration::from_secs(600)),
             tool_timeout: std::time::Duration::from_secs(60),
         },
         vec![Reply::sse(two_tool_call_reply()), Reply::sse(text_reply())],
@@ -106,7 +106,7 @@ fn a_transient_failure_retries_the_unfinished_step_in_the_same_turn() {
             max_requests: 1000,
             max_tool_calls: 1000,
             continuations: 2,
-            run_timeout: std::time::Duration::from_secs(600),
+            run_timeout: Some(Duration::from_secs(600)),
             tool_timeout: std::time::Duration::from_secs(60),
         },
         vec![limited(), limited(), limited(), Reply::sse(text_reply())],
@@ -147,7 +147,7 @@ fn a_segment_that_keeps_working_outlives_the_window() {
     let run = drive_prompt(
         "window-progress",
         TurnLimits {
-            run_timeout: Duration::from_secs(1),
+            run_timeout: Some(Duration::from_secs(1)),
             continuations: 1,
             ..TurnLimits::default()
         },
@@ -178,14 +178,15 @@ fn a_segment_that_keeps_working_outlives_the_window() {
     );
 }
 
-/// An expired segment must get the same continuation headroom as a budget
-/// stop, without adding another user prompt or ending the visible turn.
+/// A host that sets a run window gets the same continuation headroom for it as
+/// for a budget stop, without adding another user prompt or ending the visible
+/// turn. abylab's own front end sets none, so this is the host-facing path.
 #[test]
 fn a_run_deadline_continues_the_unfinished_turn() {
     let run = drive_prompt(
         "deadline-continue",
         TurnLimits {
-            run_timeout: Duration::from_secs(1),
+            run_timeout: Some(Duration::from_secs(1)),
             continuations: 1,
             ..TurnLimits::default()
         },
@@ -207,8 +208,30 @@ fn a_run_deadline_continues_the_unfinished_turn() {
             .filter(|e| e.starts_with("turn-end:"))
             .count(),
         1,
-        "the segment timeout must not end the visible turn"
+        "the window must not end the visible turn"
     );
+}
+
+/// The default limits set no run window at all, so a provider that takes its
+/// time but answers is not cut at any fixed mark — the same fixture under a
+/// one-second window (`a_run_deadline_continues_the_unfinished_turn`) does
+/// continue, which is the difference this test pins down.
+#[test]
+fn without_a_window_a_slow_but_answering_provider_is_not_cut() {
+    let run = drive_prompt(
+        "no-window",
+        TurnLimits::default(),
+        vec![Reply::sse(text_reply()).delayed(Duration::from_millis(1200))],
+    );
+
+    assert!(run.ended("completed"), "{}", run.explain());
+    assert!(run.is_clean(), "{}", run.explain());
+    assert!(
+        run.continuations().is_empty(),
+        "nothing to continue: {}",
+        run.explain()
+    );
+    assert_eq!(run.count(), 1, "{}", run.explain());
 }
 
 /// Completed tools remain in history when the follow-up model request times
@@ -218,7 +241,7 @@ fn a_run_deadline_preserves_completed_tool_results() {
     let run = drive_prompt(
         "deadline-after-tool",
         TurnLimits {
-            run_timeout: Duration::from_secs(1),
+            run_timeout: Some(Duration::from_secs(1)),
             continuations: 1,
             ..TurnLimits::default()
         },
@@ -268,11 +291,14 @@ fn a_tool_interrupted_mid_run_requires_verification_before_repeating() {
             ],
         )
         .limits(TurnLimits {
-            run_timeout: Duration::from_secs(600),
+            run_timeout: Some(Duration::from_secs(600)),
             continuations: 1,
             ..TurnLimits::default()
         })
-        .interrupted("run a slow tool", "tool-started:slow-call")
+        // Esc once the command has written its marker: from there it is
+        // unambiguously mid-execution, so the interrupt really does land inside
+        // the call (a `tool-started` event can arrive before the child runs).
+        .interrupted("run a slow tool", "file:interrupt-marker")
         .prompt("carry on"),
     );
 
@@ -312,7 +338,7 @@ fn repeated_run_deadlines_exhaust_the_continuation_limit() {
     let run = drive_prompt(
         "deadline-exhausted",
         TurnLimits {
-            run_timeout: Duration::from_secs(1),
+            run_timeout: Some(Duration::from_secs(1)),
             continuations: 1,
             ..TurnLimits::default()
         },
@@ -325,7 +351,10 @@ fn repeated_run_deadlines_exhaust_the_continuation_limit() {
     assert_eq!(run.continuations().len(), 1, "{}", run.explain());
     assert_eq!(run.count(), 2, "{}", run.explain());
     let error = run.events.iter().find(|e| e.starts_with("error:")).unwrap();
-    assert!(error.contains("ABY_TURN_TIMEOUT=1"), "{error}");
+    assert!(
+        error.contains("the run stalled with no progress for its 1s window"),
+        "the host's own window is named: {error}"
+    );
     assert!(error.contains("ABY_TOOL_TIMEOUT=60"), "{error}");
     assert!(error.contains("ABY_AUTO_CONTINUE=1"), "{error}");
     assert!(error.contains("继续输入"), "{error}");
@@ -338,7 +367,7 @@ fn the_run_deadline_ends_a_hung_segment() {
     let run = drive_prompt(
         "deadline",
         TurnLimits {
-            run_timeout: std::time::Duration::from_secs(1),
+            run_timeout: Some(Duration::from_secs(1)),
             continuations: 0,
             ..TurnLimits::default()
         },
@@ -373,7 +402,7 @@ fn an_exhausted_budget_ends_the_turn_with_an_actionable_error() {
             max_requests: 1,
             max_tool_calls: 4,
             continuations: 0,
-            run_timeout: std::time::Duration::from_secs(600),
+            run_timeout: Some(Duration::from_secs(600)),
             tool_timeout: std::time::Duration::from_secs(60),
         },
         vec![Reply::sse(tool_call_reply("call-1"))],

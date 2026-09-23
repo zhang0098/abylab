@@ -3,7 +3,7 @@ use super::{
     jobs::Jobs,
     workspace::{ToolResult, Workspace, failed, parse},
 };
-use crate::{Result, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
+use crate::{CallBudget, Result, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -83,14 +83,16 @@ impl Tool for BashTool {
             .saturating_mul(2)
             .saturating_add(Duration::from_secs(1))
     }
-    /// The model's `timeoutMs` is this call's budget, exactly as
-    /// `bash_timeout` is when the model asks for nothing: the executor's
-    /// per-call backstop must not clip a command the caller deliberately gave
-    /// more time, and the command is killed and reported by this tool, not by
-    /// the executor.
-    fn call_timeout(&self, value: &Value) -> Option<Duration> {
-        let input = self.input(value).ok()?;
-        input.timeout_ms.map(|ms| self.command_timeout(Some(ms)))
+    /// The model's `timeoutMs` is this call's budget: the executor's per-call
+    /// backstop must not clip a command the caller deliberately gave more time,
+    /// and the command is killed and reported by this tool, not by the executor.
+    fn call_budget(&self, value: &Value) -> CallBudget {
+        match self.input(value) {
+            Ok(input) => input.timeout_ms.map_or(CallBudget::Backstop, |ms| {
+                CallBudget::Own(self.command_timeout(Some(ms)))
+            }),
+            Err(_) => CallBudget::Backstop,
+        }
     }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {

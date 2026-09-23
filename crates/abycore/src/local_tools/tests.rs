@@ -5,13 +5,8 @@ use std::sync::Mutex;
 
 pub(super) fn context(output_limit: usize) -> ToolContext {
     let cancellation = CancellationToken::new();
-    let request = RequestContext::new(
-        cancellation.clone(),
-        Duration::from_secs(30),
-        16,
-        Arc::new(Mutex::new(vec![])),
-    )
-    .unwrap();
+    let request =
+        RequestContext::new(cancellation.clone(), None, 16, Arc::new(Mutex::new(vec![]))).unwrap();
     ToolContext {
         call_id: "local-test".into(),
         cancellation,

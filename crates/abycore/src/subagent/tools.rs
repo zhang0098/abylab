@@ -1,7 +1,7 @@
 use super::*;
-use crate::{Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
+use crate::{CallBudget, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture};
 use serde_json::{Value, json};
-use std::{sync::Weak, time::Duration};
+use std::sync::Weak;
 
 const NAMES: [&str; 6] = [
     "subagent",
@@ -62,18 +62,15 @@ fn failed(error: Error) -> ToolError {
 }
 
 impl Tool for DelegationTool {
-    /// Waiting on a child is bounded by the child's own run window, not by the
-    /// deployment's per-call backstop: a child turn is a whole agent run, so a
-    /// minute would cut off most of the work it was asked to do. A child that
-    /// outlives one wait keeps running and can be waited on again; only a
-    /// background child is untouched by the parent's turn ending.
-    fn call_timeout(&self, _: &Value) -> Option<Duration> {
+    /// Waiting on a child has no timer: the child's turn is what ends it, and
+    /// the child runs under its own request, tool and budget limits. A minute —
+    /// the deployment's backstop for a call that declares nothing — would cut off
+    /// most of the work the child was asked to do. The child keeps running after
+    /// a cancelled wait; `interrupt_agent` is the only thing that stops it.
+    fn call_budget(&self, _: &Value) -> CallBudget {
         match self.name {
-            "subagent" | "subagent_fork" | "wait_agent" => self
-                .manager
-                .upgrade()
-                .map(|manager| manager.config.run_options.timeout),
-            _ => None,
+            "subagent" | "subagent_fork" | "wait_agent" => CallBudget::Unbounded,
+            _ => CallBudget::Backstop,
         }
     }
     fn definition(&self) -> ToolDefinition {
@@ -107,7 +104,7 @@ impl Tool for DelegationTool {
                 json!(["agent_id"]),
             ),
             _ => (
-                "Wait for your direct child's current turn and return its final answer and stop reason. The wait is bounded by the child's run window, not by the per-call backstop: a child still working when one wait ends can be waited on again, and cancelling the wait does not stop background work.",
+                "Wait for your direct child's current turn and return its final answer and stop reason. The wait lasts as long as the child's turn does; cancelling the wait does not stop background work.",
                 json!({"agent_id":{"type":"string","minLength":1}}),
                 json!(["agent_id"]),
             ),

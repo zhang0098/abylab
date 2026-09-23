@@ -61,7 +61,9 @@ pub use subagent::{
 };
 pub use todo::{PlanView, TodoCounts, TodoItem, TodoStatus, TodoWriteTool};
 pub use tokio_util::sync::CancellationToken;
-pub use tool::{Tool, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolOutput};
+pub use tool::{
+    CallBudget, NO_DEADLINE, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolOutput,
+};
 pub use types::{
     ContentPart, Item, MessageRole, ModelInfo, RequestPurpose, RequestRecord, Response,
     ResponseStatus, ThinkingSignature, Usage,

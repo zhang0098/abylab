@@ -649,11 +649,19 @@ pub fn drive(scenario: Scenario) -> Run {
             }
             Step::Interrupted { text, marker } => {
                 handle.send(Cmd::Prompt { text: text.clone() });
-                wait_for(&events, deadline, "the interrupt marker", |events| {
-                    events
-                        .iter()
-                        .any(|event| event.starts_with(marker.as_str()))
-                });
+                // `file:<name>` waits for a workspace side effect instead of an
+                // event: a tool that has already written something is
+                // unambiguously mid-execution, while "started" is not.
+                if let Some(name) = marker.strip_prefix("file:") {
+                    let path = workspace.join(name);
+                    wait_until(deadline, &format!("{name} to appear"), || path.exists());
+                } else {
+                    wait_for(&events, deadline, "the interrupt marker", |events| {
+                        events
+                            .iter()
+                            .any(|event| event.starts_with(marker.as_str()))
+                    });
+                }
                 let ended = events
                     .lock()
                     .expect("event lock")
@@ -744,6 +752,17 @@ fn wait_for(events: &Captured, deadline: Instant, what: &str, ready: impl Fn(&[S
             "{what} never settled: {:?}",
             events.lock().expect("event lock")
         );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Poll a condition that is not an event (a file a tool has to write first).
+fn wait_until(deadline: Instant, what: &str, ready: impl Fn() -> bool) {
+    loop {
+        if ready() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what} never happened");
         std::thread::sleep(Duration::from_millis(20));
     }
 }

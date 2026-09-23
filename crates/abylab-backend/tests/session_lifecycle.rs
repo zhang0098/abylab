@@ -404,9 +404,9 @@ fn manual_and_overflow_summaries_are_interruptible_and_keep_history() {
     }
 }
 
-/// A tool call runs under its own budget, so the turn's window never cuts it
-/// short: the call is stopped by the deadline it owns, the model is handed the
-/// result, and the turn goes on to the next request.
+/// A tool call runs under its own budget, which no run-level limit clips: the
+/// call is stopped by the deadline it owns, the model is handed the result, and
+/// the turn goes on to the next request.
 #[cfg(unix)]
 #[test]
 fn a_tool_stopped_at_its_budget_is_reported_and_never_replayed() {
@@ -450,7 +450,9 @@ fn a_tool_stopped_at_its_budget_is_reported_and_never_replayed() {
 }
 
 /// A stalled segment stops the turn, not the session: Esc lands in the gap
-/// before the driver's next attempt, and that attempt never ships.
+/// before the driver's next attempt, and that attempt never ships. The one
+/// second window is the host's own, the shape a caller gets when it sets
+/// `TurnLimits::run_timeout`.
 #[test]
 fn interrupting_a_stalled_segment_saves_the_turn_without_retrying() {
     let server = MockServer::start(vec![
@@ -460,7 +462,7 @@ fn interrupting_a_stalled_segment_saves_the_turn_without_retrying() {
     let live = Live::start_with_limits_and_setup(
         &server,
         TurnLimits {
-            run_timeout: Duration::from_secs(1),
+            run_timeout: Some(Duration::from_secs(1)),
             continuations: 3,
             ..Default::default()
         },
