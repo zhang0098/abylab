@@ -43,6 +43,43 @@ context compaction, session persistence, goal rounds, uninstall) live in
   running is called out in the plan — it writes its settings and session log
   back, so quit it first.
 
+### Fixed
+
+- `ABY_TURN_TIMEOUT` is gone. It used to cap each segment's **total duration**
+  (600 seconds by default): model thinking, streamed output and every tool call
+  counted against it. A turn that had been running for fifteen minutes with every
+  step making progress was interrupted at the 600-second mark — the running tool
+  became "unverified", text already streamed was lost — and once three automatic
+  continuations were spent, the screen showed `· turn end · error` with
+  `timed out (ABY_TURN_TIMEOUT=600, ABY_TOOL_TIMEOUT=60 seconds; ABY_AUTO_CONTINUE=3)`.
+  A turn never should have had one: it is a local loop, DeepSeek only ever sees
+  stateless requests one at a time, so "how long this turn has been running" was
+  never its rule — and harness's agent loop has **no** deadline over a step
+  either. The only time limit left is `ABY_TOOL_TIMEOUT` (next entry), while
+  everything that can actually get stuck has an owner: each request belongs to
+  the transport (15s connect, 120s first byte, 60s stream idle), each tool call to
+  its own budget, a runaway loop to `ABY_MAX_REQUESTS` / `ABY_MAX_TOOL_CALLS`
+  (1000 each by default), and the user can press Esc at any point.
+- A tool's deadline no longer fails the whole turn, and no longer overrides the
+  tool's own setting. `ABY_TOOL_TIMEOUT` (60 seconds by default) used to apply to
+  every tool call and outrank a budget the tool had declared itself: `bash`'s
+  `timeoutMs` could ask for 600 seconds (`bash_max_timeout` caps it) and the
+  executor still killed the command at 60; the same held for a foreground
+  `subagent` waiting on a child turn, where a child that took a little longer had
+  its wait cut short. The tool's own declared budget now wins — the way harness
+  reads each tool's own `timeoutMs` instead of capping every call at one
+  host-wide number — and `ABY_TOOL_TIMEOUT` only backs up the tools that declare
+  nothing (`read`/`write`/`edit` and friends), while a foreground delegation and
+  `wait_agent` carry no timer at all: the child turn ends on its own. On expiry a
+  call is asked to stop, gets its own cleanup grace to settle, and the outcome
+  reaches the model as a tool error (saying it was stopped and that its result is
+  unverified) while the turn keeps going — the answer
+  `dsh-tool-call-timeout-policy` gives, not an `error` turn end.
+- The timeout error line no longer talks around the point: a request or tool call
+  reaching its own deadline says so (a tool declaring no budget stops at
+  `ABY_TOOL_TIMEOUT` seconds), and it still lists the current environment values
+  with "send a message to continue it".
+
 ## [0.1.12] - 2026-09-23
 
 ### Changed
@@ -109,42 +146,6 @@ context compaction, session persistence, goal rounds, uninstall) live in
   (selecting that line copies the command), and the `/resume` route underneath.
   The three flat `label: value` lines it replaces are gone.
 
-### Fixed
-
-- `ABY_TURN_TIMEOUT` is gone. It used to cap each segment's **total duration**
-  (600 seconds by default): model thinking, streamed output and every tool call
-  counted against it. A turn that had been running for fifteen minutes with every
-  step making progress was interrupted at the 600-second mark — the running tool
-  became "unverified", text already streamed was lost — and once three automatic
-  continuations were spent, the screen showed `· turn end · error` with
-  `timed out (ABY_TURN_TIMEOUT=600, ABY_TOOL_TIMEOUT=60 seconds; ABY_AUTO_CONTINUE=3)`.
-  A turn never should have had one: it is a local loop, DeepSeek only ever sees
-  stateless requests one at a time, so "how long this turn has been running" was
-  never its rule — and harness's agent loop has **no** deadline over a step
-  either. The only time limit left is `ABY_TOOL_TIMEOUT` (next entry), while
-  everything that can actually get stuck has an owner: each request belongs to
-  the transport (15s connect, 120s first byte, 60s stream idle), each tool call to
-  its own budget, a runaway loop to `ABY_MAX_REQUESTS` / `ABY_MAX_TOOL_CALLS`
-  (1000 each by default), and the user can press Esc at any point.
-- A tool's deadline no longer fails the whole turn, and no longer overrides the
-  tool's own setting. `ABY_TOOL_TIMEOUT` (60 seconds by default) used to apply to
-  every tool call and outrank a budget the tool had declared itself: `bash`'s
-  `timeoutMs` could ask for 600 seconds (`bash_max_timeout` caps it) and the
-  executor still killed the command at 60; the same held for a foreground
-  `subagent` waiting on a child turn, where a child that took a little longer had
-  its wait cut short. The tool's own declared budget now wins — the way harness
-  reads each tool's own `timeoutMs` instead of capping every call at one
-  host-wide number — and `ABY_TOOL_TIMEOUT` only backs up the tools that declare
-  nothing (`read`/`write`/`edit` and friends), while a foreground delegation and
-  `wait_agent` carry no timer at all: the child turn ends on its own. On expiry a
-  call is asked to stop, gets its own cleanup grace to settle, and the outcome
-  reaches the model as a tool error (saying it was stopped and that its result is
-  unverified) while the turn keeps going — the answer
-  `dsh-tool-call-timeout-policy` gives, not an `error` turn end.
-- The timeout error line no longer talks around the point: a request or tool call
-  reaching its own deadline says so (a tool declaring no budget stops at
-  `ABY_TOOL_TIMEOUT` seconds), and it still lists the current environment values
-  with "send a message to continue it".
 ## [0.1.11] - 2026-09-22
 
 ### Changed
