@@ -153,6 +153,13 @@ impl Agent {
         snapshot
     }
 
+    /// Whether the durable conversation contains image input.
+    pub fn has_image_input(&self) -> bool {
+        self.state.items.iter().any(|item| matches!(item,
+            Item::Message { content, .. } if content.iter().any(|part| matches!(part, ContentPart::InputImage { .. }))
+        ))
+    }
+
     /// Current turn's task list and progress, including a completed checklist until the next run.
     pub fn plan_view(&self) -> Option<crate::PlanView> {
         self.state.plan_view()
@@ -236,7 +243,7 @@ impl Agent {
         let received = !messages.is_empty();
         self.state
             .items
-            .extend(messages.into_iter().map(Item::user));
+            .extend(messages.into_iter().map(Item::user_parts));
         if received {
             self.state.needs_response = true;
         }
@@ -750,6 +757,25 @@ impl Agent {
         &mut self,
         input: impl Into<String>,
         options: RunOptions,
+        on_event: F,
+    ) -> Result<RunOutcome>
+    where
+        F: FnMut(AgentEvent) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.run_parts(
+            vec![ContentPart::InputText { text: input.into() }],
+            options,
+            on_event,
+        )
+        .await
+    }
+
+    /// Start a turn with ordered text and image blocks.
+    pub async fn run_parts<F, Fut>(
+        &mut self,
+        parts: Vec<ContentPart>,
+        options: RunOptions,
         mut on_event: F,
     ) -> Result<RunOutcome>
     where
@@ -772,7 +798,9 @@ impl Agent {
         )?;
         context.check()?;
         let start = self.state.items.len();
-        self.state.items.push(Item::user(input));
+        let input = Item::user_parts(parts);
+        input.validate()?;
+        self.state.items.push(input);
         self.state.needs_response = true;
         self.state.todos = None;
         self.drive(options, context, start, &mut on_event).await
@@ -804,12 +832,30 @@ impl Agent {
         F: FnMut(AgentEvent) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        self.resume_run(Some(input.into()), options, on_event).await
+        self.continue_run_with_parts(
+            vec![ContentPart::InputText { text: input.into() }],
+            options,
+            on_event,
+        )
+        .await
+    }
+
+    pub async fn continue_run_with_parts<F, Fut>(
+        &mut self,
+        parts: Vec<ContentPart>,
+        options: RunOptions,
+        on_event: F,
+    ) -> Result<RunOutcome>
+    where
+        F: FnMut(AgentEvent) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.resume_run(Some(parts), options, on_event).await
     }
 
     async fn resume_run<F, Fut>(
         &mut self,
-        input: Option<String>,
+        input: Option<Vec<ContentPart>>,
         options: RunOptions,
         mut on_event: F,
     ) -> Result<RunOutcome>
@@ -834,7 +880,9 @@ impl Agent {
         context.check()?;
         let start = self.state.items.len();
         if let Some(input) = input {
-            self.state.items.push(Item::user(input));
+            let input = Item::user_parts(input);
+            input.validate()?;
+            self.state.items.push(input);
         }
         self.drive(options, context, start, &mut on_event).await
     }

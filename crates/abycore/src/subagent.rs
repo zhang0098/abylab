@@ -127,7 +127,7 @@ pub enum SubagentEvent {
 }
 
 #[derive(Default)]
-pub(crate) struct Inbox(Mutex<VecDeque<String>>);
+pub(crate) struct Inbox(Mutex<VecDeque<Vec<crate::ContentPart>>>);
 
 impl Inbox {
     fn validate_message(message: &str) -> Result<()> {
@@ -139,15 +139,33 @@ impl Inbox {
 
     pub(crate) fn send(&self, message: String) -> Result<()> {
         Self::validate_message(&message)?;
+        self.send_parts(vec![crate::ContentPart::InputText { text: message }])
+    }
+
+    pub(crate) fn send_parts(&self, parts: Vec<crate::ContentPart>) -> Result<()> {
+        if parts.is_empty()
+            || !parts.iter().any(|part| match part {
+                crate::ContentPart::InputText { text } => !text.trim().is_empty(),
+                crate::ContentPart::InputImage { .. } => true,
+                _ => false,
+            })
+        {
+            return Err(invalid("message must contain text or an image"));
+        }
+        let input = crate::Item::user_parts(parts);
+        input.validate()?;
+        let crate::Item::Message { content, .. } = input else {
+            unreachable!("user_parts makes a message")
+        };
         let mut queue = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if queue.len() >= 32 {
             return Err(Error::new(ErrorKind::BudgetExceeded, "agent inbox is full"));
         }
-        queue.push_back(message);
+        queue.push_back(content);
         Ok(())
     }
 
-    pub(crate) fn drain(&self) -> Vec<String> {
+    pub(crate) fn drain(&self) -> Vec<Vec<crate::ContentPart>> {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -180,6 +198,10 @@ impl SteerHandle {
     /// full inbox (32 pending), never because the agent is idle.
     pub fn send(&self, text: impl Into<String>) -> Result<()> {
         self.0.send(text.into())
+    }
+
+    pub fn send_parts(&self, parts: Vec<crate::ContentPart>) -> Result<()> {
+        self.0.send_parts(parts)
     }
 
     /// Whether a message is waiting for the next step boundary.

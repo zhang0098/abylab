@@ -182,13 +182,20 @@ impl OutstandingSteers {
 /// survives a client, and so that every client renders the same rows
 /// ([`CtlEvent::Queue`]). deepseek-harness keeps the same list in its host
 /// inbox; this is that list, with the wire form the driver will send.
+#[derive(Clone)]
 struct QueuedItem {
     item_id: u64,
     text: String,
+    parts: Option<Vec<abycore::ContentPart>>,
     placement: QueuePlacement,
     /// Restored from disk: it waits for a turn this process actually ran,
     /// because the turn it was queued behind no longer exists.
     held: bool,
+}
+
+enum PromptInput {
+    Text(String),
+    Parts(Vec<abycore::ContentPart>),
 }
 
 /// The wire rows for one publish.
@@ -198,6 +205,7 @@ fn queue_rows(queue: &VecDeque<QueuedItem>) -> Vec<QueueRow> {
         .map(|item| QueueRow {
             item_id: item.item_id,
             text: item.text.clone(),
+            parts: item.parts.clone(),
             placement: item.placement,
         })
         .collect()
@@ -579,13 +587,39 @@ fn next_queue_item_id() -> u64 {
 
 /// Write the session's FIFO down, so a crash does not swallow prompts the user
 /// already sent — the same promise the client used to keep itself.
-fn persist_queue(cfg: &DriverConfig, session: &str, queue: &VecDeque<QueuedItem>) {
+fn persist_queue(
+    cfg: &DriverConfig,
+    session: &str,
+    queue: &VecDeque<QueuedItem>,
+) -> Result<(), String> {
     let home = cfg.home.as_deref().unwrap_or_default();
     if home.is_empty() {
-        return;
+        return Ok(());
     }
-    let texts: Vec<String> = queue.iter().map(|item| item.text.clone()).collect();
-    crate::queue_store::save(home, session, &texts);
+    let items: Vec<crate::queue_store::QueuedRecord> = queue
+        .iter()
+        .map(|item| crate::queue_store::QueuedRecord {
+            text: item.text.clone(),
+            parts: item.parts.clone(),
+        })
+        .collect();
+    crate::queue_store::save(home, &cfg.workspace, session, &items)
+        .map_err(|error| format!("queue save failed: {error}"))
+}
+
+fn save_queue_or_report(
+    cfg: &DriverConfig,
+    session: &str,
+    queue: &VecDeque<QueuedItem>,
+    ctl: &impl Fn(CtlEvent),
+) -> bool {
+    match persist_queue(cfg, session, queue) {
+        Ok(()) => true,
+        Err(error) => {
+            ctl(CtlEvent::TuiOpFailed(error));
+            false
+        }
+    }
 }
 
 /// Publish the whole queue, the way every client renders it.
@@ -594,6 +628,30 @@ fn publish_queue(queue: &VecDeque<QueuedItem>, session: &str, ctl: &impl Fn(CtlE
         session_id: session.to_string(),
         items: queue_rows(queue),
     });
+}
+
+fn load_session_queue(
+    cfg: &DriverConfig,
+    session: &str,
+    ctl: &impl Fn(CtlEvent),
+) -> VecDeque<QueuedItem> {
+    let records = match crate::queue_store::load_checked(cfg, session) {
+        Ok(records) => records,
+        Err(error) => {
+            ctl(CtlEvent::TuiOpFailed(error));
+            return VecDeque::new();
+        }
+    };
+    records
+        .into_iter()
+        .map(|record| QueuedItem {
+            item_id: next_queue_item_id(),
+            text: record.text,
+            parts: record.parts,
+            placement: QueuePlacement::Queued,
+            held: true,
+        })
+        .collect()
 }
 
 /// Drop queue items the running turn has taken, and tell the clients.
@@ -613,7 +671,7 @@ fn settle_taken(
     if queue.len() == before {
         return;
     }
-    persist_queue(cfg, session, queue);
+    save_queue_or_report(cfg, session, queue, ctl);
     publish_queue(queue, session, ctl);
 }
 
@@ -621,11 +679,14 @@ fn settle_taken(
 /// restored item waits until this process has run a turn, and an item the
 /// running turn already took (a steer whose queue command was still in flight)
 /// is skipped instead of being delivered twice.
-fn claim_queued(queue: &mut VecDeque<QueuedItem>, taken: &OutstandingSteers) -> Option<QueuedItem> {
+fn claim_queued(
+    queue: &mut VecDeque<QueuedItem>,
+    taken: &OutstandingSteers,
+) -> Option<(usize, QueuedItem)> {
     let index = queue
         .iter()
         .position(|item| !item.held && !taken.contains(item.item_id))?;
-    queue.remove(index)
+    queue.remove(index).map(|item| (index, item))
 }
 
 /// The driver's idle wait: commands first, then steers.
@@ -655,13 +716,19 @@ async fn next_command(
     }
     // Steers the running turn took leave the FIFO before it drains.
     settle_taken(queue, taken, cfg, session, ctl);
-    if let Some(item) = claim_queued(queue, taken) {
-        ctl(CtlEvent::QueueClaimed {
-            item_id: item.item_id,
-        });
-        persist_queue(cfg, session, queue);
-        publish_queue(queue, session, ctl);
-        return Some(Cmd::Prompt { text: item.text });
+    if let Some((index, item)) = claim_queued(queue, taken) {
+        if !save_queue_or_report(cfg, session, queue, ctl) {
+            queue.insert(index, item);
+        } else {
+            ctl(CtlEvent::QueueClaimed {
+                item_id: item.item_id,
+            });
+            publish_queue(queue, session, ctl);
+            return Some(match item.parts {
+                Some(parts) => Cmd::PromptParts { parts },
+                None => Cmd::Prompt { text: item.text },
+            });
+        }
     }
     tokio::select! {
         biased;
@@ -674,6 +741,7 @@ async fn next_command(
                 session_id: request.session_id,
                 message_id: request.message_id,
                 text: request.text,
+                parts: request.parts,
             })
         }
     }
@@ -881,15 +949,7 @@ async fn drive(
     // process actually runs before they are spent: the turn they were queued
     // behind belongs to a dead process, and spending them unbidden is not the
     // driver's call.
-    let mut queue: VecDeque<QueuedItem> = crate::queue_store::load(&cfg, &active_session)
-        .into_iter()
-        .map(|text| QueuedItem {
-            item_id: next_queue_item_id(),
-            text,
-            placement: QueuePlacement::Queued,
-            held: true,
-        })
-        .collect();
+    let mut queue = load_session_queue(&cfg, &active_session, &ctl);
     if !queue.is_empty() {
         publish_queue(&queue, &active_session, &ctl);
     }
@@ -927,6 +987,7 @@ async fn drive(
                 session_id,
                 message_id,
                 text,
+                parts,
             } => {
                 if session_id != active_session {
                     ctl(CtlEvent::SteerSettled {
@@ -938,22 +999,45 @@ async fn drive(
                 // It may have been a queue row: it is being delivered now, and
                 // the row must leave the FIFO.
                 if let Some(index) = queue.iter().position(|item| item.item_id == message_id) {
-                    queue.remove(index);
+                    let item = queue.remove(index).expect("row index is valid");
+                    if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
+                        queue.insert(index, item);
+                        ctl(CtlEvent::SteerSettled {
+                            message_id,
+                            deferred: true,
+                        });
+                        continue;
+                    }
                     taken.remember(message_id);
                     ctl(CtlEvent::QueueClaimed {
                         item_id: message_id,
                     });
-                    persist_queue(&cfg, &active_session, &queue);
                     publish_queue(&queue, &active_session, &ctl);
                 }
-                (Cmd::Prompt { text }, Some(message_id))
+                (
+                    match parts {
+                        Some(parts) => Cmd::PromptParts { parts },
+                        None => Cmd::Prompt { text },
+                    },
+                    Some(message_id),
+                )
             }
+            cmd => (cmd, None),
+        };
+        let (cmd, prompt_parts) = match cmd {
+            Cmd::PromptParts { parts } => (
+                Cmd::Prompt {
+                    text: String::new(),
+                },
+                Some(parts),
+            ),
             cmd => (cmd, None),
         };
         let restoring = matches!(cmd, Cmd::Resume { .. });
         match cmd {
             Cmd::PromptForSession { .. } => unreachable!("normalized above"),
             Cmd::SteerForSession { .. } => unreachable!("normalized above"),
+            Cmd::PromptParts { .. } => unreachable!("normalized above"),
             // The skill catalog is a pure read of the launch snapshot and the handle
             // routes it to the query task so it answers mid-turn; this arm
             // covers a direct send on the loop channel.
@@ -1208,16 +1292,7 @@ async fn drive(
                         queue.clear();
                         taken.take();
                         admitted.take();
-                        queue.extend(
-                            crate::queue_store::load(&cfg, &active_session)
-                                .into_iter()
-                                .map(|text| QueuedItem {
-                                    item_id: next_queue_item_id(),
-                                    text,
-                                    placement: QueuePlacement::Queued,
-                                    held: true,
-                                }),
-                        );
+                        queue = load_session_queue(&cfg, &active_session, &ctl);
                         publish_queue(&queue, &active_session, &ctl);
                         bind_session(
                             agent.as_ref().unwrap(),
@@ -1391,10 +1466,43 @@ async fn drive(
                 queue.push_back(QueuedItem {
                     item_id,
                     text,
+                    parts: None,
                     placement: QueuePlacement::Queued,
                     held: false,
                 });
-                persist_queue(&cfg, &active_session, &queue);
+                if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
+                    queue.pop_back();
+                    ctl(CtlEvent::QueueRemoved { item_id });
+                    continue;
+                }
+                publish_queue(&queue, &active_session, &ctl);
+            }
+            Cmd::QueuePartsForSession {
+                session_id,
+                item_id,
+                text,
+                parts,
+            } => {
+                if session_id != active_session || parts.is_empty() {
+                    ctl(CtlEvent::QueueRemoved { item_id });
+                    continue;
+                }
+                if taken.contains(item_id) || admitted.contains(item_id) {
+                    ctl(CtlEvent::QueueClaimed { item_id });
+                    continue;
+                }
+                queue.push_back(QueuedItem {
+                    item_id,
+                    text,
+                    parts: Some(parts),
+                    placement: QueuePlacement::Queued,
+                    held: false,
+                });
+                if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
+                    queue.pop_back();
+                    ctl(CtlEvent::QueueRemoved { item_id });
+                    continue;
+                }
                 publish_queue(&queue, &active_session, &ctl);
             }
             Cmd::UpdateQueue {
@@ -1406,6 +1514,7 @@ async fn drive(
                     ctl(CtlEvent::QueueRemoved { item_id });
                     continue;
                 }
+                let before_edit = queue.clone();
                 match action {
                     QueueAction::Remove => {
                         if let Some(index) = queue.iter().position(|item| item.item_id == item_id) {
@@ -1420,15 +1529,36 @@ async fn drive(
                                 ctl(CtlEvent::QueueRemoved { item_id });
                             }
                             Some(index) => {
-                                queue[index].text = text;
+                                queue[index].text = text.clone();
+                                if let Some(parts) = &mut queue[index].parts {
+                                    parts.retain(|part| {
+                                        matches!(part, abycore::ContentPart::InputImage { .. })
+                                    });
+                                    parts.insert(0, abycore::ContentPart::InputText { text });
+                                }
                             }
                             // Already delivered or removed: the client's row is
                             // stale, and saying so is cheaper than resurrecting it.
                             None => ctl(CtlEvent::QueueRemoved { item_id }),
                         }
                     }
+                    QueueAction::EditParts { text, parts } => {
+                        if let Some(index) = queue.iter().position(|item| item.item_id == item_id) {
+                            if parts.is_empty() {
+                                queue.remove(index);
+                                ctl(CtlEvent::QueueRemoved { item_id });
+                            } else {
+                                queue[index].text = text;
+                                queue[index].parts = Some(parts);
+                            }
+                        } else {
+                            ctl(CtlEvent::QueueRemoved { item_id });
+                        }
+                    }
                 }
-                persist_queue(&cfg, &active_session, &queue);
+                if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
+                    queue = before_edit;
+                }
                 publish_queue(&queue, &active_session, &ctl);
             }
             Cmd::Prompt { text } => {
@@ -1450,7 +1580,11 @@ async fn drive(
                 // `/name [args]` naming a skill becomes that skill's body: the
                 // host injects it here, at the one seam every prompt crosses
                 // (typed, queued, steered). Any other line ships unchanged.
-                let text = skills.expand(&text).unwrap_or(text);
+                let text = if prompt_parts.is_none() {
+                    skills.expand(&text).unwrap_or(text)
+                } else {
+                    text
+                };
                 let message_id = format!("aby-{}", agent.snapshot().run_sequence + 1);
                 ctl(CtlEvent::PromptQueued { message_id });
                 if let Some(message_id) = steered {
@@ -1478,7 +1612,11 @@ async fn drive(
                 // Keep the UI busy until those rounds settle, so its queued
                 // prompts cannot be dispatched between the two turns.
                 let goal_continues = goal_armed;
-                match turn(agent, Some(text), &mut ctx, !goal_continues).await {
+                let input = match prompt_parts {
+                    Some(parts) => PromptInput::Parts(parts),
+                    None => PromptInput::Text(text),
+                };
+                match turn(agent, Some(input), &mut ctx, !goal_continues).await {
                     Ok(outcome)
                         if goal_continues && outcome.stop_reason == StopReason::Completed =>
                     {
@@ -1504,7 +1642,7 @@ async fn drive(
                     for item in queue.iter_mut() {
                         item.held = false;
                     }
-                    persist_queue(&cfg, &active_session, &queue);
+                    save_queue_or_report(&cfg, &active_session, &queue, &ctl);
                 }
             }
         }
@@ -2054,7 +2192,7 @@ async fn run_goal_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &
             "Continue working toward the session goal (round {}/{}): {}\n             When the objective is achieved, call update_goal with status \"complete\".              If progress is impossible, call update_goal with status \"blocked\" and explain in note.              Otherwise keep working; do not restate the goal, just make progress.",
             goal.rounds_started, goal.max_rounds, goal.objective
         );
-        match turn(agent, Some(prompt), ctx, false).await {
+        match turn(agent, Some(PromptInput::Text(prompt)), ctx, false).await {
             Ok(outcome) if outcome.stop_reason == StopReason::Completed => {}
             Ok(_) => return,
             Err(err) => {
@@ -2296,16 +2434,25 @@ struct TurnCtx<'a> {
 /// difference between "change course mid-turn" and "cancel and retype".
 async fn run_segment(
     agent: &mut Agent,
-    text: Option<String>,
+    input: Option<PromptInput>,
     ctx: &mut TurnCtx<'_>,
 ) -> abycore::Result<RunOutcome> {
     let cancellation = CancellationToken::new();
+    let has_image = agent.has_image_input()
+        || matches!(&input,
+            Some(PromptInput::Parts(parts)) if parts.iter().any(|part| matches!(part, abycore::ContentPart::InputImage { .. }))
+        );
     let options = RunOptions {
         cancellation: cancellation.clone(),
         max_requests: ctx.limits.max_requests,
         max_tool_calls: ctx.limits.max_tool_calls,
         timeout: ctx.limits.run_timeout,
         tool_timeout: ctx.limits.tool_timeout,
+        max_input_bytes: if has_image {
+            48 * 1024 * 1024
+        } else {
+            RunOptions::default().max_input_bytes
+        },
         ..RunOptions::default()
     };
     let (sess, sink_for_events) = (ctx.session.to_string(), Arc::clone(ctx.sink));
@@ -2334,11 +2481,15 @@ async fn run_segment(
 
     let mut run_fut: std::pin::Pin<
         Box<dyn std::future::Future<Output = abycore::Result<RunOutcome>> + '_>,
-    > = match text {
-        Some(text) if agent.snapshot().needs_response => {
+    > = match input {
+        Some(PromptInput::Text(text)) if agent.snapshot().needs_response => {
             Box::pin(agent.continue_run_with_input(text, options, on_event))
         }
-        Some(text) => Box::pin(agent.run(text, options, on_event)),
+        Some(PromptInput::Text(text)) => Box::pin(agent.run(text, options, on_event)),
+        Some(PromptInput::Parts(parts)) if agent.snapshot().needs_response => {
+            Box::pin(agent.continue_run_with_parts(parts, options, on_event))
+        }
+        Some(PromptInput::Parts(parts)) => Box::pin(agent.run_parts(parts, options, on_event)),
         None => Box::pin(agent.continue_run(options, on_event)),
     };
     // Three-way race: the segment's own outcome, an interrupt (cancel), and a
@@ -2369,8 +2520,14 @@ async fn run_segment(
 fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
     // Same seam every prompt crosses: `/name` naming a skill ships that skill's
     // body, not the bare command line.
-    let text = ctx.skills.expand(&request.text).unwrap_or(request.text);
-    let deferred = match ctx.steer.send(text) {
+    let result = match request.parts {
+        Some(parts) => ctx.steer.send_parts(parts),
+        None => {
+            let text = ctx.skills.expand(&request.text).unwrap_or(request.text);
+            ctx.steer.send(text)
+        }
+    };
+    let deferred = match result {
         Ok(()) => {
             ctx.admitted.push(request.message_id);
             // It is not a queued item any more: the running turn owns it now.
@@ -2406,11 +2563,11 @@ fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
 /// ends the turn while the model still had work queued.
 async fn turn(
     agent: &mut SessionAgent,
-    text: Option<String>,
+    input: Option<PromptInput>,
     ctx: &mut TurnCtx<'_>,
     settle_status: bool,
 ) -> abycore::Result<RunOutcome> {
-    if text.is_some() && agent.snapshot().needs_response {
+    if input.is_some() && agent.snapshot().needs_response {
         settle_pending(
             agent,
             "previous tool call was interrupted; its result is unverified — check before repeating",
@@ -2436,7 +2593,7 @@ async fn turn(
     // runs must still land, so drain only once here.
     while ctx.interrupt_rx.try_recv().is_ok() {}
 
-    let mut next = text;
+    let mut next = input;
     let mut continuations = 0usize;
     let outcome = loop {
         let outcome = run_segment(agent, next.take(), ctx).await;
@@ -4042,6 +4199,46 @@ mod tests {
         std::fs::remove_dir_all(&workspace).expect("remove test workspace");
     }
 
+    #[tokio::test]
+    async fn a_pure_image_queue_item_reaches_the_model() {
+        let workspace = scratch_dir("host-image-queue");
+        let provider = FakeProvider::start(vec!["seen"], Duration::from_millis(50)).await;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(|_| {});
+        let parts = vec![abycore::ContentPart::InputImage {
+            media_type: "image/png".into(),
+            data: "YWJj".into(),
+        }];
+        cmd_tx
+            .send(Cmd::QueuePartsForSession {
+                session_id: "steer-test".into(),
+                item_id: 42,
+                text: String::new(),
+                parts: parts.clone(),
+            })
+            .unwrap();
+        let config = steer_test_config(&workspace, &provider.url);
+        let actor = async {
+            provider.served(1).await;
+            cmd_tx.send(Cmd::Shutdown).unwrap();
+        };
+        tokio::join!(
+            drive(config, cmd_rx, query_rx, interrupt_rx, steer_rx, sink),
+            actor
+        );
+        let bodies = provider.bodies();
+        assert_eq!(
+            bodies[0]["messages"][0]["content"][0],
+            serde_json::json!({
+                "type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"YWJj"}
+            })
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
     /// Steering a queued row hands it to the running turn and takes it out of
     /// the FIFO — the row gesture's whole contract.
     #[tokio::test]
@@ -4083,6 +4280,7 @@ mod tests {
                     session_id: "steer-test".into(),
                     message_id: 9,
                     text: "send me now".into(),
+                    parts: None,
                 })
                 .expect("steer the row");
             provider.served(2).await;
@@ -4220,9 +4418,11 @@ mod tests {
         let workspace = scratch_dir("host-queue-restore");
         crate::queue_store::save(
             &workspace.to_string_lossy(),
+            &workspace.to_string_lossy(),
             "steer-test",
             &["from the last run".into()],
-        );
+        )
+        .unwrap();
         let provider = FakeProvider::start(vec!["nothing yet"], Duration::from_millis(200)).await;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_query_tx, query_rx) = mpsc::unbounded_channel();
@@ -4286,9 +4486,11 @@ mod tests {
         let workspace = scratch_dir("host-queue-switch");
         crate::queue_store::save(
             &workspace.to_string_lossy(),
+            &workspace.to_string_lossy(),
             "second",
             &["second's own follow-up".into()],
-        );
+        )
+        .unwrap();
         let provider = FakeProvider::start(vec!["first answer"], Duration::from_millis(200)).await;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_query_tx, query_rx) = mpsc::unbounded_channel();
@@ -4358,7 +4560,9 @@ mod tests {
         // The old session's item is still parked on disk for its own next start.
         assert_eq!(
             crate::queue_store::load(&steer_test_config(&workspace, &provider.url), "steer-test"),
-            vec!["old session's follow-up".to_string()]
+            vec![crate::queue_store::QueuedRecord::text(
+                "old session's follow-up"
+            )]
         );
         drop(events);
         std::fs::remove_dir_all(&workspace).expect("remove test workspace");
@@ -4445,6 +4649,7 @@ mod tests {
                     session_id: "steer-test".into(),
                     message_id: 31,
                     text: "change course".into(),
+                    parts: None,
                 })
                 .expect("queue steer");
             provider.served(2).await;
@@ -4521,6 +4726,7 @@ mod tests {
                     session_id: "steer-test".into(),
                     message_id: 21,
                     text: "/review the diff".into(),
+                    parts: None,
                 })
                 .expect("queue steer");
             provider.served(2).await;
@@ -4585,6 +4791,7 @@ mod tests {
                     session_id: "steer-test".into(),
                     message_id: 7,
                     text: "change course".into(),
+                    parts: None,
                 })
                 .expect("queue steer");
             provider.served(2).await;
@@ -4637,6 +4844,7 @@ mod tests {
                 session_id: "steer-test".into(),
                 message_id: 9,
                 text: "cold start".into(),
+                parts: None,
             })
             .expect("queue steer");
         let config = steer_test_config(&workspace, &provider.url);
@@ -4677,6 +4885,7 @@ mod tests {
                 session_id: "steer-test".into(),
                 message_id: 11,
                 text: "now".into(),
+                parts: None,
             })
             .expect("queue steer");
         let mut config = steer_test_config(&workspace, "http://127.0.0.1:1");
@@ -4718,6 +4927,7 @@ mod tests {
                 session_id: "s".into(),
                 message_id: 3,
                 text: "hello".into(),
+                parts: None,
             })
             .expect("queue steer");
         match next_command(
@@ -4770,6 +4980,7 @@ mod tests {
         let push = |item_id: u64, text: &str| QueuedItem {
             item_id,
             text: text.into(),
+            parts: None,
             placement: QueuePlacement::Queued,
             held: false,
         };
@@ -4870,6 +5081,7 @@ mod tests {
                 session_id: "s".into(),
                 message_id: 5,
                 text: "steer me".into(),
+                parts: None,
             },
             &mut ctx,
         );
@@ -4890,6 +5102,7 @@ mod tests {
                 session_id: "s".into(),
                 message_id: 6,
                 text: "   ".into(),
+                parts: None,
             },
             &mut ctx,
         );

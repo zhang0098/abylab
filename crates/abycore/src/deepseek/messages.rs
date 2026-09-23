@@ -69,8 +69,11 @@ fn request_body(
                 },
                 content
                     .iter()
-                    .filter(|p| *role == MessageRole::Assistant || !p.text().is_empty())
-                    .map(|p| json!({"type":"text","text":p.text()}))
+                    .filter(|p| *role == MessageRole::Assistant || matches!(p, ContentPart::InputImage { .. }) || !p.text().is_empty())
+                    .map(|p| match p {
+                        ContentPart::InputImage { media_type, data } => json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":data}}),
+                        _ => json!({"type":"text","text":p.text()}),
+                    })
                     .collect(),
             ),
             Item::Reasoning {

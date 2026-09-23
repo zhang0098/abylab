@@ -862,8 +862,7 @@ enum StagedBlock {
     Image(crate::attachments::Attachment),
 }
 
-/// The wire text of a staged prompt: the in-process transport is text-only, so
-/// an image rides as the composer's own chip and echo.
+/// The text summary of a staged prompt, excluding image payloads.
 fn staged_text(staged: &[StagedBlock]) -> String {
     staged
         .iter()
@@ -873,6 +872,61 @@ fn staged_text(staged: &[StagedBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn staged_matches_queue(staged: &[StagedBlock], row: &crate::bus::QueueRow) -> bool {
+    let Some(parts) = &row.parts else {
+        return staged_text(staged) == row.text
+            && staged
+                .iter()
+                .all(|block| matches!(block, StagedBlock::Text(_)));
+    };
+    staged.len() == parts.len()
+        && staged
+            .iter()
+            .zip(parts)
+            .all(|(block, part)| match (block, part) {
+                (
+                    StagedBlock::Text(text),
+                    abylab_backend::PromptPart::InputText { text: other },
+                ) => text == other,
+                (
+                    StagedBlock::Image(image),
+                    abylab_backend::PromptPart::InputImage { media_type, data },
+                ) => image.media_type == *media_type && crate::pet::base64(&image.data) == *data,
+                _ => false,
+            })
+}
+
+fn queued_blocks(row: &crate::bus::QueueRow) -> Vec<StagedBlock> {
+    use base64::Engine;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT_IMAGE: AtomicU32 = AtomicU32::new(1_000_000);
+    let Some(parts) = &row.parts else {
+        return vec![StagedBlock::Text(row.text.clone())];
+    };
+    parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| match part {
+            abylab_backend::PromptPart::InputText { text } => Some(StagedBlock::Text(text.clone())),
+            abylab_backend::PromptPart::InputImage { media_type, data } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .ok()?;
+                Some(StagedBlock::Image(crate::attachments::Attachment {
+                    id: crate::attachments::KITTY_ID_BASE
+                        .wrapping_add(NEXT_IMAGE.fetch_add(1, Ordering::Relaxed)),
+                    token: format!("[image restored {index}]"),
+                    name: format!("queued image {}", index + 1),
+                    path: "queued image".into(),
+                    media_type: media_type.clone(),
+                    data: std::sync::Arc::from(bytes),
+                }))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// One client-owned queued prompt: the blocks (text and/or staged images)
@@ -1845,16 +1899,10 @@ impl App {
                             if deferred {
                                 self.transcript.mark_prompt_queued(&pending.cells);
                                 let blocks = pending.blocks;
-                                let text = match blocks.first() {
-                                    Some(StagedBlock::Text(text)) => text.clone(),
-                                    _ => String::new(),
-                                };
+                                let text = staged_text(&blocks);
+                                let wire = prompt_blocks_from_staged(&blocks);
                                 self.enqueue_prompt(message_id, blocks, pending.cells);
-                                ctl.send(Cmd::Queue {
-                                    session_id: self.session_id.clone(),
-                                    item_id: message_id,
-                                    text,
-                                });
+                                self.send_queued_wire(message_id, text, wire, ctl);
                                 self.show_tip(self.locale.tr(
                                     "agent deferred Send Now — queued after the active turn",
                                     "Agent 推迟了立即发送 —— 已排到本轮之后",
@@ -4295,14 +4343,27 @@ impl App {
             );
             return;
         };
+        let had_images = self.prompt_queue[index]
+            .blocks
+            .iter()
+            .any(|block| matches!(block, StagedBlock::Image(_)));
         self.prompt_queue[index].blocks = blocks;
-        let text = match self.prompt_queue[index].blocks.first() {
-            Some(StagedBlock::Text(text)) => text.clone(),
-            _ => String::new(),
+        let text = staged_text(&self.prompt_queue[index].blocks);
+        let images = self.prompt_queue[index]
+            .blocks
+            .iter()
+            .any(|block| matches!(block, StagedBlock::Image(_)));
+        let action = if images || had_images {
+            crate::bus::QueueAction::EditParts {
+                text,
+                blocks: prompt_blocks_from_staged(&self.prompt_queue[index].blocks),
+            }
+        } else {
+            crate::bus::QueueAction::Edit(text)
         };
         let item_id = self.prompt_queue[index].id;
         self.repaint_prompt_echo(index);
-        self.update_queue_row(item_id, crate::bus::QueueAction::Edit(text), ctl);
+        self.update_queue_row(item_id, action, ctl);
         self.finish_queue_edit();
         self.show_tip(
             self.locale
@@ -5813,19 +5874,8 @@ impl App {
                         .prompt_queue
                         .remove(index)
                         .expect("index came from a position search");
-                    let text_changed = !matches!(
-                        prompt.blocks.first(),
-                        Some(StagedBlock::Text(text)) if text == &row.text
-                    );
-                    if text_changed {
-                        // The host's text is authoritative (another client may
-                        // have edited it); local image blocks ride along.
-                        let images: Vec<StagedBlock> = std::mem::take(&mut prompt.blocks)
-                            .into_iter()
-                            .filter(|block| matches!(block, StagedBlock::Image(_)))
-                            .collect();
-                        prompt.blocks = vec![StagedBlock::Text(row.text.clone())];
-                        prompt.blocks.extend(images);
+                    if !staged_matches_queue(&prompt.blocks, &row) {
+                        prompt.blocks = queued_blocks(&row);
                         let cells = self.repaint_cells(&prompt.blocks, &prompt.cells);
                         prompt.cells = cells;
                         next.push_back(prompt);
@@ -5834,7 +5884,7 @@ impl App {
                     }
                 }
                 None => {
-                    let blocks = vec![StagedBlock::Text(row.text.clone())];
+                    let blocks = queued_blocks(&row);
                     let cells =
                         self.paint_staged_echo(&blocks, crate::transcript::Delivery::Queued);
                     next.push_back(QueuedPrompt {
@@ -5940,8 +5990,8 @@ impl App {
         steer: Option<u64>,
         ctl: &Controller,
     ) {
-        // The in-process transport carries text: an image rides the composer's
-        // own echo and chip, exactly as it did before this transport existed.
+        // Keep the text summary for queue labels while image blocks travel
+        // through the backend with the prompt.
         let text = blocks
             .iter()
             .filter_map(|block| match block {
@@ -5950,8 +6000,17 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("");
+        let has_image = blocks
+            .iter()
+            .any(|block| matches!(block, crate::bus::PromptBlock::Image(_)));
         let session_id = self.session_id.clone();
         match steer {
+            Some(message_id) if has_image => ctl.send(Cmd::SteerParts {
+                session_id,
+                message_id,
+                text,
+                blocks,
+            }),
             Some(message_id) => ctl.send(Cmd::Steer {
                 session_id,
                 message_id,
@@ -5959,12 +6018,35 @@ impl App {
             }),
             None => {
                 let item_id = self.next_prompt_id();
-                ctl.send(Cmd::Queue {
-                    session_id,
-                    item_id,
-                    text,
-                });
+                self.send_queued_wire(item_id, text, blocks, ctl);
             }
+        }
+    }
+
+    fn send_queued_wire(
+        &self,
+        item_id: u64,
+        text: String,
+        blocks: Vec<crate::bus::PromptBlock>,
+        ctl: &Controller,
+    ) {
+        let session_id = self.session_id.clone();
+        if blocks
+            .iter()
+            .any(|block| matches!(block, crate::bus::PromptBlock::Image(_)))
+        {
+            ctl.send(Cmd::QueueParts {
+                session_id,
+                item_id,
+                text,
+                blocks,
+            });
+        } else {
+            ctl.send(Cmd::Queue {
+                session_id,
+                item_id,
+                text,
+            });
         }
     }
 
@@ -6035,6 +6117,22 @@ impl App {
         data: Vec<u8>,
         caption: String,
     ) {
+        const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+        if data.len() > MAX_IMAGE_BYTES
+            || self
+                .pending_images
+                .iter()
+                .map(|item| item.data.len())
+                .sum::<usize>()
+                + data.len()
+                > MAX_IMAGE_BYTES
+        {
+            self.show_tip(self.locale.tr(
+                "images exceed the 32 MiB inline limit — send fewer or smaller images",
+                "图片超过 32 MiB 内联限制，请减少图片数量或压缩图片",
+            ));
+            return;
+        }
         let token = match self
             .pending_images
             .add(self.locale, name, path, media_type, data)
@@ -6116,12 +6214,9 @@ impl App {
         if delivery == crate::transcript::Delivery::Queued {
             let id = self.next_prompt_id();
             let text = staged_text(&staged);
+            let wire = prompt_blocks_from_staged(&staged);
             self.enqueue_prompt(id, staged, cells);
-            ctl.send(Cmd::Queue {
-                session_id: self.session_id.clone(),
-                item_id: id,
-                text,
-            });
+            self.send_queued_wire(id, text, wire, ctl);
             return;
         }
         // The wire form borrows the staged blocks (image payloads are `Arc`
@@ -10584,11 +10679,13 @@ mod mode_tests {
                     crate::bus::QueueRow {
                         item_id: 77,
                         text: "from another client".into(),
+                        parts: None,
                         steering: false,
                     },
                     crate::bus::QueueRow {
                         item_id: mine,
                         text: "mine".into(),
+                        parts: None,
                         steering: false,
                     },
                 ],
@@ -10630,6 +10727,7 @@ mod mode_tests {
                 items: vec![crate::bus::QueueRow {
                     item_id: mine,
                     text: "mine".into(),
+                    parts: None,
                     steering: true,
                 }],
             }),
@@ -10893,6 +10991,59 @@ mod mode_tests {
             matches!(app.state, RunState::Starting),
             "sending starts the turn"
         );
+    }
+
+    #[test]
+    fn a_pure_image_is_sent_as_image_blocks() {
+        let (mut app, _, _) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.stage_image(
+            "red.png".into(),
+            "clipboard".into(),
+            "image/png".into(),
+            b"png bytes".to_vec(),
+            String::new(),
+        );
+        app.submit(&ctl);
+        let crate::bus::Cmd::QueueParts { text, blocks, .. } = commands.try_recv().unwrap() else {
+            panic!("image prompt was not queued with its payload")
+        };
+        assert!(text.is_empty());
+        assert!(
+            matches!(&blocks[0], crate::bus::PromptBlock::Image(image) if image.media_type == "image/png" && !image.data.is_empty())
+        );
+    }
+
+    #[test]
+    fn removing_a_queued_image_updates_the_host_blocks() {
+        let (mut app, _, _) = test_app();
+        let (ctl, commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.stage_image(
+            "red.png".into(),
+            "clipboard".into(),
+            "image/png".into(),
+            b"png bytes".to_vec(),
+            String::new(),
+        );
+        app.input.insert_str("look");
+        app.submit(&ctl);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Cmd::QueueParts { .. }
+        ));
+        let id = app.prompt_queue[0].id;
+        app.begin_queue_edit(&id.to_string(), &ctl);
+        app.pending_images.clear();
+        app.input.set("text only".into());
+        app.save_queue_edit(&ctl);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Cmd::UpdateQueue {
+                action: crate::bus::QueueAction::EditParts { blocks, .. },
+                ..
+            } if matches!(blocks.as_slice(), [crate::bus::PromptBlock::Text(text)] if text == "text only")
+        ));
     }
     #[test]
     fn submit_echoes_interleaved_transcript_not_caption_then_images() {

@@ -13,6 +13,7 @@ pub enum MessageRole {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     InputText { text: String },
+    InputImage { media_type: String, data: String },
     OutputText { text: String },
     ReasoningText { text: String },
 }
@@ -23,6 +24,7 @@ impl ContentPart {
             Self::InputText { text } | Self::OutputText { text } | Self::ReasoningText { text } => {
                 text
             }
+            Self::InputImage { .. } => "",
         }
     }
 }
@@ -71,10 +73,14 @@ pub struct ThinkingSignature {
 
 impl Item {
     pub fn user(text: impl Into<String>) -> Self {
+        Self::user_parts(vec![ContentPart::InputText { text: text.into() }])
+    }
+
+    pub fn user_parts(content: Vec<ContentPart>) -> Self {
         Self::Message {
             id: None,
             role: MessageRole::User,
-            content: vec![ContentPart::InputText { text: text.into() }],
+            content,
         }
     }
 
@@ -88,11 +94,17 @@ impl Item {
 
     pub(crate) fn validate(&self) -> Result<()> {
         let valid = match self {
-            Self::Message { role, content, .. } => content.iter().all(|part| {
+            Self::Message { role, content, .. } => !content.is_empty() && content.iter().all(|part| {
                 matches!(
                     (role, part),
                     (MessageRole::User, ContentPart::InputText { .. })
                         | (MessageRole::Assistant, ContentPart::OutputText { .. })
+                )
+                || matches!((role, part),
+                    (MessageRole::User, ContentPart::InputImage { media_type, data })
+                        if matches!(media_type.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp")
+                            && !data.is_empty()
+                            && data.len() <= 44_739_244
                 )
             }),
             Self::Reasoning { content, .. } => content

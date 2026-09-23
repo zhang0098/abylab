@@ -55,6 +55,34 @@ async fn messages_live() {
     eprintln!("Messages probe: verified (complete and stream)");
 }
 
+#[tokio::test]
+#[ignore = "paid vision probe; requires DEEPSEEK_API_KEY"]
+async fn image_message_live() {
+    // A generated 32x32 red PNG keeps the fixture small while exercising the
+    // same Anthropic image block the TUI sends.
+    let image = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg==";
+    let mut request = MessageRequest::new("unused");
+    request.options.model = model();
+    request.options.reasoning = ReasoningEffort::Off;
+    request.options.max_tokens = 128;
+    request.history = vec![Item::user_parts(vec![
+        ContentPart::InputText {
+            text: "Name the dominant color in this image in one word.".into(),
+        },
+        ContentPart::InputImage {
+            media_type: "image/png".into(),
+            data: image.into(),
+        },
+    ])];
+    let response = DeepSeekClient::new(config())
+        .unwrap()
+        .complete(request, RequestOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(response.status, ResponseStatus::Completed);
+    assert!(!response.output_text().trim().is_empty());
+}
+
 #[cfg(feature = "web-search")]
 #[tokio::test]
 #[ignore = "paid native search probe; verified independently of conversation"]

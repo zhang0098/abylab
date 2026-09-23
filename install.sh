@@ -311,7 +311,7 @@ verify_sha256() {
 # -------------------------------------------------------------- install ----
 
 install_binary() {
-    local src="$1" dst="$BIN_DIR/$BIN_NAME"
+    local src="$1" dst="$BIN_DIR/$BIN_NAME" stage checked
     if [ ! -d "$BIN_DIR" ]; then
         mkdir -p "$BIN_DIR" || die "cannot create $BIN_DIR"
     fi
@@ -320,7 +320,21 @@ install_binary() {
        Pick a directory you own (--bin-dir ~/bin) or install by hand:
        sudo install -m 0755 $src $dst"
     fi
-    install -m 0755 "$src" "$dst" || die "could not write $dst"
+    stage=$(mktemp "$BIN_DIR/.${BIN_NAME}.XXXXXX") || die "could not stage $dst"
+    if ! install -m 0755 "$src" "$stage"; then
+        rm -f "$stage"
+        die "could not stage $dst"
+    fi
+    if ! checked=$("$stage" --version 2>&1); then
+        rm -f "$stage"
+        warn "downloaded binary will not start on this system:"
+        printf '       %s\n' "$checked" >&2
+        return 1
+    fi
+    if ! mv -f "$stage" "$dst"; then
+        rm -f "$stage"
+        die "could not replace $dst"
+    fi
 }
 
 # ----------------------------------------------------------------- PATH ----
@@ -526,13 +540,10 @@ main() {
     bin=$(find "$tmp" -type f -name "$BIN_NAME" | head -n 1)
     [ -n "$bin" ] || die "no $BIN_NAME binary inside $asset"
 
-    install_binary "$bin"
+    install_binary "$bin" || return 1
 
-    # The binary is in place — but "in place" is not "runnable": a truncated
-    # download, an asset for the wrong architecture or an unsupported (kernel,
-    # vDSO, seccomp) host would otherwise scroll by under a cheerful "installed
-    # abylab". Say what happened and where to go instead, and exit non-zero.
-    # The Linux builds are static, so a missing libc is no longer on this list.
+    # The staged binary was checked before replacement; confirm the installed
+    # path works too before reporting success.
     if ! installed=$("$BIN_DIR/$BIN_NAME" --version 2>&1); then
         warn "$BIN_DIR/$BIN_NAME is installed but will not start on this system:"
         printf '       %s\n' "$installed"

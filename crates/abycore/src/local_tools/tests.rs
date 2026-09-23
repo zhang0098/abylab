@@ -479,6 +479,22 @@ async fn edit_refuses_a_file_over_the_host_file_cap() {
 }
 
 #[tokio::test]
+async fn edit_accepts_a_file_at_the_host_file_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), "0123456789abcdef").unwrap();
+    let mut config = LocalToolConfig::new(dir.path());
+    config.max_file_bytes = Some(16);
+    let tools = LocalTools::with_config(config).unwrap();
+    let ctx = context(4096);
+    read(&tools, "a", &ctx).await;
+    edit(&tools, "a", "0", "x", false, &ctx).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a")).unwrap(),
+        "x123456789abcdef"
+    );
+}
+
+#[tokio::test]
 async fn cancelled_filesystem_operations_have_no_new_effects() {
     let dir = tempfile::tempdir().unwrap();
     let tools = LocalTools::new(dir.path()).unwrap();

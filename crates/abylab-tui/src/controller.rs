@@ -119,6 +119,20 @@ fn aby_loop(
                     session_id,
                     message_id,
                     text,
+                    parts: None,
+                });
+            }
+            Cmd::SteerParts {
+                session_id,
+                message_id,
+                text,
+                blocks,
+            } => {
+                handle.steer(abylab_backend::SteerRequest {
+                    session_id,
+                    message_id,
+                    text,
+                    parts: Some(parts_from_blocks(blocks)),
                 });
             }
             Cmd::Queue {
@@ -130,6 +144,19 @@ fn aby_loop(
                     session_id,
                     item_id,
                     text,
+                });
+            }
+            Cmd::QueueParts {
+                session_id,
+                item_id,
+                text,
+                blocks,
+            } => {
+                handle.send(abylab_backend::Cmd::QueuePartsForSession {
+                    session_id,
+                    item_id,
+                    text,
+                    parts: parts_from_blocks(blocks),
                 });
             }
             Cmd::UpdateQueue {
@@ -144,6 +171,12 @@ fn aby_loop(
                         crate::bus::QueueAction::Remove => abylab_backend::QueueAction::Remove,
                         crate::bus::QueueAction::Edit(text) => {
                             abylab_backend::QueueAction::Edit(text)
+                        }
+                        crate::bus::QueueAction::EditParts { text, blocks } => {
+                            abylab_backend::QueueAction::EditParts {
+                                text,
+                                parts: parts_from_blocks(blocks),
+                            }
                         }
                     },
                 });
@@ -200,6 +233,19 @@ fn aby_loop(
     }
 }
 
+fn parts_from_blocks(blocks: Vec<crate::bus::PromptBlock>) -> Vec<abylab_backend::PromptPart> {
+    blocks
+        .into_iter()
+        .map(|block| match block {
+            crate::bus::PromptBlock::Text(text) => abylab_backend::PromptPart::InputText { text },
+            crate::bus::PromptBlock::Image(image) => abylab_backend::PromptPart::InputImage {
+                media_type: image.media_type,
+                data: image.data,
+            },
+        })
+        .collect()
+}
+
 /// Backend events → TUI `AppEvent`s (the seam between the two contracts).
 fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
     match event {
@@ -237,6 +283,7 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                             .map(|row| crate::bus::QueueRow {
                                 item_id: row.item_id,
                                 text: row.text,
+                                parts: row.parts,
                                 steering: row.placement == abylab_backend::QueuePlacement::Steering,
                             })
                             .collect(),
