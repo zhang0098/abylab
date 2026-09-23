@@ -31,17 +31,7 @@ Your preferences live in `$ABYLAB_HOME/settings.json`: interface language
 (Chinese by default), model, reasoning effort, permission preset, and
 appearance (mode + palette). Flags override them for that run only.
 
-To get back to an as-installed state, `/reset` deletes everything this program
-saved under `$ABYLAB_HOME` (settings, API key, session logs, queued prompts) and
-starts a new session — two Enters confirm it. The same wipe from a shell is
-`abylab --reset`. A hand-written `AGENTS.md` and a session store that
-`--session-root` put outside the aby home are not part of it.
-
-To take the program itself off the machine, `abylab --uninstall` lists the
-saved data, every `abylab` binary and the PATH block the installer wrote into a
-shell startup file, then asks about the data and the program separately —
-`--keep-data` removes only the program and `--yes` skips both questions. A copy
-Homebrew or Nix owns is reported, not removed.
+To uninstall abylab, run `abylab --uninstall`.
 
 ## Keys
 

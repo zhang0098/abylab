@@ -1,12 +1,13 @@
-//! `/reset` and `abylab --reset`: delete everything this program saved under
-//! the aby home, and nothing else.
+//! The data half of `abylab --uninstall`: delete everything this program saved
+//! under the aby home, and nothing else.
 //!
-//! The command's contract is the aby home. Five entries there are ours — the
-//! interface preferences (`settings.json`), the per-workspace mode cache
-//! (`abylab-modes.json`), the API key `/login` stored (`.credentials.yaml`),
-//! the shared session store (`sessions/`) and the durable prompt queue
-//! (`queued/`) — and the plan lists them by name, with what is inside, before
-//! anything goes.
+//! `--uninstall` asks about this half and the program half separately, and this
+//! plan is what the first question is about. The contract is the aby home.
+//! Five entries there are ours — the interface preferences (`settings.json`),
+//! the per-workspace mode cache (`abylab-modes.json`), the API key `/login`
+//! stored (`.credentials.yaml`), the shared session store (`sessions/`) and the
+//! durable prompt queue (`queued/`) — and the plan lists them by name, with what
+//! is inside, before anything goes.
 //!
 //! Two things the home may hold are *not* the command's to delete, and the
 //! plan says so instead of quietly skipping them:
@@ -20,29 +21,28 @@
 //!   command removes the entries it put there, not a directory it was pointed
 //!   at).
 //!
-//! Nothing here decides *when* or *how many times* the user confirms: the TUI
-//! asks in a dialog and the CLI asks on the terminal, and both hand the same
-//! [`ResetPlan`] to [`wipe`]. Sizes are measured with `lstat`, so a symlink
-//! counts as the file it is instead of the tree it names — exactly what
-//! `remove_dir_all` will unlink.
+//! Nothing here decides *when* or *how many times* the user confirms: the CLI
+//! asks on the terminal and hands the [`DataPlan`] to [`wipe`]. Sizes are
+//! measured with `lstat`, so a symlink counts as the file it is instead of the
+//! tree it names — exactly what `remove_dir_all` will unlink.
 
 use std::path::{Path, PathBuf};
 
 use crate::locale::Locale;
 
 /// The hand-written file abycore reads out of the home (workspace
-/// instructions). Reset reports it as kept; it never deletes it.
+/// instructions). The plan reports it as kept; it is never deleted.
 const INSTRUCTIONS_FILE: &str = "AGENTS.md";
 
 /// Upper bound on the files one plan entry measures. A session store is a few
 /// small JSONL logs per session, so this is unreachable in practice; it keeps
-/// the dialog (and the CLI's plan) from stalling on a home someone filled by
-/// hand. The count then reads as a lower bound (`20000+`).
+/// the plan from stalling on a home someone filled by hand. The count then
+/// reads as a lower bound (`20000+`).
 const MAX_WALK: u64 = 20_000;
 
 /// What one removed entry is, in the interface language.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResetWhat {
+pub enum DataWhat {
     /// `settings.json`: language, model, effort, permission, appearance.
     Settings,
     /// `abylab-modes.json`: the per-workspace mode cache.
@@ -55,7 +55,7 @@ pub enum ResetWhat {
     Queue,
 }
 
-impl ResetWhat {
+impl DataWhat {
     pub fn label(self, locale: Locale) -> &'static str {
         match self {
             Self::Settings => locale.tr("settings", "设置"),
@@ -67,10 +67,10 @@ impl ResetWhat {
     }
 }
 
-/// Why one path survives the command. Every reason is printed, so the reader
-/// learns what reset does *not* cover before it runs, not after.
+/// Why one path survives the wipe. Every reason is printed, so the reader
+/// learns what uninstall does *not* cover before it runs, not after.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResetKeepWhy {
+pub enum DataKeepWhy {
     /// `--session-root` points outside the aby home.
     OutsideHome,
     /// `--session-root` names the home itself.
@@ -79,7 +79,7 @@ pub enum ResetKeepWhy {
     HandWritten,
 }
 
-impl ResetKeepWhy {
+impl DataKeepWhy {
     pub fn note(self, locale: Locale) -> &'static str {
         match self {
             Self::OutsideHome => locale.tr(
@@ -101,7 +101,7 @@ impl ResetKeepWhy {
 /// One entry the command owns in the aby home: its name and its label.
 struct Owned {
     name: &'static str,
-    what: ResetWhat,
+    what: DataWhat,
 }
 
 /// The entries this program creates in the home, in the order the plan reads:
@@ -109,30 +109,30 @@ struct Owned {
 const OWNED: &[Owned] = &[
     Owned {
         name: "settings.json",
-        what: ResetWhat::Settings,
+        what: DataWhat::Settings,
     },
     Owned {
         name: "abylab-modes.json",
-        what: ResetWhat::Modes,
+        what: DataWhat::Modes,
     },
     Owned {
         name: crate::credentials::CREDENTIALS_FILENAME,
-        what: ResetWhat::Credentials,
+        what: DataWhat::Credentials,
     },
     Owned {
         name: "sessions",
-        what: ResetWhat::Sessions,
+        what: DataWhat::Sessions,
     },
     Owned {
         name: "queued",
-        what: ResetWhat::Queue,
+        what: DataWhat::Queue,
     },
 ];
 
 /// One path the command removes, with what is inside it right now.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResetItem {
-    pub what: ResetWhat,
+pub struct DataItem {
+    pub what: DataWhat,
     pub path: PathBuf,
     /// Files under `path` (1 for a plain file); a lower bound when the walk
     /// hit [`MAX_WALK`].
@@ -142,7 +142,7 @@ pub struct ResetItem {
     pub truncated: bool,
 }
 
-impl ResetItem {
+impl DataItem {
     /// The entry's name, as it reads in a one-line report.
     #[cfg(test)]
     pub fn name(&self) -> String {
@@ -155,31 +155,33 @@ impl ResetItem {
 
 /// One path the command leaves alone, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResetKeep {
+pub struct DataKeep {
     pub path: PathBuf,
-    pub why: ResetKeepWhy,
+    pub why: DataKeepWhy,
 }
 
-/// What a reset would remove, and what it would not: measured once, shown to
+/// What a wipe would remove, and what it would not: measured once, shown to
 /// the user, then handed to [`wipe`] — so what was listed is what goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResetPlan {
+pub struct DataPlan {
     pub home: PathBuf,
     /// The entries that exist right now; absent ones are not listed.
-    pub items: Vec<ResetItem>,
-    pub kept: Vec<ResetKeep>,
+    pub items: Vec<DataItem>,
+    pub kept: Vec<DataKeep>,
 }
 
-impl ResetPlan {
+impl DataPlan {
     /// Nothing this program saved is there: the command has no work to do.
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
+    #[cfg(test)]
     pub fn files(&self) -> u64 {
         self.items.iter().map(|item| item.files).sum()
     }
 
+    #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         self.items.iter().map(|item| item.bytes).sum()
     }
@@ -188,7 +190,7 @@ impl ResetPlan {
 /// What a completed [`wipe`] did: entries removed with the size the plan
 /// promised, plus every path that refused to go.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ResetOutcome {
+pub struct DataOutcome {
     pub removed: usize,
     pub files: u64,
     pub bytes: u64,
@@ -198,16 +200,16 @@ pub struct ResetOutcome {
 }
 
 /// Measure the home and the session store the launcher was pointed at.
-pub fn scan(home: &Path, sessions_root: &Path) -> ResetPlan {
+pub fn scan(home: &Path, sessions_root: &Path) -> DataPlan {
     let mut items = Vec::new();
     for owned in OWNED {
         include(&mut items, home, owned.what, home.join(owned.name));
     }
     let mut kept = Vec::new();
     if sessions_root == home {
-        kept.push(ResetKeep {
+        kept.push(DataKeep {
             path: home.to_path_buf(),
-            why: ResetKeepWhy::RootIsHome,
+            why: DataKeepWhy::RootIsHome,
         });
     } else if sessions_root.starts_with(home) {
         // The default `$ABYLAB_HOME/sessions` is one of the entries above, so
@@ -216,23 +218,23 @@ pub fn scan(home: &Path, sessions_root: &Path) -> ResetPlan {
         include(
             &mut items,
             home,
-            ResetWhat::Sessions,
+            DataWhat::Sessions,
             sessions_root.to_path_buf(),
         );
     } else if sessions_root.exists() {
-        kept.push(ResetKeep {
+        kept.push(DataKeep {
             path: sessions_root.to_path_buf(),
-            why: ResetKeepWhy::OutsideHome,
+            why: DataKeepWhy::OutsideHome,
         });
     }
     let instructions = home.join(INSTRUCTIONS_FILE);
     if instructions.is_file() {
-        kept.push(ResetKeep {
+        kept.push(DataKeep {
             path: instructions,
-            why: ResetKeepWhy::HandWritten,
+            why: DataKeepWhy::HandWritten,
         });
     }
-    ResetPlan {
+    DataPlan {
         home: home.to_path_buf(),
         items,
         kept,
@@ -241,7 +243,7 @@ pub fn scan(home: &Path, sessions_root: &Path) -> ResetPlan {
 
 /// Add one existing path to the plan. The home itself is never a target: the
 /// command removes the entries it put in there, not the directory they live in.
-fn include(items: &mut Vec<ResetItem>, home: &Path, what: ResetWhat, path: PathBuf) {
+fn include(items: &mut Vec<DataItem>, home: &Path, what: DataWhat, path: PathBuf) {
     if path == home || items.iter().any(|item| item.path == path) {
         return;
     }
@@ -250,14 +252,14 @@ fn include(items: &mut Vec<ResetItem>, home: &Path, what: ResetWhat, path: PathB
     }
 }
 
-fn measure(what: ResetWhat, path: PathBuf) -> Option<ResetItem> {
+fn measure(what: DataWhat, path: PathBuf) -> Option<DataItem> {
     let meta = std::fs::symlink_metadata(&path).ok()?;
     let (files, bytes, truncated) = if meta.is_dir() {
         walk(&path)
     } else {
         (1, meta.len(), false)
     };
-    Some(ResetItem {
+    Some(DataItem {
         what,
         path,
         files,
@@ -294,9 +296,9 @@ fn walk(path: &Path) -> (u64, u64, bool) {
 
 /// Remove every entry the plan listed. A path that vanished since the scan is
 /// not a failure (there is nothing left to delete); everything else that
-/// refuses to go is named in [`ResetOutcome::failures`].
-pub fn wipe(plan: &ResetPlan) -> ResetOutcome {
-    let mut outcome = ResetOutcome::default();
+/// refuses to go is named in [`DataOutcome::failures`].
+pub fn wipe(plan: &DataPlan) -> DataOutcome {
+    let mut outcome = DataOutcome::default();
     for item in &plan.items {
         let result = match std::fs::symlink_metadata(&item.path) {
             Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&item.path),
@@ -353,7 +355,7 @@ mod tests {
     /// and a session tree of its own.
     fn scratch(tag: &str) -> PathBuf {
         let home = std::env::temp_dir().join(format!(
-            "aby-reset-{tag}-{}-{:x}",
+            "aby-data-{tag}-{}-{:x}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -379,7 +381,7 @@ mod tests {
     fn the_plan_names_what_the_program_saved_and_nothing_else() {
         let home = scratch("plan");
         let plan = scan(&home, &home.join("sessions"));
-        let names: Vec<String> = plan.items.iter().map(ResetItem::name).collect();
+        let names: Vec<String> = plan.items.iter().map(DataItem::name).collect();
         assert_eq!(
             names,
             vec![
@@ -395,14 +397,14 @@ mod tests {
         assert_eq!(
             plan.items
                 .iter()
-                .filter(|item| item.what == ResetWhat::Sessions)
+                .filter(|item| item.what == DataWhat::Sessions)
                 .count(),
             1
         );
         let sessions = plan
             .items
             .iter()
-            .find(|item| item.what == ResetWhat::Sessions)
+            .find(|item| item.what == DataWhat::Sessions)
             .unwrap();
         assert_eq!(sessions.files, 1);
         assert_eq!(sessions.bytes, 2048);
@@ -423,7 +425,7 @@ mod tests {
                     keep.why
                 ))
                 .collect::<Vec<_>>(),
-            vec![("AGENTS.md".to_string(), ResetKeepWhy::HandWritten)],
+            vec![("AGENTS.md".to_string(), DataKeepWhy::HandWritten)],
             "the hand-written instructions file is reported as kept"
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -447,8 +449,7 @@ mod tests {
             .any(|item| item.path == home.join("sessions")));
 
         // A store outside the home is out of scope, and says so.
-        let outside =
-            std::env::temp_dir().join(format!("aby-reset-outside-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("aby-data-outside-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
         let plan = scan(&home, &outside);
@@ -461,7 +462,7 @@ mod tests {
                 .iter()
                 .find(|keep| keep.path == outside)
                 .map(|k| k.why),
-            Some(ResetKeepWhy::OutsideHome)
+            Some(DataKeepWhy::OutsideHome)
         );
         let _ = std::fs::remove_dir_all(&outside);
 
@@ -473,14 +474,14 @@ mod tests {
                 .iter()
                 .find(|keep| keep.path == home)
                 .map(|k| k.why),
-            Some(ResetKeepWhy::RootIsHome)
+            Some(DataKeepWhy::RootIsHome)
         );
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn an_empty_home_has_nothing_to_remove() {
-        let home = std::env::temp_dir().join(format!("aby-reset-empty-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("aby-data-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let plan = scan(&home, &home.join("sessions"));
@@ -489,14 +490,14 @@ mod tests {
             plan.kept.is_empty(),
             "no instructions file, nothing to keep"
         );
-        assert_eq!(wipe(&plan), ResetOutcome::default());
+        assert_eq!(wipe(&plan), DataOutcome::default());
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn a_wipe_removes_what_the_plan_listed_and_leaves_the_rest() {
         let home = scratch("wipe");
-        let outside = std::env::temp_dir().join(format!("aby-reset-kept-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("aby-data-kept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
         let plan = scan(&home, &outside);
@@ -520,7 +521,7 @@ mod tests {
         assert!(outside.exists(), "an outside store survives");
         assert!(home.exists(), "the home itself stays");
         // A second wipe has nothing left to do.
-        assert_eq!(wipe(&scan(&home, &outside)), ResetOutcome::default());
+        assert_eq!(wipe(&scan(&home, &outside)), DataOutcome::default());
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&outside);
     }

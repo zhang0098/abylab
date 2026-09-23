@@ -61,7 +61,6 @@ impl Locale {
             "lang" => "切换界面语言",
             "login" => "保存 API key 到 aby 主目录",
             "logout" => "删除已保存的 API key",
-            "reset" => "清除 aby 主目录下本程序保存的数据（需二次确认）",
             "skill" => "按名字调用技能（内置命令同名时也能用）",
             "quit" => "退出 abylab",
             _ => fallback,

@@ -5,61 +5,43 @@
 What each abylab release changed, from the user's side. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/). Internals (workspace instructions,
-context compaction, session persistence, goal rounds, reset, uninstall) live in
+context compaction, session persistence, goal rounds, uninstall) live in
 [TECH.en.md](TECH.en.md); day-to-day usage is in [README.en.md](README.en.md).
 
 ## [Unreleased]
 
 ### Added
 
-- `/reset` puts ABYHOME back to its just-installed state: it deletes everything
-  this program saved under `$ABYLAB_HOME` — `settings.json` (language, model,
-  effort, permission preset, appearance), `abylab-modes.json` (the per-workspace
-  mode cache), `.credentials.yaml` (the key `/login` stored), `sessions/` (the
-  session logs) and `queued/` (prompts that were waiting) — and starts a new
-  session, so the timeline begins blank and the next launch reads defaults.
-  Nothing goes before the card has listed every entry with its size, and it
-  takes two Enters: the first only asks again (the border turns warn and the
-  title says so), and any other key in between — a scroll included — takes the
-  question back, so the press that deletes is always the one you meant. The
-  report names the entry, file and byte counts; what the command does not own is
-  listed as kept instead: a hand-written `~/.abylab/AGENTS.md` (your file —
-  abylab only reads it), and a session store `--session-root` put outside the
-  aby home (the command cleans the home, and leaves that one alone).
-- The same thing from a shell is `abylab --reset`: it prints the plan line by
-  line (each `remove` and `keep` row with its size and file count), then asks
-  `[y/N]` on the terminal — never on stdin, which may be carrying something
-  else — and refuses to run at all when there is no terminal to ask on, so
-  saying yes takes an explicit `--yes`. The wipe reports per path and exits
-  non-zero if anything refused to go. The flag never opens the UI and ignores
-  the other launch options: only `--session-root` matters, because it names the
-  store being checked. Another abylab still running is called out in the plan —
-  it writes its settings and session log back, so quit it first.
-- `/reset` only runs on an idle session: the driver reads its command channel
-  between turns, so a switch asked for mid-turn would land at the turn's end
-  while that turn kept checkpointing into the log that was just deleted (an
-  anchor rewrite even fails when the directory is gone) — interrupt with `esc`
-  first. Three things follow the wipe on the spot: a key that came from
-  `/login` stops being used (the `/logout` rule — a `--api-key` override is not
-  saved data and keeps running), the UI binds a fresh session (its log is the
-  one that just went), and no key left brings the first-launch `/login` card
-  back. The model, effort and permission preset stay live for this run — they
-  belong to the process, not to the files — and the defaults take over on the
-  next launch.
-- To take the program itself off the machine, `abylab --uninstall` lists both
-  halves at once: the data half is `/reset`'s list, and the program half is
-  every `abylab` on `$PATH`, the running executable, the installer's default
-  `~/.local/bin`, and the PATH block `install.sh` wrote into a shell startup
-  file (recognized by its `# added by the abylab installer` marker, with the
-  line beneath it dropped only while it still reads as a PATH line; a symlink
-  goes with the file it points at, link following is bounded; a Homebrew or Nix
-  copy is listed as kept; a copy in `~/.cargo/bin` goes through
-  `cargo uninstall abylab-tui`, so cargo's bookkeeping goes with it). It asks
-  twice — data first, program second — so "keep the data, remove the program"
-  is answering no to the first question; `--keep-data` keeps the data outright
-  and `--yes` skips both questions (in a script, `--yes` is the full clear and
-  `--keep-data --yes` is the program only). Two noes remove nothing. Like
-  `--reset`, it never reads stdin and refuses to ask without a terminal.
+- `abylab --uninstall` uninstalls abylab: it lists one plan in two
+  halves — the data this program saved under `$ABYLAB_HOME` (`settings.json`:
+  language, model, effort, permission preset, appearance; `abylab-modes.json`:
+  the per-workspace mode cache; `.credentials.yaml`: the key `/login` stored;
+  `sessions/`: the session logs; `queued/`: prompts that were waiting) and the
+  program itself (the running executable, every `abylab` on `$PATH`, the
+  installer's default `~/.local/bin`, and `$ABYLAB_BIN_DIR`). Each `remove` and
+  `keep` row carries its size and file count, and the confirmation comes in two
+  questions — data first, program second — so "keep the data, remove the
+  program" is answering no to the first question; `--keep-data` fixes that
+  answer and `--yes` skips both (in a script, `--yes` is the full clear and
+  `--keep-data --yes` is the program only). Two noes remove nothing. There is no
+  separate `/reset`: clearing the data is just the first question here.
+- The list is a whitelist, not a directory scan: a hand-written
+  `~/.abylab/AGENTS.md` (your file — abylab only reads it) and a session store
+  `--session-root` put outside the aby home are listed as kept, and the home
+  itself is never a target. The program half only takes a file still called
+  `abylab`; a symlink goes with the file it points at, link following is
+  bounded; a Homebrew or Nix copy is listed as kept; a copy in `~/.cargo/bin`
+  goes through `cargo uninstall abylab-tui`, so cargo's bookkeeping goes with
+  it. Shell startup files are left byte for byte alone — the PATH line the
+  installer added stays, and can be removed by hand.
+- It prints the plan line by line, then asks `[y/N]` on `/dev/tty` — never on
+  stdin, which may be carrying something else — and refuses to run at all when
+  there is no terminal to ask on, so saying yes takes an explicit `--yes`. The
+  wipe reports per path and exits non-zero if anything refused to go. The flag
+  never opens the UI and ignores the other launch options: only `--session-root`
+  matters, because it names the store being checked. Another abylab still
+  running is called out in the plan — it writes its settings and session log
+  back, so quit it first.
 
 ## [0.1.12] - 2026-09-23
 

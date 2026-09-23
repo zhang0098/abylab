@@ -248,11 +248,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "remove the stored API key",
     },
     SlashCommand {
-        name: "reset",
-        usage: "/reset",
-        desc: "delete everything saved under the aby home",
-    },
-    SlashCommand {
         name: "skill",
         usage: "/skill <name> [args]",
         desc: "invoke a skill by name, builtin name or not",
@@ -735,11 +730,6 @@ pub struct App {
     pub plan: Option<crate::events::PlanProgress>,
     /// The open todo progress dialog (`App::plan`'s checklist), if any.
     pub todo_dialog: Option<TodoDialog>,
-    /// The open `/reset` confirmation, if any — the modal that stands between
-    /// the command and the wipe (see [`ResetPrompt`]).
-    pub reset_prompt: Option<ResetPrompt>,
-    /// A finished wipe's report, waiting for the switch that follows it.
-    pending_reset: Option<ResetReport>,
     /// Screen rect of the cap row's clickable progress chip, recorded by
     /// `ui::draw_composer_box` every frame (`None` when it isn't drawn).
     pub(crate) plan_chip: Option<ratatui::layout::Rect>,
@@ -899,35 +889,6 @@ pub(crate) struct QueueEditState {
     prompt_id: u64,
     /// `ctrl+d` arms before it deletes: the first press asks, the second does.
     delete_confirm: bool,
-}
-
-/// The `/reset` confirmation, open between the command and the wipe.
-///
-/// The plan is measured when the dialog opens and is what the dialog shows, so
-/// what the reader approves is what goes. `armed` carries the second
-/// confirmation: the first Enter only asks, the second one deletes, and any
-/// other key drops the arm — the same two-press idiom the queue list's ctrl+d
-/// and the ctrl+c quit chord use.
-pub struct ResetPrompt {
-    pub plan: crate::reset::ResetPlan,
-    pub armed: bool,
-    pub scroll: usize,
-}
-
-/// What a finished wipe has to say, held until the session switch it asked for
-/// lands: binding a session clears the timeline (`reset_session_ui`), so a
-/// report pushed the moment the files went would be erased before it could be
-/// read. `App::flush_reset_report` writes it on the far side of the switch —
-/// and on a switch that failed, where the old session stays on screen.
-struct ResetReport {
-    /// Paths that refused to go, one notice each (empty when the wipe was
-    /// clean).
-    failures: Vec<String>,
-    /// The one-line summary: entries, files and bytes.
-    text: String,
-    level: NoticeLevel,
-    /// No key left: the first-launch `/login` card follows the report.
-    onboarding: bool,
 }
 
 fn token_spans_in(
@@ -1193,8 +1154,6 @@ impl App {
             tip: None,
             plan: None,
             todo_dialog: None,
-            reset_prompt: None,
-            pending_reset: None,
             plan_chip: None,
             hover_plan_chip: false,
             prompt_jump_btn: None,
@@ -1968,9 +1927,6 @@ impl App {
                     CtlEvent::SessionSwitchFailed(desc) => {
                         self.session_switch = None;
                         self.transcript.push_notice(NoticeLevel::Warn, desc);
-                        // A reset's switch never landed: the report still
-                        // belongs on screen, beside the failure that stopped it.
-                        self.flush_reset_report();
                     }
                     CtlEvent::AgentCaps { load_session } => {
                         self.load_session = load_session;
@@ -2010,10 +1966,6 @@ impl App {
                         if let Some(notice) = notice {
                             self.transcript.push_notice(NoticeLevel::Info, notice);
                         }
-                        // The wipe that cleared this session reports here:
-                        // the switch it ended with is what emptied the
-                        // timeline the report would otherwise have landed in.
-                        self.flush_reset_report();
                         ctl.send(Cmd::FetchSkills);
                     }
                     CtlEvent::SessionList { sessions, prefix } => {
@@ -2206,9 +2158,7 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if self.reset_prompt.is_some() {
-                    self.reset_scroll_by(-3);
-                } else if self.todo_dialog.is_some() {
+                if self.todo_dialog.is_some() {
                     self.todo_dialog_scroll_by(-3);
                 } else if self.view_overlay.is_some() {
                     self.view_scroll_by(-3);
@@ -2219,9 +2169,7 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.reset_prompt.is_some() {
-                    self.reset_scroll_by(3);
-                } else if self.todo_dialog.is_some() {
+                if self.todo_dialog.is_some() {
                     self.todo_dialog_scroll_by(3);
                 } else if self.view_overlay.is_some() {
                     self.view_scroll_by(3);
@@ -2489,7 +2437,6 @@ impl App {
     /// A modal owns the screen: clicks must not reach the chrome behind it.
     fn modal_open(&self) -> bool {
         self.todo_dialog.is_some()
-            || self.reset_prompt.is_some()
             || self.view_overlay.is_some()
             || self.permission_ask.is_some()
             || self.picker.is_some()
@@ -3016,219 +2963,6 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// `/reset` step one: measure the home and open the confirmation.
-    ///
-    /// Nothing is removed here. Two states have to be idle first, and each one
-    /// has a reason the notice spells out:
-    ///
-    /// - a turn in flight: the driver serializes commands, so the session
-    ///   switch this reset ends with would land only at the turn's boundary —
-    ///   the running turn would keep check-pointing into a log that no longer
-    ///   exists. Interrupting first (esc) makes the wipe and the switch
-    ///   immediate.
-    /// - a session switch already in flight: the fresh session this reset asks
-    ///   for would race the one on the wire (`/new` refuses the same way).
-    fn open_reset_dialog(&mut self) {
-        if self.state != RunState::Idle || self.prompt_pending {
-            self.transcript.push_notice(
-                NoticeLevel::Warn,
-                self.locale
-                    .tr(
-                        "/reset needs an idle session — esc interrupts this turn first",
-                        "/reset 需要先停下这一轮 —— 按 esc 中断后再试",
-                    )
-                    .to_string(),
-            );
-            self.needs_redraw = true;
-            return;
-        }
-        if self.session_switch.is_some() {
-            self.transcript.push_notice(
-                NoticeLevel::Warn,
-                self.locale
-                    .tr(
-                        "a session switch is still settling — /reset in a moment",
-                        "会话切换还没落定 —— 稍后再 /reset",
-                    )
-                    .to_string(),
-            );
-            self.needs_redraw = true;
-            return;
-        }
-        let plan = crate::reset::scan(
-            std::path::Path::new(&self.cfg.home),
-            std::path::Path::new(&self.cfg.sessions_root),
-        );
-        if plan.is_empty() {
-            self.transcript.push_notice(
-                NoticeLevel::Info,
-                self.locale
-                    .tr(
-                        "nothing saved under the aby home — nothing to reset",
-                        "aby 主目录下没有本程序保存的数据 —— 无需重置",
-                    )
-                    .to_string(),
-            );
-            self.needs_redraw = true;
-            return;
-        }
-        self.reset_prompt = Some(ResetPrompt {
-            plan,
-            armed: false,
-            scroll: 0,
-        });
-        self.needs_redraw = true;
-    }
-
-    /// Keys for the open [`ResetPrompt`]. Esc closes it; Enter arms on the
-    /// first press and wipes on the second; anything else drops the arm (a
-    /// scroll included — walking away from the question is never the answer
-    /// to it).
-    fn handle_reset_key(&mut self, key: KeyEvent, ctl: &Controller) {
-        match key.code {
-            KeyCode::Esc if key.modifiers == KeyModifiers::NONE => {
-                self.reset_prompt = None;
-                self.needs_redraw = true;
-            }
-            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
-                let Some(prompt) = self.reset_prompt.as_mut() else {
-                    return;
-                };
-                if prompt.armed {
-                    self.perform_reset(ctl);
-                } else {
-                    prompt.armed = true;
-                    self.needs_redraw = true;
-                }
-            }
-            KeyCode::Up => self.reset_scroll_by(-1),
-            KeyCode::Down => self.reset_scroll_by(1),
-            KeyCode::PageUp => self.reset_scroll_by(-5),
-            KeyCode::PageDown => self.reset_scroll_by(5),
-            KeyCode::Home => self.reset_scroll_to(0),
-            KeyCode::End => self.reset_scroll_to(usize::MAX),
-            _ => {
-                let Some(prompt) = self.reset_prompt.as_mut() else {
-                    return;
-                };
-                if prompt.armed {
-                    // The arm only survives the exact question it was given:
-                    // any other key (a stray character, a chord) re-asks.
-                    prompt.armed = false;
-                    self.needs_redraw = true;
-                }
-            }
-        }
-    }
-
-    fn reset_scroll_by(&mut self, delta: i64) {
-        if let Some(prompt) = self.reset_prompt.as_mut() {
-            prompt.armed = false;
-            prompt.scroll = if delta < 0 {
-                prompt.scroll.saturating_sub(delta.unsigned_abs() as usize)
-            } else {
-                prompt.scroll.saturating_add(delta as usize)
-            };
-            self.needs_redraw = true;
-        }
-    }
-
-    fn reset_scroll_to(&mut self, offset: usize) {
-        if let Some(prompt) = self.reset_prompt.as_mut() {
-            prompt.armed = false;
-            prompt.scroll = offset;
-            self.needs_redraw = true;
-        }
-    }
-
-    /// `/reset` step two: delete what the dialog listed, then put the *live*
-    /// state back in step with it.
-    ///
-    /// The wipe is the plan's own list, so the reader's approval matches the
-    /// work. What follows is the part the files cannot do by themselves:
-    ///
-    /// - a key that came from the store (`/login`) stops being used — the same
-    ///   move `/logout` makes; a `--api-key` key is this run's flag, not saved
-    ///   data, and keeps running.
-    /// - the session on screen was just deleted, so the app binds a fresh one
-    ///   (`/new`'s path): the timeline starts over, and nothing keeps
-    ///   checkpointing into the removed log.
-    /// - no key left means the onboarding card is the next step, exactly as on
-    ///   a first launch.
-    ///
-    /// The live model, effort and permission preset stay: they are this
-    /// process's session, not saved preferences — the defaults they fall back
-    /// to are what the *next* launch reads.
-    fn perform_reset(&mut self, ctl: &Controller) {
-        let Some(prompt) = self.reset_prompt.take() else {
-            return;
-        };
-        let outcome = crate::reset::wipe(&prompt.plan);
-        if matches!(self.cfg.key_origin, Some(crate::runtime::KeyOrigin::Stored)) {
-            self.cfg.api_key = None;
-            self.cfg.key_origin = None;
-            ctl.send(Cmd::SetApiKey { key: None });
-        }
-        self.session_switch = Some(SessionSwitch::New);
-        ctl.send(Cmd::NewSession);
-        let failures: Vec<String> = outcome
-            .failures
-            .iter()
-            .map(|(path, reason)| {
-                format!(
-                    "{} · {} ({reason})",
-                    self.locale.tr("reset could not remove", "重置无法删除"),
-                    path.display()
-                )
-            })
-            .collect();
-        let summary = self
-            .locale
-            .tr(
-                "reset done · {items} entries removed ({files} files · {size})",
-                "重置完成 · 已删除 {items} 项（{files} 个文件 · {size}）",
-            )
-            .replace("{items}", &outcome.removed.to_string())
-            .replace("{files}", &outcome.files.to_string())
-            .replace("{size}", &crate::reset::human_bytes(outcome.bytes));
-        // The report waits for the switch below: a fresh session clears the
-        // timeline, and this is the one message that must survive that. The
-        // tip says so in the meantime.
-        self.pending_reset = Some(ResetReport {
-            level: if failures.is_empty() {
-                NoticeLevel::Info
-            } else {
-                NoticeLevel::Warn
-            },
-            text: summary,
-            failures,
-            onboarding: !self.cfg.has_credentials(),
-        });
-        self.show_tip(self.locale.tr(
-            "reset — binding a fresh session…",
-            "已重置 —— 正在切到新会话…",
-        ));
-        self.needs_redraw = true;
-    }
-
-    /// Write the waiting reset report into the timeline. Called on the far
-    /// side of the switch a reset ends with — and when that switch fails, so a
-    /// wipe that already happened always gets reported.
-    fn flush_reset_report(&mut self) {
-        let Some(report) = self.pending_reset.take() else {
-            return;
-        };
-        for failure in &report.failures {
-            self.transcript
-                .push_notice(NoticeLevel::Error, failure.clone());
-        }
-        self.transcript.push_notice(report.level, report.text);
-        if report.onboarding {
-            self.push_no_key_onboarding();
-        }
-        self.needs_redraw = true;
-    }
-
     fn set_locale(&mut self, arg: &str) {
         let next = if arg.trim().is_empty() {
             self.locale.alternate()
@@ -3368,14 +3102,6 @@ impl App {
         // ACP tool permission sits above session pickers (Backchat ask panel).
         if self.permission_ask.is_some() {
             self.handle_permission_ask_key(key);
-            return;
-        }
-
-        // The `/reset` confirmation sits above the other client-owned modals:
-        // it is the one card that deletes things, and its second Enter must not
-        // be guessed at by any other handler.
-        if self.reset_prompt.is_some() {
-            self.handle_reset_key(key, ctl);
             return;
         }
 
@@ -5253,7 +4979,6 @@ impl App {
             "lang" => self.set_locale(arg),
             "login" => self.login(arg, ctl),
             "logout" => self.logout(ctl),
-            "reset" => self.open_reset_dialog(),
             "compact" => {
                 ctl.send(Cmd::Compact);
             }
@@ -5426,8 +5151,6 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - /lang · 切换界面语言：/lang zh 或 /lang en
 - /login · 保存 API key 到 aby 主目录，不回显明文
 - /logout · 删除已保存的 API key
-- /reset · 清除 aby 主目录下本程序保存的全部数据（设置、API key、会话日志、排队消息），
-  并开一个新会话；删除前要按两次 enter 确认（命令行同样：abylab --reset）
 - /effort · 推理强度 · /permission 权限预设 · /plan 计划模式
 - /vim · 切换 vim 模态编辑（/vim on|off，默认关闭）
 - /resume · 恢复持久会话并继续写入原日志
@@ -5459,9 +5182,6 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - /vim · toggle vim modal editing (/vim on|off, off by default)
 - /login · store the API key in the aby home (never echoed in full)
 - /logout · remove the stored API key (a --api-key override keeps running)
-- /reset · delete everything abylab saved under the aby home (settings, api key,
-  session logs, queued prompts) and start a new session; two enters confirm it
-  (`abylab --reset` does the same from a shell)
 - /resume · pick up a durable session — transcript replays, log continues
 - /image · stage a local image — /image ./pic.png [caption]
 - /clip · stage the clipboard image — /clip [caption] · ctrl+v also works
@@ -6607,8 +6327,7 @@ mod resume_tests {
         );
         let overlay = app.view_overlay.as_ref().expect("/help modal should open");
         assert_eq!(overlay.title, "Help");
-        // 44 rows: the card is scrollable, and the body has to reach `!cmd` —
-        // the budget moved with the list when `/reset` joined it.
+        // 44 rows: the card is scrollable, and the body has to reach `!cmd`.
         let frame = crate::ui::dump_frame(&mut app, 100, 44);
         assert!(frame.contains("Help · ↑↓/wheel scroll"), "modal:\n{frame}");
         assert!(frame.contains("ctrl+enter"), "binding missing:\n{frame}");
@@ -12203,369 +11922,5 @@ mod git_branch_tests {
         app.tick();
         assert_eq!(app.git_branch.as_deref(), Some("feature/next"));
         assert!(app.needs_redraw, "a branch change repaints the cap");
-    }
-}
-
-#[cfg(test)]
-mod reset_tests {
-    use super::*;
-    use std::sync::mpsc::Receiver;
-
-    /// A home holding every entry the program owns plus one file the user
-    /// wrote, so a wipe has something to keep as well as something to take.
-    fn scratch_home(tag: &str) -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let home = std::env::temp_dir().join(format!(
-            "dsh-tui-reset-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(home.join("sessions/ws-abc/aby-1")).unwrap();
-        std::fs::create_dir_all(home.join("queued")).unwrap();
-        std::fs::write(home.join("settings.json"), "{\"language\":\"en\"}").unwrap();
-        std::fs::write(home.join("abylab-modes.json"), "{}").unwrap();
-        std::fs::write(home.join(".credentials.yaml"), "version: 1\n").unwrap();
-        std::fs::write(home.join("sessions/ws-abc/aby-1/session.jsonl"), "log").unwrap();
-        std::fs::write(home.join("queued/aby-1.json"), "[]").unwrap();
-        std::fs::write(home.join("AGENTS.md"), "be terse").unwrap();
-        home.to_string_lossy().into_owned()
-    }
-
-    fn test_app(home: &str) -> (App, Controller, Receiver<AppEvent>) {
-        let cfg = RuntimeConfig {
-            workspace: "/tmp".into(),
-            home: home.into(),
-            sessions_root: std::path::Path::new(home)
-                .join("sessions")
-                .to_string_lossy()
-                .into_owned(),
-            provider: "deepseek-official".into(),
-            model: "deepseek-flash".into(),
-            max_tokens: None,
-            base_url: None,
-            api_key: None,
-            key_origin: None,
-        };
-        let (_tx, rx) = std::sync::mpsc::channel::<AppEvent>();
-        let (ctl, _commands) = crate::controller::test_controller();
-        let mut app = App::new(Theme::dark(), cfg, "dsh-test".into());
-        app.locale = crate::locale::Locale::En;
-        (app, ctl, rx)
-    }
-
-    fn key(app: &mut App, ctl: &Controller, code: KeyCode) {
-        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), ctl);
-    }
-
-    fn notices(app: &App) -> Vec<String> {
-        app.transcript
-            .cells
-            .iter()
-            .filter_map(|cell| match &cell.kind {
-                crate::transcript::CellKind::Notice { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The command opens a card and deletes nothing: the first Enter only
-    /// arms, the second one wipes — and what the card listed is what goes.
-    #[test]
-    fn reset_needs_the_second_enter_and_then_wipes_what_it_listed() {
-        let home = scratch_home("flow");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, commands) = crate::controller::test_controller();
-
-        app.run_slash("reset", "", &ctl);
-        assert!(app.reset_prompt.is_some(), "/reset opens the confirmation");
-        assert!(!app.reset_prompt.as_ref().unwrap().armed);
-        let frame = crate::ui::dump_frame(&mut app, 100, 30);
-        assert!(frame.contains("/reset"), "{frame}");
-        assert!(frame.contains("settings.json"), "{frame}");
-        assert!(frame.contains("AGENTS.md"), "kept files are named: {frame}");
-        assert!(frame.contains("enter asks again"), "{frame}");
-
-        // The first Enter asks; every file is still there.
-        key(&mut app, &ctl, KeyCode::Enter);
-        assert!(app.reset_prompt.as_ref().unwrap().armed, "armed, not done");
-        assert!(std::path::Path::new(&home).join("settings.json").exists());
-        let frame = crate::ui::dump_frame(&mut app, 100, 30);
-        assert!(
-            frame.contains("press enter again to delete"),
-            "the armed card names the next press: {frame}"
-        );
-
-        key(&mut app, &ctl, KeyCode::Enter);
-        assert!(app.reset_prompt.is_none(), "the card closes when it runs");
-        for name in [
-            "settings.json",
-            "abylab-modes.json",
-            ".credentials.yaml",
-            "sessions",
-            "queued",
-        ] {
-            assert!(
-                !std::path::Path::new(&home).join(name).exists(),
-                "{name} should be gone"
-            );
-        }
-        assert!(
-            std::path::Path::new(&home).join("AGENTS.md").exists(),
-            "a hand-written file is never in the plan"
-        );
-        assert!(
-            matches!(app.session_switch, Some(SessionSwitch::New)),
-            "the deleted session is left behind"
-        );
-        assert!(commands
-            .try_iter()
-            .any(|cmd| matches!(cmd, Cmd::NewSession)));
-        // The report waits: binding the fresh session is what clears the
-        // timeline, so the numbers are written on the far side of it.
-        assert!(
-            !notices(&app).iter().any(|text| text.contains("reset done")),
-            "the report must not land in a timeline about to be cleared: {:?}",
-            notices(&app)
-        );
-        assert!(app.pending_reset.is_some());
-
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "aby-fresh".into(),
-                notice: Some("session/new → aby-fresh".into()),
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        assert_eq!(app.session_id, "aby-fresh");
-        assert!(
-            notices(&app).iter().any(|text| text.contains("reset done")),
-            "{:?}",
-            notices(&app)
-        );
-        assert!(
-            notices(&app)
-                .iter()
-                .any(|text| text.contains("session/new → aby-fresh")),
-            "the switch's own notice is there too: {:?}",
-            notices(&app)
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// A stray key between the two Enters is not an answer: the arm drops and
-    /// the next Enter asks again.
-    #[test]
-    fn any_other_key_takes_the_confirmation_back() {
-        let home = scratch_home("disarm");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.run_slash("reset", "", &ctl);
-        key(&mut app, &ctl, KeyCode::Enter);
-        assert!(app.reset_prompt.as_ref().unwrap().armed);
-
-        key(&mut app, &ctl, KeyCode::Char('x'));
-        assert!(!app.reset_prompt.as_ref().unwrap().armed, "the arm drops");
-        key(&mut app, &ctl, KeyCode::Enter);
-        assert!(app.reset_prompt.as_ref().unwrap().armed, "…asked again");
-        assert!(std::path::Path::new(&home).join("settings.json").exists());
-
-        // A scroll is a key too: walking the card is not an answer to it.
-        key(&mut app, &ctl, KeyCode::Down);
-        assert!(!app.reset_prompt.as_ref().unwrap().armed);
-        assert!(std::path::Path::new(&home).join("settings.json").exists());
-
-        key(&mut app, &ctl, KeyCode::Esc);
-        assert!(app.reset_prompt.is_none(), "esc closes the card");
-        assert!(std::path::Path::new(&home).join("settings.json").exists());
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// A stored key follows the store it lived in (`/logout`'s rule), and no
-    /// key left means the launch onboarding is the next step.
-    #[test]
-    fn a_wipe_clears_a_stored_key_and_points_at_login_again() {
-        let home = scratch_home("key");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, commands) = crate::controller::test_controller();
-        app.cfg.api_key = Some("sk-stored0001".into());
-        app.cfg.key_origin = Some(crate::runtime::KeyOrigin::Stored);
-        app.run_slash("reset", "", &ctl);
-        key(&mut app, &ctl, KeyCode::Enter);
-        key(&mut app, &ctl, KeyCode::Enter);
-        assert!(app.cfg.api_key.is_none());
-        assert!(app.cfg.key_origin.is_none());
-        assert!(commands
-            .try_iter()
-            .any(|cmd| matches!(cmd, Cmd::SetApiKey { key: None })));
-        // The onboarding card is part of the report, so it lands with it —
-        // after the switch cleared the timeline, not before.
-        assert!(!crate::ui::dump_frame(&mut app, 100, 40).contains("/login sk-xxxxxxxx"));
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionBound {
-                session_id: "aby-fresh".into(),
-                notice: None,
-                model: None,
-                effort: None,
-            }),
-            &ctl,
-        );
-        let frame = crate::ui::dump_frame(&mut app, 100, 40);
-        assert!(
-            frame.contains("/login sk-xxxxxxxx"),
-            "the no-key onboarding follows a reset: {frame}"
-        );
-
-        // A `--api-key` override is this run's flag, not saved data: it stays.
-        let home = scratch_home("flag");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, commands) = crate::controller::test_controller();
-        app.cfg.api_key = Some("sk-flag0000001".into());
-        app.cfg.key_origin = Some(crate::runtime::KeyOrigin::Flag);
-        app.run_slash("reset", "", &ctl);
-        key(&mut app, &ctl, KeyCode::Enter);
-        key(&mut app, &ctl, KeyCode::Enter);
-        assert_eq!(app.cfg.api_key.as_deref(), Some("sk-flag0000001"));
-        assert!(
-            !commands
-                .try_iter()
-                .any(|cmd| matches!(cmd, Cmd::SetApiKey { key: None })),
-            "a flag key is not the store's to clear"
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The wipe and the fresh session need an idle driver: a running turn
-    /// check-points into the log the reset is about to delete.
-    #[test]
-    fn a_running_turn_is_refused_before_the_card_opens() {
-        let home = scratch_home("busy");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, commands) = crate::controller::test_controller();
-        app.state = RunState::Running;
-        app.run_slash("reset", "", &ctl);
-        assert!(app.reset_prompt.is_none(), "no card while a turn runs");
-        assert!(
-            notices(&app)
-                .iter()
-                .any(|text| text.contains("/reset needs an idle session")),
-            "{:?}",
-            notices(&app)
-        );
-        assert!(std::path::Path::new(&home).join("settings.json").exists());
-        assert!(!commands
-            .try_iter()
-            .any(|cmd| matches!(cmd, Cmd::NewSession)));
-
-        // …and a switch already on the wire refuses the same way.
-        app.state = RunState::Idle;
-        app.session_switch = Some(SessionSwitch::New);
-        app.run_slash("reset", "", &ctl);
-        assert!(app.reset_prompt.is_none());
-        app.session_switch = None;
-
-        // An empty home has nothing to confirm at all.
-        let empty = scratch_home("empty");
-        for name in [
-            "settings.json",
-            "abylab-modes.json",
-            ".credentials.yaml",
-            "sessions",
-            "queued",
-        ] {
-            let path = std::path::Path::new(&empty).join(name);
-            let _ = std::fs::remove_dir_all(&path);
-            let _ = std::fs::remove_file(&path);
-        }
-        let (mut app, _ctl, _rx) = test_app(&empty);
-        app.run_slash("reset", "", &ctl);
-        assert!(app.reset_prompt.is_none());
-        assert!(
-            notices(&app)
-                .iter()
-                .any(|text| text.contains("nothing saved under the aby home")),
-            "{:?}",
-            notices(&app)
-        );
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&empty);
-    }
-
-    /// The card reads in the interface language `/lang` picked — the default
-    /// is Chinese, and the two presses have to be as legible there as here.
-    #[test]
-    fn the_card_speaks_the_interface_language() {
-        let home = scratch_home("locale");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.locale = crate::locale::Locale::Zh;
-        app.run_slash("reset", "", &ctl);
-        // The test backend paints a continuation cell after every wide glyph,
-        // so a CJK frame reads with a space between the characters.
-        let frame = crate::ui::dump_frame(&mut app, 110, 44).replace(' ', "");
-        assert!(frame.contains("删除aby主目录下本程序保存的数据"), "{frame}");
-        assert!(frame.contains("enter再确认一次"), "{frame}");
-        assert!(frame.contains("…/settings.json"), "{frame}");
-        key(&mut app, &ctl, KeyCode::Enter);
-        let frame = crate::ui::dump_frame(&mut app, 110, 44).replace(' ', "");
-        assert!(frame.contains("再按一次enter删除"), "{frame}");
-        assert!(frame.contains("AGENTS.md"), "{frame}");
-        assert!(frame.contains("手写文件，不是本程序保存的"), "{frame}");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// A switch that fails leaves the old session on screen — and the wipe
-    /// that already happened still gets its report, beside the failure.
-    #[test]
-    fn a_failed_switch_still_reports_the_wipe() {
-        let home = scratch_home("failed-switch");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.run_slash("reset", "", &ctl);
-        key(&mut app, &ctl, KeyCode::Enter);
-        key(&mut app, &ctl, KeyCode::Enter);
-        assert!(app.pending_reset.is_some());
-
-        app.handle(
-            AppEvent::Ctl(CtlEvent::SessionSwitchFailed(
-                "cannot open aby-fresh".into(),
-            )),
-            &ctl,
-        );
-        assert!(app.pending_reset.is_none(), "the report came out");
-        let texts = notices(&app);
-        assert!(
-            texts.iter().any(|text| text.contains("reset done")),
-            "{texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|text| text.contains("cannot open aby-fresh")),
-            "{texts:?}"
-        );
-        assert!(
-            !std::path::Path::new(&home).join("settings.json").exists(),
-            "the wipe itself is not undone by a failed switch"
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The card owns the screen while it is open: typing must not reach the
-    /// composer behind it.
-    #[test]
-    fn the_card_owns_the_keyboard() {
-        let home = scratch_home("keys");
-        let (mut app, _ctl, _rx) = test_app(&home);
-        let (ctl, _commands) = crate::controller::test_controller();
-        app.run_slash("reset", "", &ctl);
-        key(&mut app, &ctl, KeyCode::Char('a'));
-        key(&mut app, &ctl, KeyCode::Char('b'));
-        assert_eq!(app.input.buf(), "", "the draft stays with the composer");
-        assert!(app.modal_open(), "clicks behind the card are refused too");
-        let _ = std::fs::remove_dir_all(&home);
     }
 }

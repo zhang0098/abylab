@@ -1,11 +1,11 @@
 //! `abylab --uninstall`: take back what install.sh put on this machine.
 //!
-//! Two halves, two questions: the data half is [`crate::reset`]'s (the entries
+//! Two halves, two questions: the data half is [`crate::data`]'s (the entries
 //! this program saved under the aby home), and the program half is the binary
-//! (or binaries) this machine has plus the PATH block install.sh appended to a
-//! shell startup file. The caller deletes only what it listed first, only what
-//! this program owns, and only after the user says so — "keep the data, remove
-//! the program" is the point of asking the two halves separately.
+//! (or binaries) this machine has. The caller deletes only what it listed
+//! first, only what this program owns, and only after the user says so — "keep
+//! the data, remove the program" is the point of asking the two halves
+//! separately.
 //!
 //! The program half follows the rules uninstall.sh documents:
 //!
@@ -15,10 +15,12 @@
 //!   must not hang);
 //! - a file another installer owns (Homebrew, Nix) is reported, never removed;
 //! - a copy in cargo's bin directory goes through `cargo uninstall`, so the
-//!   bookkeeping in `~/.cargo/.crates.toml` goes with it;
-//! - the PATH block is recognized by the marker install.sh writes, plus one
-//!   line under it that still has to look like a PATH line — a hand edit below
-//!   the marker survives.
+//!   bookkeeping in `~/.cargo/.crates.toml` goes with it.
+//!
+//! One thing the shell script does that this command deliberately does not:
+//! edit the PATH block install.sh appended to a shell startup file. That file
+//! belongs to the user, so it is left byte for byte alone — the stale PATH
+//! entry is harmless once the binary is gone, and can be removed by hand.
 
 use std::path::{Path, PathBuf};
 
@@ -29,27 +31,9 @@ pub const BIN_NAME: &str = "abylab";
 /// The cargo package `cargo install` installs, for copies in cargo's bin.
 pub const CARGO_PKG: &str = "abylab-tui";
 
-/// The comment install.sh writes above the PATH line it appends. The marker is
-/// the contract on the read side, exactly as it is on the write side.
-pub const PATH_MARKER: &str = "# added by the abylab installer";
-
 /// How many symlink hops to follow before giving up. A loop must not hang the
 /// command, and no real install is this deep.
 const MAX_LINK_HOPS: usize = 20;
-
-/// Startup files that can hold install.sh's PATH block, one per shell the
-/// installer may have run under. The marker is the authority, not `$SHELL`:
-/// someone who changed shells since installing still gets the right file
-/// cleaned, and a file without the marker is never touched.
-pub fn rc_candidates(home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join(".zshrc"),
-        home.join(".bashrc"),
-        home.join(".bash_profile"),
-        home.join(".profile"),
-        home.join(".config/fish/config.fish"),
-    ]
-}
 
 /// Where [`scan`] looks. Every input is passed in: the launcher reads the
 /// environment once and tests pin whatever they need, so a scan can never
@@ -64,8 +48,6 @@ pub struct ScanInput {
     /// cargo's bin directory. A binary in there is removed through
     /// `cargo uninstall`, with the bookkeeping that goes with it.
     pub cargo_bin: Option<PathBuf>,
-    /// Shell startup files that may hold the installer's PATH block.
-    pub rc_files: Vec<PathBuf>,
 }
 
 /// One binary the command removes.
@@ -76,14 +58,6 @@ pub struct ProgramBin {
     pub cargo: bool,
     /// Apparent bytes of the file; a symlink counts as the link itself.
     pub bytes: u64,
-}
-
-/// One startup file whose PATH block goes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PathEdit {
-    pub path: PathBuf,
-    /// Marker blocks in the file right now.
-    pub blocks: usize,
 }
 
 /// Why a binary survives the command. The reason is printed, so the reader
@@ -115,15 +89,13 @@ pub struct ProgramKeep {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProgramPlan {
     pub bins: Vec<ProgramBin>,
-    pub edits: Vec<PathEdit>,
     pub kept: Vec<ProgramKeep>,
 }
 
 impl ProgramPlan {
-    /// No binary and no PATH block this command owns: the program half has no
-    /// work to do.
+    /// No binary this command owns: the program half has no work to do.
     pub fn is_empty(&self) -> bool {
-        self.bins.is_empty() && self.edits.is_empty()
+        self.bins.is_empty()
     }
 
     #[cfg(test)]
@@ -133,13 +105,11 @@ impl ProgramPlan {
 }
 
 /// What a completed [`wipe`] did: binaries removed with the size the plan
-/// promised, startup files edited, plus every path that refused to go.
+/// promised, plus every path that refused to go.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProgramOutcome {
     pub removed: usize,
     pub bytes: u64,
-    /// Startup files the PATH block was stripped from.
-    pub edited: usize,
     /// `cargo uninstall` took the cargo-bin copies, bookkeeping included.
     pub cargo_uninstalled: bool,
     /// `cargo uninstall` was tried and did not work; the file was removed
@@ -150,8 +120,7 @@ pub struct ProgramOutcome {
     pub failures: Vec<(PathBuf, String)>,
 }
 
-/// Find every binary this machine has and every startup file carrying the
-/// installer's PATH block.
+/// Find every binary this machine has.
 pub fn scan(input: &ScanInput) -> ProgramPlan {
     let mut plan = ProgramPlan::default();
     let mut queue: Vec<PathBuf> = Vec::new();
@@ -199,25 +168,12 @@ pub fn scan(input: &ScanInput) -> ProgramPlan {
     }
     plan.bins.sort_by(|a, b| a.path.cmp(&b.path));
     plan.kept.sort_by(|a, b| a.path.cmp(&b.path));
-
-    for file in &input.rc_files {
-        let Ok(text) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        let blocks = marker_blocks(&text).len();
-        if blocks > 0 {
-            plan.edits.push(PathEdit {
-                path: file.clone(),
-                blocks,
-            });
-        }
-    }
     plan
 }
 
-/// Remove every binary the plan listed and strip every PATH block. A path that
-/// vanished since the scan is not a failure (there is nothing left to delete);
-/// everything else that refuses to go is named in [`ProgramOutcome::failures`].
+/// Remove every binary the plan listed. A path that vanished since the scan is
+/// not a failure (there is nothing left to delete); everything else that
+/// refuses to go is named in [`ProgramOutcome::failures`].
 pub fn wipe(plan: &ProgramPlan) -> ProgramOutcome {
     let mut outcome = ProgramOutcome::default();
     if plan.bins.iter().any(|bin| bin.cargo) {
@@ -236,14 +192,6 @@ pub fn wipe(plan: &ProgramPlan) -> ProgramOutcome {
         outcome.removed += 1;
         outcome.bytes += bin.bytes;
     }
-    for edit in &plan.edits {
-        match strip_file(&edit.path) {
-            Ok(()) => outcome.edited += 1,
-            Err(error) => outcome
-                .failures
-                .push((edit.path.clone(), error.to_string())),
-        }
-    }
     outcome
 }
 
@@ -260,69 +208,6 @@ fn run_cargo_uninstall() -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-}
-
-/// Strip the marker blocks from one startup file, re-reading it at wipe time:
-/// content that changed since the scan is re-checked, and a file that no
-/// longer holds the marker is simply done.
-fn strip_file(path: &Path) -> std::io::Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let spans = marker_blocks(&text);
-    if spans.is_empty() {
-        return Ok(());
-    }
-    std::fs::write(path, strip_blocks(&text, &spans))
-}
-
-/// The line spans one PATH block occupies: the marker, plus the line beneath
-/// it when that line really is a PATH line. A hand-written line under the
-/// marker is left where it is.
-fn marker_blocks(text: &str) -> Vec<(usize, usize)> {
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if line_text(lines[i]) == PATH_MARKER {
-            let end = if i + 1 < lines.len() && is_path_line(lines[i + 1]) {
-                i + 2
-            } else {
-                i + 1
-            };
-            spans.push((i, end));
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
-    spans
-}
-
-/// A line without its terminator, whichever terminator the file uses.
-fn line_text(line: &str) -> &str {
-    line.trim_end_matches(['\n', '\r'])
-}
-
-/// Does this look like the line install.sh writes under the marker? Fish
-/// spells it `fish_add_path`; every other shell writes `export PATH=…`.
-fn is_path_line(line: &str) -> bool {
-    line.contains("PATH") || line.contains("fish_add_path")
-}
-
-/// Drop the given line spans, keeping every other byte — terminators included,
-/// so a file's line endings survive an edit.
-fn strip_blocks(text: &str, spans: &[(usize, usize)]) -> String {
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        if spans.iter().any(|(start, end)| i >= *start && i < *end) {
-            continue;
-        }
-        out.push_str(line);
-    }
-    out
 }
 
 /// Follow a symlink to the file it lands on, so a shim goes together with its
@@ -401,7 +286,6 @@ mod tests {
             current_exe: Some(renamed),
             dirs: vec![root.join("path-bin"), root.join("empty")],
             cargo_bin: None,
-            rc_files: vec![],
         });
         assert_eq!(
             plan.bins
@@ -411,7 +295,7 @@ mod tests {
             vec![payload.clone(), shim.clone()],
             "the shim and its payload are both planned, sorted by path: {plan:?}"
         );
-        assert!(plan.edits.is_empty() && plan.kept.is_empty());
+        assert!(plan.kept.is_empty());
         // The symlink counts as the link itself, the payload as its bytes.
         assert_eq!(
             plan.bytes(),
@@ -431,7 +315,6 @@ mod tests {
             current_exe: Some(cargo.clone()),
             dirs: vec![],
             cargo_bin: Some(root.join(".cargo/bin")),
-            rc_files: vec![],
         });
         assert_eq!(plan.bins.len(), 1);
         assert!(plan.bins[0].cargo, "{plan:?}");
@@ -455,64 +338,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The marker is the contract: a file without it is not an edit at all,
-    /// and under the marker only a real PATH line is dropped.
-    #[test]
-    fn scan_reads_the_marker_block_not_just_the_marker() {
-        let root = scratch("marker");
-        let rc = root.join(".bashrc");
-        std::fs::write(
-            &rc,
-            "export FOO=1\n\
-             # added by the abylab installer\n\
-             export PATH=\"/home/alice/.local/bin:$PATH\"\n\
-             alias ll='ls -l'\n\
-             \n\
-             # added by the abylab installer\n\
-             # a comment the user wrote\n\
-             keep me\n",
-        )
-        .unwrap();
-        let untouched = root.join(".zshrc");
-        std::fs::write(&untouched, "export BAR=1\n").unwrap();
-
-        let plan = scan(&ScanInput {
-            current_exe: None,
-            dirs: vec![],
-            cargo_bin: None,
-            rc_files: vec![rc.clone(), untouched.clone()],
-        });
-        assert_eq!(
-            plan.edits,
-            vec![PathEdit {
-                path: rc.clone(),
-                blocks: 2
-            }],
-            "only the marked file is an edit: {plan:?}"
-        );
-
-        let outcome = wipe(&plan);
-        assert_eq!(outcome.edited, 1);
-        assert!(outcome.failures.is_empty(), "{outcome:?}");
-        assert_eq!(
-            std::fs::read_to_string(&rc).unwrap(),
-            "export FOO=1\n\
-             alias ll='ls -l'\n\
-             \n\
-             # a comment the user wrote\n\
-             keep me\n",
-            "the PATH line under the marker goes; the hand comment under it stays"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&untouched).unwrap(),
-            "export BAR=1\n",
-            "a file without the marker is byte-for-byte untouched"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// A wipe removes what the plan listed, leaves everything else (including
-    /// the directory the binary lived in), and a second wipe is a no-op.
+    /// the directory the binary lived in and a hand-edited startup file), and
+    /// a second wipe is a no-op.
     #[cfg(unix)]
     #[test]
     fn a_wipe_removes_what_the_plan_listed_and_leaves_the_rest() {
@@ -525,7 +353,7 @@ mod tests {
         std::fs::write(
             &rc,
             "# added by the abylab installer\n\
-             fish_add_path \"/home/alice/.local/bin\"\n\
+             export PATH=\"/home/alice/.local/bin:$PATH\"\n\
              set -gx EDITOR vim\n",
         )
         .unwrap();
@@ -534,11 +362,9 @@ mod tests {
             current_exe: None,
             dirs: vec![bin_dir.clone()],
             cargo_bin: None,
-            rc_files: vec![rc.clone()],
         });
         let outcome = wipe(&plan);
         assert_eq!(outcome.removed, 1);
-        assert_eq!(outcome.edited, 1);
         assert!(!outcome.cargo_uninstalled && !outcome.cargo_failed);
         assert_eq!(outcome.bytes, plan.bytes());
         assert!(outcome.failures.is_empty(), "{outcome:?}");
@@ -547,16 +373,11 @@ mod tests {
         assert!(bin_dir.exists(), "the directory itself stays");
         assert_eq!(
             std::fs::read_to_string(&rc).unwrap(),
-            "set -gx EDITOR vim\n"
+            "# added by the abylab installer\n\
+             export PATH=\"/home/alice/.local/bin:$PATH\"\n\
+             set -gx EDITOR vim\n",
+            "a shell startup file is never touched"
         );
-        assert!(wipe(&scan(&ScanInput {
-            current_exe: None,
-            dirs: vec![bin_dir],
-            cargo_bin: None,
-            rc_files: vec![rc],
-        }))
-        .failures
-        .is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
