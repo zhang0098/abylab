@@ -702,7 +702,9 @@ pub struct App {
     file_menu_dismissed: Option<String>,
     /// ACP tool permission ask (separate from `/permission` session modes).
     pub permission_ask: Option<PermissionAskOverlay>,
+    pending_permission_asks: VecDeque<PermissionAskOverlay>,
     pub user_question: Option<UserQuestionOverlay>,
+    pending_user_questions: VecDeque<UserQuestionOverlay>,
     /// Read-only modal rendered from a semantic TuiNode tree. Builtin chrome
     /// such as `/keys` uses this surface.
     pub view_overlay: Option<ViewOverlay>,
@@ -1153,7 +1155,9 @@ impl App {
             file_menu: None,
             file_menu_dismissed: None,
             permission_ask: None,
+            pending_permission_asks: VecDeque::new(),
             user_question: None,
+            pending_user_questions: VecDeque::new(),
             view_overlay: None,
             pending_images: crate::attachments::Staged::default(),
             att_chips: Vec::new(),
@@ -1242,6 +1246,20 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        if self
+            .permission_ask
+            .as_ref()
+            .is_some_and(|ask| ask.reply.as_ref().is_some_and(|reply| reply.is_closed()))
+        {
+            self.finish_permission_ask(PermissionAskReply::Cancelled);
+        }
+        if self
+            .user_question
+            .as_ref()
+            .is_some_and(|ask| ask.reply.as_ref().is_some_and(|reply| reply.is_closed()))
+        {
+            self.finish_user_question(None);
+        }
         // The cap's ":branch" label tracks mid-session checkouts on a
         // throttled cadence.
         self.refresh_git_branch();
@@ -1997,13 +2015,25 @@ impl App {
                 if reply.is_closed() {
                     return;
                 }
-                self.user_question = Some(UserQuestionOverlay {
+                if self
+                    .user_question
+                    .as_ref()
+                    .is_some_and(|ask| ask.reply.as_ref().is_some_and(|reply| reply.is_closed()))
+                {
+                    self.finish_user_question(None);
+                }
+                let ask = UserQuestionOverlay {
                     selected: vec![false; question.options.len()],
                     sel: 0,
                     custom: String::new(),
                     question,
                     reply: Some(reply),
-                });
+                };
+                if self.user_question.is_some() {
+                    self.pending_user_questions.push_back(ask);
+                } else {
+                    self.user_question = Some(ask);
+                }
                 self.needs_redraw = true;
             }
         }
@@ -2136,7 +2166,12 @@ impl App {
                     self.prompt_pending = false;
                     self.run_started = None;
                     self.state_note.clear();
-                    self.user_question = None;
+                    // A background child may still be waiting for an answer
+                    // after the parent turn becomes idle.
+                    if !self.subagents.iter().any(|view| view.running) {
+                        self.user_question = None;
+                        self.pending_user_questions.clear();
+                    }
                 }
             }
         }
@@ -2156,6 +2191,19 @@ impl App {
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Resize(..) => self.needs_redraw = true,
             Event::Paste(text) => {
+                if let Some(keys) = decode_leaked_csi_u_keys(&text) {
+                    for key in keys {
+                        if key.kind != KeyEventKind::Release {
+                            self.handle_key(crate::input::rescue_key(key), ctl);
+                        }
+                    }
+                    return;
+                }
+                // Permission has keyboard priority over a simultaneous task
+                // question, so a paste cannot edit the hidden question.
+                if self.permission_ask.is_some() {
+                    return;
+                }
                 if let Some(ask) = self.user_question.as_mut() {
                     ask.sel = ask.question.options.len();
                     for ch in text.chars().filter(|ch| *ch != '\r' && *ch != '\n') {
@@ -2165,14 +2213,6 @@ impl App {
                         ask.custom.push(ch);
                     }
                     self.needs_redraw = true;
-                    return;
-                }
-                if let Some(keys) = decode_leaked_csi_u_keys(&text) {
-                    for key in keys {
-                        if key.kind != KeyEventKind::Release {
-                            self.handle_key(crate::input::rescue_key(key), ctl);
-                        }
-                    }
                     return;
                 }
                 // The composer is multi-line (soft wrap, ctrl+j), so a paste
@@ -3773,6 +3813,12 @@ impl App {
                 let _ = reply.send(answer);
             }
         }
+        while let Some(ask) = self.pending_user_questions.pop_front() {
+            if ask.reply.as_ref().is_some_and(|reply| !reply.is_closed()) {
+                self.user_question = Some(ask);
+                break;
+            }
+        }
         self.needs_redraw = true;
     }
 
@@ -3782,13 +3828,28 @@ impl App {
         options: Vec<PermissionAskOption>,
         reply: tokio::sync::oneshot::Sender<PermissionAskReply>,
     ) {
+        if reply.is_closed() {
+            return;
+        }
+        if self
+            .permission_ask
+            .as_ref()
+            .is_some_and(|ask| ask.reply.as_ref().is_some_and(|reply| reply.is_closed()))
+        {
+            self.finish_permission_ask(PermissionAskReply::Cancelled);
+        }
         let sel = permission_ask_default_sel(&options);
-        self.permission_ask = Some(PermissionAskOverlay {
+        let ask = PermissionAskOverlay {
             title,
             sel,
             options,
             reply: Some(reply),
-        });
+        };
+        if self.permission_ask.is_some() {
+            self.pending_permission_asks.push_back(ask);
+        } else {
+            self.permission_ask = Some(ask);
+        }
         self.needs_redraw = true;
     }
 
@@ -3796,6 +3857,12 @@ impl App {
         if let Some(mut ask) = self.permission_ask.take() {
             if let Some(tx) = ask.reply.take() {
                 let _ = tx.send(reply);
+            }
+        }
+        while let Some(ask) = self.pending_permission_asks.pop_front() {
+            if ask.reply.as_ref().is_some_and(|reply| !reply.is_closed()) {
+                self.permission_ask = Some(ask);
+                break;
             }
         }
         self.needs_redraw = true;
@@ -9599,6 +9666,128 @@ mod mode_tests {
     }
 
     #[test]
+    fn concurrent_task_questions_are_answered_in_arrival_order() {
+        let (mut app, ctl, _rx) = test_app();
+        let mut replies = Vec::new();
+        for id in ["first", "cancelled", "last"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let mut question = user_question(&["Yes"], false);
+            question.id = id.into();
+            app.handle(
+                AppEvent::UserQuestion {
+                    question,
+                    reply: tx,
+                },
+                &ctl,
+            );
+            replies.push(rx);
+        }
+        assert_eq!(app.user_question.as_ref().unwrap().question.id, "first");
+        assert_eq!(app.pending_user_questions.len(), 2);
+
+        drop(replies.remove(1));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(
+            replies.remove(0).blocking_recv().unwrap().unwrap().selected,
+            ["Yes"]
+        );
+        assert_eq!(app.user_question.as_ref().unwrap().question.id, "last");
+        assert!(app.pending_user_questions.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(
+            replies.remove(0).blocking_recv().unwrap().unwrap().selected,
+            ["Yes"]
+        );
+        assert!(app.user_question.is_none());
+    }
+
+    #[test]
+    fn parent_idle_does_not_cancel_a_running_childs_question() {
+        let (mut app, ctl, _rx) = test_app();
+        app.apply_ui(crate::events::UiEvent::SubagentStarted {
+            parent: app.session_id.clone(),
+            child: "child-1".into(),
+            label: None,
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&["Yes"], false),
+                reply: tx,
+            },
+            &ctl,
+        );
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::SessionStatus {
+                session: app.session_id.clone(),
+                running: false,
+            }),
+            &ctl,
+        );
+        assert!(app.user_question.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap().selected, ["Yes"]);
+    }
+
+    #[test]
+    fn permission_ask_keeps_paste_out_of_hidden_task_question() {
+        let (mut app, ctl, _rx) = test_app();
+        let (question_tx, question_rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&[], false),
+                reply: question_tx,
+            },
+            &ctl,
+        );
+        let (permission_tx, permission_rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::PermissionAsk {
+                title: "bash".into(),
+                options: ask_options(),
+                reply: permission_tx,
+            },
+            &ctl,
+        );
+        app.handle(AppEvent::Term(Event::Paste("hidden".into())), &ctl);
+        assert!(app.user_question.as_ref().unwrap().custom.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(matches!(
+            permission_rx.blocking_recv().unwrap(),
+            PermissionAskReply::Selected(_)
+        ));
+        assert!(app.user_question.is_some());
+        app.handle(AppEvent::Term(Event::Paste("visible".into())), &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(
+            question_rx
+                .blocking_recv()
+                .unwrap()
+                .unwrap()
+                .custom
+                .as_deref(),
+            Some("visible")
+        );
+    }
+
+    #[test]
+    fn task_question_recovers_keys_wrapped_as_terminal_paste() {
+        let (mut app, ctl, _rx) = test_app();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.handle(
+            AppEvent::UserQuestion {
+                question: user_question(&[], false),
+                reply: tx,
+            },
+            &ctl,
+        );
+        app.handle(AppEvent::Term(Event::Paste("\u{1b}[99;5u".into())), &ctl);
+        assert!(app.user_question.is_none());
+        assert_eq!(rx.blocking_recv().unwrap(), None);
+    }
+
+    #[test]
     fn acp_permission_ask_enter_selects_option_id() {
         let (mut app, ctl, _rx) = test_app();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -9639,6 +9828,42 @@ mod mode_tests {
             rx.blocking_recv().expect("reply"),
             crate::bus::PermissionAskReply::Cancelled
         );
+    }
+
+    #[test]
+    fn concurrent_permission_asks_are_answered_in_arrival_order() {
+        let (mut app, ctl, _rx) = test_app();
+        let mut replies = Vec::new();
+        for title in ["bash", "cancelled", "web_search"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.handle(
+                AppEvent::PermissionAsk {
+                    title: title.into(),
+                    options: ask_options(),
+                    reply: tx,
+                },
+                &ctl,
+            );
+            replies.push(rx);
+        }
+        assert_eq!(app.permission_ask.as_ref().unwrap().title, "bash");
+        assert_eq!(app.pending_permission_asks.len(), 2);
+
+        drop(replies.remove(1));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert_eq!(
+            replies.remove(0).blocking_recv().unwrap(),
+            PermissionAskReply::Selected("allow".into())
+        );
+        assert_eq!(app.permission_ask.as_ref().unwrap().title, "web_search");
+        assert!(app.pending_permission_asks.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert_eq!(
+            replies.remove(0).blocking_recv().unwrap(),
+            PermissionAskReply::Cancelled
+        );
+        assert!(app.permission_ask.is_none());
     }
     /// `/skill` with no argument renders the catalog the agent discovered,
     /// source file and all; its empty state names the directory instead of

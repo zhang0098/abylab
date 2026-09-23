@@ -182,8 +182,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_model_picker(f, app, cards);
     draw_view_overlay(f, app, cards);
     draw_todo_dialog(f, app, cards);
-    draw_permission_ask(f, app, cards);
     draw_user_question(f, app, cards);
+    // Permission owns keyboard input while both asks are present.
+    draw_permission_ask(f, app, cards);
 }
 
 /// Outer breathing room for the modal cards (pickers, `/keys`, `/help`, the
@@ -1976,8 +1977,8 @@ fn draw_permission_ask(f: &mut Frame, app: &App, screen: Rect) {
         .map(|opt| 2 + opt.name.width().max(24) + 1 + opt.kind.width())
         .max()
         .unwrap_or(0) as u16;
-    let cap = screen.width.saturating_sub(4).max(24);
-    let w = (needed + 2).max(58).min(cap);
+    let cap = screen.width.saturating_sub(4);
+    let w = needed.saturating_add(2).max(58).min(cap);
     let x = screen.x + (screen.width - w) / 2;
     let y = screen.y + (screen.height - h) / 3;
     let area = Rect::new(x, y, w, h);
@@ -3961,6 +3962,41 @@ mod tests {
             compact.contains("Proceed"),
             "question remains visible: {compact}"
         );
+    }
+
+    #[test]
+    fn permission_ask_stays_visible_over_question_on_narrow_terminals() {
+        use crate::app::{PermissionAskOverlay, UserQuestionOverlay};
+        let mut app = test_app();
+        app.user_question = Some(UserQuestionOverlay {
+            question: abylab_backend::UserQuestion {
+                id: "confirm".into(),
+                question: "A question behind the permission card".into(),
+                header: None,
+                options: vec![],
+                multi_select: false,
+            },
+            sel: 0,
+            selected: vec![],
+            custom: String::new(),
+            reply: None,
+        });
+        app.permission_ask = Some(PermissionAskOverlay {
+            title: "bash".into(),
+            sel: 0,
+            options: vec![crate::bus::PermissionAskOption {
+                option_id: "allow".into(),
+                kind: "allow_once".into(),
+                name: "Allow once".into(),
+            }],
+            reply: None,
+        });
+        let frame = dump_frame(&mut app, 90, 30);
+        assert!(
+            frame.contains("Allow once"),
+            "permission must be on top: {frame}"
+        );
+        let _ = dump_frame(&mut app, 20, 8);
     }
 
     #[test]
