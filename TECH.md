@@ -208,44 +208,45 @@ Web UI）看到的都是同一份 FIFO。行里带 `placement`：`Queued`（等�
   花掉；这个进程真正跑完一轮之后才解除，之后按 FIFO 放出。文件缺失、损坏或形状不对
   都只是空队列，和 `settings.json` 一个待遇。
 
-## 重置（/reset）
+## 卸载（`abylab --uninstall`）
 
-`/reset`（TUI）和 `abylab --reset`（命令行）是同一件事的两个入口：删掉 `$ABYLAB_HOME`
-下**这个程序自己存的东西**，别的一概不动。两边共用 `reset::scan` / `reset::wipe`，
-只有确认方式按各自界面的规矩来。
+`--uninstall` 是唯一的维护命令，只有命令行一个入口（没有 `/uninstall`：它要删的正是自己，
+TUI 还开着没有意义；也没有单独的 `/reset` —— 清数据就是它的第一个问题）。计划分两半：数据
+那半在 `data.rs`（`data::scan` / `data::wipe`），程序那半在 `uninstall.rs`
+（`uninstall::scan` / `uninstall::wipe`）。
 
-- **名单是白名单，不扫目录**：`settings.json`、`abylab-modes.json`、`.credentials.yaml`、
-  `sessions/`、`queued/`，外加 `--session-root` 指到 home 里面的那个会话库（默认就是
-  `sessions/`，按路径去重，只列一次）。名单外的文件不在里面，尤其两处会在计划里
-  写明"保留"：手写的 `AGENTS.md`（abycore 从 home 读的工作区指令，是用户的文件），
-  以及 `--session-root` 指到 home 之外的会话库（命令只清 ABYHOME）。home 自己永远不是
-  删除目标——有人把 `--session-root` 指成 home 也一样，那条路径会以"指的就是 aby 主目录"
-  记在保留里。
-- **先测量，再照单执行**：`scan` 用 `lstat` 统计每个条目的文件数和体积（符号链接按
-  链接本身算，和 `remove_dir_all` 真正会 unlink 的东西一致；单个条目最多数 `MAX_WALK`
-  个文件，超了显示 `N+`，免得一份手摆的目录把对话框卡住）。对话框和命令行打印的都是
-  这份测量结果，`wipe` 删的也是它——看到的和删掉的是同一份。删不掉的按路径报告，
-  不四舍五入成"成功"；扫描之后消失的路径不算失败。
-- **二次确认**：TUI 里第一次 enter 只是把卡片"上膛"（边框转警告色、标题改口），第二次
-  enter 才动手；期间任何别的键（滚轮也算）都退回第一次，所以删下去的那一下一定是
-  自己按的。命令行在 `/dev/tty` 上问 `[y/N]`（从不读 stdin：管道里可能是别的东西），
-  `--yes` 明写免确认，没有终端可问就报错退出——不会默认成"是"。
-- **删完的现场**：`/login` 存的 key 立刻停用（`/login`/`/logout` 的同一套规则；
-  `--api-key` 传进来的不是保存的数据，继续用）。界面接着发 `Cmd::NewSession` 换会话：
-  当前会话的日志刚被删掉，旧 writer 会继续往已 unlink 的 inode 里追加，锚点重写还会
-  因为目录不在而报错，换会话才是干净的收尾（新会话的目录由驱动按需重建，日志照旧
-  在第一次 checkpoint 时才落地）。模型、推理强度和权限预设留在这次运行里——它们属于
-  进程，不属于文件；下次启动读到的自然是默认值，这也是"回到初始状态"的落点。
-- **报告写在切换之后的那一侧**：绑定新会话会清空时间线（`reset_session_ui`），所以项数、
-  文件数、体积这些数字以及"没有 key"时那份 `/login` 引导，都由 `App::flush_reset_report`
-  在 `SessionBound`（或 `SessionSwitchFailed`——切换没成，报告也照样落在旧会话的时间线上）
-  才写进时间线；切换期间先挂一条 tip 说明正在换会话。
-- **命令行那边的额外一行**：计划里检测到还有别的 abylab 在跑时会提示先退出它——它会在
-  下一次偏好变更时把 `settings.json` 写回来，而 TUI 内的 `/reset` 看不到别的进程。
-
-`/reset` 在 TUI 里要求会话空闲（`RunState::Idle` 且没有已交出、还没到 ACP 请求的首个
-prompt），会话切换在飞时也拒绝：驱动按轮次串行读命令，一轮进行中换会话要等这轮结束，
-而这轮会继续往被删的日志里 checkpoint。
+- **数据那半是白名单，不扫目录**：`settings.json`、`abylab-modes.json`、
+  `.credentials.yaml`、`sessions/`、`queued/`，外加 `--session-root` 指到 home 里面的那个
+  会话库（默认就是 `sessions/`，按路径去重，只列一次）。名单外的一概不动，两处会在计划里
+  写明"保留"：手写的 `AGENTS.md`（abycore 从 home 读的工作区指令，是用户的文件），以及
+  `--session-root` 指到 home 之外的会话库（命令只清 ABYHOME）。home 自己永远不是删除
+  目标——有人把 `--session-root` 指成 home 也一样，那条路径会以"指的就是 aby 主目录"记在
+  保留里。
+- **先测量，再照单执行**：`scan` 用 `lstat` 统计每个条目的文件数和体积（符号链接按链接
+  本身算，和 `remove_dir_all` 真正会 unlink 的东西一致；单个条目最多数 `MAX_WALK` 个文件，
+  超了显示 `N+`，免得一份手摆的目录把计划卡住）。命令行打印的就是这份测量，`wipe` 删的也
+  是它——看到的和删掉的是同一份。删不掉的按路径报告，不四舍五入成"成功"；扫描之后消失的
+  路径不算失败。
+- **程序那半的名单**：`std::env::current_exe`（从 `$PATH` 之外启动也能找到正在运行的
+  自己）、`$PATH` 每个目录下的 `abylab`、`~/.local/bin/abylab`、`$ABYLAB_BIN_DIR/abylab`。
+  候选路径必须还叫 `abylab`（改过名的不动）；符号链接连它指向的文件一起进名单，
+  `link_target` 有 20 跳上限，成环不会挂。另一个包管理器拥有的路径（`/opt/homebrew`、
+  `/homebrew`、任何 `/Cellar/`、`/nix/store`、`/.nix-profile/`）只列 `keep`。
+  `$CARGO_HOME/bin`（默认 `~/.cargo/bin`）里的副本标记为 cargo：整批交给
+  `cargo uninstall abylab-tui`，让 `~/.cargo/.crates.toml` 的登记一起走；cargo 不在或
+  执行失败就退回直接 unlink，报告里明说 cargo 的名单可能还留着这个名字。
+- **两半，两个问题**：计划把数据行和程序行列在同一张单子上（`remove` / `keep`），确认却分
+  两次：先问数据、再问程序。这样"保留数据、只删程序"是明确答出来的一个组合，而不是让用户
+  先清数据再自己删二进制。`--keep-data` 把数据问题固定成"不删"，`--yes` 把两个问题都固定成
+  "删"；命令行在 `/dev/tty` 上问 `[y/N]`（从不读 stdin：管道里可能是别的东西），没有终端
+  可问就报错退出，绝不默认成"是"。两个问题都答 n 则原样退出。
+- **不动 shell 启动文件**：`install.sh` 追加的那行 PATH 留在原处，删二进制不会顺带编辑 rc
+  文件——那是用户的文件，命令只把二进制删掉就结束。
+- **还在跑的另一个 abylab**：计划里会多一行提示先退出它——它会在下一次偏好变更时把
+  `settings.json` 写回来，半清的 home 会自己长回去。
+- **删的是正在运行的自己**：Unix 上 unlink 一个正在执行的映像没有问题，进程把报告写完才
+  退出；发行目标（Linux musl、macOS）都在这个前提下。测试里扫的目录、`current_exe` 全部
+  由调用方传入（`ScanInput`），所以测试不可能碰到真实安装。
 
 ## 构建与发布
 
