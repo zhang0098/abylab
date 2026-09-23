@@ -1559,9 +1559,12 @@ fn turn_error_text(err: &abycore::Error, limits: TurnLimits) -> String {
         }
         ErrorKind::Timeout => {
             return format!(
-                "timed out (ABY_TURN_TIMEOUT={}, ABY_TOOL_TIMEOUT={} seconds; ABY_AUTO_CONTINUE={}) \
-                 — the turn is unfinished; send a message to continue it or adjust these environment variables \
-                 / 超时：回合未完成，继续输入可续跑；可调整上述环境变量中的时限和自动续跑次数{detail}",
+                "timed out — the run stalled with no progress for ABY_TURN_TIMEOUT={} seconds, or one \
+                 request or tool call reached a deadline of its own (a tool that declares no budget \
+                 stops at ABY_TOOL_TIMEOUT={} seconds; ABY_AUTO_CONTINUE={}) \
+                 — the turn is unfinished; send a message to continue it or adjust these environment \
+                 variables / 超时：运行停滞，或单个请求／工具调用到达自身时限，回合未完成，继续输入可续跑；\
+                 可调整上述环境变量中的时限和自动续跑次数{detail}",
                 limits.run_timeout.as_secs(),
                 limits.tool_timeout.as_secs(),
                 limits.continuations,
@@ -2176,7 +2179,8 @@ async fn compact_view(
                 .unwrap_or_else(|| CompactionConfig::default().max_tokens),
         ),
         // Forced compaction is an explicit recovery operation with its own
-        // deadline and the driver's active interrupt signal.
+        // no-progress window (five minutes of silence is a failed summary, while
+        // a long one keeps going) and the driver's active interrupt signal.
         cancellation,
         timeout: Duration::from_secs(300),
         ..Default::default()
@@ -2532,11 +2536,12 @@ async fn turn(
 /// Whether a failed segment is worth resuming inside the same open turn.
 ///
 /// Mirrors deepseek-harness's retryable step failures (`dsh-llm-retry`:
-/// `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`). A timeout, including
-/// the whole-segment deadline, also leaves the turn resumable: a long task can
-/// need a fresh segment even when every individual request/tool made progress.
-/// Timeout continuations share the same finite headroom as all other retries.
-/// `BudgetExceeded` is abylab's own watchdog.
+/// `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`). A timeout — the run's
+/// own no-progress window, or a request that reached its deadline — also leaves
+/// the turn resumable: a segment that went quiet can need a fresh one, and the
+/// work already committed is unaffected. Timeout continuations share the same
+/// finite headroom as all other retries. `BudgetExceeded` is abylab's own
+/// watchdog.
 fn resumable_failure(err: &abycore::Error) -> bool {
     matches!(
         err.kind,

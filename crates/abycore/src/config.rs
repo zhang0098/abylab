@@ -150,11 +150,26 @@ impl Default for RequestOptions {
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub cancellation: CancellationToken,
+    /// How long one run segment may go **without progress** before it fails
+    /// with [`ErrorKind::Timeout`](crate::ErrorKind::Timeout): no bytes from the
+    /// provider, no request or tool call finishing, no checkpoint. It is a gap
+    /// between two moments of work, not a cap on the segment's total duration —
+    /// a segment that keeps working runs for as long as it needs, the way
+    /// deepseek-harness's agent loop has no deadline over a step at all.
+    ///
+    /// Every operation that owns a tighter deadline (a request's first-byte and
+    /// stream-idle timeouts, a tool call's budget) suspends this window instead
+    /// of racing it.
     pub timeout: Duration,
     /// This agent turn's HTTP dispatches, including retries and auxiliary searches.
     /// Subagent turns have independent budgets configured by `SubagentConfig`.
     pub max_requests: usize,
     pub max_tool_calls: usize,
+    /// The backstop for one tool call that declares no budget of its own:
+    /// [`Tool::call_timeout`](crate::Tool::call_timeout) is what a tool that
+    /// knows its own work (a command with `timeoutMs`, a delegation waiting on a
+    /// child) answers with, and that value is the call's budget. Expiry is
+    /// reported to the model as a tool error, not as a failed turn.
     pub tool_timeout: Duration,
     pub max_tool_output_bytes: usize,
     /// Serialized input budget in bytes, not an estimate of model tokens.

@@ -36,8 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **Agent loop** — multi-step turns over streaming Messages responses, with a
   durable inbox (a prompt sent mid-turn queues behind the active turn),
-  per-run budgets (`max_requests`, `max_tool_calls`), run/tool deadlines, and
-  cooperative cancellation through `CancellationToken`.
+  per-run budgets (`max_requests`, `max_tool_calls`), a no-progress window over
+  each run (`timeout`) with a per-tool budget backstop (`tool_timeout`, which a
+  tool may raise for itself through `Tool::call_timeout`), and cooperative
+  cancellation through `CancellationToken`.
 - **Local tool bundle** — `LocalTools` registers `read`, `write`, `edit` and
   `bash` atomically, or individually:
   - `read`/`write`/`edit` run on a cap-std directory capability with version

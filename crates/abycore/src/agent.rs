@@ -1052,20 +1052,29 @@ impl Agent {
                                 self.state.pending[0].state = PendingState::Unknown;
                                 let cancellation = context.cancellation.child_token();
                                 let _cancel_on_drop = cancellation.clone().drop_guard();
+                                let budget = call_budget(&*tool, &arguments, options);
                                 let mut tool_request = context.clone();
                                 tool_request.cancellation = cancellation.clone();
-                                tool_request.deadline = tokio::time::Instant::now().checked_add(options.tool_timeout).unwrap_or(context.deadline).min(context.deadline);
-                                let tool_context = ToolContext { call_id: call.call_id.clone(), cancellation, deadline: tool_request.deadline, max_output_bytes: options.max_tool_output_bytes, request: tool_request, local_session: self.local_session.clone(), parent: parent.clone() };
-                                let wait_timeout = options.tool_timeout.saturating_add(tool.cleanup_grace());
-                                match context.timed(wait_timeout, tool.execute(arguments, tool_context)).await? {
-                                    Ok(output) => output,
-                                    Err(ToolError::Failed(message)) => ToolOutput::error(message),
-                                    Err(ToolError::Uncertain(_)) => return Err(Error::new(ErrorKind::NeedsResolution, "tool reported uncertain side effects; resolve its result explicitly")),
+                                let deadline = tokio::time::Instant::now() + budget;
+                                let tool_context = ToolContext { call_id: call.call_id.clone(), cancellation: cancellation.clone(), deadline, max_output_bytes: options.max_tool_output_bytes, request: tool_request, local_session: self.local_session.clone(), parent: parent.clone() };
+                                match run_tool(tool, arguments, tool_context, context, cancellation, budget).await? {
+                                    // The call's budget expired: the model is told, and the
+                                    // turn goes on with the rest of the batch.
+                                    ToolRun::TimedOut => ToolOutput::error(format!(
+                                        "the tool call timed out after {} and was stopped; whatever it already did is unverified — check the workspace before repeating it",
+                                        budget_label(budget)
+                                    )),
+                                    ToolRun::Settled(Ok(output)) => output,
+                                    ToolRun::Settled(Err(ToolError::Failed(message))) => ToolOutput::error(message),
+                                    ToolRun::Settled(Err(ToolError::Uncertain(_))) => return Err(Error::new(ErrorKind::NeedsResolution, "tool reported uncertain side effects; resolve its result explicitly")),
                                 }
                             }
                         }
                     }
                 }.bounded(options.max_tool_output_bytes.saturating_sub("Tool error: ".len()));
+                // A committed step is progress: the batch moves even when one
+                // call in it timed out or failed.
+                context.touch();
                 // From here on `output` is the committed result, not the tool's
                 // proposal: checkpoints, host events and the next request all
                 // carry the same text (see `resolve_tool`).
@@ -1222,4 +1231,78 @@ where
         .wait(handler(event))
         .await?
         .map_err(|_| Error::new(ErrorKind::EventHandler, "event handler failed"))
+}
+
+/// One tool call's budget: what the tool declares for these arguments, else the
+/// deployment's backstop.
+///
+/// The declaration wins because it is the tool's own contract — the harness
+/// reads the same value from the tool definition rather than capping every call
+/// at one host-wide number, so a `bash` call that asks for ten minutes gets ten
+/// minutes and a `read` that asks for nothing still cannot hang the turn.
+fn call_budget(tool: &dyn Tool, arguments: &Value, options: &RunOptions) -> Duration {
+    /// Past this a declaration is not a limit but a mistake: clamping keeps one
+    /// from turning a single call into an unbounded wait inside the turn.
+    const MAX_CALL_BUDGET: Duration = Duration::from_secs(60 * 60);
+    match tool.call_timeout(arguments) {
+        Some(declared) => declared.min(MAX_CALL_BUDGET),
+        None => options.tool_timeout,
+    }
+}
+
+/// A budget in the units a human reads: seconds when there is at least one,
+/// milliseconds below that (`bash` asks in milliseconds and tests use tiny ones).
+fn budget_label(budget: Duration) -> String {
+    if budget.as_secs() > 0 {
+        format!("{}s", budget.as_secs())
+    } else {
+        format!("{}ms", budget.as_millis())
+    }
+}
+
+/// What one tool call produced under its budget.
+enum ToolRun {
+    Settled(std::result::Result<ToolOutput, ToolError>),
+    /// The budget expired, and the call did not settle within its cleanup
+    /// grace after being asked to stop.
+    TimedOut,
+}
+
+/// Drive one tool call under its own budget, inside the run's cancellation.
+///
+/// On expiry the call's token is cancelled — a compliant tool stops and reports
+/// what it managed to do — and it gets its cleanup grace to settle. A tool that
+/// still will not settle is dropped, which is its hard stop, and the caller
+/// answers the model with an error result. deepseek-harness's
+/// `dsh-tool-call-timeout-policy` does the same thing for the same reason: one
+/// slow call is not a failed turn.
+async fn run_tool(
+    tool: Arc<dyn Tool>,
+    arguments: Value,
+    tool_context: ToolContext,
+    context: &RequestContext,
+    cancellation: crate::CancellationToken,
+    budget: Duration,
+) -> Result<ToolRun> {
+    let grace = tool.cleanup_grace();
+    let mut call = std::pin::pin!(tool.execute(arguments, tool_context));
+    let mut stop_at = tokio::time::Instant::now() + budget;
+    let mut stopping = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled() => {
+                return Err(Error::new(ErrorKind::Cancelled, "operation cancelled"));
+            }
+            result = &mut call => return Ok(ToolRun::Settled(result)),
+            _ = tokio::time::sleep_until(stop_at) => {
+                if stopping {
+                    return Ok(ToolRun::TimedOut);
+                }
+                stopping = true;
+                cancellation.cancel();
+                stop_at = tokio::time::Instant::now() + grace;
+            }
+        }
+    }
 }

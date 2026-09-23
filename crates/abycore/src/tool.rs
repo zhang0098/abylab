@@ -123,8 +123,22 @@ pub type ToolFuture<'a> = BoxFuture<'a, std::result::Result<ToolOutput, ToolErro
 /// Execute is never automatically retried. Cancellation drops its future.
 pub trait Tool: Send + Sync {
     /// Extra time for orderly cleanup after the tool's execution deadline.
+    /// Cancellation comes first: the call is asked to stop, then given this long
+    /// to settle, and only a tool that still will not settle is dropped.
     fn cleanup_grace(&self) -> Duration {
         Duration::ZERO
+    }
+    /// The budget this call asks for, or `None` for the deployment's backstop
+    /// ([`crate::RunOptions::tool_timeout`]).
+    ///
+    /// A declared budget belongs to the tool, the way deepseek-harness's
+    /// `ToolDefinition.timeoutMs` does: the model's `timeoutMs` for `bash`, the
+    /// window a delegation waits out. The executor enforces it and answers the
+    /// expiry with a tool result the model can read, so the turn continues; the
+    /// backstop applies only to calls that declare nothing.
+    fn call_timeout(&self, arguments: &Value) -> Option<Duration> {
+        let _ = arguments;
+        None
     }
     fn definition(&self) -> ToolDefinition;
     fn validate(&self, arguments: &Value) -> std::result::Result<(), ToolError>;

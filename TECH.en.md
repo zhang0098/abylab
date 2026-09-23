@@ -140,18 +140,40 @@ measurement when there is one, otherwise estimated at 3 bytes per token. A view
 change invalidates the old measurement; restoring an already-compacted session
 conservatively waits for a new one.
 
-Where abylab is stricter than harness: each segment runs under a 10-minute
-deadline by default (`ABY_TURN_TIMEOUT=600`) and each tool call under 60 seconds
-(`ABY_TOOL_TIMEOUT=60`). A timeout waits one second and continues the same open
-turn, sharing the `ABY_AUTO_CONTINUE` allowance with budget stops and transient
-failures (default 3; `0` stops on the first failure). Completed tool results
-survive; a tool truncated mid-execution is marked "unverified — check before
-repeating" and never replayed. Only once that allowance is spent does the error
-surface, listing the current limits; another message continues the session, and
-Esc interrupts both execution and the wait between segments. (These budgets and
-deadlines are abylab's own backstops, not DeepSeek limits — usage is billed as
-usual.) Serialized input has its own 4 MiB cap. The byte estimate is not a
-guaranteed upper bound.
+Where abylab is stricter than harness, both backstops exist to keep a turn from
+hanging, never to keep it from working.
+
+`ABY_TURN_TIMEOUT` (600 seconds by default) is the limit on a segment making **no
+progress** — no bytes arriving, no request or tool call finishing, no committed
+step — not a limit on how long the segment may take. A run that keeps working
+takes as long as it needs: every stream chunk and every committed tool result
+re-arms the clock, and each wake-up of a pending await re-reads the whole gap, so
+a long answer or a long tool sequence is never cut off. What actually kills a
+dead network is the transport's own timeouts (15s connect, 120s first byte, 60s
+stream idle), so the window only fires when the whole run has stopped moving; a
+stalled request is not retried at the transport either — it goes straight to the
+driver's continuation.
+
+`ABY_TOOL_TIMEOUT` (60 seconds by default) is the backstop for a tool call that
+**declares no budget of its own**; a declared budget wins, which is how harness
+works too (each tool's own `timeoutMs`, not one host-wide number). A `bash` call
+carrying `timeoutMs` runs under it (`bash_max_timeout` caps it, 600 seconds by
+default), and a foreground delegation or `wait_agent` waits out the child's run
+window. When a call reaches its budget it is asked to stop, gets its own
+`cleanup_grace` to settle, and answers with a tool error the model can read
+(saying it was stopped and that its result is unverified); the turn continues —
+the same answer `dsh-tool-call-timeout-policy` gives, instead of failing the turn.
+
+A genuinely stalled segment, or a request or tool call reaching its own deadline,
+waits one second and continues the same open turn, sharing the `ABY_AUTO_CONTINUE`
+allowance with budget stops and transient failures (default 3; `0` stops on the
+first failure). Completed tool results survive; a tool truncated mid-execution is
+marked "unverified — check before repeating" and never replayed. Only once that
+allowance is spent does the error surface, listing the current limits; another
+message continues the session, and Esc interrupts both execution and the wait
+between segments. (These budgets and windows are abylab's own backstops, not
+DeepSeek limits — usage is billed as usual.) Serialized input has its own 4 MiB
+cap. The byte estimate is not a guaranteed upper bound.
 
 ## Session persistence
 

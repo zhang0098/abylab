@@ -27,7 +27,7 @@ pub enum ToolDecision {
     Deny(String),
 }
 
-/// Hooks run outside the tool execution timeout, but inside the run's deadline.
+/// Hooks run outside the tool execution timeout, but inside the run's window.
 /// A failed checkpoint prevents the next network request or tool execution.
 /// The host still saves `Agent::snapshot()` after run returns (including errors).
 /// Hooks are not restored from a snapshot; install them before each resumed run.

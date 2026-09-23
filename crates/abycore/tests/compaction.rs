@@ -705,7 +705,7 @@ async fn automatic_summary_shares_the_run_request_budget() {
 }
 
 #[tokio::test]
-async fn automatic_summary_obeys_cancellation_and_run_deadline() {
+async fn automatic_summary_obeys_cancellation_and_the_run_window() {
     for cancel in [false, true] {
         let mut reply = Reply::sse(response("summary", vec![message("s", "checkpoint")]));
         reply.header_delay = Duration::from_secs(5);
@@ -726,6 +726,9 @@ async fn automatic_summary_obeys_cancellation_and_run_deadline() {
                 trigger.cancel();
             });
         }
+        // A window far shorter than this fixture's answer: a summary that says
+        // nothing for the whole window is a stalled run, whichever bound
+        // (transport or window) fires first.
         let options = RunOptions {
             cancellation,
             timeout: if cancel {

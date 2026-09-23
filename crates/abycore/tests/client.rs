@@ -222,7 +222,7 @@ async fn idle_timeout_counts_network_wait_not_consumer_delay() {
 }
 
 #[tokio::test]
-async fn cancellation_first_byte_idle_and_total_timeouts() {
+async fn cancellation_first_byte_idle_timeouts_and_the_run_window() {
     let mut reply = Reply::json(response("r", vec![message("m", "ok")]));
     reply.header_delay = Duration::from_secs(1);
     let server = Server::start(vec![reply]).await;
@@ -249,7 +249,10 @@ async fn cancellation_first_byte_idle_and_total_timeouts() {
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Cancelled);
     assert_eq!(server.captured().len(), 1);
-    for total in [false, true] {
+    // A window is a gap between two moments of progress, not a cap on how long
+    // a stream may take: whichever of the two bounds is reached first, a stream
+    // that says nothing for a whole window has stalled.
+    for window in [false, true] {
         let mut reply = Reply::raw(200, "text/event-stream", "");
         reply.chunks = vec![
             (Duration::ZERO, frame(&message_start("r")).into_bytes()),
@@ -257,13 +260,13 @@ async fn cancellation_first_byte_idle_and_total_timeouts() {
         ];
         let server = Server::start(vec![reply]).await;
         let mut config = server.config();
-        config.stream_idle_timeout = if total {
+        config.stream_idle_timeout = if window {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(30)
         };
         let mut options = RequestOptions::default();
-        if total {
+        if window {
             options.timeout = Duration::from_millis(30);
         }
         let mut stream = DeepSeekClient::new(config)
@@ -277,6 +280,32 @@ async fn cancellation_first_byte_idle_and_total_timeouts() {
             ErrorKind::Timeout
         );
     }
+    // The same window never cuts a response that keeps producing events: every
+    // event re-arms it, so a slow answer is a working run.
+    let events = message_events(response("r", vec![message("m", "ok")]));
+    let mut reply = Reply::raw(200, "text/event-stream", "");
+    reply.chunks = events
+        .iter()
+        .map(|event| (Duration::from_millis(20), frame(event).into_bytes()))
+        .collect();
+    let server = Server::start(vec![reply]).await;
+    let mut stream = server
+        .client()
+        .stream(
+            MessageRequest::new("x"),
+            RequestOptions {
+                timeout: Duration::from_millis(30),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut seen = 0usize;
+    while let Some(event) = stream.next().await {
+        event.expect("every frame of a progressing stream arrives");
+        seen += 1;
+    }
+    assert!(seen > 1, "the stream ran to its end past the window");
 }
 
 #[tokio::test]

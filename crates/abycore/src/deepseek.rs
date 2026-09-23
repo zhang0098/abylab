@@ -161,6 +161,9 @@ impl DeepSeekClient {
                     .map_err(|_| Error::new(ErrorKind::Transport, "response stream interrupted"))?;
                 size = size.checked_add(chunk.len()).ok_or_else(|| Error::protocol("stream size overflow"))?;
                 if size > client.transport.config().max_response_bytes { Err(Error::protocol("stream size limit exceeded"))?; }
+                // Bytes on the wire are progress: a long response is a working
+                // run, not a stalled one.
+                context.touch();
                 for frame in parser.feed(&chunk)? {
                     context.check()?;
                     if let Some(mut event) = assembler.accept(frame)? {

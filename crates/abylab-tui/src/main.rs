@@ -949,8 +949,8 @@ mod cli_args_tests {
         assert_eq!(cap_or_unlimited(7), 7);
     }
 
-    /// The deadlines abylab exposes are the limits that bind in practice once
-    /// the request/tool budgets are backstops.
+    /// The two timeouts abylab exposes: a run's no-progress window and the
+    /// backstop for a tool call that declares no budget of its own.
     #[test]
     fn deadlines_resolve_from_env_with_zero_refused() {
         assert_eq!(

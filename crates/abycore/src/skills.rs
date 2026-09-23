@@ -675,7 +675,7 @@ mod tests {
         ToolContext {
             call_id: "skill-test".into(),
             cancellation,
-            deadline: request.deadline,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             max_output_bytes: 64 * 1024,
             request,
             local_session: Arc::default(),

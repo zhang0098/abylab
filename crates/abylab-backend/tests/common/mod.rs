@@ -503,6 +503,13 @@ pub struct Scenario {
 #[derive(Clone, Debug)]
 pub enum Step {
     Prompt(String),
+    /// Send `text`, then Esc once `marker` shows up among the events; the step is
+    /// done when the turn ends. The marker keeps the interrupt timed to a known
+    /// point inside the turn instead of a guess.
+    Interrupted {
+        text: String,
+        marker: String,
+    },
     Compact,
     /// `/goal <arg>`: the driver settles the whole goal run before the next step.
     Goal(String),
@@ -555,6 +562,16 @@ impl Scenario {
     /// `/goal <arg>` as one scripted step.
     pub fn goal(mut self, arg: impl Into<String>) -> Self {
         self.steps.push(Step::Goal(arg.into()));
+        self
+    }
+
+    /// Send `text` and Esc as soon as `marker` appears in the event stream
+    /// (e.g. `tool-started:call-1`).
+    pub fn interrupted(mut self, text: impl Into<String>, marker: impl Into<String>) -> Self {
+        self.steps.push(Step::Interrupted {
+            text: text.into(),
+            marker: marker.into(),
+        });
         self
     }
 
@@ -628,6 +645,28 @@ pub fn drive(scenario: Scenario) -> Run {
                         .filter(|event| event.starts_with("turn-end:"))
                         .count()
                         >= expected
+                });
+            }
+            Step::Interrupted { text, marker } => {
+                handle.send(Cmd::Prompt { text: text.clone() });
+                wait_for(&events, deadline, "the interrupt marker", |events| {
+                    events
+                        .iter()
+                        .any(|event| event.starts_with(marker.as_str()))
+                });
+                let ended = events
+                    .lock()
+                    .expect("event lock")
+                    .iter()
+                    .filter(|event| event.starts_with("turn-end:"))
+                    .count();
+                handle.interrupt();
+                wait_for(&events, deadline, "the interrupted turn", |events| {
+                    events
+                        .iter()
+                        .filter(|event| event.starts_with("turn-end:"))
+                        .count()
+                        > ended
                 });
             }
             Step::Compact => {

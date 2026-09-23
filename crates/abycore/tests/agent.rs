@@ -52,6 +52,32 @@ impl Tool for Echo {
         })
     }
 }
+/// The same tool with a budget of its own, the way `bash` reads `timeoutMs`:
+/// its declaration, not the deployment's backstop, is what the call runs under.
+struct DeclaredEcho {
+    delay: Duration,
+    budget: Duration,
+}
+impl Tool for DeclaredEcho {
+    fn call_timeout(&self, _: &Value) -> Option<Duration> {
+        Some(self.budget)
+    }
+    fn cleanup_grace(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn definition(&self) -> ToolDefinition {
+        Echo::new(Arc::new(AtomicUsize::new(0))).definition()
+    }
+    fn validate(&self, arguments: &Value) -> std::result::Result<(), ToolError> {
+        Echo::new(Arc::new(AtomicUsize::new(0))).validate(arguments)
+    }
+    fn execute<'a>(&'a self, arguments: Value, _context: ToolContext) -> ToolFuture<'a> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            Ok(ToolOutput::text(arguments["text"].as_str().unwrap()))
+        })
+    }
+}
 fn agent(server: &Server) -> Agent {
     Agent::new(server.client(), "system", ModelOptions::default()).unwrap()
 }
@@ -372,71 +398,152 @@ async fn continuation_input_does_not_change_pending_idle_or_cancelled_sessions()
 }
 
 #[tokio::test]
-async fn interrupted_or_dropped_tool_requires_explicit_resolution() {
-    for drop_future in [false, true] {
-        let server = Server::start(vec![
-            Reply::sse(response(
-                "r1",
-                vec![call("c", "echo", r#"{"text":"once"}"#)],
-            )),
-            Reply::sse(response("r2", vec![message("m", "done")])),
-        ])
-        .await;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut agent = agent(&server);
-        agent
-            .register_tool(Echo {
-                calls: calls.clone(),
-                delay: Duration::from_secs(5),
-                uncertain: false,
-            })
-            .unwrap();
-        let mut options = RunOptions {
-            tool_timeout: Duration::from_millis(40),
-            ..Default::default()
-        };
-        if drop_future {
-            options.tool_timeout = Duration::from_secs(2);
-            assert!(
-                tokio::time::timeout(
-                    Duration::from_millis(100),
-                    agent.run("start", options, ignore)
-                )
-                .await
-                .is_err()
-            );
-        } else {
-            assert_eq!(
-                agent.run("start", options, ignore).await.unwrap_err().kind,
-                ErrorKind::Timeout
-            );
-        }
-        let snapshot = agent.snapshot();
-        assert_eq!(snapshot.pending[0].state, PendingState::Unknown);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let mut restored = Agent::restore(
-            server.client(),
-            SessionSnapshot::from_json(&snapshot.to_json().unwrap()).unwrap(),
-        )
+async fn a_dropped_tool_call_requires_explicit_resolution() {
+    let server = Server::start(vec![
+        Reply::sse(response(
+            "r1",
+            vec![call("c", "echo", r#"{"text":"once"}"#)],
+        )),
+        Reply::sse(response("r2", vec![message("m", "done")])),
+    ])
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent(&server);
+    agent
+        .register_tool(Echo {
+            calls: calls.clone(),
+            delay: Duration::from_secs(5),
+            uncertain: false,
+        })
         .unwrap();
-        assert_eq!(
-            restored
-                .continue_run(RunOptions::default(), ignore)
-                .await
-                .unwrap_err()
-                .kind,
-            ErrorKind::NeedsResolution
-        );
-        assert_eq!(server.captured().len(), 1);
-        restored
-            .resolve_tool("c", ToolOutput::text("host verified result"))
-            .unwrap();
+    let options = RunOptions {
+        tool_timeout: Duration::from_secs(2),
+        ..Default::default()
+    };
+    // Dropping the run drops the call while it is executing: nothing can say
+    // whether its side effects happened, so only the host may settle it.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            agent.run("start", options, ignore)
+        )
+        .await
+        .is_err()
+    );
+    let snapshot = agent.snapshot();
+    assert_eq!(snapshot.pending[0].state, PendingState::Unknown);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let mut restored = Agent::restore(
+        server.client(),
+        SessionSnapshot::from_json(&snapshot.to_json().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
         restored
             .continue_run(RunOptions::default(), ignore)
             .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
+            .unwrap_err()
+            .kind,
+        ErrorKind::NeedsResolution
+    );
+    assert_eq!(server.captured().len(), 1);
+    restored
+        .resolve_tool("c", ToolOutput::text("host verified result"))
+        .unwrap();
+    restored
+        .continue_run(RunOptions::default(), ignore)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_tool_that_declares_its_own_budget_is_not_clipped_by_the_backstop() {
+    let server = Server::start(vec![
+        Reply::sse(response(
+            "r1",
+            vec![call("c", "echo", r#"{"text":"slow but allowed"}"#)],
+        )),
+        Reply::sse(response("r2", vec![message("m", "done")])),
+    ])
+    .await;
+    let mut agent = agent(&server);
+    agent
+        .register_tool(DeclaredEcho {
+            delay: Duration::from_millis(300),
+            budget: Duration::from_secs(5),
+        })
+        .unwrap();
+    // The backstop is ten times shorter than the call: a tool that knows how long
+    // its work takes owns that number, exactly as the harness reads each tool's
+    // own limit instead of capping every call at one host-wide value.
+    let options = RunOptions {
+        tool_timeout: Duration::from_millis(30),
+        ..Default::default()
+    };
+    let outcome = agent.run("start", options, ignore).await.unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    let output = outcome
+        .new_items
+        .iter()
+        .find_map(|item| match item {
+            Item::FunctionCallOutput { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("the call is answered");
+    assert_eq!(output, "slow but allowed");
+}
+
+#[tokio::test]
+async fn a_call_that_outlives_its_budget_becomes_a_tool_result_and_the_turn_goes_on() {
+    let server = Server::start(vec![
+        Reply::sse(response(
+            "r1",
+            vec![call("c", "echo", r#"{"text":"once"}"#)],
+        )),
+        Reply::sse(response("r2", vec![message("m", "done")])),
+    ])
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent(&server);
+    agent
+        .register_tool(Echo {
+            calls: calls.clone(),
+            delay: Duration::from_secs(5),
+            uncertain: false,
+        })
+        .unwrap();
+    let options = RunOptions {
+        tool_timeout: Duration::from_millis(40),
+        ..Default::default()
+    };
+    // The call is stopped at its budget and the model is told, the way
+    // deepseek-harness's tool-call timeout answers with an error result: one
+    // slow call does not fail the turn.
+    let outcome = agent.run("start", options, ignore).await.unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let timed_out = outcome
+        .new_items
+        .iter()
+        .find_map(|item| match item {
+            Item::FunctionCallOutput {
+                output, is_error, ..
+            } => Some((output, is_error)),
+            _ => None,
+        })
+        .expect("the timed-out call is answered");
+    assert!(timed_out.1, "the result is an error the model can read");
+    assert!(timed_out.0.contains("timed out"), "{}", timed_out.0);
+    assert!(timed_out.0.contains("unverified"), "{}", timed_out.0);
+    assert_eq!(
+        server.captured().len(),
+        2,
+        "the turn continued to the model"
+    );
+    let snapshot = agent.snapshot();
+    assert!(snapshot.pending.is_empty());
+    assert!(!snapshot.needs_response);
 }
 
 #[tokio::test]

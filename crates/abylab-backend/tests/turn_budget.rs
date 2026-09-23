@@ -13,7 +13,9 @@
 mod common;
 
 use abylab_backend::TurnLimits;
-use common::{Reply, drive_prompt, text_reply, tool_call_reply, two_tool_call_reply};
+use common::{
+    Reply, Scenario, drive, drive_prompt, text_reply, tool_call_reply, two_tool_call_reply,
+};
 use std::time::Duration;
 
 /// Request budget: the tool call forces a second reservation that trips the
@@ -129,6 +131,53 @@ fn a_transient_failure_retries_the_unfinished_step_in_the_same_turn() {
     );
 }
 
+/// The window is a gap between two moments of work, not a cap on the turn: a
+/// segment that keeps running tool after tool outlives it without a single
+/// continuation. This is the shape that used to die at a fixed wall-clock mark.
+#[cfg(unix)]
+#[test]
+fn a_segment_that_keeps_working_outlives_the_window() {
+    let slow = |id: &str| {
+        Reply::sse(common::single_call_reply(
+            id,
+            "bash",
+            &format!(r#"{{"command":"sleep 0.5","description":"Keep the run moving ({id})"}}"#),
+        ))
+    };
+    let run = drive_prompt(
+        "window-progress",
+        TurnLimits {
+            run_timeout: Duration::from_secs(1),
+            continuations: 1,
+            ..TurnLimits::default()
+        },
+        vec![
+            slow("call-1"),
+            slow("call-2"),
+            slow("call-3"),
+            Reply::sse(text_reply()),
+        ],
+    );
+
+    assert!(run.ended("completed"), "{}", run.explain());
+    assert!(run.is_clean(), "{}", run.explain());
+    assert!(
+        run.continuations().is_empty(),
+        "nothing stalled: {}",
+        run.explain()
+    );
+    assert_eq!(run.count(), 4, "{}", run.explain());
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|e| e.starts_with("tool-result:"))
+            .count(),
+        3,
+        "every step ran: {}",
+        run.explain()
+    );
+}
+
 /// An expired segment must get the same continuation headroom as a budget
 /// stop, without adding another user prompt or ending the visible turn.
 #[test]
@@ -194,40 +243,43 @@ fn a_run_deadline_preserves_completed_tool_results() {
     );
 }
 
-/// A tool may have changed the workspace before the run deadline fires. The
-/// next model request must say its result is unverified, never that it did
-/// not execute, and the driver must not replay the side effect.
+/// A tool call runs under its own budget, so the turn's window never cuts it
+/// short — but Esc does. A call stopped mid-execution may have changed the
+/// workspace: the next model request must say its result is unverified, never
+/// that it did not execute, and the driver must not replay the side effect.
 #[cfg(unix)]
 #[test]
-fn a_run_deadline_during_a_tool_requires_verification_before_repeating() {
-    let run = drive_prompt(
-        "deadline-during-tool",
-        TurnLimits {
-            run_timeout: Duration::from_secs(1),
+fn a_tool_interrupted_mid_run_requires_verification_before_repeating() {
+    let run = drive(
+        Scenario::new(
+            "interrupted-tool",
+            vec![
+                Reply::sse(common::single_call_reply(
+                    "slow-call",
+                    "bash",
+                    r#"{"command":"printf once >> interrupt-marker; sleep 30","description":"Record a side effect, then wait"}"#,
+                )),
+                Reply::sse(common::single_call_reply(
+                    "verify-call",
+                    "read",
+                    r#"{"file_path":"interrupt-marker"}"#,
+                )),
+                Reply::sse(text_reply()),
+            ],
+        )
+        .limits(TurnLimits {
+            run_timeout: Duration::from_secs(600),
             continuations: 1,
             ..TurnLimits::default()
-        },
-        vec![
-            Reply::sse(common::single_call_reply(
-                "slow-call",
-                "bash",
-                r#"{"command":"printf once >> deadline-marker; sleep 30","description":"Record a side effect before the deadline"}"#,
-            )),
-            Reply::sse(common::single_call_reply(
-                "verify-call",
-                "read",
-                r#"{"file_path":"deadline-marker"}"#,
-            )),
-            Reply::sse(text_reply()),
-        ],
+        })
+        .interrupted("run a slow tool", "tool-started:slow-call")
+        .prompt("carry on"),
     );
 
-    assert!(run.ended("completed"), "{}", run.explain());
+    assert!(run.ended("interrupted"), "{}", run.explain());
     assert!(run.is_clean(), "{}", run.explain());
-    assert_eq!(run.continuations().len(), 1, "{}", run.explain());
-    assert_eq!(run.count(), 3, "{}", run.explain());
-    let continued: serde_json::Value = serde_json::from_str(&run.requests[1]).unwrap();
-    let result = &continued["messages"].as_array().unwrap().last().unwrap()["content"][0];
+    let resumed: serde_json::Value = serde_json::from_str(&run.requests[1]).unwrap();
+    let result = &resumed["messages"].as_array().unwrap().last().unwrap()["content"][0];
     assert_eq!(result["type"], "tool_result");
     assert_eq!(result["tool_use_id"], "slow-call");
     assert_eq!(result["is_error"], true);
@@ -243,13 +295,13 @@ fn a_run_deadline_during_a_tool_requires_verification_before_repeating() {
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("once"), "{text}");
     assert!(!text.contains("onceonce"), "{text}");
-    assert!(run.events.iter().any(|e| e == "tool-result:slow-call"));
     assert_eq!(
         run.events
             .iter()
             .filter(|e| *e == "tool-started:slow-call")
             .count(),
-        1
+        1,
+        "the interrupted call is never replayed"
     );
 }
 

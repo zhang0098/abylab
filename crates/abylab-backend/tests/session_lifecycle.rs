@@ -404,14 +404,59 @@ fn manual_and_overflow_summaries_are_interruptible_and_keep_history() {
     }
 }
 
+/// A tool call runs under its own budget, so the turn's window never cuts it
+/// short: the call is stopped by the deadline it owns, the model is handed the
+/// result, and the turn goes on to the next request.
 #[cfg(unix)]
 #[test]
-fn interrupting_timeout_backoff_saves_the_unverified_result_without_retrying() {
-    let server = MockServer::start(vec![Reply::sse(single_call_reply(
-        "slow-call",
-        "bash",
-        r#"{"command":"sleep 30","description":"Wait past the segment deadline"}"#,
-    ))]);
+fn a_tool_stopped_at_its_budget_is_reported_and_never_replayed() {
+    let server = MockServer::start(vec![
+        Reply::sse(single_call_reply(
+            "slow-call",
+            "bash",
+            r#"{"command":"sleep 30","description":"Outlive the tool budget"}"#,
+        )),
+        Reply::sse(text_body("done", "answered")),
+    ]);
+    let live = Live::start_with_limits_and_setup(
+        &server,
+        TurnLimits {
+            tool_timeout: Duration::from_secs(1),
+            ..Default::default()
+        },
+        |_| {},
+    );
+    live.prompt("run a slow tool");
+
+    let snapshot = live.snapshot();
+    let outputs: Vec<_> = snapshot
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            abycore::Item::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == "slow-call" => Some(output.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs.len(), 1, "the call is answered exactly once");
+    assert!(outputs[0].contains("timed out"), "{}", outputs[0]);
+    assert!(!snapshot.needs_response, "the turn finished");
+    assert_eq!(server.bodies().len(), 2, "the turn continued to the model");
+    assert!(
+        server.bodies()[1].contains("timed out"),
+        "the model reads the result instead of the call being replayed"
+    );
+}
+
+/// A stalled segment stops the turn, not the session: Esc lands in the gap
+/// before the driver's next attempt, and that attempt never ships.
+#[test]
+fn interrupting_a_stalled_segment_saves_the_turn_without_retrying() {
+    let server = MockServer::start(vec![
+        Reply::sse(text_body("first", "late answer")).delayed(Duration::from_secs(3)),
+        Reply::sse(text_body("second", "answer")),
+    ]);
     let live = Live::start_with_limits_and_setup(
         &server,
         TurnLimits {
@@ -422,14 +467,14 @@ fn interrupting_timeout_backoff_saves_the_unverified_result_without_retrying() {
         |_| {},
     );
     live.send(Cmd::Prompt {
-        text: "run a slow tool".into(),
+        text: "take your time".into(),
     });
-    // The settlement event occurs after the deadline and before the retry
-    // delay. Synchronize on it instead of guessing when to press Esc.
-    live.wait(|event| {
-        matches!(event, Event::Ui(UiEvent::ToolResult { call_id, is_error: true, text, .. })
-            if call_id == "slow-call" && text.contains("unverified"))
-    });
+    live.wait(|event| matches!(event, Event::Ui(UiEvent::TurnStart { .. })));
+    // The answer is three seconds out and the window is one: by the time Esc
+    // arrives the segment has stalled, and the driver is either counting down
+    // the window or the one-second wait before its next attempt. Both are
+    // interruptible, and neither may ship a second request.
+    std::thread::sleep(Duration::from_millis(1200));
     let started = Instant::now();
     live.handle.as_ref().unwrap().interrupt();
     live.wait(
@@ -440,14 +485,6 @@ fn interrupting_timeout_backoff_saves_the_unverified_result_without_retrying() {
 
     let snapshot = live.snapshot();
     assert!(snapshot.needs_response, "the user can resume later");
-    assert!(
-        snapshot.pending.is_empty(),
-        "the interrupted call was settled"
-    );
-    assert!(snapshot.items.iter().any(|item| {
-        matches!(item, abycore::Item::FunctionCallOutput { call_id, output, .. }
-            if call_id == "slow-call" && output.contains("unverified"))
-    }));
     assert_eq!(snapshot.requests.len(), 1);
 }
 

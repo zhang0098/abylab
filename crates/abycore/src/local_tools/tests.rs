@@ -15,7 +15,7 @@ pub(super) fn context(output_limit: usize) -> ToolContext {
     ToolContext {
         call_id: "local-test".into(),
         cancellation,
-        deadline: request.deadline,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
         max_output_bytes: output_limit,
         request,
         local_session: Arc::default(),
