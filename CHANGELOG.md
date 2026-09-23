@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-09-23
+
 ### 变更
 
 - shift+tab 轮换权限时会说明自己在等：驱动按轮次串行处理命令（一轮进行中，命令通道要到这轮结束
@@ -288,7 +290,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/zhang0098/abylab/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/zhang0098/abylab/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/zhang0098/abylab/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/zhang0098/abylab/compare/v0.1.8...v0.1.9
