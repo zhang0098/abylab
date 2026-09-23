@@ -67,7 +67,7 @@
         <p>Type what you want done. That is the whole setup.</p>
       </li>
     </ol>
-    <p class="hint">Back to an as-installed state: <code>/reset</code> deletes everything this program saved under <code>~/.abylab</code> (settings, API key, session logs, queued prompts) — two <kbd>enter</kbd> presses confirm it, and the same wipe from a shell is <code>abylab --reset</code> (<code>--yes</code> skips the prompt).</p>
+    <p class="hint">Back to an as-installed state: <code>/reset</code> deletes everything this program saved under <code>~/.abylab</code> (settings, API key, session logs, queued prompts) — two <kbd>enter</kbd> presses confirm it, and the same wipe from a shell is <code>abylab --reset</code> (<code>--yes</code> skips the prompt). Taking the program itself off the machine is <code>abylab --uninstall</code>: besides the data it removes every abylab binary and the PATH block the installer added, asking about the data and the program separately (<code>--keep-data</code> removes only the program).</p>
     <p class="hint">Building from source instead: <code>cargo build --release</code>. The installer also takes <code>--bin-dir</code>, <code>--version</code>, <code>--no-path</code>, <code>--path-file</code> and <code>--help</code>.</p>
   </section>
 

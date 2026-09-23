@@ -5,7 +5,7 @@
 What each abylab release changed, from the user's side. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/). Internals (workspace instructions,
-context compaction, session persistence, goal rounds, reset) live in
+context compaction, session persistence, goal rounds, reset, uninstall) live in
 [TECH.en.md](TECH.en.md); day-to-day usage is in [README.en.md](README.en.md).
 
 ## [Unreleased]
@@ -46,6 +46,20 @@ context compaction, session persistence, goal rounds, reset) live in
   back. The model, effort and permission preset stay live for this run — they
   belong to the process, not to the files — and the defaults take over on the
   next launch.
+- To take the program itself off the machine, `abylab --uninstall` lists both
+  halves at once: the data half is `/reset`'s list, and the program half is
+  every `abylab` on `$PATH`, the running executable, the installer's default
+  `~/.local/bin`, and the PATH block `install.sh` wrote into a shell startup
+  file (recognized by its `# added by the abylab installer` marker, with the
+  line beneath it dropped only while it still reads as a PATH line; a symlink
+  goes with the file it points at, link following is bounded; a Homebrew or Nix
+  copy is listed as kept; a copy in `~/.cargo/bin` goes through
+  `cargo uninstall abylab-tui`, so cargo's bookkeeping goes with it). It asks
+  twice — data first, program second — so "keep the data, remove the program"
+  is answering no to the first question; `--keep-data` keeps the data outright
+  and `--yes` skips both questions (in a script, `--yes` is the full clear and
+  `--keep-data --yes` is the program only). Two noes remove nothing. Like
+  `--reset`, it never reads stdin and refuses to ask without a terminal.
 
 ## [0.1.12] - 2026-09-23
 

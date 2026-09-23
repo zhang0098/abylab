@@ -19,6 +19,7 @@ mod slots;
 mod theme;
 mod transcript;
 mod ui;
+mod uninstall;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -64,7 +65,16 @@ OPTIONS:
                             and exit; lists what goes and asks on the terminal
                             first. Other launch options are ignored, except
                             --session-root, which names the store it checks
-      --yes                 with --reset: do not ask
+      --uninstall           take abylab back off this machine: the saved data,
+                            every abylab binary and the PATH block install.sh
+                            added to a shell startup file. Lists what goes and
+                            asks about the data and the program separately;
+                            --keep-data removes the program and leaves the
+                            data. Other launch options are ignored, except
+                            --session-root, which names the store it checks
+      --keep-data           with --uninstall: keep the saved data and remove
+                            only the program
+      --yes                 with --reset or --uninstall: do not ask
   -V, --version             print version
   -h, --help                this help
 ";
@@ -80,7 +90,11 @@ struct Args {
     theme: Option<String>,
     /// `--reset`: wipe the saved state under the aby home and exit.
     reset: bool,
-    /// `--yes`: skip `--reset`'s terminal prompt.
+    /// `--uninstall`: take back the data and the program itself, then exit.
+    uninstall: bool,
+    /// `--keep-data`: with `--uninstall`, leave the saved state alone.
+    keep_data: bool,
+    /// `--yes`: skip the terminal prompts of `--reset` / `--uninstall`.
     yes: bool,
 }
 
@@ -98,6 +112,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
         api_key: None,
         theme: None,
         reset: false,
+        uninstall: false,
+        keep_data: false,
         yes: false,
     };
     let mut it = args.into_iter();
@@ -114,6 +130,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--api-key" => args_out.api_key = Some(take("--api-key")?),
             "--theme" => args_out.theme = Some(take("--theme")?),
             "--reset" => args_out.reset = true,
+            "--uninstall" => args_out.uninstall = true,
+            "--keep-data" => args_out.keep_data = true,
             "--yes" => args_out.yes = true,
             "-V" | "--version" => {
                 println!("abylab {}", env!("CARGO_PKG_VERSION"));
@@ -126,8 +144,14 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             other => bail!("unknown argument {other} (see --help)"),
         }
     }
-    if args_out.yes && !args_out.reset {
-        bail!("--yes only means something with --reset (see --help)");
+    if args_out.reset && args_out.uninstall {
+        bail!("--reset and --uninstall are two different commands — pick one (see --help)");
+    }
+    if args_out.keep_data && !args_out.uninstall {
+        bail!("--keep-data only means something with --uninstall (see --help)");
+    }
+    if args_out.yes && !args_out.reset && !args_out.uninstall {
+        bail!("--yes only means something with --reset or --uninstall (see --help)");
     }
     Ok(args_out)
 }
@@ -197,7 +221,7 @@ fn run_reset(args: &Args, home: &Path) -> Result<()> {
         );
         return Ok(());
     }
-    if !args.yes && !confirm_on_terminal(home)? {
+    if !args.yes && !confirm_on_terminal("Remove everything above?")? {
         println!("\nnothing removed\n");
         return Ok(());
     }
@@ -216,12 +240,24 @@ fn run_reset(args: &Args, home: &Path) -> Result<()> {
 /// inside, then the paths this command does *not* own. Anything not listed
 /// here is not touched either — the list is the contract.
 fn reset_plan_text(plan: &reset::ResetPlan) -> String {
-    use crate::reset::{human_bytes, human_files};
-
     let mut out = format!(
         "abylab reset — everything this program saved under {}\n\n",
         plan.home.display()
     );
+    out.push_str(&reset_item_rows(plan));
+    out.push_str(&reset_kept_rows(plan));
+    if !plan.is_empty() && other_instance_running() {
+        out.push_str(OTHER_INSTANCE_NOTE);
+    }
+    out
+}
+
+/// One `remove` row per measured data entry: label, path, files and bytes, the
+/// shape both `--reset` and `--uninstall` print.
+fn reset_item_rows(plan: &reset::ResetPlan) -> String {
+    use crate::reset::{human_bytes, human_files};
+
+    let mut out = String::new();
     for item in &plan.items {
         let files = human_files(item.files, item.truncated);
         let plural = if item.files == 1 { "file" } else { "files" };
@@ -232,6 +268,12 @@ fn reset_plan_text(plan: &reset::ResetPlan) -> String {
             human_bytes(item.bytes),
         ));
     }
+    out
+}
+
+/// The data paths the reset half lists as out of scope.
+fn reset_kept_rows(plan: &reset::ResetPlan) -> String {
+    let mut out = String::new();
     for keep in &plan.kept {
         out.push_str(&format!(
             "  keep    {}  ({})\n",
@@ -239,14 +281,14 @@ fn reset_plan_text(plan: &reset::ResetPlan) -> String {
             keep.why.note(crate::locale::Locale::En),
         ));
     }
-    if !plan.is_empty() && other_instance_running() {
-        out.push_str(
-            "  note    another abylab is running — quit it first, or it writes its\n\
-             \x20         settings and session log back after this\n",
-        );
-    }
     out
 }
+
+/// Another abylab holds the home open; it writes settings and session logs
+/// back, so the removal would half-undo itself. Printed by both commands.
+const OTHER_INSTANCE_NOTE: &str =
+    "  note    another abylab is running — quit it first, or it writes its\n\
+     \x20         settings and session log back after this\n";
 
 /// What the wipe did, with every path that refused to go named on its own
 /// line: a partial reset is reported, never rounded up to a success.
@@ -270,20 +312,224 @@ fn reset_outcome_text(outcome: &reset::ResetOutcome) -> String {
     out
 }
 
+/// `abylab --uninstall`: `--reset`'s data half plus the program half — every
+/// binary this machine has and the PATH block install.sh wrote. Both halves
+/// are listed before anything goes, and the user is asked about them
+/// separately, so "keep the data, remove the program" is one answer away.
+fn run_uninstall(args: &Args, home: &Path) -> Result<()> {
+    let input = scan_input_from_env();
+    run_uninstall_with(args, home, &input)
+}
+
+/// The environment half of the program scan: what this machine has and where.
+/// `current_exe` covers a binary started from outside `$PATH`; the `$PATH`
+/// entries, `~/.local/bin` and `$ABYLAB_BIN_DIR` cover the rest.
+fn scan_input_from_env() -> uninstall::ScanInput {
+    let user_home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.push(Path::new(&user_home).join(".local/bin"));
+    if let Some(dir) = std::env::var_os("ABYLAB_BIN_DIR").filter(|value| !value.is_empty()) {
+        dirs.push(PathBuf::from(dir));
+    }
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(&user_home).join(".cargo"));
+    uninstall::ScanInput {
+        current_exe: std::env::current_exe().ok(),
+        dirs,
+        cargo_bin: Some(cargo_home.join("bin")),
+        rc_files: uninstall::rc_candidates(Path::new(&user_home)),
+    }
+}
+
+/// The scan and prompts, with the environment passed in — which is also what
+/// the tests pin, so a test run can never delete a real binary.
+fn run_uninstall_with(
+    args: &Args,
+    home: &Path,
+    program_input: &uninstall::ScanInput,
+) -> Result<()> {
+    let sessions_root = args
+        .sessions_root
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_sessions_root);
+    let data = reset::scan(home, &sessions_root);
+    let program = uninstall::scan(program_input);
+    print!("{}", uninstall_plan_text(&data, &program, args.keep_data));
+
+    if data.is_empty() && program.is_empty() {
+        println!(
+            "\nnothing to remove — no saved data under {} and no abylab binary found\n",
+            home.display()
+        );
+        return Ok(());
+    }
+
+    // Two questions, each skippable: `--keep-data` answers the first with "no",
+    // `--yes` answers both with "yes".
+    let remove_data = if args.keep_data || data.is_empty() {
+        false
+    } else if args.yes {
+        true
+    } else {
+        confirm_on_terminal("Remove the saved data above?")?
+    };
+    let remove_program = if program.is_empty() {
+        false
+    } else if args.yes {
+        true
+    } else {
+        confirm_on_terminal("Remove the abylab program above?")?
+    };
+
+    if !remove_data && !remove_program {
+        println!("\nnothing removed\n");
+        return Ok(());
+    }
+
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
+    if remove_data {
+        let outcome = reset::wipe(&data);
+        print!("{}", reset_outcome_text(&outcome));
+        failures.extend(outcome.failures);
+    }
+    if remove_program {
+        let outcome = uninstall::wipe(&program);
+        print!("{}", program_outcome_text(&outcome));
+        failures.extend(outcome.failures);
+    }
+    if failures.is_empty() {
+        if remove_program {
+            print!("{}", uninstall_done_text(remove_data, home));
+        }
+        return Ok(());
+    }
+    bail!(
+        "uninstall did not finish — {} path(s) could not be removed (see above)",
+        failures.len()
+    )
+}
+
+/// The plan as the terminal reads it: the reset rows (or the home as kept,
+/// under `--keep-data`), then one row per program path. Anything not listed
+/// here is not touched either — the list is the contract.
+fn uninstall_plan_text(
+    data: &reset::ResetPlan,
+    program: &uninstall::ProgramPlan,
+    keep_data: bool,
+) -> String {
+    let mut out =
+        String::from("abylab uninstall — the program and everything it put on this machine\n\n");
+    if keep_data {
+        out.push_str(&format!(
+            "  keep    {}  (--keep-data)\n",
+            data.home.display()
+        ));
+    } else {
+        out.push_str(&reset_item_rows(data));
+        out.push_str(&reset_kept_rows(data));
+    }
+    for bin in &program.bins {
+        let through = if bin.cargo {
+            " · through cargo uninstall abylab-tui"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "  remove  {}  (binary{through} · {})\n",
+            bin.path.display(),
+            reset::human_bytes(bin.bytes),
+        ));
+    }
+    for edit in &program.edits {
+        let plural = if edit.blocks == 1 { "block" } else { "blocks" };
+        out.push_str(&format!(
+            "  edit    {}  ({} PATH {plural} the installer added)\n",
+            edit.path.display(),
+            edit.blocks,
+        ));
+    }
+    for keep in &program.kept {
+        out.push_str(&format!(
+            "  keep    {}  ({})\n",
+            keep.path.display(),
+            keep.why.note(),
+        ));
+    }
+    if !data.is_empty() && other_instance_running() {
+        out.push_str(OTHER_INSTANCE_NOTE);
+    }
+    out
+}
+
+/// What the program half's wipe did, with every path that refused to go named
+/// on its own line and cargo's bookkeeping called out either way.
+fn program_outcome_text(outcome: &uninstall::ProgramOutcome) -> String {
+    let plural =
+        |count: u64, one: &str, many: &str| if count == 1 { one } else { many }.to_string();
+    let mut out = format!(
+        "\nremoved {} {} — {}\n",
+        outcome.removed,
+        plural(outcome.removed as u64, "binary", "binaries"),
+        reset::human_bytes(outcome.bytes),
+    );
+    if outcome.cargo_uninstalled {
+        out.push_str("  (the copies in cargo's bin went through cargo uninstall abylab-tui)\n");
+    }
+    if outcome.cargo_failed {
+        out.push_str(
+            "warning cargo uninstall abylab-tui did not work — the file was removed \
+             directly, but cargo's list may still name the package\n",
+        );
+    }
+    if outcome.edited > 0 {
+        out.push_str(&format!(
+            "edited {} startup {} (the installer's PATH block is gone; restart your shell)\n",
+            outcome.edited,
+            plural(outcome.edited as u64, "file", "files"),
+        ));
+    }
+    for (path, reason) in &outcome.failures {
+        out.push_str(&format!(
+            "warning could not remove {} ({reason})\n",
+            path.display()
+        ));
+    }
+    out
+}
+
+/// The last line of a finished uninstall, said only when the program half
+/// really went.
+fn uninstall_done_text(data_removed: bool, home: &Path) -> String {
+    if data_removed {
+        "\nabylab is gone. The data directory, the binaries and the PATH block are all removed.\n"
+            .to_string()
+    } else {
+        format!(
+            "\nabylab is gone. The data under {} was kept.\n",
+            home.display()
+        )
+    }
+}
+
 /// Ask on the terminal (not stdin: a caller may pipe something into abylab,
 /// and the prompt must not eat it). No terminal to ask on is an error, not a
 /// silent "yes".
-fn confirm_on_terminal(home: &Path) -> Result<bool> {
+fn confirm_on_terminal(prompt: &str) -> Result<bool> {
     let reader: Box<dyn std::io::BufRead> = match std::fs::File::open("/dev/tty") {
         Ok(tty) => Box::new(std::io::BufReader::new(tty)),
         Err(error) if cfg!(unix) => bail!(
-            "there is no terminal to ask on ({error}) — re-run with --yes if {} should \
-             be emptied without a prompt",
-            home.display()
+            "there is no terminal to ask on ({error}) — re-run with --yes to remove \
+             without a prompt"
         ),
         Err(_) => Box::new(std::io::BufReader::new(std::io::stdin())),
     };
-    eprint!("\nRemove everything above? [y/N] ");
+    eprint!("\n{prompt} [y/N] ");
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
     let mut reader = reader;
@@ -464,9 +710,12 @@ fn main() -> Result<()> {
 
     let args = parse_args()?;
 
-    // `--reset` never reaches the screen: it lists what it would delete, takes
-    // the answer on the terminal and exits (the TUI's `/reset` does the same
-    // inside the app).
+    // `--reset` and `--uninstall` never reach the screen: they list what they
+    // would delete, take the answers on the terminal and exit (the TUI's
+    // `/reset` does the same inside the app).
+    if args.uninstall {
+        return run_uninstall(&args, &aby_home());
+    }
     if args.reset {
         return run_reset(&args, &aby_home());
     }
@@ -843,6 +1092,173 @@ mod cli_args_tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("--yes"), "{err:#}");
+    }
+
+    /// `--uninstall` is its own mode: `--keep-data` belongs to it and nothing
+    /// else, and it and `--reset` are two commands that cannot be combined.
+    #[test]
+    fn uninstall_flags_parse_and_only_pair_with_each_other() {
+        assert!(
+            HELP.contains("--uninstall") && HELP.contains("--keep-data"),
+            "{HELP}"
+        );
+        let args = parse_args_from(["--uninstall".into()]).expect("--uninstall parses");
+        assert!(
+            args.uninstall && !args.keep_data && !args.yes && !args.reset,
+            "the prompts are the default"
+        );
+        let args = parse_args_from(["--uninstall".into(), "--keep-data".into(), "--yes".into()])
+            .expect("the pair parses");
+        assert!(args.uninstall && args.keep_data && args.yes);
+        let args = parse_args_from([
+            "--uninstall".into(),
+            "--session-root".into(),
+            "/srv/store".into(),
+        ])
+        .expect("the store can be named");
+        assert_eq!(args.sessions_root.as_deref(), Some("/srv/store"));
+        // Two commands, one run: refuse instead of silently picking one.
+        let err = match parse_args_from(["--reset".into(), "--uninstall".into()]) {
+            Ok(_) => panic!("--reset and --uninstall must be refused together"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("pick one"), "{err:#}");
+        // `--keep-data` alone is a typo, not a mode.
+        let err = match parse_args_from(["--keep-data".into()]) {
+            Ok(_) => panic!("--keep-data without --uninstall must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--keep-data"), "{err:#}");
+    }
+
+    /// The plan reads as a contract here too: the data half and the program
+    /// half in one list, and `--keep-data` replaces the data rows with a keep
+    /// row instead of hiding the decision.
+    #[test]
+    fn the_cli_uninstall_plan_names_both_halves() {
+        let home = reset_home("uninstall-plan");
+        let root = std::env::temp_dir().join(format!(
+            "aby-cli-uninstall-plan-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let bin_dir = root.join("bin");
+        let _ = std::fs::create_dir_all(&bin_dir);
+        std::fs::write(bin_dir.join("abylab"), b"fake binary").expect("bin");
+        let rc = root.join(".zshrc");
+        std::fs::write(
+            &rc,
+            "# added by the abylab installer\nexport PATH=\"/x:$PATH\"\n",
+        )
+        .expect("rc");
+        let program = uninstall::scan(&uninstall::ScanInput {
+            current_exe: None,
+            dirs: vec![bin_dir.clone()],
+            cargo_bin: None,
+            rc_files: vec![rc.clone()],
+        });
+        let data = reset::scan(&home, &home.join("sessions"));
+        let text = uninstall_plan_text(&data, &program, false);
+        assert!(text.contains("settings.json"), "{text}");
+        assert!(text.contains("binary") && text.contains("abylab"), "{text}");
+        assert!(text.contains("PATH block"), "{text}");
+        assert!(text.contains("AGENTS.md"), "the kept file is named: {text}");
+
+        let text = uninstall_plan_text(&data, &program, true);
+        assert!(text.contains("--keep-data"), "{text}");
+        assert!(
+            !text.contains("settings.json"),
+            "kept data is not listed as removal: {text}"
+        );
+
+        // The report names cargo's side either way.
+        let outcome = uninstall::ProgramOutcome {
+            removed: 2,
+            bytes: 8 * 1024 * 1024,
+            edited: 1,
+            cargo_uninstalled: true,
+            cargo_failed: false,
+            failures: vec![],
+        };
+        let text = program_outcome_text(&outcome);
+        assert!(text.contains("removed 2 binaries — 8.0 MB"), "{text}");
+        assert!(text.contains("cargo uninstall abylab-tui"), "{text}");
+        assert!(text.contains("restart your shell"), "{text}");
+        let outcome = uninstall::ProgramOutcome {
+            cargo_failed: true,
+            ..outcome
+        };
+        assert!(
+            program_outcome_text(&outcome).contains("did not work"),
+            "a cargo fallback is reported"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `--yes` uninstall with the environment pinned: the data half and the
+    /// program half both go, and `--keep-data` leaves the home standing while
+    /// the program still goes. Nothing here reads the real environment.
+    #[test]
+    fn a_yes_uninstall_removes_both_halves_and_keep_data_only_the_program() {
+        let home = reset_home("uninstall-yes");
+        let root = std::env::temp_dir().join(format!(
+            "aby-cli-uninstall-yes-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let bin_dir = root.join("bin");
+        let _ = std::fs::create_dir_all(&bin_dir);
+        let rc = root.join(".bashrc");
+        let program_input = uninstall::ScanInput {
+            current_exe: None,
+            dirs: vec![bin_dir.clone()],
+            cargo_bin: None,
+            rc_files: vec![rc.clone()],
+        };
+        let arm = |home: &Path| {
+            std::fs::write(bin_dir.join("abylab"), b"fake binary").expect("bin");
+            std::fs::write(
+                &rc,
+                "# added by the abylab installer\nexport PATH=\"/x:$PATH\"\n",
+            )
+            .expect("rc");
+            let mut args = parse_args_from(["--uninstall".into(), "--yes".into()]).expect("args");
+            args.sessions_root = Some(home.join("sessions").to_string_lossy().into_owned());
+            args
+        };
+
+        let args = arm(&home);
+        run_uninstall_with(&args, &home, &program_input).expect("--yes does not ask");
+        assert!(!home.join("settings.json").exists(), "the data half ran");
+        assert!(
+            home.join("AGENTS.md").exists(),
+            "the hand-written file stays"
+        );
+        assert!(home.exists(), "the home itself stays");
+        assert!(!bin_dir.join("abylab").exists(), "the binary went");
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), "", "the block went");
+
+        let home = reset_home("uninstall-keep");
+        let mut args = arm(&home);
+        args.keep_data = true;
+        run_uninstall_with(&args, &home, &program_input).expect("--keep-data does not ask");
+        assert!(
+            home.join("settings.json").exists(),
+            "--keep-data leaves the saved data alone"
+        );
+        assert!(!bin_dir.join("abylab").exists(), "the program still goes");
+        assert_eq!(
+            std::fs::read_to_string(&rc).unwrap(),
+            "",
+            "the block still goes"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The plan reads as a contract: one `remove` row per entry with what is

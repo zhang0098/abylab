@@ -247,6 +247,34 @@ Web UI）看到的都是同一份 FIFO。行里带 `placement`：`Queued`（等�
 prompt），会话切换在飞时也拒绝：驱动按轮次串行读命令，一轮进行中换会话要等这轮结束，
 而这轮会继续往被删的日志里 checkpoint。
 
+## 卸载（`abylab --uninstall`）
+
+`--uninstall` 是 `--reset` 的超集，只有命令行一个入口（`/uninstall` 不存在：它要删的
+正是自己，TUI 还开着没有意义）。数据那半原样调用 `reset::scan` / `reset::wipe`；程序那半
+在 `uninstall.rs` 里，扫出二进制和 PATH 块，两份计划合成一张先列出来，确认则分开问。
+
+- **两半，两个问题**：计划把数据行和程序行列在同一张单子上（`remove` / `edit` / `keep`），
+  但确认分两次：先问数据、再问程序。这样"保留数据、只删程序"是明确答出来的一个组合，
+  而不是让用户先 reset 再自己删二进制。`--keep-data` 把数据问题固定成"不删"，`--yes`
+  把两个问题都固定成"删"；没有终端就问不了，报错退出，绝不默认成"是"。两个问题都答 n
+  则原样退出。
+- **程序名单**：`std::env::current_exe`（从 `$PATH` 之外启动也能找到正在运行的自己）、
+  `$PATH` 每个目录下的 `abylab`、`~/.local/bin/abylab`、`$ABYLAB_BIN_DIR/abylab`。
+  候选路径必须还叫 `abylab`（改过名的不动）；符号链接连它指向的文件一起进名单，
+  `link_target` 有 20 跳上限，成环不会挂。另一个包管理器拥有的路径（`/opt/homebrew`、
+  `/homebrew`、任何 `/Cellar/`、`/nix/store`、`/.nix-profile/`）只列 `keep`。
+  `$CARGO_HOME/bin`（默认 `~/.cargo/bin`）里的副本标记为 cargo：整批交给
+  `cargo uninstall abylab-tui`，让 `~/.cargo/.crates.toml` 的登记一起走；cargo 不在或
+  执行失败就退回直接 unlink，报告里明说 cargo 的名单可能还留着这个名字。
+- **PATH 块按标记认**：`install.sh` 追加的是 `# added by the abylab installer` 加一行
+  PATH 语句。扫描的候选文件是 `~/.zshrc`、`~/.bashrc`、`~/.bash_profile`、`~/.profile`、
+  `~/.config/fish/config.fish` —— 不按 `$SHELL` 挑，换过 shell 也能清到；认的是标记，
+  没有标记的文件一个字节都不动。删除时标记行必删，下面那行只有仍像 PATH 行（含 `PATH`
+  或 `fish_add_path`）才跟着删，手写在标记下面的注释会留下。重写整文件、保留原行尾。
+- **删的是正在运行的自己**：Unix 上 unlink 一个正在执行的映像没有问题，进程把报告写完
+  才退出；发行目标（Linux musl、macOS）都在这个前提下。测试里扫的目录、rc 文件和
+  `current_exe` 全部由调用方传入（`ScanInput`），所以测试不可能碰到真实安装。
+
 ## 构建与发布
 
 Linux 只发一种包：musl 静态链接的单一二进制（`x86_64`、`aarch64` 各一个），

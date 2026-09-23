@@ -323,6 +323,48 @@ session switch is on the wire: the driver reads commands between turns, so a
 switch asked for mid-turn waits for that turn, while the turn keeps
 checkpointing into the log that was just deleted.
 
+## Uninstall (`abylab --uninstall`)
+
+`--uninstall` is `--reset`'s superset, and it is a CLI entry only (there is no
+`/uninstall`: the thing being deleted is the program itself, so a TUI still on
+screen would be pointless). The data half calls `reset::scan` / `reset::wipe`
+unchanged; the program half lives in `uninstall.rs` and scans for binaries and
+the PATH block. One plan lists both halves; the confirmations are separate.
+
+- **Two halves, two questions**: the plan rows (`remove` / `edit` / `keep`)
+  cover the data and the program together, but the prompt asks twice — data
+  first, program second. "Keep the data, remove the program" is therefore an
+  answer the user gives on purpose, not a reset followed by hand-deleting a
+  binary. `--keep-data` fixes the data answer to no, `--yes` fixes both answers
+  to yes; with no terminal to ask on the command errors out, never defaulting
+  to yes. Two noes change nothing.
+- **The program list**: `std::env::current_exe` (so a binary started outside
+  `$PATH` still finds itself), the `abylab` in every `$PATH` directory,
+  `~/.local/bin/abylab`, and `$ABYLAB_BIN_DIR/abylab`. A candidate has to still
+  be called `abylab` (a renamed file is left alone); a symlink enters the list
+  together with the file it points at, and `link_target` is bounded to 20 hops
+  so a link loop cannot hang. A path another package manager owns
+  (`/opt/homebrew`, `/homebrew`, any `/Cellar/`, `/nix/store`,
+  `/.nix-profile/`) is reported as kept. Copies in `$CARGO_HOME/bin` (default
+  `~/.cargo/bin`) are marked as cargo's: the batch goes through
+  `cargo uninstall abylab-tui` so the entry in `~/.cargo/.crates.toml` goes
+  with it; when cargo is absent or fails, the files are unlinked directly and
+  the report says cargo's list may still name the package.
+- **The PATH block is recognized by its marker**: install.sh appends
+  `# added by the abylab installer` plus one PATH line. The candidate files are
+  `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, `~/.profile` and
+  `~/.config/fish/config.fish` — not picked by `$SHELL`, so a user who changed
+  shells still gets the file cleaned, and a file without the marker is not
+  touched at all. On removal the marker line always goes and the line beneath
+  it goes only while it still reads as a PATH line (`PATH` or `fish_add_path`);
+  a hand-written comment under the marker survives. The file is rewritten whole,
+  keeping its line endings.
+- **What is deleted is the running program**: on Unix unlinking a live image is
+  fine; the process finishes writing its report and exits. Both shipped targets
+  (Linux musl, macOS) are in that world. In tests the directories, rc files and
+  `current_exe` all come in through `ScanInput`, so a test run can never touch a
+  real installation.
+
 ## Packaging and releases
 
 Linux ships one kind of asset: a single musl static binary per architecture

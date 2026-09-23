@@ -5,7 +5,7 @@
 这个文件记录 abylab 每一次发布里值得用户知道的变更。格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
-内部细节（工作区指令、上下文压缩、会话持久化、目标轮次、重置）写在
+内部细节（工作区指令、上下文压缩、会话持久化、目标轮次、重置、卸载）写在
 [TECH.md](TECH.md)；日常用法看 [README.md](README.md)。
 
 ## [Unreleased]
@@ -35,6 +35,16 @@
   用），界面切到一个新会话（旧日志已经没了），没有 key 了就把首次启动的 `/login` 引导
   再摆一次。模型、推理强度和权限预设这次运行内不变——它们是这次运行的活状态，不是保存
   的偏好；回到默认值的是下次启动。
+- 想把程序本身也请下这台机器：`abylab --uninstall` 一次列完两半 —— 数据那半用 `/reset`
+  同一份名单，程序那半是 `$PATH` 上的每一个 `abylab`、正在运行的这个可执行文件、安装器
+  的默认目录 `~/.local/bin`，以及 `install.sh` 写进 shell 启动文件的那段 PATH 块（认
+  `# added by the abylab installer` 标记，标记下面那行还要仍像 PATH 行才一起删；符号
+  链接连它指向的文件一起处理，跟链有上限；Homebrew、Nix 装的副本只列 `keep` 不动手；
+  `~/.cargo/bin` 里的副本交给 `cargo uninstall abylab-tui`，`~/.cargo/.crates.toml` 的
+  登记随之消失）。确认分两次问：先问数据、再问程序 ——"保留数据、只删程序"就是第一个问题
+  答 n；`--keep-data` 直接替数据问题答 n，`--yes` 两个都免问（脚本化时 `--yes` 是整清，
+  `--keep-data --yes` 是只删程序）。两个问题都答 n 就什么也不动。和 `--reset` 一样，
+  命令行这边从不读 stdin，也没有终端可问就报错退出。
 
 ## [0.1.12] - 2026-09-23
 

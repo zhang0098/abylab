@@ -37,6 +37,12 @@ starts a new session — two Enters confirm it. The same wipe from a shell is
 `abylab --reset`. A hand-written `AGENTS.md` and a session store that
 `--session-root` put outside the aby home are not part of it.
 
+To take the program itself off the machine, `abylab --uninstall` lists the
+saved data, every `abylab` binary and the PATH block the installer wrote into a
+shell startup file, then asks about the data and the program separately —
+`--keep-data` removes only the program and `--yes` skips both questions. A copy
+Homebrew or Nix owns is reported, not removed.
+
 ## Keys
 
 enter send / queue · ctrl+enter send now · alt+↑ (mac ⌥↑) edit queued prompt ·

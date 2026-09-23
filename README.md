@@ -39,6 +39,11 @@ API key、会话日志、排队消息）并开一个新会话 —— 删之前�
 同一件事是 `abylab --reset`。手写的 `AGENTS.md` 和 `--session-root` 指到 aby home 之外
 的会话库不在清理范围内。
 
+连程序一起卸掉：`abylab --uninstall` 在数据之外列出每一个 `abylab` 二进制和安装器写进
+shell 启动文件的 PATH 块，然后分别问数据删不删、程序删不删 —— 保留数据只删程序，就只对
+第二个问题答 y；`--keep-data` 保留数据，`--yes` 两个都免问。Homebrew / Nix 装的副本只列
+不动。
+
 ## 按键
 
 enter 发送 / 排队 · ctrl+enter 立即发送 · alt+↑（mac ⌥↑）编辑排队消息 ·
