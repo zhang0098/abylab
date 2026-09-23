@@ -14,6 +14,52 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 - `ask_user_question` lets the agent pause during a task for a Yes/No choice, a single or multiple selection, or a written answer. The same turn continues after the answer; `esc` cancels the question.
 
+### Fixed
+
+- Concurrent asks queue in arrival order. When a second permission ask or task
+  question arrived while one was on screen, the new one used to replace it
+  outright: the replaced asker got no answer (its reply channel went with the
+  overlay, so the tool or subagent waiting on it saw only a cancellation), and
+  the user never saw what it asked. Later asks now wait their turn, one is
+  answered and the next appears; an ask whose asker has already gone (an
+  interrupted subagent, say) is skipped instead of shown. When a permission ask
+  and a task question are both up, the permission card draws on top and owns the
+  keyboard, so a paste cannot land in the question hidden behind it; a parent
+  turn going idle no longer clears a still-running child's question. Keys that
+  some terminals deliver wrapped as a paste are handled as keys too — esc and
+  ctrl+c still cancel a question instead of being typed into its answer.
+- Image prompts actually reach the model. An image staged in the composer used
+  to be a chip and an echo: the in-process transport carried text only, the
+  bytes never left the terminal, and the prompt the model received did not
+  contain it. Images now travel the whole way with the prompt — queueing,
+  editing a queued prompt, Send Now steering, subagent steering, the session
+  snapshot — and appear in the request as base64 image blocks, in order with the
+  text. png / jpeg / gif / webp; a prompt's inline images total at most 32 MiB
+  (more is refused with a tip), and a conversation carrying images gets its
+  request budget raised from 4 MiB to 48 MiB.
+- The durable queue is split by workspace. It used to live at
+  `$ABYLAB_HOME/queued/<session id>.json`: the file name knew only the session
+  id (which is user-supplied), so two workspaces with the same id shared one
+  file and a restart could show workspace A's waiting prompts in workspace B;
+  the old path also folded every non-alphanumeric character to `_`, so `a/b` and
+  `a_b` landed on the same file; and it stored text alone, so a queued image
+  died at the first restart. The path is now
+  `queued/<workspace hash>/<escaped session id>.json`, any byte of an id outside
+  `[A-Za-z0-9_-]` is escaped losslessly as `~XX`, and records keep text and
+  image blocks. A damaged or unknown-version store is no longer silently read as
+  an empty queue: loading reports the error to the user, and saving refuses to
+  overwrite it (so anything still salvageable by hand survives); a queue file in
+  the old location is reported with its path for the user to move after checking
+  it. Saves go through a temp file and a rename, and a queue change that cannot
+  be written is rolled back and reported instead of pretending to succeed.
+- The installer verifies before it replaces. Upgrading used to `install`
+  straight over the installed binary, so a truncated download, a
+  wrong-architecture asset or a binary that would not start on this system
+  overwrote a working abylab. The new binary is now staged inside the target
+  directory and has to answer `--version` before it is moved onto the
+  destination; a failed check removes the staged file, keeps the previous
+  version, and exits non-zero.
+
 ## [0.1.13] - 2026-09-23
 
 ### Added
