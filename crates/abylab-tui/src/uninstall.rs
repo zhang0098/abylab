@@ -7,7 +7,7 @@
 //! the data, remove the program" is the point of asking the two halves
 //! separately.
 //!
-//! The program half follows the rules uninstall.sh documents:
+//! The program half's rules:
 //!
 //! - every `abylab` on `$PATH` is a target, plus the running executable
 //!   (`std::env::current_exe`) and the installer's default `~/.local/bin`;
@@ -17,10 +17,10 @@
 //! - a copy in cargo's bin directory goes through `cargo uninstall`, so the
 //!   bookkeeping in `~/.cargo/.crates.toml` goes with it.
 //!
-//! One thing the shell script does that this command deliberately does not:
-//! edit the PATH block install.sh appended to a shell startup file. That file
-//! belongs to the user, so it is left byte for byte alone — the stale PATH
-//! entry is harmless once the binary is gone, and can be removed by hand.
+//! One thing this command deliberately does not do: edit the PATH block
+//! install.sh appended to a shell startup file. That file belongs to the user,
+//! so it is left byte for byte alone — the stale PATH entry is harmless once
+//! the binary is gone, and can be removed by hand.
 
 use std::path::{Path, PathBuf};
 
@@ -198,7 +198,7 @@ pub fn wipe(plan: &ProgramPlan) -> ProgramOutcome {
 /// `cargo uninstall abylab-tui` in cargo's own bin directory, so the entry in
 /// `~/.cargo/.crates.toml` goes with the file. False when cargo is absent or
 /// the package is not one cargo installed; the caller falls back to unlinking
-/// the file directly (the script does the same, with a warning).
+/// the file directly and says so in the report.
 fn run_cargo_uninstall() -> bool {
     std::process::Command::new("cargo")
         .arg("uninstall")
@@ -212,7 +212,7 @@ fn run_cargo_uninstall() -> bool {
 
 /// Follow a symlink to the file it lands on, so a shim goes together with its
 /// payload. `None` when the path is not a symlink; bounded so a loop cannot
-/// hang, exactly like the shell uninstaller's `link_target`.
+/// hang.
 fn link_target(path: &Path) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
     let mut hops = 0;
