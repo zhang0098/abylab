@@ -8,7 +8,7 @@
 <link rel="canonical" href="https://abylab.ai/">
 <link rel="alternate" hreflang="en" href="https://abylab.ai/en/">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<meta name="theme-color" content="#0b0d10">
+<meta name="theme-color" content="#f6f7f2">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://abylab.ai/">
 <meta property="og:title" content="abylab — 极简主义的 DeepSeek harness">
@@ -16,108 +16,200 @@
 <meta property="og:locale" content="zh_CN">
 <link rel="stylesheet" href="/vendor/pico.min.css">
 <link rel="stylesheet" href="/styles.css">
-<script>try{var t=localStorage.getItem("theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<script>try{var t=localStorage.getItem("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
 </head>
 <body>
-
+<a class="skip-link" href="#main">跳转到主要内容</a>
 <header class="container site-header">
-  <nav>
-    <ul>
-      <li><a href="/" class="brand"><strong>abylab</strong><span class="brand-dot">.ai</span></a></li>
-    </ul>
-    <ul>
-      <li><a href="#start">快速开始</a></li>
-      <li><a href="#features">特性</a></li>
-      <li><a href="#commands">命令</a></li>
-      <li><a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a></li>
-      <li><button type="button" id="theme-toggle" class="outline secondary toggler" aria-label="切换深色 / 浅色">◐</button></li>
-      <li><a href="/en/" hreflang="en" lang="en">EN</a></li>
-    </ul>
+  <nav aria-label="主导航">
+    <a href="/" class="brand" aria-label="abylab 首页"><img src="/favicon.svg" width="30" height="30" alt=""><strong>abylab<span class="brand-dot">.</span></strong></a>
+    <div class="nav-links">
+      <a class="section-link" href="#start">快速开始</a>
+      <a class="section-link" href="#features">特性</a>
+      <a class="section-link" href="#commands">命令</a>
+      <a class="github-link" href="https://github.com/zhang0098/abylab" rel="noopener">GitHub <span aria-hidden="true">↗</span></a>
+      <span class="nav-divider" aria-hidden="true"></span>
+      <a class="language-link" href="/en/" hreflang="en" lang="en">EN</a>
+      <button type="button" id="theme-toggle" class="toggler" aria-label="切换深色 / 浅色" data-label-dark="切换到深色" data-label-light="切换到浅色">◐</button>
+    </div>
   </nav>
 </header>
 
-<main class="container">
-
-  <section class="hero">
-    <hgroup>
-      <h1>abylab</h1>
-      <p>极简主义的 DeepSeek harness。装完就是一个可执行文件，没有依赖，启动飞快，开源免费。</p>
-    </hgroup>
-  </section>
-
-  <section id="start">
-    <h2>快速开始</h2>
-    <ol class="steps">
-      <li>
-        <p>在你的终端中执行下面语句：</p>
-        <div class="install">
-          <code id="install-cmd">curl -fsSL https://abylab.ai/install.sh | bash</code>
-          <button type="button" class="copy outline" data-copy="#install-cmd" data-copied="已复制">复制</button>
+<main id="main" class="container" tabindex="-1">
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> DEEPSEEK NATIVE · TERMINAL FIRST</p>
+      <h1 id="hero-title">让想法，<br>在终端里<span>发生。</span></h1>
+      <p class="hero-description">极简主义的 DeepSeek harness。<br>一个可执行文件，让 AI 和你一起写代码、解问题、把事情做完。</p>
+      <div class="hero-actions">
+        <a class="button-primary" href="#start">开始使用 <span aria-hidden="true">↗</span></a>
+        <a class="text-link" href="https://github.com/zhang0098/abylab" rel="noopener">看看源码 <span aria-hidden="true">→</span></a>
+      </div>
+      <p class="hero-note">Linux &amp; macOS <span aria-hidden="true">/</span> 开源 · MIT 许可</p>
+    </div>
+    <figure class="terminal-preview">
+      <div class="terminal-window">
+        <div class="terminal-titlebar"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>abylab — ~/project</span><span class="terminal-badge">TUI</span></div>
+        <div class="terminal-body">
+          <div class="terminal-brand">a<span>▌</span> <strong>abylab</strong><span class="terminal-muted"> / DeepSeek</span></div>
+          <p class="terminal-greeting">从一个想法开始。</p>
+          <div class="terminal-prompt"><span class="terminal-chevron" aria-hidden="true">›</span><span>帮我读懂这个项目，再一起改进它。</span></div>
+          <p class="terminal-response">先看看项目结构和入口文件。</p>
+          <div class="terminal-tool"><span class="terminal-check" aria-hidden="true">✓</span><span>read_file</span><span class="terminal-muted">README.md</span></div>
+          <div class="terminal-tool"><span class="terminal-check" aria-hidden="true">✓</span><span>list_dir</span><span class="terminal-muted">src/</span></div>
+          <p class="terminal-answer">结构理清了。接下来，一步步把想法变成代码。</p>
+          <div class="terminal-composer"><span aria-hidden="true">›</span> <span class="terminal-muted">输入你的下一个想法</span><span class="terminal-cursor" aria-hidden="true"></span></div>
+          <div class="terminal-status"><span><span class="terminal-check">●</span> DeepSeek</span><span>/ 命令 <span aria-hidden="true">·</span> @ 文件</span></div>
         </div>
-        <p class="hint">支持 Linux · macOS · 安装到 <code>~/.local/bin/abylab</code></p>
-      </li>
-      <li>
-        <p>去 <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a> 取一个 API Key。</p>
-      </li>
-      <li>
-        <p>在终端里运行 <code>abylab</code>，然后在输入框里登录一次：</p>
-        <pre><code>/login sk-xxxxxxxx</code></pre>
-      </li>
-      <li>
-        <p>直接输入你的要求，开始工作。</p>
-      </li>
-    </ol>
-    <p class="hint">想从源码构建：<code>cargo build --release</code>。安装脚本支持 <code>--bin-dir</code>、<code>--version</code>、<code>--no-path</code>、<code>--path-file</code>、<code>--help</code>。</p>
-    <p class="hint">想卸载 abylab：运行 <code>abylab --uninstall</code>。</p>
+      </div>
+      <figcaption><span aria-hidden="true">↳</span> 熟悉的终端，多一个一起工作的伙伴。 <span class="preview-label">交互示意</span></figcaption>
+    </figure>
   </section>
 
-  <section id="features">
-    <h2>特性</h2>
-    <div class="grid">
-      <article>
+  <div class="principles" aria-label="设计理念">
+    <p><span aria-hidden="true">01</span> 一个文件</p>
+    <p><span aria-hidden="true">02</span> 一个进程</p>
+    <p><span aria-hidden="true">03</span> 专注把事做好</p>
+    <span class="principles-note">SMALL BY DESIGN.</span>
+  </div>
+
+  <section id="start" class="section-layout" aria-labelledby="start-title">
+    <div class="section-heading">
+      <p class="eyebrow">01 / GET STARTED</p>
+      <h2 id="start-title">快速开始</h2>
+      <p>从安装到第一句对话，<br>只需这几步。</p>
+      <span class="section-decoration" aria-hidden="true">&gt;_</span>
+    </div>
+    <div class="setup-panel">
+      <ol class="steps">
+        <li>
+          <h3>安装 abylab</h3>
+          <p>在你的终端中执行下面语句：</p>
+          <div class="install">
+            <code id="install-cmd">curl -fsSL https://abylab.ai/install.sh | bash</code>
+            <button type="button" class="copy" data-copy="#install-cmd" data-copied="已复制" data-copy-error="请手动复制" aria-label="复制安装命令">复制</button>
+          </div>
+          <p class="hint">支持 Linux · macOS · 安装到 <code>~/.local/bin/abylab</code></p>
+        </li>
+        <li>
+          <h3>准备 API Key</h3>
+          <p>去 <a href="https://platform.deepseek.com/" rel="noopener">platform.deepseek.com</a> 取一个 API Key。</p>
+        </li>
+        <li>
+          <h3>启动，然后登录</h3>
+          <p>在终端里运行 <code>abylab</code>，然后在输入框里登录一次：</p>
+          <pre class="login-command"><code>/login sk-xxxxxxxx</code></pre>
+        </li>
+        <li>
+          <h3>开始你的第一个任务</h3>
+          <p>直接输入你的要求，开始工作。</p>
+        </li>
+      </ol>
+      <div class="setup-notes">
+        <p>想从源码构建：<code>cargo build --release</code>。安装脚本支持 <code>--bin-dir</code>、<code>--version</code>、<code>--no-path</code>、<code>--path-file</code>、<code>--help</code>。</p>
+        <p>想卸载 abylab：运行 <code>abylab --uninstall</code>。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" class="section-block" aria-labelledby="features-title">
+    <div class="section-heading heading-inline">
+      <div><p class="eyebrow">02 / LESS, BUT BETTER</p><h2 id="features-title">轻装上阵，认真工作。</h2></div>
+      <p>把复杂留给任务，<br>把简单留给工具。</p>
+    </div>
+    <div class="feature-grid">
+      <article class="feature-card feature-wide">
+        <span class="feature-index" aria-hidden="true">01 / BINARY</span>
         <h3>一个文件</h3>
         <p>没有 Node、没有 Python、没有依赖目录、没有后台进程。发布构建约 <strong>11 MB</strong>，压缩包约 4.9 MB，<code>abylab --version</code> 冷启动约 <strong>2 ms</strong>。</p>
+        <div class="binary-note"><span>Rust</span><span>Linux + macOS</span><span>~11 MB</span></div>
       </article>
-      <article>
+      <article class="feature-card">
+        <span class="feature-index" aria-hidden="true">02 / RUNTIME</span>
         <h3>一个进程</h3>
         <p>流式输出、工具执行、会话持久化都发生在同一个进程里：没有 IPC 往返，没有 GC 停顿，没有额外的 runtime。</p>
+
       </article>
-      <article>
+      <article class="feature-card">
+        <span class="feature-index" aria-hidden="true">03 / PRIVACY</span>
         <h3>凭证只落在你手里</h3>
-        <p>abylab 不读 <code>DEEPSEEK_API_KEY</code> 或任何环境变量。密钥由 <code>/login</code> 写入 <code>~/.abylab/.credentials.yaml</code>（0600，仅属主可读）。</p>
+        <p>abylab 不从 <code>DEEPSEEK_API_KEY</code> 等环境变量读取凭据。密钥由 <code>/login</code> 写入 <code>~/.abylab/.credentials.yaml</code>（0600，仅属主可读）。</p>
+
       </article>
-      <article>
+      <article class="feature-card">
+        <span class="feature-index" aria-hidden="true">04 / EXPERIENCE</span>
         <h3>终端原生</h3>
         <p>九个内置主题包、鼠标滚动与拖拽复制、<code>@</code> 文件提及、图片粘贴，以及 <code>read-only</code> / <code>workspace-write</code> / <code>danger-full-access</code> 三档权限。</p>
+
       </article>
-      <article>
+      <article class="feature-card">
+        <span class="feature-index" aria-hidden="true">05 / OPEN SOURCE</span>
         <h3>开源免费</h3>
         <p>MIT 许可，源码全在 <a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a>：读、改、自己 <code>cargo build --release</code> 都行。不用注册账号，也没有付费档。</p>
+
       </article>
     </div>
   </section>
 
-  <section id="commands">
-    <h2>命令</h2>
-    <p class="mono-lines">
-      <code>/help</code> <code>/keys</code> <code>/new</code> <code>/resume [id]</code> <code>/compact</code> <code>/goal</code> <code>/clear</code> <code>/model [id]</code>
-      <code>/effort [off|low|high|max]</code> <code>/permission [preset]</code> <code>/plan [on|off]</code>
-      <code>/vim [on|off]</code> <code>/image &lt;path&gt; [text]</code> <code>/clip [text]</code> <code>/theme [dark|light|pack]</code>
-      <code>/status</code> <code>/lang [zh|en]</code> <code>/quit</code>
-      <code>/skill &lt;name&gt; [args]</code>
-    </p>
-
-    <h2>按键</h2>
-    <p class="mono-lines">
-      <kbd>enter</kbd> 发送 / 排队 · <kbd>ctrl+enter</kbd> 立即发送 · <kbd>alt+↑</kbd>（mac <kbd>⌥↑</kbd>）编辑排队消息 · <kbd>esc</kbd> 中断 / 双击清空草稿 ·
-      <kbd>ctrl+c</kbd> 清空 / 退出 · <kbd>↑</kbd> 历史 · <kbd>/</kbd> 命令 · <kbd>@</kbd> 文件提及 ·
-      <kbd>ctrl+z</kbd> 撤销 · <kbd>ctrl+p</kbd> 模型 · <kbd>ctrl+t</kbd> 主题 · <kbd>shift+tab</kbd> 权限预设
-    </p>
-    <p class="hint"><kbd>alt+↑</kbd> 只在有排队消息、草稿为空时打开列表：<kbd>↑/↓</kbd> 选择 · <kbd>enter</kbd> 编辑 · <kbd>ctrl+enter</kbd> 把这条插话进正在跑的轮次 · <kbd>ctrl+d</kbd> 删除（同一行按两次）。完整清单见 TUI 里的 <code>/keys</code>。</p>
+  <section id="commands" class="section-layout" aria-labelledby="commands-title">
+    <div class="section-heading">
+      <p class="eyebrow">03 / AT YOUR FINGERTIPS</p>
+      <h2 id="commands-title">顺手，才会常用。</h2>
+      <p>常用操作，触手可及。<br>在终端输入 <code>/help</code> 随时查看。</p>
+    </div>
+    <div class="reference-panel">
+      <h3>常用命令</h3>
+      <div class="command-shortlist">
+        <div><code>/new</code><span>开始新会话</span></div>
+        <div><code>/resume [id]</code><span>接着上次的工作</span></div>
+        <div><code>/model [id]</code><span>选择合适的模型</span></div>
+        <div><code>/theme</code><span>换一个喜欢的主题</span></div>
+      </div>
+      <details>
+        <summary>查看全部命令 <span class="detail-plus" aria-hidden="true">+</span></summary>
+        <div class="command-groups">
+          <div class="command-group">
+            <h4>会话与任务</h4>
+            <p><code>/new</code> <code>/resume [id]</code> <code>/compact</code> <code>/goal</code> <code>/clear</code></p>
+          </div>
+          <div class="command-group">
+            <h4>模型与权限</h4>
+            <p><code>/model [id]</code> <code>/effort [off|low|high|max]</code> <code>/permission [preset]</code> <code>/plan [on|off]</code></p>
+          </div>
+          <div class="command-group">
+            <h4>输入与外观</h4>
+            <p><code>/vim [on|off]</code> <code>/image &lt;path&gt; [text]</code> <code>/clip [text]</code> <code>/theme [dark|light|pack]</code> <code>/lang [zh|en]</code></p>
+          </div>
+          <div class="command-group">
+            <h4>帮助与扩展</h4>
+            <p><code>/help</code> <code>/keys</code> <code>/status</code> <code>/skill &lt;name&gt; [args]</code> <code>/quit</code></p>
+          </div>
+        </div>
+      </details>
+      <details>
+        <summary>键盘快捷键 <span class="detail-plus" aria-hidden="true">+</span></summary>
+        <dl class="key-list">
+            <div><dt><kbd>enter</kbd></dt><dd>发送 / 排队</dd></div>
+            <div><dt><kbd>ctrl+enter</kbd></dt><dd>插话</dd></div>
+            <div><dt><kbd>esc × 2</kbd></dt><dd>中断 / 清空草稿</dd></div>
+            <div><dt><kbd>ctrl+c</kbd></dt><dd>清空 / 退出</dd></div>
+            <div><dt><kbd>↑</kbd></dt><dd>输入历史</dd></div>
+            <div><dt><kbd>/ · @</kbd></dt><dd>命令 / 文件提及</dd></div>
+            <div><dt><kbd>ctrl+z</kbd></dt><dd>撤销</dd></div>
+            <div><dt><kbd>ctrl+p</kbd></dt><dd>切换模型</dd></div>
+            <div><dt><kbd>ctrl+t</kbd></dt><dd>切换主题</dd></div>
+            <div><dt><kbd>shift+tab</kbd></dt><dd>切换权限预设</dd></div>
+        </dl>
+        <p class="hint"><kbd>alt+↑</kbd>（mac <kbd>⌥↑</kbd>）只在有排队消息、草稿为空时打开列表：<kbd>↑/↓</kbd> 选择 · <kbd>enter</kbd> 编辑 · <kbd>ctrl+enter</kbd> 把这条插话进正在跑的轮次 · <kbd>ctrl+d</kbd> 删除（同一行按两次）。完整清单见 TUI 里的 <code>/keys</code>。</p>
+      </details>
+    </div>
   </section>
 
-  <section id="inside">
-    <h2>里面是什么</h2>
+  <section id="inside" class="inside-section" aria-labelledby="inside-title">
+    <div class="section-heading heading-inline">
+      <div><p class="eyebrow">04 / UNDER THE HOOD</p><h2 id="inside-title">里面是什么，一目了然。</h2></div>
+      <a class="text-link" href="https://github.com/zhang0098/abylab/blob/main/TECH.md" rel="noopener">阅读技术文档 <span aria-hidden="true">↗</span></a>
+    </div>
     <div class="overflow-auto">
       <table>
         <tbody>
@@ -127,20 +219,15 @@
         </tbody>
       </table>
     </div>
-    <p class="hint">实现细节（工作区指令、上下文压缩、会话持久化、目标轮次）见 <a href="https://github.com/zhang0098/abylab/blob/main/TECH.md" rel="noopener">TECH.md</a>。</p>
+    <p class="hint">工作区指令、上下文压缩、会话持久化、目标轮次——实现细节都在源码和技术文档里。</p>
   </section>
-
 </main>
 
 <footer class="container site-footer">
-  <small>
-    MIT 许可证 · <a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub</a> ·
-    <a href="https://github.com/zhang0098/abylab/blob/main/README.md" rel="noopener">文档</a> ·
-    <a href="https://platform.deepseek.com/" rel="noopener">DeepSeek 平台</a> ·
-    abylab.ai
-  </small>
+  <div><a href="/" class="brand"><strong>abylab<span class="brand-dot">.</span></strong></a><p>保持轻巧，持续创造。</p></div>
+  <div class="footer-links"><a href="https://github.com/zhang0098/abylab" rel="noopener">GitHub ↗</a><a href="https://github.com/zhang0098/abylab/blob/main/README.md" rel="noopener">文档</a><a href="https://platform.deepseek.com/" rel="noopener">DeepSeek</a><span>MIT License · abylab.ai</span></div>
 </footer>
-
+<p id="copy-status" class="sr-only" role="status" aria-live="polite"></p>
 <script src="/app.js" defer></script>
 </body>
 </html>
