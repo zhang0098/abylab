@@ -193,6 +193,10 @@ curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-
 - `styles.css` 只做两件事：按明暗两套变量定配色，再把 Pico 的变量指过去。版式是
   单栏、没有插图和自定义组件，坏起来一眼能看见。改样式时一起检查中英文、深浅色
   和手机宽度；不要往里加「只在某个宽度下才对」的装饰。
+- 覆盖 Pico 元素的背景时，`color` 要一起写。Pico 给 `kbd` 的 `color` 是
+  `var(--pico-background-color)`——也就是页面底色：只把背景换成浅色，字就成了
+  「浅色配浅色」，按键表里那一排会整列看不见。同类变量还有
+  `--pico-code-kbd-color`、`--pico-range-thumb-border-color`。
 - README 的横幅是 `docs/assets/readme-banner.svg`，与站点共用墨绿配色，
   使用系统字体，不依赖外链图片服务。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
