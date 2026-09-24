@@ -53,6 +53,21 @@ context compaction, session persistence, goal rounds, uninstall) live in
   the input well to 5/8 of the frame, another restored it. The well now only grows with the draft
   (half the screen, capped at 14 rows), and the `click ⛶` row is gone from `/keys`. The right end keeps
   just `↥` (jump back to your previous prompt).
+- `ctrl+o` cycles three tool-output modes instead of toggling two: **summary** (the default — one line per
+  call), **preview** (one card per call with a 4-line tail), **full** (every thought and result expanded),
+  then back. Summary folds consecutive calls into one block headed by a count — `13 tool calls · 13
+  commands · 1 failed`, with the command and failure segments dropped when they are zero — and hangs each
+  call off the head as a branch, `├─ Ran ls -la …`, the last one closing it with `└─`. A finished call
+  carries no bullet, since the line is the call; only one still running keeps its spinner, after the
+  branch. A whole turn's tool work then fits on a screen instead of drowning the
+  conversation in output. A failed call leads with its own message rather than a made-up verb
+  (`Failed shell request · 1 invalid field`) and keeps the rest behind a click; a successful call opens
+  its full output on one. The header line ignores clicks. An empty assistant message between steps does
+  not break a block, so a multi-step turn still reads as one; an assistant reply or a thought with text in
+  it splits them as before. The `ctrl+o` row in `/keys` says so. The verb opening each call stays
+  English in every locale (`Ran` / `Read` / `Wrote` / `Edited` / `Searched`): a command or a path follows
+  it, and the tools we cannot name already show their English tool names. The count header, the click
+  hints and a failure's own message still follow the interface language.
 
 ## [0.1.14] - 2026-09-24
 
