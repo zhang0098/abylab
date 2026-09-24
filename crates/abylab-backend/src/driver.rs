@@ -26,6 +26,9 @@ use crate::contract::{
 };
 use crate::user_questions::AskUserQuestionTool;
 
+mod goal;
+use goal::{GoalCommand, GoalControl};
+
 const SERVER_LABEL: &str = "abycore · deepseek-responses";
 
 /// Handle to one running driver. `send` never blocks; turns serialize inside
@@ -44,10 +47,11 @@ pub struct DriverHandle {
 
 impl DriverHandle {
     pub fn send(&self, cmd: Cmd) {
-        // The turn loop answers everything in order; a query that touches no
-        // agent state is served by the side task so it lands immediately.
+        // Read-only catalog queries are served off-loop. Goal controls are
+        // forwarded to the single owner, which polls them during a turn too.
         let tx = match &cmd {
             Cmd::ListSessions { .. } | Cmd::FetchCatalog | Cmd::FetchSkills => &self.query_tx,
+            Cmd::Goal { arg } if GoalControl::parse(arg).is_some() => &self.query_tx,
             _ => &self.cmd_tx,
         };
         let _ = tx.send(cmd);
@@ -699,6 +703,7 @@ fn claim_queued(
 #[allow(clippy::too_many_arguments)] // the queue's owners live in drive's scope
 async fn next_command(
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    goal_rx: &mut mpsc::UnboundedReceiver<GoalControl>,
     steer_rx: &mut mpsc::UnboundedReceiver<SteerRequest>,
     queue: &mut VecDeque<QueuedItem>,
     taken: &OutstandingSteers,
@@ -713,6 +718,11 @@ async fn next_command(
         Ok(cmd) => return Some(cmd),
         Err(mpsc::error::TryRecvError::Disconnected) => return None,
         Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+    // Preserve an already queued create/resume before its follow-up pause.
+    // During execution the run itself services controls before polling work.
+    if let Ok(control) = goal_rx.try_recv() {
+        return Some(control.command());
     }
     // Steers the running turn took leave the FIFO before it drains.
     settle_taken(queue, taken, cfg, session, ctl);
@@ -733,6 +743,7 @@ async fn next_command(
     tokio::select! {
         biased;
         cmd = cmd_rx.recv() => cmd,
+        Some(control) = goal_rx.recv() => Some(control.command()),
         request = steer_rx.recv() => {
             // No turn is running (this is the idle wait), so a steer is
             // admitted as the next turn: the harness's best-effort contract,
@@ -789,9 +800,8 @@ async fn drive(
         skills: Arc::clone(&skills),
         steers: Arc::clone(&admitted),
     };
-    // Harness arms goal continuation explicitly: creating a goal from the model
-    // does not start spending rounds, `/goal <objective>` or `/goal resume` does.
-    let mut goal_armed = false;
+    // Queries and pauses are forwarded to the owner even while it runs a turn.
+    let (goal_tx, mut goal_rx) = mpsc::unbounded_channel::<GoalControl>();
 
     // The TUI resolves the key (--api-key override, else the /login store);
     // the environment is not consulted.
@@ -835,7 +845,8 @@ async fn drive(
     // them here): the loop is busy for a whole turn, and both `/resume`'s
     // picker and the `/model` catalog have to answer while the agent is still
     // working. The task owns a store clone, the live key and the same sink, so
-    // it needs nothing from the loop.
+    // it needs nothing from the loop. Goal controls are forwarded without
+    // touching the Agent; only its owning task reads or mutates goal state.
     {
         let store = store.clone();
         let base_url = cfg.base_url.clone();
@@ -858,6 +869,11 @@ async fn drive(
                     Cmd::FetchSkills => sink(Event::Ctl(CtlEvent::Skills {
                         skills: skill_rows(&skills),
                     })),
+                    Cmd::Goal { arg } => {
+                        if let Some(control) = GoalControl::parse(&arg) {
+                            let _ = goal_tx.send(control);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -956,6 +972,7 @@ async fn drive(
 
     while let Some(cmd) = next_command(
         &mut cmd_rx,
+        &mut goal_rx,
         &mut steer_rx,
         &mut queue,
         &taken,
@@ -1051,105 +1068,35 @@ async fn drive(
                     ));
                     continue;
                 };
-                let mut ctx = TurnCtx {
-                    session: &active_session,
-                    sink: &sink,
-                    interrupt_rx: &mut interrupt_rx,
-                    steer_rx: &mut steer_rx,
-                    steer: agent.steer_handle(),
-                    skills: &skills,
-                    admitted: &admitted,
-                    taken: &taken,
-                    limits,
-                    compaction,
-                };
-                let arg = arg.trim();
-                let (arg, max_rounds) = parse_goal_argument(arg);
-                match arg {
-                    "" | "status" => match agent.goal() {
-                        Some(goal) => ctl(CtlEvent::TuiOpDone(format!(
-                            "goal · {} / 目标 · {}",
-                            goal.summary(),
-                            goal.summary()
-                        ))),
-                        None => ctl(CtlEvent::TuiOpFailed(
-                            "no goal is set — /goal <objective> / 当前没有目标：/goal <目标>"
-                                .into(),
-                        )),
-                    },
-                    "rounds" => ctl(CtlEvent::TuiOpFailed(
-                        "usage: /goal @<rounds> <objective> / 用法：/goal @<轮数> <目标>".into(),
-                    )),
-                    "pause" | "resume" | "complete" | "clear" => {
-                        let outcome = match arg {
-                            "clear" => {
-                                agent.clear_goal();
-                                goal_armed = false;
-                                Ok("goal cleared / 目标已清除".to_string())
-                            }
-                            _ => {
-                                let status = match arg {
-                                    "pause" => abycore::GoalStatus::Paused,
-                                    "resume" => abycore::GoalStatus::Active,
-                                    _ => abycore::GoalStatus::Complete,
-                                };
-                                agent.update_goal(status, None).map(|goal| {
-                                    format!("goal → {} / 目标 → {}", goal.summary(), goal.summary())
-                                })
-                            }
-                        };
-                        match outcome {
-                            Ok(message) => {
-                                if let Err(error) = agent.save() {
-                                    goal_armed = false;
-                                    ctl(CtlEvent::TuiOpFailed(format!(
-                                        "goal save failed: {error}"
-                                    )));
-                                    continue;
-                                }
-                                match arg {
-                                    // Resuming an idle goal continues it, exactly
-                                    // like a fresh goal: arming is the human opt-in.
-                                    "resume" => {
-                                        goal_armed = true;
-                                        ctl(CtlEvent::TuiOpDone(message));
-                                        drive_goal_rounds(agent, &mut ctx, &ctl).await;
-                                        goal_armed = goal_armed
-                                            && agent
-                                                .goal()
-                                                .is_some_and(abycore::Goal::may_start_round);
-                                        continue;
-                                    }
-                                    "pause" | "complete" | "clear" => goal_armed = false,
-                                    _ => {}
-                                }
-                                ctl(CtlEvent::TuiOpDone(message));
-                            }
-                            Err(error) => ctl(CtlEvent::TuiOpFailed(format!(
-                                "goal update failed: {error} / 目标更新失败：{error}"
-                            ))),
-                        }
+                let command = match GoalCommand::parse(&arg) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        ctl(CtlEvent::TuiOpFailed(error.into()));
+                        continue;
                     }
-                    objective => match agent.set_goal(objective, max_rounds) {
-                        Ok(goal) => {
-                            if let Err(error) = agent.save() {
-                                ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
-                                continue;
-                            }
-                            goal_armed = true;
-                            ctl(CtlEvent::TuiOpDone(format!(
-                                "goal · {} / 目标 · {} — starting round 1",
-                                goal.summary(),
-                                goal.summary()
-                            )));
-                            drive_goal_rounds(agent, &mut ctx, &ctl).await;
-                            goal_armed = goal_armed
-                                && agent.goal().is_some_and(abycore::Goal::may_start_round);
-                        }
-                        Err(error) => ctl(CtlEvent::TuiOpFailed(format!(
-                            "goal not set: {error} / 目标创建失败：{error}"
-                        ))),
-                    },
+                };
+                match goal::apply(agent, command, &ctl) {
+                    Ok(true) => {
+                        let mut ctx = TurnCtx {
+                            session: &active_session,
+                            sink: &sink,
+                            interrupt_rx: &mut interrupt_rx,
+                            goal_rx: &mut goal_rx,
+                            pause_requested: false,
+                            steer_rx: &mut steer_rx,
+                            steer: agent.steer_handle(),
+                            skills: &skills,
+                            admitted: &admitted,
+                            taken: &taken,
+                            limits,
+                            compaction,
+                        };
+                        goal::drive_rounds(agent, &mut ctx, &ctl).await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => ctl(CtlEvent::TuiOpFailed(format!(
+                        "goal update failed: {error} / 目标更新失败：{error}"
+                    ))),
                 }
             }
             Cmd::Compact => {
@@ -1164,9 +1111,15 @@ async fn drive(
                     session: active_session.clone(),
                     running: true,
                 }));
-                let result =
-                    compact_history(agent, compaction, CompactTrigger::Manual, &mut interrupt_rx)
-                        .await;
+                let result = compact_history(
+                    agent,
+                    compaction,
+                    CompactTrigger::Manual,
+                    &mut interrupt_rx,
+                    &mut goal_rx,
+                    &sink,
+                )
+                .await;
                 sink(Event::Ui(UiEvent::SessionStatus {
                     session: active_session.clone(),
                     running: false,
@@ -1285,7 +1238,6 @@ async fn drive(
                         agent = Some(next);
                         active_session = id;
                         resume_target = restoring.then(|| active_session.clone());
-                        goal_armed = false;
                         // The queue belongs to a session. The old one's items are
                         // already written down (every mutation persists); this
                         // session's own saved queue comes back as held items.
@@ -1597,6 +1549,8 @@ async fn drive(
                     session: &active_session,
                     sink: &sink,
                     interrupt_rx: &mut interrupt_rx,
+                    goal_rx: &mut goal_rx,
+                    pause_requested: false,
                     steer_rx: &mut steer_rx,
                     steer: agent.steer_handle(),
                     skills: &skills,
@@ -1608,33 +1562,12 @@ async fn drive(
                 // Context pressure is handled by the agent itself at every
                 // request boundary (`AgentHooks::view_request`), so it applies
                 // inside a turn too; nothing to do before shipping the prompt.
-                // An armed goal can continue immediately after this prompt.
-                // Keep the UI busy until those rounds settle, so its queued
-                // prompts cannot be dispatched between the two turns.
-                let goal_continues = goal_armed;
                 let input = match prompt_parts {
                     Some(parts) => PromptInput::Parts(parts),
                     None => PromptInput::Text(text),
                 };
-                match turn(agent, Some(input), &mut ctx, !goal_continues).await {
-                    Ok(outcome)
-                        if goal_continues && outcome.stop_reason == StopReason::Completed =>
-                    {
-                        drive_goal_rounds(agent, &mut ctx, &ctl).await;
-                        goal_armed =
-                            goal_armed && agent.goal().is_some_and(abycore::Goal::may_start_round);
-                    }
-                    Ok(_) => {
-                        if goal_continues {
-                            emit_idle_status(&ctx);
-                        }
-                    }
-                    Err(err) => {
-                        if goal_continues {
-                            emit_idle_status(&ctx);
-                        }
-                        report_turn_err(&ctl, &err, limits);
-                    }
+                if let Err(error) = turn(agent, Some(input), &mut ctx, true).await {
+                    report_turn_err(&ctl, &error, limits);
                 }
                 // This process has run a turn: restored items are no longer
                 // waiting for one, so the next drain may spend them.
@@ -1781,24 +1714,6 @@ fn permission_preset(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// Split `/goal`'s argument into the objective and an optional round
-/// allowance: `/goal @3 objective` sets the allowance, a bare `@3` names no
-/// objective (the caller routes the literal `"rounds"` to its usage arm), and
-/// anything else is the objective as typed.
-fn parse_goal_argument(arg: &str) -> (&str, Option<u64>) {
-    let Some(rest) = arg.strip_prefix('@') else {
-        return (arg, None);
-    };
-    match rest.split_once(char::is_whitespace) {
-        Some((rounds, objective)) => match rounds.parse::<u64>() {
-            Ok(rounds) => (objective.trim(), Some(rounds)),
-            Err(_) => (arg, None),
-        },
-        None if rest.trim().parse::<u64>().is_ok() => ("rounds", None),
-        None => (arg, None),
-    }
-}
-
 fn emit_permission_facts(
     sink: &Arc<dyn Fn(Event) + Send + Sync>,
     session: &str,
@@ -1921,7 +1836,18 @@ fn resume_agent(ctx: &AgentContext<'_>) -> abycore::Result<SessionAgent> {
         .ok_or_else(|| abycore::Error::new(ErrorKind::Session, "session store unavailable"))?;
     let (writer, snapshot) = store.open_for_resume(ctx.session_id)?;
     let persist = Arc::new(PersistState::with_writer(store, writer));
-    build_agent(ctx, snapshot, Some(persist))
+    let mut agent = build_agent(ctx, snapshot, Some(persist))?;
+    if agent
+        .goal()
+        .is_some_and(|goal| goal.status == abycore::GoalStatus::Active)
+    {
+        agent.update_goal(
+            abycore::GoalStatus::Paused,
+            Some("session restored; use /goal resume".into()),
+        )?;
+        agent.save()?;
+    }
+    Ok(agent)
 }
 
 fn build_agent(
@@ -2112,95 +2038,11 @@ fn settle_pending(agent: &mut Agent, reason: &str, ctx: &TurnCtx<'_>) -> abycore
     Ok(())
 }
 
-/// Spend rounds on an armed, active goal.
-///
-/// Harness's `goal-round-driver`, as host policy: each round is one ordinary
-/// turn seeded with the objective, the goal's own allowance bounds the loop,
-/// and exhaustion records a blocker instead of looping forever. The model ends
-/// the loop by completing or blocking the goal through `update_goal`; an error
-/// or an interrupt stops it too.
-async fn drive_goal_rounds(
-    agent: &mut SessionAgent,
-    ctx: &mut TurnCtx<'_>,
-    ctl: &impl Fn(CtlEvent),
-) {
-    run_goal_rounds(agent, ctx, ctl).await;
-    if let Err(error) = agent.save() {
-        ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
-        emit_idle_status(ctx);
-        return;
-    }
-    // One settled state after the loop, whatever stopped it: the transcript's
-    // last word on the goal is always its current status.
-    if let Some(goal) = agent.goal() {
-        ctl(CtlEvent::TuiOpDone(format!(
-            "goal settled · {} / 目标状态 · {}",
-            goal.summary(),
-            goal.summary()
-        )));
-    }
-    // The rounds suppressed their per-turn idle status; emit it once after
-    // the sequence and final save, even if no round was needed.
-    emit_idle_status(ctx);
-}
-
 fn emit_idle_status(ctx: &TurnCtx<'_>) {
     (ctx.sink)(Event::Ui(UiEvent::SessionStatus {
         session: ctx.session.into(),
         running: false,
     }));
-}
-
-async fn run_goal_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &impl Fn(CtlEvent)) {
-    loop {
-        let Some(goal) = agent.goal() else {
-            return;
-        };
-        if goal.status != abycore::GoalStatus::Active {
-            return;
-        }
-        if goal.remaining_rounds() == 0 {
-            let _ = agent.update_goal(
-                abycore::GoalStatus::Blocked,
-                Some("round allowance exhausted".into()),
-            );
-            if let Err(error) = agent.save() {
-                ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
-                return;
-            }
-            ctl(CtlEvent::TuiOpFailed(
-                "goal rounds exhausted — marked blocked / 目标轮次用尽，已标记 blocked".into(),
-            ));
-            return;
-        }
-        let Some(goal) = agent.begin_goal_round().ok().flatten() else {
-            return;
-        };
-        if let Err(error) = agent.save() {
-            ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
-            return;
-        }
-        ctl(CtlEvent::TuiOpDone(format!(
-            "goal round {}/{} — {} / 目标第 {}/{} 轮",
-            goal.rounds_started,
-            goal.max_rounds,
-            goal.objective,
-            goal.rounds_started,
-            goal.max_rounds
-        )));
-        let prompt = format!(
-            "Continue working toward the session goal (round {}/{}): {}\n             When the objective is achieved, call update_goal with status \"complete\".              If progress is impossible, call update_goal with status \"blocked\" and explain in note.              Otherwise keep working; do not restate the goal, just make progress.",
-            goal.rounds_started, goal.max_rounds, goal.objective
-        );
-        match turn(agent, Some(PromptInput::Text(prompt)), ctx, false).await {
-            Ok(outcome) if outcome.stop_reason == StopReason::Completed => {}
-            Ok(_) => return,
-            Err(err) => {
-                report_turn_err(ctl, &err, ctx.limits);
-                return;
-            }
-        }
-    }
 }
 
 /// Why a *forced* compaction is running. Pressure-driven condensation happens
@@ -2257,22 +2099,52 @@ async fn compact_history(
     policy: Option<CompactionConfig>,
     trigger: CompactTrigger,
     interrupt_rx: &mut mpsc::UnboundedReceiver<()>,
+    goal_rx: &mut mpsc::UnboundedReceiver<GoalControl>,
+    sink: &Arc<dyn Fn(Event) + Send + Sync>,
 ) -> abycore::Result<Option<CompactionReport>> {
     let cancellation = CancellationToken::new();
+    let current_goal = agent.goal().cloned();
+    let mut interrupted = false;
     let outcome = {
         let work = compact_view(agent, policy, trigger, cancellation.clone());
         tokio::pin!(work);
-        tokio::select! {
-            biased;
-            _ = interrupt_rx.recv() => {
-                cancellation.cancel();
-                work.await
+        loop {
+            tokio::select! {
+                biased;
+                Some(control) = goal_rx.recv() => {
+                    if goal::during_turn(control, current_goal.as_ref(), &|event| sink(Event::Ctl(event))) {
+                        interrupted = true;
+                        cancellation.cancel();
+                    }
+                }
+                Some(()) = interrupt_rx.recv() => {
+                    interrupted = true;
+                    cancellation.cancel();
+                }
+                outcome = &mut work => break if interrupted {
+                    Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"))
+                } else { outcome },
             }
-            outcome = &mut work => outcome,
         }
     };
+    let paused = interrupted
+        && agent
+            .goal()
+            .is_some_and(|goal| goal.status == abycore::GoalStatus::Active);
+    if paused {
+        agent.update_goal(
+            abycore::GoalStatus::Paused,
+            Some("interrupted; use /goal resume".into()),
+        )?;
+    }
     // Save both successful view changes and the ledger/prune left on failure.
     agent.save()?;
+    if paused {
+        let summary = agent.goal().expect("paused goal").summary();
+        sink(Event::Ctl(CtlEvent::TuiOpDone(format!(
+            "goal → {summary} / 目标 → {summary}"
+        ))));
+    }
     outcome
 }
 
@@ -2408,6 +2280,8 @@ struct TurnCtx<'a> {
     session: &'a str,
     sink: &'a Arc<dyn Fn(Event) + Send + Sync>,
     interrupt_rx: &'a mut mpsc::UnboundedReceiver<()>,
+    goal_rx: &'a mut mpsc::UnboundedReceiver<GoalControl>,
+    pause_requested: bool,
     steer_rx: &'a mut mpsc::UnboundedReceiver<SteerRequest>,
     /// Inbox of the live agent: text pushed here is appended at its next step
     /// boundary, which is what makes Send Now not cancel anything.
@@ -2438,6 +2312,8 @@ async fn run_segment(
     ctx: &mut TurnCtx<'_>,
 ) -> abycore::Result<RunOutcome> {
     let cancellation = CancellationToken::new();
+    let live_goal = Arc::new(std::sync::Mutex::new(agent.goal().cloned()));
+    let event_goal = Arc::clone(&live_goal);
     let has_image = agent.has_image_input()
         || matches!(&input,
             Some(PromptInput::Parts(parts)) if parts.iter().any(|part| matches!(part, abycore::ContentPart::InputImage { .. }))
@@ -2459,7 +2335,11 @@ async fn run_segment(
     let on_event = move |event: AgentEvent| {
         let sink = Arc::clone(&sink_for_events);
         let sess = sess.clone();
+        let event_goal = Arc::clone(&event_goal);
         async move {
+            if let AgentEvent::GoalChanged { goal } = &event {
+                *event_goal.lock().unwrap_or_else(|p| p.into_inner()) = goal.clone();
+            }
             // A view change is a control fact, not transcript content: report it
             // as a notice before the (empty) translation.
             if let AgentEvent::ViewChanged { change } = &event {
@@ -2492,17 +2372,27 @@ async fn run_segment(
         Some(PromptInput::Parts(parts)) => Box::pin(agent.run_parts(parts, options, on_event)),
         None => Box::pin(agent.continue_run(options, on_event)),
     };
-    // Three-way race: the segment's own outcome, an interrupt (cancel), and a
-    // steer (inject, keep going). `biased` keeps an already-settled outcome
-    // from losing to a steer that arrived in the same poll.
+    // Controls win before another request can start. After cancellation, keep
+    // polling the run for its cleanup and keep answering status requests.
+    let mut interrupted = false;
     loop {
         tokio::select! {
             biased;
-            result = &mut run_fut => return result,
-            _ = ctx.interrupt_rx.recv() => {
-                cancellation.cancel();
-                return (&mut run_fut).await;
+            Some(control) = ctx.goal_rx.recv() => {
+                let snapshot = live_goal.lock().unwrap_or_else(|p| p.into_inner());
+                if goal::during_turn(control, snapshot.as_ref(), &|event| (ctx.sink)(Event::Ctl(event))) {
+                    ctx.pause_requested = true;
+                    interrupted = true;
+                    cancellation.cancel();
+                }
             }
+            Some(()) = ctx.interrupt_rx.recv() => {
+                interrupted = true;
+                cancellation.cancel();
+            }
+            result = &mut run_fut => return if interrupted {
+                Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"))
+            } else { result },
             request = ctx.steer_rx.recv() => {
                 let Some(request) = request else { continue };
                 settle_steer(request, ctx);
@@ -2591,11 +2481,16 @@ async fn turn(
     // Stale interrupts (sent between turns, e.g. by the steer path) must not
     // cancel this turn — but an interrupt that arrives while a later segment
     // runs must still land, so drain only once here.
-    while ctx.interrupt_rx.try_recv().is_ok() {}
+    if !agent
+        .goal()
+        .is_some_and(|goal| goal.status == abycore::GoalStatus::Active)
+    {
+        while ctx.interrupt_rx.try_recv().is_ok() {}
+    }
 
     let mut next = input;
     let mut continuations = 0usize;
-    let outcome = loop {
+    let outcome = 'segments: loop {
         let outcome = run_segment(agent, next.take(), ctx).await;
         // A context overflow is recoverable: condense hard, then resume the
         // same open turn (harness retries the request after the surface
@@ -2608,6 +2503,8 @@ async fn turn(
                 ctx.compaction,
                 CompactTrigger::Overflow,
                 ctx.interrupt_rx,
+                ctx.goal_rx,
+                ctx.sink,
             )
             .await
             {
@@ -2647,10 +2544,21 @@ async fn turn(
         // storm would only burn the remaining headroom. The wait stays
         // interruptible so esc still ends the turn.
         if let Some(delay) = continuation_delay(failure) {
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = ctx.interrupt_rx.recv() => {
-                    break Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"));
+            let wait = tokio::time::sleep(delay);
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(control) = ctx.goal_rx.recv() => {
+                        if goal::during_turn(control, agent.goal(), &emit_ctl) {
+                            ctx.pause_requested = true;
+                            break 'segments Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"));
+                        }
+                    }
+                    Some(()) = ctx.interrupt_rx.recv() => {
+                        break 'segments Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"));
+                    }
+                    _ = &mut wait => break,
                 }
             }
         }
@@ -2662,9 +2570,49 @@ async fn turn(
         ))));
     };
 
+    let stopped_goal = if agent
+        .goal()
+        .is_some_and(|goal| goal.status == abycore::GoalStatus::Active)
+    {
+        let stopped = match &outcome {
+            Ok(result) if result.stop_reason == StopReason::Completed => None,
+            Ok(_) => Some((
+                abycore::GoalStatus::Paused,
+                "turn stopped; use /goal resume",
+            )),
+            Err(error) if error.kind == ErrorKind::Cancelled => {
+                Some((abycore::GoalStatus::Paused, "interrupted; use /goal resume"))
+            }
+            Err(_) => Some((
+                abycore::GoalStatus::Blocked,
+                "turn failed; resolve the error and use /goal resume",
+            )),
+        };
+        match stopped {
+            Some((status, note)) => {
+                agent.update_goal(status, Some(note.into()))?;
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     // Save final state and the ledger on every exit, including cancellation
     // while waiting between segments or an incomplete model response.
-    let outcome = agent.save().and(outcome);
+    let saved = agent.save();
+    if saved.is_ok()
+        && (stopped_goal || ctx.pause_requested)
+        && let Some(goal) = agent.goal()
+    {
+        emit_ctl(CtlEvent::TuiOpDone(format!(
+            "goal → {} / 目标 → {}",
+            goal.summary(),
+            goal.summary()
+        )));
+    }
+    ctx.pause_requested = false;
+    let outcome = saved.and(outcome);
     let kind = match &outcome {
         Ok(outcome) => stop_kind(&outcome.stop_reason),
         Err(err) if err.kind == ErrorKind::Cancelled => "interrupted",
@@ -3373,24 +3321,6 @@ mod tests {
             permission_preset(PermissionMode::FullAccess),
             "danger-full-access"
         );
-    }
-
-    #[test]
-    fn goal_arguments_split_the_round_allowance_from_the_objective() {
-        assert_eq!(
-            parse_goal_argument("ship the release"),
-            ("ship the release", None)
-        );
-        assert_eq!(
-            parse_goal_argument("@3 ship the release"),
-            ("ship the release", Some(3))
-        );
-        assert_eq!(parse_goal_argument("@0 ship"), ("ship", Some(0)));
-        // A bare allowance names no objective: the usage arm handles "rounds".
-        assert_eq!(parse_goal_argument("@3"), ("rounds", None));
-        // A non-numeric round token is an ordinary objective.
-        assert_eq!(parse_goal_argument("@here fix it"), ("@here fix it", None));
-        assert_eq!(parse_goal_argument("rounds"), ("rounds", None));
     }
 
     #[tokio::test]
@@ -4916,6 +4846,7 @@ mod tests {
     /// the turn loop already knows how to run.
     #[tokio::test]
     async fn the_idle_wait_turns_a_steer_into_the_next_turn() {
+        let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let mut queue = VecDeque::new();
@@ -4932,6 +4863,7 @@ mod tests {
             .expect("queue steer");
         match next_command(
             &mut cmd_rx,
+            &mut goal_rx,
             &mut steer_rx,
             &mut queue,
             &taken,
@@ -4953,6 +4885,7 @@ mod tests {
         assert!(matches!(
             next_command(
                 &mut cmd_rx,
+                &mut goal_rx,
                 &mut steer_rx,
                 &mut queue,
                 &taken,
@@ -4969,6 +4902,7 @@ mod tests {
     /// waiting is applied first — the item it changes cannot ship ahead of it.
     #[tokio::test]
     async fn the_idle_wait_drains_the_queue_after_pending_commands() {
+        let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let mut queue = VecDeque::new();
@@ -4997,6 +4931,7 @@ mod tests {
             .expect("queue removal");
         match next_command(
             &mut cmd_rx,
+            &mut goal_rx,
             &mut steer_rx,
             &mut queue,
             &taken,
@@ -5013,6 +4948,7 @@ mod tests {
         queue.retain(|item| item.item_id != 1);
         match next_command(
             &mut cmd_rx,
+            &mut goal_rx,
             &mut steer_rx,
             &mut queue,
             &taken,
@@ -5036,6 +4972,37 @@ mod tests {
             })
             .collect();
         assert_eq!(claimed, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn a_pending_goal_start_precedes_its_followup_pause() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (goal_tx, mut goal_rx) = mpsc::unbounded_channel();
+        let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+        let mut queue = VecDeque::new();
+        let taken = OutstandingSteers::default();
+        let cfg = steer_test_config(std::path::Path::new("/tmp"), "http://127.0.0.1:1");
+        let ctl = |_event: CtlEvent| {};
+        cmd_tx
+            .send(Cmd::Goal {
+                arg: "new objective".into(),
+            })
+            .unwrap();
+        goal_tx.send(GoalControl::Pause).unwrap();
+        for expected in ["new objective", "pause"] {
+            let next = next_command(
+                &mut cmd_rx,
+                &mut goal_rx,
+                &mut steer_rx,
+                &mut queue,
+                &taken,
+                &cfg,
+                "s",
+                &ctl,
+            )
+            .await;
+            assert!(matches!(next, Some(Cmd::Goal { arg }) if arg == expected));
+        }
     }
 
     /// Acceptance means "the agent holds it": the text sits in the inbox until
@@ -5063,10 +5030,13 @@ mod tests {
         let taken: Arc<OutstandingSteers> = Arc::default();
         let (_interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+        let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
         let mut ctx = TurnCtx {
             session: "s",
             sink: &sink,
             interrupt_rx: &mut interrupt_rx,
+            goal_rx: &mut goal_rx,
+            pause_requested: false,
             steer_rx: &mut steer_rx,
             steer: steer.clone(),
             skills: &skills,

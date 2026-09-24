@@ -95,7 +95,7 @@ fn the_model_can_complete_the_goal() {
             ],
         )
         .limits(TurnLimits::default())
-        .goal("@4 finish the migration"),
+        .goal("finish the migration"),
     );
 
     assert!(
@@ -223,46 +223,38 @@ fn goal_rounds_emit_one_idle_status_after_the_last_round() {
     );
 }
 
-/// An active goal can remain armed after a failed round. A later user prompt
-/// then starts the remaining round; there must be no idle event between them,
-/// because the TUI dispatches its queued prompt on every idle event.
+/// A failed run is stopped explicitly; an ordinary prompt never re-arms it.
 #[test]
-fn an_armed_goal_keeps_the_user_turn_busy_until_its_followup_round_finishes() {
+fn a_failed_goal_does_not_resume_after_an_ordinary_prompt() {
     let run = common::drive(
         Scenario::new(
             "goal-prompt-status",
             vec![
                 Reply::error(400, "invalid_request_error"),
                 Reply::sse(text_body("msg-user", "working on it")),
-                Reply::sse(text_body("msg-round", "finished the next round")),
             ],
         )
         .goal("@2 make the widget faster")
-        .prompt("continue the work")
+        .prompt("answer this separate question")
         .goal("status"),
     );
-
-    let starts: Vec<usize> = run
-        .events
-        .iter()
-        .enumerate()
-        .filter_map(|(index, event)| event.starts_with("turn-start:").then_some(index))
-        .collect();
-    assert_eq!(starts.len(), 3, "{}", run.explain());
-    assert!(
-        !run.events[starts[1]..starts[2]]
-            .iter()
-            .any(|event| event == "status:false"),
-        "the user turn must not release the UI before the goal round: {}",
-        run.explain()
-    );
+    assert_eq!(run.count(), 2, "{}", run.explain());
     assert_eq!(
         run.events
             .iter()
-            .filter(|event| *event == "status:false")
+            .filter(|event| event.starts_with("op-done:goal round"))
             .count(),
-        2,
-        "one idle status per completed sequence: {}",
+        1,
+        "{}",
+        run.explain()
+    );
+    assert!(
+        run.events
+            .iter()
+            .any(|event| event.starts_with("op-done:goal ·")
+                && event.contains("blocked")
+                && event.contains("1/2")),
+        "{}",
         run.explain()
     );
 }

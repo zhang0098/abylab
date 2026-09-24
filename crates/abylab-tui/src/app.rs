@@ -177,7 +177,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "goal",
-        usage: "/goal [objective|pause|resume|complete|clear]",
+        usage: "/goal [@n] [objective|status|pause|resume|rounds <n|off>|complete|clear]",
         desc: "set or control the long-running goal",
     },
     SlashCommand {

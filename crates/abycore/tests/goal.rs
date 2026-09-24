@@ -28,7 +28,7 @@ async fn host_api_owns_the_lifecycle_and_round_allowance() {
 
     let goal = agent.set_goal("ship the release", Some(2)).unwrap();
     assert_eq!(goal.status, GoalStatus::Active);
-    assert_eq!(goal.max_rounds, 2);
+    assert_eq!(goal.max_rounds, Some(2));
     assert!(
         agent.set_goal("another", None).is_err(),
         "one goal per session while it is not complete"
@@ -36,7 +36,7 @@ async fn host_api_owns_the_lifecycle_and_round_allowance() {
 
     let first = agent.begin_goal_round().unwrap().expect("round one");
     assert_eq!(first.rounds_started, 1);
-    assert_eq!(first.remaining_rounds(), 1);
+    assert_eq!(first.remaining_rounds(), Some(1));
     let second = agent.begin_goal_round().unwrap().expect("round two");
     assert_eq!(second.rounds_started, 2);
     assert_eq!(
@@ -59,7 +59,8 @@ async fn host_api_owns_the_lifecycle_and_round_allowance() {
     assert!(agent.goal().is_none());
     // Round limits are validated before anything is stored.
     assert!(agent.set_goal("x", Some(0)).is_err());
-    assert!(agent.set_goal("x", Some(1_000)).is_err());
+    assert!(agent.set_goal("x", Some(1_000)).is_ok());
+    agent.clear_goal();
     assert!(agent.set_goal("   ", None).is_err());
 }
 
@@ -93,7 +94,9 @@ async fn model_tools_create_read_and_complete_the_goal() {
 
     let goal = agent.goal().cloned().expect("the tool created the goal");
     assert_eq!(goal.objective, "ship the release");
-    assert_eq!(goal.max_rounds, 3);
+    assert_eq!(goal.status, GoalStatus::Paused);
+    assert!(!goal.may_start_round());
+    assert_eq!(goal.max_rounds, Some(3));
     assert_eq!(goal.revision, 1);
     assert!(goal.id.starts_with("goal-"));
     let seen = events.lock().unwrap().clone();
@@ -308,9 +311,120 @@ async fn a_goal_round_trips_and_is_validated() {
     );
     assert_eq!(restored.goal.as_ref().unwrap().rounds_started, 1);
     let restored = Agent::restore(server.client(), restored).unwrap();
-    assert_eq!(restored.goal().unwrap().max_rounds, 5);
+    assert_eq!(restored.goal().unwrap().max_rounds, Some(5));
 
     let mut broken = SessionSnapshot::from_json(&json).unwrap();
-    broken.goal.as_mut().unwrap().max_rounds = 0;
+    broken.goal.as_mut().unwrap().max_rounds = Some(0);
     assert!(broken.validate().is_err());
+}
+
+#[tokio::test]
+async fn resuming_with_a_larger_total_preserves_identity_and_spent_rounds() {
+    let server = Server::start(vec![]).await;
+    let mut agent = agent(&server);
+    agent.set_goal("finish the migration", Some(1)).unwrap();
+    agent.begin_goal_round().unwrap();
+    let stopped = agent
+        .update_goal(
+            GoalStatus::Blocked,
+            Some("round allowance exhausted".into()),
+        )
+        .unwrap();
+    for allowance in [None, Some(0), Some(1)] {
+        assert!(agent.resume_goal(allowance).is_err());
+        assert_eq!(agent.goal(), Some(&stopped), "failed resume is atomic");
+    }
+    let resumed = agent.resume_goal(Some(3)).unwrap();
+    assert_eq!(
+        resumed,
+        Goal {
+            status: GoalStatus::Active,
+            max_rounds: Some(3),
+            revision: stopped.revision + 1,
+            note: None,
+            ..stopped
+        }
+    );
+    agent.begin_goal_round().unwrap();
+    agent.update_goal(GoalStatus::Paused, None).unwrap();
+    let paused = agent.goal().unwrap().clone();
+    assert!(agent.set_goal_rounds(Some(1)).is_err());
+    assert_eq!(agent.goal(), Some(&paused));
+    let extended = agent.set_goal_rounds(Some(5)).unwrap();
+    assert_eq!(
+        extended,
+        Goal {
+            max_rounds: Some(5),
+            revision: paused.revision + 1,
+            ..paused
+        }
+    );
+    assert_eq!(
+        extended.status,
+        GoalStatus::Paused,
+        "changing allowance never resumes"
+    );
+    agent.update_goal(GoalStatus::Complete, None).unwrap();
+    let complete = agent.goal().cloned();
+    assert!(agent.resume_goal(Some(10)).is_err());
+    assert_eq!(agent.goal().cloned(), complete);
+}
+
+#[tokio::test]
+async fn unlimited_goals_round_trip_and_only_explicit_limits_stop_rounds() {
+    let server = Server::start(vec![]).await;
+    let mut agent = agent(&server);
+    let goal = agent.set_goal("long task", None).unwrap();
+    assert_eq!(goal.max_rounds, None);
+    for _ in 0..150 {
+        assert!(agent.begin_goal_round().unwrap().is_some());
+    }
+    assert_eq!(agent.goal().unwrap().remaining_rounds(), None);
+    let snapshot = SessionSnapshot::from_json(&agent.snapshot().to_json().unwrap()).unwrap();
+    assert_eq!(snapshot.goal, agent.goal().cloned());
+    let limited = agent.set_goal_rounds(Some(150)).unwrap();
+    assert!(!limited.may_start_round());
+    assert!(agent.begin_goal_round().unwrap().is_none());
+    // An older snapshot's numeric max_rounds retains its original allowance.
+    let legacy = SessionSnapshot::from_json(&agent.snapshot().to_json().unwrap()).unwrap();
+    assert_eq!(legacy.goal.unwrap().max_rounds, Some(150));
+    let unlimited = agent.set_goal_rounds(None).unwrap();
+    assert_eq!(unlimited.id, goal.id);
+    assert_eq!(unlimited.rounds_started, 150);
+    assert!(agent.begin_goal_round().unwrap().is_some());
+    assert!(agent.set_goal_rounds(Some(1000)).is_ok());
+}
+
+#[tokio::test]
+async fn model_cannot_activate_a_paused_goal() {
+    let server = Server::start(vec![]).await;
+    let mut agent = agent(&server);
+    agent.set_goal("wait for authorization", Some(3)).unwrap();
+    let paused = agent.update_goal(GoalStatus::Paused, None).unwrap();
+    let server = Server::start(vec![
+        Reply::sse(response(
+            "r1",
+            vec![call(
+                "c1",
+                "update_goal",
+                &serde_json::json!({
+                    "goal_id": paused.id, "revision": paused.revision, "status": "active"
+                })
+                .to_string(),
+            )],
+        )),
+        Reply::sse(response(
+            "r2",
+            vec![message("m2", "resume requires the host")],
+        )),
+    ])
+    .await;
+    let mut restored = Agent::restore(server.client(), agent.snapshot()).unwrap();
+    restored.register_tool(UpdateGoalTool).unwrap();
+    restored
+        .run("attempt resume", RunOptions::default(), ignore)
+        .await
+        .unwrap();
+    assert_eq!(restored.goal(), Some(&paused));
+    assert!(restored.snapshot().items.iter().any(|item| matches!(item, Item::FunctionCallOutput { output, .. } if output.contains("only the host"))));
 }
