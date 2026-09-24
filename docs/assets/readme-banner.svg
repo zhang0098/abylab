@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="300" viewBox="0 0 1120 300" role="img" aria-labelledby="title desc">
+  <title id="title">abylab — DeepSeek, at home in your terminal.</title>
+  <desc id="desc">A minimalist DeepSeek harness. One executable, one process. Open source under the MIT license.</desc>
+  <rect width="1120" height="300" rx="16" fill="#f0f3e9"/>
+  <rect x="0.5" y="0.5" width="1119" height="299" rx="15.5" fill="none" stroke="#dce1d7"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <circle cx="57" cy="56" r="4" fill="#32684a"/>
+    <text x="72" y="61" font-size="11" letter-spacing="2" fill="#32684a">DEEPSEEK NATIVE / TERMINAL FIRST</text>
+    <text x="49" y="155" font-size="79" font-weight="700" letter-spacing="-6" fill="#202e29">abylab<tspan fill="#32684a">.</tspan></text>
+    <text x="54" y="195" font-size="17" fill="#65716a">DeepSeek, at home in your terminal.</text>
+    <text x="54" y="251" font-size="11" letter-spacing="1" fill="#65716a">RUST  /  LINUX + macOS  /  MIT</text>
+  </g>
+  <rect x="610" y="47" width="464" height="219" rx="10" fill="#dce5d3"/>
+  <rect x="600" y="37" width="464" height="219" rx="10" fill="#1e2922"/>
+  <path d="M610 37h444a10 10 0 0 1 10 10v27H600V47a10 10 0 0 1 10-10Z" fill="#2b382e"/>
+  <g fill="#b6c7a4"><circle cx="620" cy="56" r="3.5"/><circle cx="633" cy="56" r="3.5"/><circle cx="646" cy="56" r="3.5"/></g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">
+    <text x="790" y="60" fill="#a5b3a5">~/project</text>
+    <text x="628" y="108" fill="#b6d696">$ <tspan fill="#e3e9dd">abylab</tspan></text>
+    <text x="628" y="137" fill="#b6d696">a▌ <tspan fill="#e3e9dd" font-weight="700">abylab</tspan><tspan fill="#a5b3a5"> / DeepSeek</tspan></text>
+    <text x="628" y="165" fill="#a5b3a5">A little terminal. A place to build.</text>
+    <rect x="623" y="184" width="417" height="36" rx="5" fill="#29372b" stroke="#516447"/>
+    <text x="636" y="207" fill="#b6d696">› <tspan fill="#e3e9dd">Let's make something.</tspan></text>
+    <rect x="822" y="195" width="7" height="14" fill="#b6d696"/>
+    <text x="628" y="239" font-size="9" fill="#a5b3a5">ONE EXECUTABLE. ONE PROCESS. YOUR WORKSPACE.</text>
+  </g>
+</svg>

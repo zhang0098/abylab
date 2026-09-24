@@ -1,7 +1,7 @@
 # abylab.ai
 
 网站源码：纯静态，没有构建步骤，没有 npm 依赖。HTML + 一个样式表 + 一个很小的
-脚本，CSS 框架是自托管的 [Pico CSS](https://picocss.com/)（classless 用法）。
+脚本，基础样式来自自托管的 [Pico CSS](https://picocss.com/)，布局与配色由 `styles.css` 定义。
 整站零外部请求，托管在 Cloudflare Pages。
 
 ```
@@ -9,8 +9,8 @@ site/
   index.html            中文首页（默认）
   en/index.html         英文首页
   404.html              Pages 的 404 页（自动生效，返回 404 状态码）
-  styles.css            Pico 之上的薄薄一层：header、hero、安装块、footer
-  app.js                主题切换 + 复制按钮（全部前端逻辑）
+  styles.css            暖白 / 墨绿主题、终端预览、步骤、卡片与响应式布局
+  app.js                主题切换 + 复制按钮与状态反馈（全部前端逻辑）
   install.sh            安装脚本，仓库根目录那份的逐字节副本
   vendor/pico.min.css   Pico v2.1.1，自托管，不用 CDN
   favicon.svg · robots.txt · sitemap.xml
@@ -183,14 +183,16 @@ curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-
 ## 改内容
 
 - 文案只在两个 `index.html` 里，改中文别忘了 `en/index.html`；命令列表、体积这些
-  数字以站点为唯一出处（README 只留快速开始和一段按键），改动时两版页面一起改。
+  数字以站点为唯一出处（README 保留入门说明与快捷键速查），改动时两版页面一起改。
 - 按键不归站点管：真值是 `crates/abylab-tui/src/input/keymap.rs` 的 `KEY_ROWS` ——
   `/keys` 由它渲染（测试保证每个 Action 都有一行、每个写出来的键都真能解析回那个
-  Action），`/help` 是手写的同一份清单。站点上那行键位、两份 README 的「按键」段
+  Action），`/help` 是手写的同一份清单。站点的快捷键列表、两份 README 的快捷键表
   都只是手抄本：改键位以 keymap 为准，顺手把这四处一起同步。`ctrl+x` 从「立即
   发送」漂到「剪切选区」，就是只改了 TUI、站点没人管的下场。
-- `styles.css` 只做 Pico 变量之外的一点点事；能靠 Pico classless 解决的样式就
-  别往这儿加。
+- `styles.css` 定义站点的配色和布局，Pico 保留为基础样式。改样式时一起检查
+  中英文、深浅色和手机宽度；终端预览是 HTML 示意，不是可交互的终端。
+- README 的横幅是 `docs/assets/readme-banner.svg`，与站点共用墨绿配色，
+  使用系统字体，不依赖外链图片服务。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
 - 改了 `install.sh` 记得 `cp install.sh site/install.sh`（CI 会 diff 两份，忘了
   会直接挂）。
