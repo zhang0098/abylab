@@ -111,10 +111,10 @@ fn arrows_move_inside_a_draft_and_keep_browsing_active_history() {
 }
 
 #[test]
-fn expand_all_lives_on_ctrl_o_not_ctrl_e() {
+fn the_tool_output_cycle_lives_on_ctrl_o_not_ctrl_e() {
     assert_eq!(
         classify(&key(KeyCode::Char('o'), CTRL), empty()),
-        Some(Action::ToggleExpandAll)
+        Some(Action::CycleToolOutput)
     );
     assert_eq!(
         classify(&key(KeyCode::Char('e'), CTRL), empty()),
@@ -203,7 +203,7 @@ fn every_action_has_exactly_one_documented_row_except_typing_insert() {
         Action::Quit,
         Action::ClearScrollback,
         Action::ToggleTheme,
-        Action::ToggleExpandAll,
+        Action::CycleToolOutput,
         Action::SendNow,
         Action::EditQueuedPrompt,
         Action::AttachClipboard,

@@ -19,7 +19,7 @@ pub enum Action {
     Quit,
     ClearScrollback,
     ToggleTheme,
-    ToggleExpandAll,
+    CycleToolOutput,
     SendNow,
     /// `⌥↑`: pick one queued follow-up to edit in the composer.
     EditQueuedPrompt,
@@ -119,7 +119,7 @@ pub fn classify(key: &KeyEvent, ctx: KeyCtx) -> Option<Action> {
         KeyCode::Char('t') if ctrl => ToggleTheme,
         // ^o (not ^e): ghostty/iterm send ^e for ⌘→, and "explode the
         // transcript" on ⌘→ was evil.
-        KeyCode::Char('o') if ctrl => ToggleExpandAll,
+        KeyCode::Char('o') if ctrl => CycleToolOutput,
         KeyCode::Char('v') if ctrl => AttachClipboard,
         // ctrl+p (not ctrl+m): terminals send ctrl+m as the Enter byte.
         KeyCode::Char('p') if ctrl => ModelPicker,
@@ -857,13 +857,13 @@ pub const KEY_ROWS: &[KeyRow] = &[
         probes: &[p(KeyCode::Char('t'), CTRL, false)],
     },
     KeyRow {
-        action: ToggleExpandAll,
+        action: CycleToolOutput,
         group: KeyGroup::App,
         chords_mac: &["ctrl+o"],
         chords_other: &["ctrl+o"],
         ctx: CtxNote::Always,
-        desc_en: "expand/collapse thoughts + tool output",
-        desc_zh: "展开/折叠思考与工具输出",
+        desc_en: "cycle tool output: summary → preview → full",
+        desc_zh: "轮换工具输出：摘要 → 预览 → 全展开",
         probes: &[p(KeyCode::Char('o'), CTRL, false)],
     },
     KeyRow {

@@ -5,7 +5,7 @@
 //! results, injected context, subagent lifecycle, usage accounting, and turn
 //! outcomes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,6 +23,39 @@ pub const TOOL_VIEWPORT: usize = 4;
 const COLLAPSED_REASONING_PREVIEW: usize = 2;
 /// Thumbnail width in cells (PNG images reserve a box of this many columns).
 const THUMB_COLS: usize = 24;
+
+/// How the transcript paints tool calls. `ctrl+o` cycles the three, so a long
+/// agent run can open from full bodies down to one line per call and back
+/// without leaving the keyboard. The default is `Summary`: a turn's tool work
+/// reads as a short block of lines, and the cards are one chord away.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolOutput {
+    /// One card per call: a fixed tail preview plus a click-to-expand footer.
+    Preview,
+    /// One card per call showing the whole body.
+    Full,
+    /// One line per call — `Ran <command>` — grouped under a count header.
+    /// Failures keep their first line; a click expands that call's full output.
+    #[default]
+    Summary,
+}
+
+impl ToolOutput {
+    /// The next state in the `ctrl+o` cycle.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Preview => Self::Full,
+            Self::Full => Self::Summary,
+            Self::Summary => Self::Preview,
+        }
+    }
+
+    /// Whether every thought and tool body should be painted in full. `Summary`
+    /// deliberately does not expand thoughts: one line per call is the point.
+    pub fn expand_all(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
@@ -274,7 +307,8 @@ pub struct Transcript {
     /// Provenance-reported model of the last assembled assistant message —
     /// the ground truth of what actually answered.
     pub last_model: Option<String>,
-    pub expand_all: bool,
+    /// How tool calls are painted; `ctrl+o` cycles it.
+    pub tool_output: ToolOutput,
     /// Interface language for this timeline's own chrome: the notice wording,
     /// the tool-card footer, the reasoning heading. Payload text stays
     /// authored by its owner; `App` keeps this in sync with `/lang`.
@@ -301,7 +335,7 @@ impl Transcript {
             ttft_pending: false,
             last_finish: None,
             last_model: None,
-            expand_all: false,
+            tool_output: ToolOutput::default(),
             locale: Locale::default(),
         }
     }
@@ -973,6 +1007,18 @@ impl Transcript {
         )
     }
 
+    /// Whether a cell paints no row at all, so a summary-mode run of tool calls
+    /// on either side of it is still one block. Mirrors the `continue`s in
+    /// [`Transcript::layout`]; keep the two in step.
+    fn paints_nothing(&self, index: usize) -> bool {
+        match self.cells.get(index).map(|cell| &cell.kind) {
+            Some(CellKind::Assistant { text, .. }) => text.trim().is_empty(),
+            Some(CellKind::Plan { summary }) => summary.is_empty(),
+            Some(CellKind::MarkdownNotice { text }) => text.trim().is_empty(),
+            _ => false,
+        }
+    }
+
     /// Is any assistant/reasoning cell currently streaming?
     pub fn streaming(&self) -> bool {
         !self.open_assistant.is_empty() || !self.open_reasoning.is_empty()
@@ -1013,6 +1059,45 @@ impl Transcript {
             .filter(|ci| !self.pending_steering(*ci))
             .chain(pending.iter().copied())
             .collect();
+        // Summary mode paints one line per call, so consecutive calls share a
+        // single header counting them. Cells that paint nothing (an empty
+        // assistant husk between two steps) do not break a run: the two steps
+        // read as one block, which is what a long agent run looks like. The run
+        // is drawn as a tree — every call hangs off the head's dot, and the last
+        // one closes the branch — so `run_tails` names the closers.
+        let mut run_heads: HashMap<usize, ToolRun> = HashMap::new();
+        let mut run_tails: HashSet<usize> = HashSet::new();
+        if self.tool_output == ToolOutput::Summary {
+            let visible: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|ci| !self.paints_nothing(*ci))
+                .collect();
+            let mut at = 0;
+            while at < visible.len() {
+                if !matches!(self.cells[visible[at]].kind, CellKind::Tool { .. }) {
+                    at += 1;
+                    continue;
+                }
+                let head = visible[at];
+                let mut run = ToolRun::default();
+                while at < visible.len() {
+                    let CellKind::Tool { name, ok, .. } = &self.cells[visible[at]].kind else {
+                        break;
+                    };
+                    run.calls += 1;
+                    if name == "bash" {
+                        run.commands += 1;
+                    }
+                    if *ok == Some(false) {
+                        run.failed += 1;
+                    }
+                    at += 1;
+                }
+                run_heads.insert(head, run);
+                run_tails.insert(visible[at - 1]);
+            }
+        }
         let mut in_tail = false;
         for ci in order {
             let cell = &self.cells[ci];
@@ -1037,7 +1122,7 @@ impl Transcript {
                     None,
                 );
             }
-            let expanded = cell.expanded || self.expand_all;
+            let expanded = cell.expanded || self.tool_output.expand_all();
             match &cell.kind {
                 CellKind::User { text, delivery } => {
                     emit(&mut out, &mut owners, Line::default(), None);
@@ -1276,6 +1361,67 @@ impl Transcript {
                     error,
                     agent,
                 } => {
+                    if self.tool_output == ToolOutput::Summary {
+                        // The run head carries the counts for every call under
+                        // it; the calls themselves are one owned line each, so
+                        // a click still expands the one you clicked.
+                        if let Some(run) = run_heads.get(&ci) {
+                            emit(&mut out, &mut owners, Line::default(), None);
+                            // A big dot marks the block head, so the run reads as
+                            // one unit against the lines of calls under it. The
+                            // head sits at `fg_tertiary` — a step below the calls
+                            // themselves, a step above the hint greys.
+                            emit(
+                                &mut out,
+                                &mut owners,
+                                Line::from(vec![
+                                    Span::styled(
+                                        "● ".to_string(),
+                                        Style::default().fg(theme.fg_tertiary),
+                                    ),
+                                    Span::styled(
+                                        tool_run_headline(self.locale, *run),
+                                        Style::default().fg(theme.fg_tertiary),
+                                    ),
+                                ]),
+                                None,
+                            );
+                        }
+                        let (line, rows) = tool_summary_rows(
+                            theme,
+                            width,
+                            spinner,
+                            &SummaryCall {
+                                name,
+                                title,
+                                result,
+                                ok: *ok,
+                                error: error.as_deref(),
+                                agent: agent.as_deref(),
+                            },
+                            expanded,
+                            run_tails.contains(&ci),
+                        );
+                        emit(&mut out, &mut owners, line, Some(ci));
+                        let bar = match ok {
+                            Some(false) => theme.err,
+                            _ => theme.border,
+                        };
+                        for row in rows {
+                            // The body hangs off the branch's own column, so the
+                            // text under a call lines up with its label.
+                            emit(
+                                &mut out,
+                                &mut owners,
+                                Line::from(vec![
+                                    Span::styled("│  ".to_string(), Style::default().fg(bar)),
+                                    Span::styled(row, Style::default().fg(theme.fg_tertiary)),
+                                ]),
+                                Some(ci),
+                            );
+                        }
+                        continue;
+                    }
                     emit(&mut out, &mut owners, Line::default(), None);
                     let body = result.trim_end();
                     let all: Vec<String> = if body.is_empty() {
@@ -1588,6 +1734,184 @@ fn agent_prefix(agent: &Option<String>) -> String {
     }
 }
 
+/// What one summary-mode run of consecutive tool calls contains: the count the
+/// block header reports, and the two subsets worth breaking out.
+#[derive(Clone, Copy, Default)]
+struct ToolRun {
+    calls: usize,
+    /// Calls to `bash` — the shell work, which is what a run usually is.
+    commands: usize,
+    failed: usize,
+}
+
+/// The header over a summary-mode run: `13 tool calls · 13 commands · 1 failed`.
+/// The `commands` and `failed` segments are dropped when they are zero, so a run
+/// of reads does not claim to have run no commands.
+fn tool_run_headline(locale: Locale, run: ToolRun) -> String {
+    let mut parts = vec![match (locale, run.calls) {
+        (Locale::En, 1) => "1 tool call".to_string(),
+        (Locale::En, n) => format!("{n} tool calls"),
+        (Locale::Zh, n) => format!("{n} 次工具调用"),
+    }];
+    if run.commands > 0 {
+        parts.push(match (locale, run.commands) {
+            (Locale::En, 1) => "1 command".to_string(),
+            (Locale::En, n) => format!("{n} commands"),
+            (Locale::Zh, n) => format!("{n} 条命令"),
+        });
+    }
+    if run.failed > 0 {
+        parts.push(match (locale, run.failed) {
+            (Locale::En, 1) => "1 failed".to_string(),
+            (Locale::En, n) => format!("{n} failed"),
+            (Locale::Zh, n) => format!("{n} 条失败"),
+        });
+    }
+    parts.join(" · ")
+}
+
+/// The label a summary-mode call leads with: a verb for the tools we can name
+/// (`Ran ls -la`), the tool's own name for the rest. The verb stays English in
+/// every locale: it opens a line whose payload is a command or a path, and the
+/// un-named tools beside it already show their English tool names (`bash`,
+/// `read`). The chrome around the block — the count header, the click hints —
+/// still follows the interface language.
+fn tool_summary_label(name: &str, title: &str) -> String {
+    let verb = match name {
+        "bash" => "Ran",
+        "read" => "Read",
+        "write" => "Wrote",
+        "edit" | "str_replace_editor" => "Edited",
+        "web_search" => "Searched",
+        _ => "",
+    };
+    match (verb.is_empty(), title.is_empty()) {
+        (true, true) => name.to_string(),
+        (true, false) => format!("{name} {title}"),
+        (false, true) => verb.to_string(),
+        (false, false) => format!("{verb} {title}"),
+    }
+}
+
+/// The facts one summary-mode line is built from: a tool cell's label parts and
+/// its outcome.
+struct SummaryCall<'a> {
+    name: &'a str,
+    title: &'a str,
+    result: &'a str,
+    ok: Option<bool>,
+    error: Option<&'a str>,
+    agent: Option<&'a str>,
+}
+
+/// One call in summary mode: the glyph, the label (or a failure's own first
+/// line), the `▸`/`▾` hint — plus the body rows to paint underneath when the
+/// call is expanded. A failure leads with its message rather than a verb: the
+/// text already names what went wrong, and only its first line shows until the
+/// call is clicked.
+fn tool_summary_rows(
+    theme: &Theme,
+    width: usize,
+    spinner: char,
+    call: &SummaryCall<'_>,
+    expanded: bool,
+    closes_run: bool,
+) -> (Line<'static>, Vec<String>) {
+    let SummaryCall {
+        name,
+        title,
+        result,
+        ok,
+        error,
+        agent,
+    } = *call;
+    let failed = ok == Some(false);
+    // The run is a tree under the head's dot: every call hangs off `├─`, and
+    // the last one closes the branch with `└─`. A finished call wears no other
+    // bullet: the line is the command itself, which is as compact as a tool call
+    // gets. A call still running keeps its spinner — that is the only thing
+    // saying it has not landed yet.
+    let branch = if closes_run { "└─ " } else { "├─ " };
+    let lead = match ok {
+        None => Some((spinner, Style::default().fg(theme.brand))),
+        Some(_) => None,
+    };
+    let lead_cells = branch.width() + if lead.is_some() { 2 } else { 0 };
+    // The call's own text column, which the expanded body shares (the caller
+    // hangs the body off a `│` in the same column as the branch).
+    let inner = width.saturating_sub(branch.width());
+    let (label, rows) = if failed {
+        let message = error
+            .map(str::trim_end)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| result.trim_end());
+        let rows = wrap_rows(message, inner);
+        let head = rows
+            .first()
+            .cloned()
+            // English like the verbs: this heads the same kind of line.
+            .unwrap_or_else(|| "failed".to_string());
+        (head, rows)
+    } else {
+        (
+            tool_summary_label(name, title),
+            wrap_rows(result.trim_end(), inner),
+        )
+    };
+    // The hint only appears when there is something behind the click — a body
+    // for a success, a second line for a failure.
+    let hidden = if failed {
+        rows.len() > 1
+    } else {
+        !rows.is_empty()
+    };
+    let tail = match (hidden, expanded) {
+        (false, _) => "",
+        (true, true) => " ▾",
+        (true, false) => " ▸",
+    };
+    let note = agent.map_or_else(String::new, |a| format!(" · {a}"));
+    let mut spans = Vec::new();
+    spans.push(Span::styled(
+        branch,
+        Style::default().fg(if failed { theme.err } else { theme.border }),
+    ));
+    if let Some((glyph, style)) = lead {
+        spans.push(Span::styled(format!("{glyph} "), style));
+    }
+    // The call reads at `fg_secondary`: a shade down from prose so a wall of
+    // calls recedes, but well clear of the footer/hint greys.
+    spans.push(Span::styled(
+        clamp_str(
+            &label,
+            width.saturating_sub(lead_cells + note.width() + tail.width()),
+        ),
+        Style::default().fg(if failed {
+            theme.err
+        } else {
+            theme.fg_secondary
+        }),
+    ));
+    if !note.is_empty() {
+        spans.push(Span::styled(note, Style::default().fg(theme.caption)));
+    }
+    if !tail.is_empty() {
+        spans.push(Span::styled(
+            tail.to_string(),
+            Style::default().fg(theme.caption),
+        ));
+    }
+    (Line::from(spans), if expanded { rows } else { Vec::new() })
+}
+
+/// Wrap `text` to `inner` columns, one entry per painted row.
+fn wrap_rows(text: &str, inner: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.lines().flat_map(|raw| wrap(raw, inner)).collect()
+}
+
 /// Human title for a tool call, parsed from its raw JSON argument string.
 pub fn tool_title(name: &str, arguments: &str) -> String {
     let parsed: Option<serde_json::Value> = serde_json::from_str(arguments).ok();
@@ -1603,6 +1927,26 @@ pub fn tool_title(name: &str, arguments: &str) -> String {
                 let path = v.get("path").and_then(|c| c.as_str()).unwrap_or("");
                 if !cmd.is_empty() || !path.is_empty() {
                     return one_line(&format!("{cmd} {path}"));
+                }
+            }
+            // The file tools title themselves by the path they touched: the raw
+            // argument object is noise a card — and even more a one-line summary
+            // — should not carry.
+            "read" | "write" | "edit" => {
+                if let Some(path) = v.get("file_path").and_then(|c| c.as_str()) {
+                    return one_line(path);
+                }
+            }
+            "web_search" => {
+                if let Some(queries) = v.get("queries").and_then(|q| q.as_array()) {
+                    let joined: Vec<&str> = queries
+                        .iter()
+                        .filter_map(|q| q.as_str())
+                        .filter(|q| !q.is_empty())
+                        .collect();
+                    if !joined.is_empty() {
+                        return one_line(&joined.join(", "));
+                    }
                 }
             }
             _ => {}
@@ -2028,6 +2372,8 @@ mod tests {
             "{notices:?}"
         );
 
+        // The card footer is what this test is about: the default is summary.
+        tr.tool_output = ToolOutput::Preview;
         let theme = Theme::dark();
         let rendered: String = tr
             .lines(&theme, 40, ' ')
@@ -2258,7 +2604,10 @@ mod tests {
         let CellKind::Tool { title, .. } = &tr.cells[0].kind else {
             panic!("expected tool")
         };
-        assert_eq!(title, r#"{"file_path":"/tmp/a.txt"}"#);
+        assert_eq!(
+            title, "/tmp/a.txt",
+            "a file tool titles itself by the path it touched"
+        );
 
         // A call whose stream produced no delta (e.g. a resumed pending call)
         // still gets its card from ToolStarted, as before.
@@ -2570,6 +2919,8 @@ mod tests {
         let text = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8";
         let mut tr = t("s");
         tr.set_locale(Locale::En);
+        // The cards are one chord away from the default summary mode.
+        tr.tool_output = ToolOutput::Preview;
         tr.apply(UiEvent::ToolCall {
             session: "s".into(),
             call_id: "c1".into(),
@@ -2605,14 +2956,325 @@ mod tests {
         assert!(!p.contains("l4"), "l4 above the tail window is hidden: {p}");
         assert!(p.contains("l8"), "tail line visible: {p}");
 
-        // expand_all (ctrl+o) opens the whole body and drops the footer.
-        tr.expand_all = true;
+        // full (ctrl+o) opens the whole body and drops the footer.
+        tr.tool_output = ToolOutput::Full;
         let lines = tr.lines(&theme, 40, ' ');
         let p = plain(&lines);
-        assert!(p.contains("l1"), "expand_all shows the top: {p}");
+        assert!(p.contains("l1"), "full mode shows the top: {p}");
         assert!(
             !p.contains("click to expand"),
             "no footer when expanded: {p}"
+        );
+    }
+
+    /// Flatten a rendered transcript to one string for `contains` assertions.
+    fn flat(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    }
+
+    /// One finished tool call, as the UI sees it: a card created by `ToolCall`
+    /// and closed by `ToolResult`. `error` marks the call failed and is what the
+    /// summary line leads with.
+    fn call(
+        tr: &mut Transcript,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        text: &str,
+        error: Option<&str>,
+    ) {
+        tr.apply(UiEvent::ToolCall {
+            session: "s".into(),
+            call_id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        });
+        tr.apply(UiEvent::ToolResult {
+            session: "s".into(),
+            call_id: id.into(),
+            is_error: error.is_some(),
+            text: text.into(),
+            error: error.map(str::to_string),
+        });
+    }
+
+    /// Summary mode draws the run as a tree: every call hangs off the head's
+    /// dot on `├─`, the last one closes the branch with `└─`, and an expanded
+    /// body hangs off a `│` in the branch's own column — the text lines up
+    /// under the call's label.
+    #[test]
+    fn summary_draws_the_run_as_a_tree() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        tr.tool_output = ToolOutput::Summary;
+        call(&mut tr, "c1", "bash", r#"{"command":"ls"}"#, "a", None);
+        call(&mut tr, "c2", "bash", r#"{"command":"pwd"}"#, "b", None);
+        let theme = Theme::dark();
+        let p = flat(&tr.lines(&theme, 60, ' '));
+        assert!(p.contains("● 2 tool calls · 2 commands"), "{p}");
+        assert!(
+            p.contains("├─ Ran ls"),
+            "the first call opens the branch: {p}"
+        );
+        assert!(p.contains("└─ Ran pwd"), "the last call closes it: {p}");
+        assert_eq!(p.matches('├').count(), 1, "{p}");
+        assert_eq!(p.matches('└').count(), 1, "{p}");
+
+        // A single-call run closes on its own.
+        let mut one = t("s");
+        one.set_locale(Locale::En);
+        one.tool_output = ToolOutput::Summary;
+        call(&mut one, "c1", "bash", r#"{"command":"ls"}"#, "a\nb", None);
+        let p = flat(&one.lines(&theme, 60, ' '));
+        assert!(p.contains("└─ Ran ls"), "{p}");
+        assert!(!p.contains('├'), "a lone call is the whole branch: {p}");
+
+        // The body hangs off the branch's column (three cells), so it lines up
+        // with the label the branch introduced.
+        one.cells[0].expanded = true;
+        let opened = one.lines(&theme, 60, ' ');
+        let p = flat(&opened);
+        assert!(p.contains("│  a"), "the body gutter: {p}");
+        assert_eq!(
+            opened
+                .iter()
+                .filter(|l| l.spans.first().is_some_and(|s| s.content == "│  "))
+                .count(),
+            2,
+            "one gutter per body row: {p}"
+        );
+    }
+
+    /// The verbs in a summary line stay English in every locale: the line they
+    /// open carries a command or a path, and the un-named tools beside them
+    /// already show their English tool names. The chrome around the block still
+    /// follows the interface language.
+    #[test]
+    fn summary_verbs_stay_english_in_every_locale() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::Zh);
+        call(&mut tr, "c1", "bash", r#"{"command":"ls -la"}"#, "a", None);
+        call(
+            &mut tr,
+            "c2",
+            "read",
+            r#"{"file_path":"src/main.rs"}"#,
+            "b",
+            None,
+        );
+        call(
+            &mut tr,
+            "c3",
+            "web_search",
+            r#"{"queries":["rust"]}"#,
+            "c",
+            None,
+        );
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert!(p.contains("Ran ls -la"), "{p}");
+        assert!(p.contains("Read src/main.rs"), "{p}");
+        assert!(p.contains("Searched rust"), "{p}");
+        for zh_word in ["运行", "读取", "搜索"] {
+            assert!(!p.contains(zh_word), "{zh_word} must not be a verb: {p}");
+        }
+        assert!(
+            p.contains("3 次工具调用"),
+            "the count header stays Chinese: {p}"
+        );
+    }
+
+    /// The default is the one-line mode: a fresh transcript folds tool calls
+    /// into the summary block, and `ctrl+o` opens up from there.
+    #[test]
+    fn the_default_tool_output_is_the_one_line_summary() {
+        assert_eq!(ToolOutput::default(), ToolOutput::Summary);
+        assert_eq!(
+            ToolOutput::default().cycle(),
+            ToolOutput::Preview,
+            "the chord opens up from the default, it does not start over"
+        );
+
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        call(&mut tr, "c1", "bash", r#"{"command":"ls"}"#, "a", None);
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert!(p.contains("1 tool call · 1 command"), "{p}");
+        assert!(p.contains("└─ Ran ls"), "{p}");
+    }
+
+    #[test]
+    fn summary_paints_one_line_per_call_under_one_header() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        tr.tool_output = ToolOutput::Summary;
+        call(
+            &mut tr,
+            "c1",
+            "bash",
+            r#"{"command":"ls -la"}"#,
+            "one\ntwo",
+            None,
+        );
+        call(&mut tr, "c2", "bash", r#"{"command":"pwd"}"#, "x", None);
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert!(p.contains("2 tool calls · 2 commands"), "{p}");
+        assert!(
+            p.contains("● 2 tool calls · 2 commands"),
+            "the block head is marked with a dot: {p}"
+        );
+        assert!(p.contains("Ran ls -la"), "{p}");
+        assert!(p.contains("Ran pwd"), "{p}");
+        assert!(!p.contains('│'), "bodies stay behind the click: {p}");
+    }
+
+    #[test]
+    fn summary_header_breaks_out_commands_and_failures() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        tr.tool_output = ToolOutput::Summary;
+        call(
+            &mut tr,
+            "c1",
+            "read",
+            r#"{"file_path":"a.rs"}"#,
+            "text",
+            None,
+        );
+        call(&mut tr, "c2", "bash", r#"{"command":"ls"}"#, "ok", None);
+        call(
+            &mut tr,
+            "c3",
+            "bash",
+            r#"{"command":"boom"}"#,
+            "first\nsecond",
+            Some("first\nsecond"),
+        );
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert!(p.contains("3 tool calls · 2 commands · 1 failed"), "{p}");
+        assert!(p.contains("Read a.rs"), "the path titles the call: {p}");
+        assert!(p.contains("Ran ls"), "{p}");
+        assert!(
+            p.contains("first"),
+            "the failure leads with its message: {p}"
+        );
+        assert!(!p.contains("second"), "the rest waits for a click: {p}");
+        assert!(
+            !p.contains("Ran boom"),
+            "a failure does not claim a verb: {p}"
+        );
+    }
+
+    #[test]
+    fn summary_failure_opens_on_click() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        tr.tool_output = ToolOutput::Summary;
+        call(
+            &mut tr,
+            "c1",
+            "bash",
+            r#"{"command":"boom"}"#,
+            "first\nsecond",
+            Some("first\nsecond"),
+        );
+        let theme = Theme::dark();
+        let collapsed = flat(&tr.lines(&theme, 60, ' '));
+        assert!(
+            collapsed.contains("▸"),
+            "a hidden line is hinted: {collapsed}"
+        );
+
+        // The click lands on the cell the summary line owns.
+        let layout = tr.layout(&theme, 60, ' ', false);
+        let ci = layout
+            .owners
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .expect("the call line is owned");
+        tr.cells[ci].expanded = true;
+
+        let opened = flat(&tr.lines(&theme, 60, ' '));
+        assert!(
+            opened.contains("second"),
+            "the click reveals the rest: {opened}"
+        );
+        assert!(
+            opened.contains("│ "),
+            "the body hangs off the call: {opened}"
+        );
+        assert!(opened.contains("▾"), "the hint flips once open: {opened}");
+    }
+
+    #[test]
+    fn summary_run_survives_an_empty_assistant_husk_between_steps() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        tr.tool_output = ToolOutput::Summary;
+        call(&mut tr, "c1", "bash", r#"{"command":"ls"}"#, "a", None);
+        // A step that called a tool without saying anything leaves a husk the
+        // renderer skips; the two steps still read as one block.
+        tr.cells.push(Cell::new(CellKind::Assistant {
+            text: String::new(),
+            done: true,
+            model: None,
+            agent: None,
+        }));
+        call(&mut tr, "c2", "bash", r#"{"command":"pwd"}"#, "b", None);
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert!(p.contains("2 tool calls · 2 commands"), "{p}");
+        assert_eq!(p.matches("Ran ").count(), 2, "{p}");
+    }
+
+    #[test]
+    fn summary_run_stops_at_a_painted_cell() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        tr.tool_output = ToolOutput::Summary;
+        call(&mut tr, "c1", "bash", r#"{"command":"ls"}"#, "a", None);
+        tr.cells.push(Cell::new(CellKind::Assistant {
+            text: "here is what I found".into(),
+            done: true,
+            model: None,
+            agent: None,
+        }));
+        call(&mut tr, "c2", "bash", r#"{"command":"pwd"}"#, "b", None);
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert_eq!(
+            p.matches("1 tool call · 1 command").count(),
+            2,
+            "each run heads its own block: {p}"
+        );
+    }
+
+    #[test]
+    fn full_and_preview_modes_leave_the_summary_alone() {
+        let mut tr = t("s");
+        tr.set_locale(Locale::En);
+        tr.tool_output = ToolOutput::Preview;
+        call(&mut tr, "c1", "bash", r#"{"command":"ls"}"#, "a\nb", None);
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert!(!p.contains("Ran "), "preview keeps the card: {p}");
+        assert!(!p.contains("tool call"), "preview has no run header: {p}");
+        tr.tool_output = ToolOutput::Full;
+        let p = flat(&tr.lines(&Theme::dark(), 60, ' '));
+        assert!(!p.contains("Ran "), "full keeps the card: {p}");
+    }
+
+    #[test]
+    fn tool_output_cycles_preview_full_summary() {
+        assert_eq!(ToolOutput::Preview.cycle(), ToolOutput::Full);
+        assert_eq!(ToolOutput::Full.cycle(), ToolOutput::Summary);
+        assert_eq!(ToolOutput::Summary.cycle(), ToolOutput::Preview);
+        assert!(ToolOutput::Full.expand_all());
+        assert!(!ToolOutput::Preview.expand_all());
+        assert!(
+            !ToolOutput::Summary.expand_all(),
+            "summary is about one line per call, not expanded thoughts"
         );
     }
 

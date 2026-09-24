@@ -24,7 +24,7 @@ use crate::input::Action;
 use crate::locale::{Locale, UiSettings};
 use crate::runtime::{settings_path, RuntimeConfig};
 use crate::theme::Theme;
-use crate::transcript::{clamp_str, NoticeLevel, Transcript};
+use crate::transcript::{clamp_str, NoticeLevel, ToolOutput, Transcript};
 
 pub const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -3630,18 +3630,22 @@ impl App {
                     self.theme.mode.as_str()
                 ));
             }
-            Action::ToggleExpandAll => {
-                self.transcript.expand_all = !self.transcript.expand_all;
-                self.show_tip(if self.transcript.expand_all {
-                    self.locale.tr(
-                        "expanded all thoughts and tool results",
-                        "已展开全部思考与工具结果",
-                    )
-                } else {
-                    self.locale.tr(
-                        "collapsed all thoughts and tool results",
-                        "已折叠全部思考与工具结果",
-                    )
+            Action::CycleToolOutput => {
+                self.transcript.tool_output = self.transcript.tool_output.cycle();
+                let mode = self.transcript.tool_output;
+                self.show_tip(match mode {
+                    ToolOutput::Preview => self.locale.tr(
+                        "tool output: preview · one card per call",
+                        "工具输出：预览 · 每次调用一张卡片",
+                    ),
+                    ToolOutput::Full => self.locale.tr(
+                        "tool output: full · every thought and result expanded",
+                        "工具输出：全展开 · 思考与结果全部展开",
+                    ),
+                    ToolOutput::Summary => self.locale.tr(
+                        "tool output: summary · one line per call",
+                        "工具输出：摘要 · 每次调用一行",
+                    ),
                 });
             }
             Action::SendNow => {
@@ -5417,7 +5421,7 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - !cmd · 在会话级本地 shell 中运行命令，不经过 Agent；初始目录为 workspace，cd/环境变量跨命令保留
 - /<skill> · 手打的技能行由 Agent 注入技能正文（技能不进 / 菜单）
 - /skill · 列出/调用本工作区的技能（`.agents/skills/`）：/skill <名字> [参数]；空格后是候选清单
-- ctrl+o · 展开思考和工具输出 · ctrl+l · 清屏
+- ctrl+o · 轮换工具输出：摘要（默认）→ 预览 → 全展开 · ctrl+l · 清屏
 - 编辑 · readline 组合键 + ⌘/⌥ 方向键 · 完整映射见 /keys
 - 点击工具 · 展开/折叠 · 滚轮滚动对话
 - pgup/pgdn · 翻页 · end 回到最新消息
@@ -5446,7 +5450,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - !cmd · run in the session's local shell (not the agent); starts in the workspace, keeps cd/env across commands
 - /<skill> · a hand-typed skill line — the agent injects the skill's body (skills never list under /)
 - /skill · list or run this workspace's skills (`.agents/skills/`) — `/skill ` opens the catalog, Tab completes
-- ctrl+o · expand thoughts + tool output · ctrl+l · clear
+- ctrl+o · cycle tool output: summary (default) → preview → full · ctrl+l · clear
 - editing · readline chords + ⌘/⌥ arrows (ctrl+arrows elsewhere) · full map in /keys
 - click tool · expand/collapse that tool · wheel scrolls the conversation
 - pgup/pgdn · scroll · mouse wheel works · end follows the tail
