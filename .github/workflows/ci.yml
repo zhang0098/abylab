@@ -39,6 +39,31 @@ jobs:
           fi
           echo "site/install.sh matches install.sh"
 
+      # Deploying references the CSS and JS under hashed URLs, so a stale copy
+      # can never outlive a deploy. If the rewrite breaks, the deployed HTML
+      # points at a file nobody uploaded and every visitor gets an unstyled
+      # page — worth a check that does not need a deploy to find out.
+      - name: Staged pages reference the hashed assets
+        run: |
+          set -euo pipefail
+          rm -rf staging-check
+          scripts/stage-site.sh staging-check
+          for asset in styles.css app.js vendor/pico.min.css; do
+            hash=$(sha256sum "staging-check/$asset" | cut -c1-12)
+            for page in staging-check/index.html staging-check/en/index.html staging-check/404.html; do
+              if ! grep -q "/$asset?v=$hash" "$page"; then
+                echo "::error::$page does not reference /$asset?v=$hash"
+                exit 1
+              fi
+              if grep -q "\"/$asset\"" "$page"; then
+                echo "::error::$page still links /$asset unversioned"
+                exit 1
+              fi
+            done
+          done
+          rm -rf staging-check
+          echo "staged pages carry content-hashed asset URLs"
+
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal \

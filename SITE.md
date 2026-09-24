@@ -149,7 +149,8 @@ GitHub Releases 慢或被墙的网络留一条路：
   快照，所以谁跑都得把另一半带上。组目录这件事收在 `scripts/stage-site.sh`：
   mirror job 用 `stage-site.sh staging $TAG`（站点 + 安装包），`site.yml` 用最新
   tag 调同一个脚本。在此之前 `site.yml` 是直接 `pages deploy site`，于是任何
-  `site/**` 的推送都会把 `/downloads/*` 从线上抹掉。
+  `site/**` 的推送都会把 `/downloads/*` 从线上抹掉。它还负责给静态资源加内容
+  哈希，见下面「改内容」里的那条。
 - **site/ 取默认分支，不取 tag**：站点不跟着版本走，所以 mirror job 的 checkout
   用的是默认分支。回填旧 tag（`-f tag=v0.1.1`）时如果跟着 tag 取 `site/`，推上
   去的就是那个 tag 当时的站点——没有 `site/install.sh`、`_redirects` 里还带着
@@ -195,6 +196,12 @@ curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-
 - README 的横幅是 `docs/assets/readme-banner.svg`，与站点共用墨绿配色，
   使用系统字体，不依赖外链图片服务。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
+- 改 CSS / JS 不用改版本号、也不用清缓存：`scripts/stage-site.sh` 在每次部署时
+  按文件内容把 HTML 里的 `/styles.css`、`/app.js`、`/vendor/pico.min.css` 改写成
+  `?v=<sha256 前 12 位>`。HTML 本身每次加载都会回源校验，所以换了内容就是换了
+  URL，回访者立刻拿到新的那份。这条不是洁癖：zone 的 Browser Cache TTL 是 4 小时，
+  `_headers` 里写更短的值会被它盖掉（曾经写过 3600，线上发出来的是 14400），
+  而旧样式配新 HTML 正好是「页面显示不正确」的样子。CI 里有一条检查盯着这个改写。
 - 改了 `install.sh` 记得 `cp install.sh site/install.sh`（CI 会 diff 两份，忘了
   会直接挂）。
 
@@ -221,6 +228,8 @@ sha256sum site/vendor/pico.min.css      # 与上面那行比对，然后更新�
 ```
 
 版本号和哈希同时写在上面这个块里和本文件开头的目录清单里，升级后两处都要改。
+换上去之后不用管缓存：部署时引用的 URL 会带上内容哈希（`?v=fbc9a63fc9fc` 这种），
+`_headers` 里那 7 天是给同一个 URL 的。
 
 想确认线上确实没有任何外链，抓一下页面里的静态资源引用就够了——它们必须全
 是本站路径（`canonical` / `alternate` 是给搜索引擎看的声明，不是会去请求的
