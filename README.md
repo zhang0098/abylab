@@ -39,7 +39,7 @@ abylab 不读 `DEEPSEEK_API_KEY`，也不读任何别的变量；`--api-key <key
 ## 按键
 
 enter 发送 / 排队 · ctrl+enter 立即发送 · alt+↑（mac ⌥↑）编辑排队消息 ·
-esc 中断 / 双击清空草稿 · ctrl+c 清空 / 退出 · ↑ 历史 · `/` 命令 · `@` 文件提及 ·
+esc 连按两次中断 / 清空草稿 · ctrl+c 清空 / 退出 · ↑ 历史 · `/` 命令 · `@` 文件提及 ·
 ctrl+z 撤销 · ctrl+p 模型 · ctrl+t 主题 · shift+tab 权限预设
 
 `alt+↑` 只在有排队消息、草稿为空时打开列表：`↑/↓` 选择 · `enter` 编辑 ·

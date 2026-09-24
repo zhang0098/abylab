@@ -398,8 +398,8 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_mac: &["esc"],
         chords_other: &["esc"],
         ctx: CtxNote::Always,
-        desc_en: "close / suggestions · cancel edit · interrupt",
-        desc_zh: "关闭 / 推荐 · 取消编辑 · 中断",
+        desc_en: "close / suggestions · cancel edit · esc twice interrupts a turn",
+        desc_zh: "关闭 / 推荐 · 取消编辑 · 连按两次中断本轮",
         probes: &[p(KeyCode::Esc, NONE, false)],
     },
     KeyRow {
@@ -913,11 +913,6 @@ pub const MOUSE_ROWS: &[MouseRow] = &[
         chords: &["click ↥"],
         desc_en: "jump to your prompt on the composer cap's right end",
         desc_zh: "跳到输入框上沿右端的 ↥ 处（你上一条输入）",
-    },
-    MouseRow {
-        chords: &["click ⛶"],
-        desc_en: "pin the input well to the amplified height · click again to restore",
-        desc_zh: "把输入框固定到放大高度 · 再点一下还原（无快捷键）",
     },
     MouseRow {
         chords: &["drag"],

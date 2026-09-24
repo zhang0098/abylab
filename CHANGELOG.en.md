@@ -10,12 +10,49 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Added
+
+- The composer border's top-left now carries `abylab.ai`, like a window title. That cell used to stay
+  empty when the app was idle; a tip or the todo checklist takes the row while it is up, and the brand
+  returns when it expires.
+- The preview card of a staged image now pops up by itself after `/clip` (and ctrl+v, or an `@`-picked
+  image) and stays on screen. It used to appear only while the mouse hovered the chip or the text cursor
+  sat in or right after it, so the first character of the caption you typed took it away — you could not
+  look at the picture while writing about it. A freshly staged image is now pinned: the card lives
+  exactly as long as that image does (⌫ on the chip, esc clearing the draft, or sending all take it
+  with them), while hovering another chip still previews that one. The `/help` line for `/clip` says so.
+
+### Fixed
+
+- With an empty draft the caret block sat on the first glyph of the placeholder hint, boxing that
+  character. The hint is now ghost text one cell right of the caret, which keeps a blank cell of its
+  own (reversed into a solid block) and looks like the caret over a real draft.
+- The caret stayed in the composer while the `ask_user_question` dialog's "Other" field was selected.
+  A card owns the whole keyboard while it is up (every key reaches it first, the draft gets none), yet the
+  composer still painted its caret block on the draft — and the IME popup anchored there too, so typing
+  into the dialog looked like typing into the input box. The composer now paints no caret while any card
+  owns the keyboard; the question dialog paints one in its own `Other:` field — right after the label on
+  an empty field, which no longer carries a "type an answer" hint (the caret is the affordance), then
+  riding the tail of what you type — and a permission card stacked over the dialog leaves no caret on
+  either side.
+
 ### Changed
 
+- Interrupting the running turn now takes two `esc` presses. One press used to cancel outright, so a
+  stray keypress threw away the turn in flight; the first press now only arms — a tip says "press esc
+  again to interrupt", live for 1.5s, the same chord shape `ctrl+c` quit wears — and the second one
+  cancels. Neither touches the draft. Closing a card, cancelling a queue edit and dismissing suggestions
+  stay single-press, and `/help`, `/keys` and both READMEs say so.
+- A dot now separates the workspace title from the `↥` glyph at the right end of the composer cap, in the
+  same pale tone as the title itself: `· ~/project/abylab:main · ↥`.
 - The install one-liner is now `curl -fsSL https://abylab.ai/install.sh | bash` — the same script at the
   same URL, without the `/bin/bash -c "$(…)"` wrapper. Both READMEs, the site hero, `install.sh --help`
   and the note in `site/_redirects` all switched. The script never reads stdin (the `read` behind the
   PATH step consumes its own heredoc), so piping it into `bash` cannot eat the script.
+- Dropped the `⛶` expand button at the right end of the composer cap. It was mouse-only: one click pinned
+  the input well to 5/8 of the frame, another restored it. The well now only grows with the draft
+  (half the screen, capped at 14 rows), and the `click ⛶` row is gone from `/keys`. The right end keeps
+  just `↥` (jump back to your previous prompt).
 
 ## [0.1.14] - 2026-09-24
 
