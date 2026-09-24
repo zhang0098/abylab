@@ -97,7 +97,10 @@ code, pre, kbd { font-family: var(--aby-mono); }
 code { padding: 0.12em 0.35em; border-radius: 4px; background: var(--aby-code); color: var(--aby-text); font-size: 0.85em; overflow-wrap: anywhere; }
 pre { margin: 0; padding: 0.8rem 1rem; border: 1px solid var(--aby-border); border-radius: var(--pico-border-radius); background: var(--aby-code); overflow-x: auto; }
 pre code { padding: 0; background: none; font-size: 0.85rem; }
-kbd { display: inline-block; padding: 0.1rem 0.4rem; border: 1px solid var(--aby-border); border-radius: 4px; background: var(--aby-surface); box-shadow: var(--aby-shadow); font-size: 0.8rem; }
+/* Pico colours `kbd` as page-background-on-dark, which assumes the keycap keeps
+   its own dark background: override either one alone and the text disappears
+   into the cap. Set both. */
+kbd { display: inline-block; padding: 0.1rem 0.4rem; border: 1px solid var(--aby-border); border-radius: 4px; background: var(--aby-soft); color: var(--aby-text); box-shadow: var(--aby-shadow); font-size: 0.8rem; }
 
 table { width: 100%; font-size: 0.9rem; }
 td, th { padding-block: 0.55rem; }
