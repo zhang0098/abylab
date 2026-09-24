@@ -2,7 +2,7 @@
 #
 # abylab installer
 #
-#   /bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
+#   curl -fsSL https://abylab.ai/install.sh | bash
 #
 # Downloads the prebuilt `abylab` binary for this machine from GitHub Releases,
 # verifies its SHA-256 sum and installs that one file. Everything else happens
@@ -71,12 +71,13 @@ note() { printf '%s->%s %s\n' "$DIM" "$OFF" "$1"; }
 have() { command -v "$1" >/dev/null 2>&1 || return 1; }
 
 # The text is embedded rather than sliced out of $0: the documented one-liner
-# runs the script through `bash -c`, where $0 is "bash" and no file exists.
+# pipes the script into `bash`, which reads it from stdin — $0 is "bash" and
+# no file exists to slice from.
 usage() {
     cat <<'EOF'
 abylab installer
 
-  /bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
+  curl -fsSL https://abylab.ai/install.sh | bash
 
 Downloads the prebuilt abylab binary for this machine, verifies its SHA-256 sum
 and installs that one file. A plain "latest" install tries the mirror on

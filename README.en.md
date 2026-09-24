@@ -9,7 +9,7 @@ ACP, no plugins, no demo mode.
 ## Quick start
 
 ```sh
-/bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
+curl -fsSL https://abylab.ai/install.sh | bash
 abylab
 ```
 
@@ -36,7 +36,7 @@ To uninstall abylab, run `abylab --uninstall`.
 ## Keys
 
 enter send / queue · ctrl+enter send now · alt+↑ (mac ⌥↑) edit queued prompt ·
-esc interrupt / 2× clear draft · ctrl+c clear / quit · ↑ history · `/` commands ·
+esc 2× interrupt / clear draft · ctrl+c clear / quit · ↑ history · `/` commands ·
 `@` file mention · ctrl+z undo · ctrl+p model · ctrl+t theme · shift+tab permission preset
 
 `alt+↑` opens the list only when prompts are waiting and the draft is empty:

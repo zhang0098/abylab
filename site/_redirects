@@ -5,7 +5,7 @@
 # No rule for /install.sh on purpose: site/install.sh is a real file here and
 # is served from this origin, so
 #
-#   /bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
+#   curl -fsSL https://abylab.ai/install.sh | bash
 #
 # still works on networks where raw.githubusercontent.com is blocked. It used
 # to 302 to GitHub, which defeated the point — and a redirect beats the file,

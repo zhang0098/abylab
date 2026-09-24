@@ -29,7 +29,10 @@ use crate::transcript::{clamp_str, NoticeLevel, Transcript};
 pub const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
-const CTRL_C_QUIT_WINDOW: Duration = Duration::from_millis(1500);
+/// How long a two-press chord stays armed between its presses: the `ctrl+c`
+/// quit chord and `esc` interrupting a running turn (nothing stops a lone esc
+/// from firing on a stray keypress otherwise).
+const DOUBLE_PRESS_WINDOW: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy)]
 struct CtrlCQuitChord {
@@ -718,6 +721,13 @@ pub struct App {
     pub att_thumbs: Vec<ThumbPlacement>,
     /// Chip index under the mouse pointer (grok-style hover preview).
     pub hover_att: Option<usize>,
+    /// Attachment id whose preview card is pinned open: staging an image
+    /// (`/clip`, ctrl+v, an `@…png` path) pops its preview by itself and it
+    /// stays — a caption typed after the chip would otherwise walk the text
+    /// cursor off the token and take the card with it. Hovering a chip (or
+    /// parking the cursor on one) previews that chip instead; the pin is
+    /// dropped with the image itself.
+    pub preview_pin: Option<u32>,
     pub modes: Modes,
     /// The permission preset the user last asked for and the host has not
     /// echoed yet. The driver serializes turns — it reads its command channel
@@ -753,19 +763,11 @@ pub struct App {
     pub(crate) prompt_jump_btn: Option<ratatui::layout::Rect>,
     /// The pointer rests on the `↥` glyph: brighten it.
     pub(crate) hover_prompt_jump_btn: bool,
-    /// Screen rect of the cap row's mouse-only `⛶` expand glyph, recorded by
-    /// `ui::draw_composer_box` every frame.
-    pub(crate) expand_btn: Option<ratatui::layout::Rect>,
-    /// The pointer rests on the `⛶` glyph: brighten it.
-    pub(crate) hover_expand_btn: bool,
     /// Screen rect of the meta row's `↓ N` scroll chip, recorded by the frame
     /// that draws it. `None` while the transcript follows the tail (no chip).
     pub(crate) scroll_btn: Option<ratatui::layout::Rect>,
     /// The pointer rests on the `↓ N` chip: brighten it.
     pub(crate) hover_scroll_btn: bool,
-    /// The `⛶` click pins the well to the amplified height (issue #92) until
-    /// the next click; the auto layout returns.
-    pub(crate) composer_expanded: bool,
     /// Transcript cell of the user prompt the last `↥` click jumped to; the
     /// next click walks one prompt further back (the oldest wraps around).
     /// In-memory only, and it rides across clicks so jumping resumes where the
@@ -785,6 +787,11 @@ pub struct App {
     /// always does the other one (harness's `busyEnter` preference).
     pub enter: crate::locale::EnterBehavior,
     ctrl_c_armed: Option<CtrlCQuitChord>,
+    /// When the first `esc` of an interrupt chord landed. Esc never cancels a
+    /// running turn on its own: the first press arms (and says so), a second
+    /// inside [`DOUBLE_PRESS_WINDOW`] interrupts. Anything else leaves it to
+    /// the window (`tick`) to disarm.
+    esc_armed: Option<Instant>,
     /// The queued prompt whose `ctrl+d` in the queue picker already asked: the
     /// id of the armed row, cleared when the highlight moves or the list is
     /// rebuilt without it.
@@ -1217,6 +1224,7 @@ impl App {
             att_chips: Vec::new(),
             att_thumbs: Vec::new(),
             hover_att: None,
+            preview_pin: None,
             modes,
             skills: Vec::new(),
             last_models: Vec::new(),
@@ -1228,11 +1236,8 @@ impl App {
             hover_plan_chip: false,
             prompt_jump_btn: None,
             hover_prompt_jump_btn: false,
-            expand_btn: None,
-            hover_expand_btn: false,
             scroll_btn: None,
             hover_scroll_btn: false,
-            composer_expanded: false,
             prompt_jump_cell: None,
             prompt_flash: None,
             prompt_flash_lines: None,
@@ -1240,6 +1245,7 @@ impl App {
             vim: crate::input::VimState::default(),
             enter,
             ctrl_c_armed: None,
+            esc_armed: None,
             queue_delete_armed: None,
             session_id,
             cfg,
@@ -1343,9 +1349,15 @@ impl App {
         }
         // disarm expired chords
         if let Some(chord) = self.ctrl_c_armed {
-            if chord.started.elapsed() > CTRL_C_QUIT_WINDOW {
+            if chord.started.elapsed() > DOUBLE_PRESS_WINDOW {
                 self.ctrl_c_armed = None;
             }
+        }
+        if self
+            .esc_armed
+            .is_some_and(|at| at.elapsed() > DOUBLE_PRESS_WINDOW)
+        {
+            self.esc_armed = None;
         }
     }
 
@@ -2335,15 +2347,6 @@ impl App {
                         return;
                     }
                 }
-                // The mouse-only `⛶` glyph (issue #92) pins the well to the
-                // amplified height and restores it on the next click.
-                if self.expand_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
-                    self.input_sel = None;
-                    self.input_selecting = false;
-                    self.composer_expanded = !self.composer_expanded;
-                    self.needs_redraw = true;
-                    return;
-                }
                 // The `↓ N` chip in the meta row is the way back down: one
                 // click drops the scroll and follows the tail again.
                 if self.scroll_btn_hit(mouse.column, mouse.row) && !self.modal_open() {
@@ -2450,13 +2453,6 @@ impl App {
                     self.hover_prompt_jump_btn = jump_hover;
                     self.needs_redraw = true;
                 }
-                // …and for the `⛶` expand glyph beside it.
-                let expand_hover =
-                    self.expand_btn_hit(mouse.column, mouse.row) && !self.modal_open();
-                if expand_hover != self.hover_expand_btn {
-                    self.hover_expand_btn = expand_hover;
-                    self.needs_redraw = true;
-                }
                 // …and for the meta row's `↓ N` scroll chip.
                 let scroll_hover =
                     self.scroll_btn_hit(mouse.column, mouse.row) && !self.modal_open();
@@ -2520,19 +2516,34 @@ impl App {
             self.hover_att = None;
             self.needs_redraw = true;
         }
+        // A pinned preview dies with its image (sent, deleted, draft
+        // cleared); a stale id is inert either way, so this is hygiene.
+        if self
+            .preview_pin
+            .is_some_and(|id| !self.pending_images.iter().any(|att| att.id == id))
+        {
+            self.preview_pin = None;
+        }
     }
 
     /// The chip to preview: mouse hover wins, else the chip the text
-    /// cursor sits in or immediately after (“光标在附近”).
+    /// cursor sits in or immediately after (“光标在附近”), else the image
+    /// staged a moment ago — whose preview stays up while its caption is
+    /// being typed (see `preview_pin`).
     pub fn preview_att(&self) -> Option<usize> {
         if let Some(idx) = self.hover_att {
             return Some(idx);
         }
         let c = self.input.cursor_char();
-        self.token_spans()
+        if let Some(&(_, _, idx)) = self
+            .token_spans()
             .iter()
             .find(|(s, e, _)| c >= *s && c <= *e)
-            .map(|&(_, _, idx)| idx)
+        {
+            return Some(idx);
+        }
+        let id = self.preview_pin?;
+        self.pending_images.iter().position(|att| att.id == id)
     }
 
     /// Hit-test a screen cell against the inline chips drawn this frame.
@@ -2559,8 +2570,11 @@ impl App {
         })
     }
 
-    /// A modal owns the screen: clicks must not reach the chrome behind it.
-    fn modal_open(&self) -> bool {
+    /// A modal owns the screen: clicks must not reach the chrome behind it,
+    /// and the keys it takes never reach the composer either (every card is
+    /// checked ahead of the draft in `handle_key_inner`), so `ui::draw_input`
+    /// asks this before painting the composer caret.
+    pub(crate) fn modal_open(&self) -> bool {
         self.todo_dialog.is_some()
             || self.view_overlay.is_some()
             || self.permission_ask.is_some()
@@ -2572,17 +2586,6 @@ impl App {
     /// drawn this frame.
     fn prompt_jump_btn_hit(&self, col: u16, row: u16) -> bool {
         self.prompt_jump_btn.is_some_and(|r| {
-            col >= r.x
-                && col < r.x.saturating_add(r.width)
-                && row >= r.y
-                && row < r.y.saturating_add(r.height)
-        })
-    }
-
-    /// Hit-test a screen cell against the cap row's `⛶` expand glyph drawn
-    /// this frame.
-    fn expand_btn_hit(&self, col: u16, row: u16) -> bool {
-        self.expand_btn.is_some_and(|r| {
             col >= r.x
                 && col < r.x.saturating_add(r.width)
                 && row >= r.y
@@ -5065,7 +5068,22 @@ impl App {
         }
         match self.state {
             RunState::Running | RunState::Starting => {
-                // grok: Esc cancels immediately; the draft survives.
+                // Interrupting is a two-press chord, the shape ctrl+c quit
+                // wears: a single stray esc must not throw away the turn in
+                // flight. The first press arms and says so; a second one
+                // inside the window cancels. The draft survives either way.
+                let armed = self
+                    .esc_armed
+                    .take()
+                    .is_some_and(|at| at.elapsed() <= DOUBLE_PRESS_WINDOW);
+                if !armed {
+                    self.esc_armed = Some(Instant::now());
+                    self.show_tip(
+                        self.locale
+                            .tr("press esc again to interrupt", "再按一次 esc 中断本轮"),
+                    );
+                    return;
+                }
                 ctl.interrupt_now();
                 ctl.send(Cmd::Interrupt {
                     session_id: self.session_id.clone(),
@@ -5086,8 +5104,8 @@ impl App {
                     return;
                 }
                 self.show_tip(self.locale.tr(
-                    "esc — idle · a running turn is interrupted with esc",
-                    "esc —— 空闲；运行中按 esc 会中断本轮",
+                    "esc — idle · press it twice while a turn runs to interrupt",
+                    "esc —— 空闲；运行中连按两次中断本轮",
                 ));
             }
         }
@@ -5384,7 +5402,7 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - /enter · 繁忙时 enter 的模式：queue 排队 / steer 立即插话 · ctrl+enter 始终是另一种
 - ⌥↑ · 排队的后续消息：↑/↓ 选择 · enter 编辑 · ctrl+enter 立即插话 · 列表中 ctrl+d 连按两次删除 · esc 关闭
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
-- esc · 中断（保留草稿）；空闲时清除草稿
+- esc · 连按两次中断本轮（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
 - shift+tab · 轮换权限预设（只读 → 工作区可写 → 完全访问，一轮结束后生效）· /permission 打开选择器
 - ctrl+p · 打开模型选择器，然后选择推理强度
@@ -5395,7 +5413,7 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - /vim · 切换 vim 模态编辑（/vim on|off，默认关闭）
 - /resume · 恢复持久会话并继续写入原日志
 - /image · 暂存本地图片：/image ./pic.png [说明]
-- /clip · 暂存剪贴板图片；ctrl+v 同样可用
+- /clip · 暂存剪贴板图片并弹出预览（⌫ 删除图片）· ctrl+v 同样可用
 - !cmd · 在会话级本地 shell 中运行命令，不经过 Agent；初始目录为 workspace，cd/环境变量跨命令保留
 - /<skill> · 手打的技能行由 Agent 注入技能正文（技能不进 / 菜单）
 - /skill · 列出/调用本工作区的技能（`.agents/skills/`）：/skill <名字> [参数]；空格后是候选清单
@@ -5414,7 +5432,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - /enter · what enter does while busy: queue / steer · ctrl+enter is always the other mode
 - ⌥↑ · queued follow-ups: ↑/↓ select · enter edit · ctrl+enter steers one now · ctrl+d twice deletes a row · esc close
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
-- esc · interrupt (draft survives) · clears the draft when idle
+- esc · twice interrupts the running turn (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
 - shift+tab · cycle permission (read only → workspace write → full access, takes effect after a turn) · /permission opens the preset picker
 - ctrl+p · model picker → effort picker
@@ -5424,7 +5442,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - /logout · remove the stored API key (a --api-key override keeps running)
 - /resume · pick up a durable session — transcript replays, log continues
 - /image · stage a local image — /image ./pic.png [caption]
-- /clip · stage the clipboard image — /clip [caption] · ctrl+v also works
+- /clip · stage the clipboard image — its preview pops up (⌫ drops the chip) · /clip [caption] · ctrl+v also works
 - !cmd · run in the session's local shell (not the agent); starts in the workspace, keeps cd/env across commands
 - /<skill> · a hand-typed skill line — the agent injects the skill's body (skills never list under /)
 - /skill · list or run this workspace's skills (`.agents/skills/`) — `/skill ` opens the catalog, Tab completes
@@ -6133,11 +6151,11 @@ impl App {
             ));
             return;
         }
-        let token = match self
+        let (token, id) = match self
             .pending_images
             .add(self.locale, name, path, media_type, data)
         {
-            Ok(att) => att.token.clone(),
+            Ok(att) => (att.token.clone(), att.id),
             Err(full) => {
                 self.show_tip(full);
                 return;
@@ -6157,9 +6175,13 @@ impl App {
             self.input.insert_char(' ');
         }
         self.input.insert_str(&token);
+        // The fresh image previews itself: the caret sits on its chip this
+        // instant, but a caption typed next would walk off it, so the card is
+        // pinned until the image leaves the draft.
+        self.preview_pin = Some(id);
         self.show_tip(self.locale.tr(
-            "image staged — ⌫ deletes its chip · hover it to preview",
-            "图片已暂存 —— ⌫ 删除它的筹码 · 悬停可预览",
+            "image staged — ⌫ deletes its chip · its preview is up",
+            "图片已暂存 —— ⌫ 删除图片 · 预览已弹出",
         ));
         self.needs_redraw = true;
     }
@@ -8291,6 +8313,72 @@ mod mode_tests {
         assert!(app.pending_images.is_empty(), "chips go with the draft");
     }
 
+    /// Staging an image opens its preview on its own — `/clip`, ctrl+v and an
+    /// `@…png` path all funnel through `stage_image` — and the card stays
+    /// while the caption is typed, then leaves with the image.
+    #[test]
+    fn a_fresh_stage_pins_its_preview_until_the_image_leaves_the_draft() {
+        let (mut app, _ctl, _rx) = test_app();
+        app.stage_image(
+            "clipboard.png".into(),
+            "clipboard".into(),
+            "image/png".into(),
+            png_header(64, 64),
+            String::new(),
+        );
+        assert_eq!(
+            app.preview_att(),
+            Some(0),
+            "the fresh stage previews itself"
+        );
+
+        // The caption moves the text cursor off the chip: the pin holds.
+        app.input.insert_str(" a caption");
+        assert_eq!(app.preview_att(), Some(0), "the pin outlives the caption");
+
+        // Hovering a chip still wins over the pin.
+        app.hover_att = None;
+        app.stage_image(
+            "shot-2.png".into(),
+            "clipboard".into(),
+            "image/png".into(),
+            png_header(32, 32),
+            String::new(),
+        );
+        app.hover_att = Some(0);
+        assert_eq!(app.preview_att(), Some(0), "hover picks the chip it is on");
+        app.hover_att = None;
+
+        // The card is really on screen, and it is the *staged* image's.
+        let frame = crate::ui::dump_frame(&mut app, 100, 30);
+        assert!(
+            frame.contains("32×32 px"),
+            "the pinned image's dims: {frame}"
+        );
+        assert!(
+            frame.contains("removes the image"),
+            "the card is up: {frame}"
+        );
+
+        // Deleting the pinned chip takes the card with it, and the next
+        // staged image pins itself instead.
+        app.preview_pin = Some(app.pending_images.get(1).unwrap().id);
+        app.input.clear();
+        app.reconcile_attachments();
+        assert!(app.pending_images.is_empty(), "the draft took the chips");
+        assert_eq!(app.preview_att(), None, "no image, no card");
+        assert_eq!(app.preview_pin, None, "a pin dies with its image");
+    }
+
+    /// A bag of bytes that reads as a PNG of the given pixel size.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut png = vec![0u8; 32];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[16..20].copy_from_slice(&w.to_be_bytes());
+        png[20..24].copy_from_slice(&h.to_be_bytes());
+        png
+    }
+
     #[test]
     fn backspace_on_a_chip_cuts_the_whole_token() {
         let (mut app, ctl, _rx) = test_app();
@@ -10046,6 +10134,74 @@ mod mode_tests {
             crate::transcript::CellKind::User { text, .. } if text == "unrelated"
         ));
     }
+    /// Interrupting a running turn is a two-press chord, like ctrl+c quit: a
+    /// lone esc only arms (and says so) — nothing is cancelled, nothing is
+    /// sent — and the draft survives either way.
+    #[test]
+    fn esc_interrupts_a_running_turn_on_the_second_press() {
+        let (mut app, _demo_ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_interruptible_controller();
+        app.state = RunState::Running;
+        app.input.set("a draft that must survive".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.esc_armed.is_some(), "the first esc arms the chord");
+        assert_eq!(app.state, RunState::Running, "nothing cancelled yet");
+        assert!(
+            app.tip
+                .as_ref()
+                .is_some_and(|(tip, _)| tip.contains("again")),
+            "the armed chord says so: {:?}",
+            app.tip
+        );
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "the first press must not reach the driver"
+        );
+        assert_eq!(app.input.buf(), "a draft that must survive");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.esc_armed.is_none(), "the chord is spent");
+        assert_eq!(app.state_note, "cancelling");
+        assert!(
+            matches!(commands.try_recv(), Ok(Cmd::Interrupt { .. })),
+            "the second press cancels the turn"
+        );
+        assert_eq!(
+            app.input.buf(),
+            "a draft that must survive",
+            "esc never touches the draft while a turn runs"
+        );
+    }
+
+    /// A first press older than the window never counts: esc re-arms instead
+    /// of interrupting, and the tick disarms a stale arm.
+    #[test]
+    fn a_stale_esc_press_does_not_interrupt() {
+        let (mut app, _demo_ctl, _rx) = test_app();
+        let (ctl, commands) = crate::controller::test_interruptible_controller();
+        app.state = RunState::Running;
+
+        app.esc_armed = Some(Instant::now() - DOUBLE_PRESS_WINDOW - Duration::from_millis(1));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "an expired arm never interrupts"
+        );
+        assert_eq!(app.state, RunState::Running);
+        assert!(app.esc_armed.is_some(), "it re-arms from now");
+
+        app.esc_armed = Some(Instant::now() - DOUBLE_PRESS_WINDOW - Duration::from_millis(1));
+        app.tick();
+        assert!(app.esc_armed.is_none(), "tick drops the stale arm");
+    }
+
     #[test]
     fn ctrl_c_while_running_never_interrupts_and_two_empty_presses_quit() {
         let (mut app, _demo_ctl, _rx) = test_app();
@@ -12084,34 +12240,6 @@ mod resume_replay_tests {
         );
         app.reset_session_ui();
         assert_eq!(app.plan, None);
-    }
-
-    /// The cap row's `⛶` glyph is a mouse-only toggle: each click pins the
-    /// well to the amplified height or hands it back to the auto layout.
-    #[test]
-    fn the_expand_glyph_pins_and_restores_the_well_height() {
-        let (mut app, _ctl, _rx) = test_app();
-        // The frame that draws the glyph records its hit target.
-        app.expand_btn = Some(ratatui::layout::Rect::new(80, 4, 3, 1));
-
-        for expected in [true, false] {
-            app.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 81,
-                row: 4,
-                modifiers: KeyModifiers::NONE,
-            });
-            assert_eq!(app.composer_expanded, expected, "click {expected}");
-        }
-
-        // A click that misses the glyph leaves the height alone.
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 40,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert!(!app.composer_expanded);
     }
 
     /// The driver's live catalog fills an open `/model` picker (a query it now

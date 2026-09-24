@@ -19,9 +19,6 @@ use crate::transcript::wrap;
 /// The `↥` prompt-jump glyph's hit width: the glyph cell plus the margin cell
 /// left of it (Martty's two-cell button).
 const PROMPT_JUMP_BTN_W: u16 = 2;
-/// The `⛶` expand glyph's hit width: a margin, the glyph, and one more cell so
-/// the corner `╮` keeps its room (Martty's issue #92 button).
-const EXPAND_BTN_W: u16 = 3;
 
 /// Composer card height for a terminal `height` rows tall.
 /// Composer height: the input well plus one bottom meta row (state ·
@@ -40,30 +37,19 @@ fn composer_height(height: u16) -> u16 {
 
 /// Grow with hard/soft-wrapped draft rows, while leaving at least half of a
 /// normal terminal to the conversation. Beyond the cap, `draw_input` keeps a
-/// cursor-following viewport inside the composer. The mouse-only expand button
-/// (`⛶`) pins the well to the amplified height instead.
+/// cursor-following viewport inside the composer.
 fn resolved_composer_height(area: Rect, app: &App) -> u16 {
     let minimum = composer_height(area.height);
     let inner_width = area.width.saturating_sub(2);
     let prompt_width = "❯ ".width() as u16;
     let wrap_width = inner_width.saturating_sub(prompt_width).max(1) as usize;
-    // Expanded: up to 5/8 of the frame and no compact cap — the conversation
-    // keeps the rest. Auto: half the screen, ≤ 14.
-    let maximum = if app.composer_expanded {
-        (area.height * 5 / 8)
-            .max(minimum)
-            .min(area.height.saturating_sub(4).max(minimum))
-    } else {
-        (area.height / 2).max(minimum).min(14)
-    };
-    let desired = if app.composer_expanded {
-        maximum
-    } else {
-        app.input
-            .visual_row_count(wrap_width)
-            .saturating_add(1)
-            .min(maximum as usize) as u16
-    };
+    // Auto: half the screen, ≤ 14 — the conversation keeps the rest.
+    let maximum = (area.height / 2).max(minimum).min(14);
+    let desired = app
+        .input
+        .visual_row_count(wrap_width)
+        .saturating_add(1)
+        .min(maximum as usize) as u16;
     desired.max(minimum).min(maximum)
 }
 
@@ -78,7 +64,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // them may leave a target behind.
     app.plan_chip = None;
     app.prompt_jump_btn = None;
-    app.expand_btn = None;
     app.scroll_btn = None;
     // …and the well's own hit targets: a frame that draws no composer (a
     // child view, or a terminal too small for one) must not leave the last
@@ -826,7 +811,7 @@ fn status_right(app: &App) -> Vec<Span<'static>> {
     }
     if app.scroll_up > 0 {
         // The chip is a button: the meta row's `↓ N` jumps back to the tail,
-        // so the pointer resting on it brightens it like `↥` and `⛶`.
+        // so the pointer resting on it brightens it like `↥`.
         let tone = if app.hover_scroll_btn {
             theme.fg
         } else {
@@ -1027,10 +1012,10 @@ struct CapLine {
 }
 
 /// Priority: transient action feedback (a few seconds) → the live todo
-/// checklist. The rotating usage hints that used to fall through here are
-/// gone, and nothing greets a session in their place (`/keys` and `/help`
-/// carry them), so an idle cap line stays empty and only the workspace title
-/// on the right marks the row.
+/// checklist → the brand mark. The rotating usage hints that used to fall
+/// through here are gone (`/keys` and `/help` carry them), so an idle cap line
+/// carries the site on the box's top-left, where a window title would sit; a
+/// tip or a checklist takes the row while it is up.
 fn cap_line(app: &App) -> CapLine {
     let theme = app.theme;
     if let Some((text, _)) = &app.tip {
@@ -1049,7 +1034,14 @@ fn cap_line(app: &App) -> CapLine {
     }
 
     CapLine {
-        line: Line::default(),
+        line: Line::from(vec![
+            Span::raw(" "),
+            // The pale chrome tone the model id wears on the other end of the
+            // box (`status_right`). The site is a mark, not a state, so it
+            // never takes the brand accent.
+            Span::styled("abylab.ai", Style::default().fg(theme.fg_tertiary)),
+            Span::raw(" "),
+        ]),
         chip: None,
     }
 }
@@ -1171,20 +1163,14 @@ pub fn head_branch(workspace: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The cap row's right side: the project path with the `:branch` suffix, plus
-/// the mouse-only `⛶` expand button (Martty's issue #92) and, one cell left of
-/// it, the `↥` user prompt jump glyph (issue #103). Both keep one cell of
-/// margin from the corner; hovering brightens them to the strongest
+/// The cap row's right side: the project path with the `:branch` suffix, a dot
+/// and the mouse-only `↥` user prompt jump glyph (issue #103), which keeps one
+/// cell of margin from the corner; hovering brightens it to the strongest
 /// foreground.
 fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
     let title_width = (area_width / 2).clamp(8, 64);
     let path_width = title_width.saturating_sub(4);
     let tone = if app.hover_prompt_jump_btn {
-        app.theme.fg
-    } else {
-        app.theme.caption
-    };
-    let expand_tone = if app.hover_expand_btn {
         app.theme.fg
     } else {
         app.theme.caption
@@ -1202,10 +1188,10 @@ fn workspace_cap_title(app: &App, area_width: usize) -> Line<'static> {
     }
     Line::from(vec![
         Span::styled(text, Style::default().fg(app.theme.caption)),
-        Span::raw(" "),
+        // The same dot the path itself wears: it separates the title from the
+        // jump glyph instead of leaving the two glued by a bare space.
+        Span::styled("· ", Style::default().fg(app.theme.caption)),
         Span::styled("↥", Style::default().fg(tone)),
-        Span::raw(" "),
-        Span::styled("⛶", Style::default().fg(expand_tone)),
         Span::raw(" "),
     ])
     .right_aligned()
@@ -1274,19 +1260,13 @@ fn draw_composer_box(f: &mut Frame, app: &mut App, area: Rect) {
             1,
         ),
     );
-    // Both cap-row glyphs ride the right-aligned workspace title with a
-    // trailing space before the corner, so their cells are fixed: `⛶` two
-    // cells left of the corner, `↥` two cells left of that. Each hit target
-    // adds the margin cell on its left (Martty's two-cell buttons).
-    if area.width > EXPAND_BTN_W + PROMPT_JUMP_BTN_W + 4 {
-        app.expand_btn = Some(Rect::new(
-            area.x + area.width - EXPAND_BTN_W - 1,
-            area.y,
-            EXPAND_BTN_W,
-            1,
-        ));
+    // The cap-row glyph rides the right-aligned workspace title with a
+    // trailing space before the corner, so its cell is fixed: `↥` two cells
+    // left of the corner. The hit target adds the margin cell on its left
+    // (Martty's two-cell button).
+    if area.width > PROMPT_JUMP_BTN_W + 4 {
         app.prompt_jump_btn = Some(Rect::new(
-            area.x + area.width - EXPAND_BTN_W - PROMPT_JUMP_BTN_W - 1,
+            area.x + area.width - PROMPT_JUMP_BTN_W - 1,
             area.y,
             PROMPT_JUMP_BTN_W,
             1,
@@ -1372,8 +1352,8 @@ fn draw_attachment_preview(f: &mut Frame, app: &mut App, composer: Rect, screen:
     lines.push(Line::from(Span::styled(
         app.locale
             .tr(
-                "⌫ on the chip removes · enter sends",
-                "⌫ 删除筹码 · enter 发送",
+                "⌫ removes the image · enter sends",
+                "⌫ 删除图片 · enter 发送",
             )
             .to_string(),
         Style::default().fg(theme.caption),
@@ -1417,8 +1397,12 @@ fn draw_attachment_preview(f: &mut Frame, app: &mut App, composer: Rect, screen:
 /// lockstep with the widget's own viewport.
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
-    // Overlays that own input never paint the composer caret.
-    let composer_owns_cursor = true;
+    // A modal card owns the keyboard while it is up: every key goes to it
+    // (`App::handle_key_inner` checks the cards ahead of the draft), so the
+    // composer paints no caret. The card that does own the input — the
+    // question dialog's Other field — paints its own (see
+    // `draw_user_question`).
+    let composer_owns_cursor = !app.modal_open();
     // The well's rect is the seam mouse hit-testing reads between frames
     // (placed before the early return: an empty draft is still clickable).
     app.composer_area = area;
@@ -1454,9 +1438,14 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                     .replace("{chord}", chord)
             }
         };
+        // The hint is ghost text one cell right of the caret: the caret block
+        // keeps a cell of its own (an empty well's cursor) instead of boxing
+        // the hint's first glyph. The spacer carries no style of its own, so
+        // the reversed caret reads exactly like the one over a real draft.
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(prompt.to_string(), prompt_style),
+                Span::raw(" "),
                 Span::styled(
                     placeholder.to_string(),
                     Style::default()
@@ -2019,7 +2008,7 @@ fn draw_permission_ask(f: &mut Frame, app: &App, screen: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_user_question(f: &mut Frame, app: &App, screen: Rect) {
+fn draw_user_question(f: &mut Frame, app: &mut App, screen: Rect) {
     let Some(ask) = &app.user_question else {
         return;
     };
@@ -2078,32 +2067,25 @@ fn draw_user_question(f: &mut Frame, app: &App, screen: Rect) {
             ));
         }
     }
-    if ask.sel == ask.question.options.len() {
+    let other_row = ask.question.options.len();
+    let focused_other = ask.sel == other_row;
+    let cursor = if focused_other { "▸" } else { " " };
+    if focused_other {
         selected_row = lines.len();
     }
     let other = app.locale.tr("Other: ", "其他：");
-    let custom = if ask.custom.is_empty() {
-        app.locale.tr("type an answer", "输入回答").to_string()
-    } else {
-        ask.custom.clone()
-    };
-    let custom = wrap(
-        &format!(
-            "{} {other}{custom}",
-            if ask.sel == ask.question.options.len() {
-                "▸"
-            } else {
-                " "
-            }
-        ),
-        text_w,
-    )
-    .into_iter()
-    .last()
-    .unwrap_or_default();
+    // The Other row is the label plus what has been typed — no hint text: an
+    // empty field shows the caret alone, right after the label. The caret
+    // rides the last wrapped row, so it stays on the tail of a long answer.
+    let custom_row = lines.len();
+    let custom = wrap(&format!("{cursor} {other}{}", ask.custom), text_w)
+        .into_iter()
+        .last()
+        .unwrap_or_default();
+    let caret_col = UnicodeWidthStr::width(custom.as_str()) as u16;
     lines.push(Line::styled(
         custom,
-        Style::default().fg(if ask.sel == ask.question.options.len() {
+        Style::default().fg(if focused_other {
             theme.brand
         } else {
             theme.fg_secondary
@@ -2127,6 +2109,21 @@ fn draw_user_question(f: &mut Frame, app: &App, screen: Rect) {
         .saturating_add(1)
         .saturating_sub(visible)
         .min(lines.len().saturating_sub(visible));
+    // The dialog owns the keyboard while it is up, so the caret belongs in
+    // its Other field — not in the composer well (`draw_input` leaves that
+    // one bare). Only while that row is the focused one, and only while no
+    // permission card is stacked over the dialog (that card takes the keys).
+    let caret = if focused_other && app.permission_ask.is_none() {
+        custom_row
+            .checked_sub(start)
+            .filter(|row| *row < visible)
+            .map(|row| {
+                let col = caret_col.min(area.width.saturating_sub(3));
+                (area.x + 1 + col, area.y + 1 + row as u16)
+            })
+    } else {
+        None
+    };
     let header = ask
         .question
         .header
@@ -2160,6 +2157,10 @@ fn draw_user_question(f: &mut Frame, app: &App, screen: Rect) {
         .block(block),
         area,
     );
+    if let Some((x, y)) = caret {
+        paint_caret(f, x, y);
+        app.caret_cell = Some((x, y));
+    }
 }
 
 fn shorten_home(path: &str) -> String {
@@ -2228,6 +2229,17 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         dir.to_string_lossy().into_owned()
+    }
+
+    /// The style painted on one cell of a rendered frame: `dump_frame` prints
+    /// symbols only, so caret assertions (a reversed cell) read the buffer.
+    fn cell_style(app: &mut App, width: u16, height: u16, col: u16, row: u16) -> Style {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|f| draw(f, app)).expect("draw frame");
+        terminal.backend().buffer()[(col, row)].style()
     }
 
     fn test_app() -> App {
@@ -2473,62 +2485,6 @@ mod tests {
         assert!(cap.contains("· …/deepseek-harness"), "{cap}");
     }
 
-    /// The `⛶` expand glyph sits right of the `↥` jump glyph on the cap row
-    /// (two cells left of the corner), its hit rect covers it, and a click
-    /// pins the well to the amplified height until the next one.
-    #[test]
-    fn the_expand_glyph_rides_the_cap_row_and_pins_the_well() {
-        let mut app = test_app();
-        app.cfg.workspace = "/work/acme/deepseek-harness".into();
-
-        let frame = dump_frame(&mut app, 100, 20);
-        let row = frame
-            .lines()
-            .position(|line| line.contains('⛶'))
-            .expect("cap row with the ⛶ glyph");
-        let cap = frame.lines().nth(row).unwrap();
-        assert!(
-            cap.find('⛶').unwrap() > cap.find('↥').unwrap(),
-            "⛶ follows ↥: {cap}"
-        );
-        assert!(
-            cap.find('↥').unwrap() > cap.find("deepseek-harness").unwrap(),
-            "both glyphs follow the path: {cap}"
-        );
-
-        let btn = app.expand_btn.expect("expand button rect");
-        assert_eq!(btn.y as usize, row, "the hit rect rides the cap row");
-        assert_eq!(btn.right(), 99, "it ends one cell short of the corner");
-        let glyph = cap.chars().position(|c| c == '⛶').unwrap() as u16;
-        assert!(
-            glyph >= btn.x && glyph < btn.x + btn.width,
-            "glyph at {glyph} inside {btn:?}"
-        );
-
-        // Hover is the only affordance: it brightens, like `↥`.
-        let tone = |app: &App| -> Style {
-            workspace_cap_title(app, 100)
-                .spans
-                .iter()
-                .find(|span| span.content.contains('⛶'))
-                .expect("glyph span")
-                .style
-        };
-        let idle = tone(&app);
-        app.hover_expand_btn = true;
-        let hovered = tone(&app);
-        assert_ne!(idle, hovered, "hover must be visible");
-        assert_eq!(hovered.fg, Some(app.theme.fg));
-
-        // Clicking pins the well: 5/8 of the frame, past the auto cap.
-        let area = Rect::new(0, 0, 100, 40);
-        let auto = resolved_composer_height(area, &app);
-        app.composer_expanded = true;
-        let pinned = resolved_composer_height(area, &app);
-        assert_eq!(pinned, 25, "5/8 of a 40-row frame");
-        assert!(pinned > auto, "the click amplifies: {auto} → {pinned}");
-    }
-
     /// The `↥` prompt-jump button rides the cap row right of the project path,
     /// and the recorded hit rect covers the glyph cell.
     #[test]
@@ -2554,6 +2510,23 @@ mod tests {
         assert!(
             glyph >= btn.x && glyph < btn.x + btn.width,
             "glyph at {glyph} inside {btn:?}"
+        );
+
+        // A dot separates the path from the glyph, in the path's own tone.
+        assert!(
+            cap.find(" · ↥").unwrap() > cap.find("deepseek-harness").unwrap(),
+            "the dot sits between the two: {cap}"
+        );
+        let title = workspace_cap_title(&app, 100);
+        let dot = title
+            .spans
+            .iter()
+            .find(|span| span.content == "· ")
+            .expect("the dot span");
+        assert_eq!(
+            dot.style.fg,
+            Some(app.theme.caption),
+            "the dot wears the path's tone"
         );
     }
 
@@ -3964,6 +3937,165 @@ mod tests {
         );
     }
 
+    /// While the question dialog owns the keyboard the caret lives in its
+    /// Other field — the composer paints none — and it walks with the typed
+    /// answer. A dialog resting on its options leaves no caret anywhere, and
+    /// a permission card stacked on top takes the caret back with the keys.
+    #[test]
+    fn the_question_dialog_owns_the_caret_in_its_other_field() {
+        use crate::app::UserQuestionOverlay;
+        let mut app = test_app();
+        app.user_question = Some(UserQuestionOverlay {
+            question: abylab_backend::UserQuestion {
+                id: "confirm".into(),
+                question: "Proceed?".into(),
+                header: Some("Confirm".into()),
+                options: vec![abylab_backend::UserQuestionOption {
+                    label: "Yes".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            },
+            sel: 0,
+            selected: vec![false],
+            custom: String::new(),
+            reply: None,
+        });
+
+        // Highlight on the option: nothing in the dialog takes text yet, and
+        // the composer well shows no caret either.
+        let frame = dump_frame(&mut app, 60, 20);
+        assert!(frame.contains("Other:"), "{frame}");
+        assert!(
+            app.caret_cell.is_none(),
+            "no field focused: {:?}",
+            app.caret_cell
+        );
+
+        // Highlight on Other: the field is empty (no hint words — the caret
+        // is the affordance) and the caret sits right after the label.
+        app.user_question.as_mut().unwrap().sel = 1;
+        let frame = dump_frame(&mut app, 60, 20);
+        assert!(
+            !frame.contains("type an answer"),
+            "the hint text is gone: {frame}"
+        );
+        let (col, row) = app.caret_cell.expect("caret in the Other field");
+        assert!(
+            row < app.composer_area.y,
+            "the caret must leave the composer well: {row} vs {}",
+            app.composer_area.y
+        );
+        let line = frame.lines().nth(row as usize).expect("caret row");
+        // `find` counts bytes (the box border and the `▸` are multi-byte), so
+        // the label's byte offset is converted to the column the caret uses.
+        let label = &line[..line.find("Other: ").expect("the Other row")];
+        let label_w = UnicodeWidthStr::width(label) as u16;
+        assert_eq!(col, label_w + 7, "right after the label");
+        assert_eq!(
+            line.chars().nth(col as usize),
+            Some(' '),
+            "an empty field: {line}"
+        );
+        // …and it is *painted*, as the composer's caret block would be.
+        let caret = cell_style(&mut app, 60, 20, col, row);
+        assert!(
+            caret.add_modifier.contains(Modifier::REVERSED),
+            "the Other field's caret must show: {caret:?}"
+        );
+        let (well_x, well_y) = (app.composer_area.x, app.composer_area.y);
+        let composer_prompt = cell_style(&mut app, 60, 20, well_x, well_y);
+        assert!(
+            !composer_prompt.add_modifier.contains(Modifier::REVERSED),
+            "the composer keeps no caret while the dialog owns the keys"
+        );
+
+        // …and it rides the tail of whatever was typed.
+        app.user_question.as_mut().unwrap().custom = "a custom answer".into();
+        let frame = dump_frame(&mut app, 60, 20);
+        let (col, row) = app.caret_cell.expect("caret follows the answer");
+        let line = frame.lines().nth(row as usize).unwrap();
+        let typed = "Other: a custom answer";
+        let head = &line[..line.find(typed).expect("typed answer on the row")];
+        assert_eq!(
+            col,
+            UnicodeWidthStr::width(head) as u16 + UnicodeWidthStr::width(typed) as u16,
+            "the caret ends the answer: {line}"
+        );
+
+        // No card up: the draft keeps its own caret.
+        app.user_question = None;
+        let _ = dump_frame(&mut app, 60, 20);
+        assert_eq!(
+            app.caret_cell,
+            Some((app.composer_area.x + 2, app.composer_area.y)),
+            "the composer keeps its caret once the dialog is gone"
+        );
+    }
+
+    /// The empty well's caret owns its cell: the ghost hint starts one column
+    /// right of it, so the reversed block never boxes the hint's first glyph.
+    #[test]
+    fn the_empty_well_caret_does_not_sit_on_the_hint() {
+        let mut app = test_app();
+        let frame = dump_frame(&mut app, 80, 20);
+        let (col, row) = app.caret_cell.expect("the empty well shows a caret");
+        assert_eq!(
+            row, app.composer_area.y,
+            "the caret rides the well's first row"
+        );
+        let line = frame.lines().nth(row as usize).expect("caret row");
+        let at = col as usize;
+        assert_eq!(line.chars().nth(at), Some(' '), "an empty cell: {line}");
+        assert_eq!(
+            line.chars().nth(at + 1),
+            Some('d'),
+            "the hint follows the caret: {line}"
+        );
+        assert!(
+            cell_style(&mut app, 80, 20, col, row)
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the caret is painted"
+        );
+    }
+
+    /// The idle cap row carries the site on the box's top-left, in the row's
+    /// dim chrome tone; a tip takes the row while it is up, and the brand
+    /// comes back when it expires.
+    #[test]
+    fn the_idle_cap_row_carries_the_brand_mark() {
+        let mut app = test_app();
+        let frame = dump_frame(&mut app, 80, 20);
+        let cap = cap_row(&frame);
+        assert!(cap.contains("abylab.ai"), "brand on the cap row: {cap}");
+        assert!(
+            cap.find("abylab.ai").unwrap() < cap.find("· /tmp").unwrap(),
+            "the brand leads the row, the workspace keeps the right: {cap}"
+        );
+        let mark = cap_line(&app);
+        let brand = mark
+            .line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("abylab.ai"))
+            .expect("brand span");
+        assert_eq!(
+            brand.style.fg,
+            Some(app.theme.fg_tertiary),
+            "the pale chrome tone the model id wears, no accent"
+        );
+
+        app.show_tip("image staged".to_string());
+        let frame = dump_frame(&mut app, 80, 20);
+        let cap = cap_row(&frame);
+        assert!(cap.contains("image staged"), "{cap}");
+        assert!(
+            !cap.contains("abylab.ai"),
+            "a tip takes the whole left title: {cap}"
+        );
+    }
+
     #[test]
     fn permission_ask_stays_visible_over_question_on_narrow_terminals() {
         use crate::app::{PermissionAskOverlay, UserQuestionOverlay};
@@ -3995,6 +4127,11 @@ mod tests {
         assert!(
             frame.contains("Allow once"),
             "permission must be on top: {frame}"
+        );
+        assert!(
+            app.caret_cell.is_none(),
+            "the card on top takes the caret with the keys: {:?}",
+            app.caret_cell
         );
         let _ = dump_frame(&mut app, 20, 8);
     }
