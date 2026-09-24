@@ -8,6 +8,10 @@
 # tarballs under `downloads/latest/`, using the stable names plus VERSION and
 # SHA256SUMS that install.sh asks the mirror for.
 #
+# Either way the staged HTML references the CSS and JS as `/styles.css?v=<hash>`
+# (see version_assets below) — the staging step is where a deploy learns what it
+# is uploading, and it is the one place both deployers already share.
+#
 # Both deployers call this — site.yml for site pushes, release.yml's mirror job
 # after a release — because a Pages deployment is a full snapshot of the
 # uploaded directory: whichever one runs has to carry the other one's half, or
@@ -28,6 +32,34 @@ fi
 
 mkdir -p "$DEST"
 cp -R site/. "$DEST"/
+
+# Point the HTML at content-addressed copies of the CSS and JS.
+#
+# The zone's Browser Cache TTL (4 hours) is longer than anything `_headers` can
+# ask for, and it silently wins: a returning visitor keeps the stylesheet it
+# already has while the HTML around it is already the new one, which is how a
+# restyled page renders half-old for hours. HTML itself is revalidated on every
+# load, so hanging a hash off the asset URL means a changed file is a new URL,
+# fetched immediately, and the old one is never requested again.
+#
+# The hash comes from the bytes we are about to upload, so no one has to
+# remember to bump a version when the stylesheet changes.
+version_assets() {
+    local asset hash page
+    for asset in styles.css app.js vendor/pico.min.css; do
+        [ -f "$DEST/$asset" ] || continue
+        hash=$(sha256sum "$DEST/$asset" | cut -c1-12)
+        for page in "$DEST"/*.html "$DEST"/*/*.html; do
+            [ -f "$page" ] || continue
+            sed "s#\"/$asset\"#\"/$asset?v=$hash\"#g" "$page" >"$page.tmp"
+            mv "$page.tmp" "$page"
+        done
+        echo "  /$asset?v=$hash"
+    done
+}
+
+echo "staged site/ with hashed asset URLs:"
+version_assets
 
 if [ -z "$TAG" ]; then
     echo "staged site/ only, no downloads (no tag given)"

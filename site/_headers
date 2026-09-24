@@ -10,14 +10,20 @@
   Permissions-Policy: camera=(), microphone=(), geolocation=()
   Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'
 
-# Pico is pinned to a version, but the filename is not: keep this short enough
-# that a Pico upgrade reaches returning visitors without a hard refresh.
+# Everything below is safe to pin for a week because the staging step gives the
+# URL a content hash (`/styles.css?v=<sha256>`, see scripts/stage-site.sh), so a
+# changed file is a new URL rather than a stale one. Note that the zone's
+# Browser Cache TTL overrides anything shorter than 4 hours anyway — a `3600`
+# here did nothing — which is exactly why the hashes exist.
+#
+# The splat also catches the hashed form if Pages ever matches on the full URL.
+# HTML is deliberately absent: Pages revalidates it on every load, and that is
+# what makes the new URLs reach a returning visitor right away.
 /vendor/*
   Cache-Control: public, max-age=604800
-
-/styles.css
-  Cache-Control: public, max-age=3600
-/app.js
-  Cache-Control: public, max-age=3600
+/styles.css*
+  Cache-Control: public, max-age=604800
+/app.js*
+  Cache-Control: public, max-age=604800
 /favicon.svg
   Cache-Control: public, max-age=604800
