@@ -11,7 +11,7 @@ ACP，没有插件，没有 demo 模式。
 1. 安装（支持 Linux，macOS），在你的终端中运行：
 
 ```sh
-/bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
+curl -fsSL https://abylab.ai/install.sh | bash
 ```
 
 你可以直接让你的 ai 帮你安装。

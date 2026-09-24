@@ -9,7 +9,7 @@ ACP, no plugins, no demo mode.
 ## Quick start
 
 ```sh
-/bin/bash -c "$(curl -fsSL https://abylab.ai/install.sh)"
+curl -fsSL https://abylab.ai/install.sh | bash
 abylab
 ```
 

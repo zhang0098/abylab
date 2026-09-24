@@ -10,6 +10,13 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Changed
+
+- The install one-liner is now `curl -fsSL https://abylab.ai/install.sh | bash` — the same script at the
+  same URL, without the `/bin/bash -c "$(…)"` wrapper. Both READMEs, the site hero, `install.sh --help`
+  and the note in `site/_redirects` all switched. The script never reads stdin (the `read` behind the
+  PATH step consumes its own heredoc), so piping it into `bash` cannot eat the script.
+
 ## [0.1.14] - 2026-09-24
 
 ### Added

@@ -10,6 +10,13 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 安装命令换成 `curl -fsSL https://abylab.ai/install.sh | bash`。脚本还是同一份（还是 curl 那个
+  地址），只是不再套一层 `/bin/bash -c "$(…)"`。README 中英、站点首页、`install.sh --help`
+  和 `site/_redirects` 里的注释一起改。脚本从不读标准输入（PATH 那段的 `read` 读的是这里的
+  heredoc），所以管道形式不会吞掉脚本内容。
+
 ## [0.1.14] - 2026-09-24
 
 ### 新增
