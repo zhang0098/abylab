@@ -1,6 +1,8 @@
 //! Cross-layer regressions: acknowledged host mutations are durable, and live
 //! settings changes retain the parent's writer, identity and child controls.
 mod common;
+#[path = "session_lifecycle/goal_controls.rs"]
+mod goal_controls;
 
 use abycore::{GoalStatus, SessionSnapshot, SessionStore};
 use abylab_backend::{Cmd, CtlEvent, DriverConfig, Event, TurnLimits, UiEvent};

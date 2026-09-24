@@ -49,11 +49,6 @@ impl GoalStatus {
     }
 }
 
-/// Default round allowance when neither the host nor the model sets one.
-pub const DEFAULT_MAX_ROUNDS: u64 = 10;
-/// Upper bound on a requested allowance: an unattended loop stays bounded.
-pub const MAX_MAX_ROUNDS: u64 = 100;
-
 /// The session's durable completion objective.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,22 +60,24 @@ pub struct Goal {
     pub status: GoalStatus,
     /// Rounds the host's driver has already spent on this goal.
     pub rounds_started: u64,
-    /// Round allowance for this goal.
-    pub max_rounds: u64,
+    /// Optional total round allowance. None means no round limit.
+    #[serde(default)]
+    pub max_rounds: Option<u64>,
     /// Optional reason, e.g. why the goal is blocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
 impl Goal {
-    /// Rounds still available to a driver.
-    pub fn remaining_rounds(&self) -> u64 {
-        self.max_rounds.saturating_sub(self.rounds_started)
+    /// Rounds still available to a driver; None means unlimited.
+    pub fn remaining_rounds(&self) -> Option<u64> {
+        self.max_rounds
+            .map(|limit| limit.saturating_sub(self.rounds_started))
     }
 
     /// Whether a driver may start another round right now.
     pub fn may_start_round(&self) -> bool {
-        self.status == GoalStatus::Active && self.remaining_rounds() > 0
+        self.status == GoalStatus::Active && self.remaining_rounds() != Some(0)
     }
 
     /// Line the model and the transcript both read.
@@ -96,7 +93,9 @@ impl Goal {
             self.objective,
             self.status.label(),
             self.rounds_started,
-            self.max_rounds,
+            self.max_rounds
+                .map(|limit| limit.to_string())
+                .unwrap_or_else(|| "unlimited".into()),
             note
         )
     }
@@ -113,10 +112,10 @@ pub(crate) fn validate_goal(goal: Option<&Goal>) -> Result<()> {
             "goal id and objective must not be empty",
         ));
     }
-    if goal.max_rounds == 0 || goal.max_rounds > MAX_MAX_ROUNDS {
+    if goal.max_rounds == Some(0) {
         return Err(Error::new(
             ErrorKind::Session,
-            "goal max_rounds must be between 1 and 100",
+            "goal max_rounds must be a positive integer or null (unlimited)",
         ));
     }
     Ok(())
@@ -131,11 +130,10 @@ pub(crate) fn new_goal(objective: String, max_rounds: Option<u64>) -> Result<Goa
             "a goal needs an objective",
         ));
     }
-    let max_rounds = max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
-    if max_rounds == 0 || max_rounds > MAX_MAX_ROUNDS {
+    if max_rounds == Some(0) {
         return Err(Error::new(
             ErrorKind::Configuration,
-            "goal max_rounds must be between 1 and 100",
+            "goal max_rounds must be a positive integer",
         ));
     }
     Ok(Goal {
@@ -215,7 +213,10 @@ pub(crate) fn apply_goal_request(current: Option<&Goal>, request: &GoalRequest) 
                     "a goal already exists; update it instead of creating another",
                 ));
             }
-            new_goal(objective.clone(), *max_rounds)
+            let mut goal = new_goal(objective.clone(), *max_rounds)?;
+            goal.status = GoalStatus::Paused;
+            goal.note = Some("awaiting /goal resume".into());
+            Ok(goal)
         }
         GoalRequest::Update {
             goal_id,
@@ -239,6 +240,12 @@ pub(crate) fn apply_goal_request(current: Option<&Goal>, request: &GoalRequest) 
                         "goal revision {} is stale; read the goal again (current {})",
                         revision, goal.revision
                     ),
+                ));
+            }
+            if *status == GoalStatus::Active {
+                return Err(Error::new(
+                    ErrorKind::Configuration,
+                    "only the host can resume a goal",
                 ));
             }
             Ok(Goal {
@@ -294,12 +301,12 @@ impl Tool for CreateGoalTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "create_goal".into(),
-            description: "Create the session's completion objective. Only do this for a direct, long-running request from the user; it fails while another active goal exists. max_rounds bounds how many autonomous rounds a host may spend (default 10, max 100).".into(),
+            description: "Create a paused completion objective for a direct, long-running user request. The user starts it with /goal resume; creation does not start autonomous work. It fails while an unfinished goal exists. Omit max_rounds for no round limit; set a positive total only when the user specifies a limit.".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
                     "objective":{"type":"string","minLength":1},
-                    "max_rounds":{"type":"integer","minimum":1,"maximum":100}
+                    "max_rounds":{"type":"integer","minimum":1}
                 },
                 "required":["objective"],
                 "additionalProperties":false
@@ -359,13 +366,13 @@ impl Tool for UpdateGoalTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "update_goal".into(),
-            description: "Update the session's goal: pause, resume (active), mark complete when the objective is achieved, or blocked when progress is impossible. Quote the exact id and revision from get_goal; a stale revision is refused. Use note to explain a block.".into(),
+            description: "Update the session's goal: pause at the user's request, mark complete when achieved, or blocked when progress is impossible. Only the host can resume a goal. Quote the exact id and revision from get_goal; stale updates are refused. Use note to explain a block.".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
                     "goal_id":{"type":"string","minLength":1},
                     "revision":{"type":"integer","minimum":1},
-                    "status":{"type":"string","enum":["active","paused","blocked","complete"]},
+                    "status":{"type":"string","enum":["paused","blocked","complete"]},
                     "note":{"type":"string"}
                 },
                 "required":["goal_id","revision","status"],
@@ -406,10 +413,10 @@ impl Tool for UpdateGoalTool {
             .get("status")
             .and_then(Value::as_str)
             .and_then(GoalStatus::parse)
-            .is_some()
+            .is_some_and(|status| status != GoalStatus::Active)
         {
             return Err(tool_error(
-                "status must be active, paused, blocked or complete",
+                "status must be paused, blocked or complete; only the host can resume",
             ));
         }
         Ok(())
@@ -466,7 +473,7 @@ mod tests {
         );
         assert!(
             UpdateGoalTool
-                .validate(&json!({"goal_id": "g", "revision": 1, "status": "active"}))
+                .validate(&json!({"goal_id": "g", "revision": 1, "status": "paused"}))
                 .is_ok()
         );
         assert!(

@@ -538,6 +538,59 @@ impl Agent {
         Ok(updated)
     }
 
+    /// Change the total allowance without starting the goal; None removes the limit.
+    pub fn set_goal_rounds(&mut self, max_rounds: Option<u64>) -> Result<Goal> {
+        let updated = self.goal_with_rounds(Some(max_rounds))?;
+        self.state.goal = Some(updated.clone());
+        Ok(updated)
+    }
+
+    /// Resume with the remaining allowance, optionally changing its total first.
+    /// Validation is atomic: an invalid allowance leaves the goal untouched.
+    pub fn resume_goal(&mut self, max_rounds: Option<u64>) -> Result<Goal> {
+        let mut updated = self.goal_with_rounds(max_rounds.map(Some))?;
+        if updated.status == GoalStatus::Complete {
+            return Err(Error::new(
+                ErrorKind::Configuration,
+                "the goal is already complete",
+            ));
+        }
+        if updated.remaining_rounds() == Some(0) {
+            return Err(Error::new(
+                ErrorKind::Configuration,
+                "goal rounds exhausted; use /goal @<larger total> resume / 目标轮次用尽，请提高总配额后恢复",
+            ));
+        }
+        updated.status = GoalStatus::Active;
+        updated.note = None;
+        self.state.goal = Some(updated.clone());
+        Ok(updated)
+    }
+
+    fn goal_with_rounds(&self, max_rounds: Option<Option<u64>>) -> Result<Goal> {
+        let goal = self
+            .state
+            .goal
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::Configuration, "no goal to update"))?;
+        let updated = Goal {
+            max_rounds: max_rounds.unwrap_or(goal.max_rounds),
+            revision: goal.revision.saturating_add(1),
+            ..goal.clone()
+        };
+        crate::goal::validate_goal(Some(&updated))?;
+        if updated
+            .max_rounds
+            .is_some_and(|limit| limit < updated.rounds_started)
+        {
+            return Err(Error::new(
+                ErrorKind::Configuration,
+                "goal max_rounds cannot be less than rounds already started",
+            ));
+        }
+        Ok(updated)
+    }
+
     /// Forget the goal entirely.
     pub fn clear_goal(&mut self) {
         self.state.goal = None;

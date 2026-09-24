@@ -220,21 +220,29 @@ state is announced.
 
 ## Goal rounds
 
-One durable objective per session, with an explicit round allowance:
+One durable objective per session, unlimited by default unless a round allowance is specified:
 
 - `/goal <objective>` creates the goal and spends round 1 right away.
-  `/goal @<n> <objective>` sets the allowance (default 10, max 100).
+  `/goal @<n> <objective>` sets a positive total allowance, without a fixed
+  100-round cap. Numeric allowances in older saved sessions remain in effect.
 - `/goal status` prints it; `/goal pause|resume|complete|clear` controls it.
-  `/goal resume` also gets an idle goal moving again, and any prompt you send
-  while the goal is armed continues the rounds after it.
+  Status and pause use a control channel serviced during execution. Status
+  costs no model request; pause cancels the current turn and acknowledges the
+  saved paused state after cleanup, without waiting for every round to finish.
+- `/goal @<n> resume` sets the total allowance and continues the same goal,
+  preserving its identity and spent rounds. `/goal rounds <n>` only changes
+  the allowance; `/goal rounds off` removes it. Neither starts execution.
+  A bare resume fails with an actionable message if the allowance is exhausted.
 - Each round is one ordinary turn seeded with the objective; the model ends the
   loop by calling `update_goal` with `complete` or `blocked` (it has to quote the
   id and revision from `get_goal`, so a stale model can't overwrite a goal that
-  moved on). Running out of allowance records a blocker instead of looping
-  forever, and esc still interrupts a round.
+  moved on). Exhausting an explicit allowance stops the goal as blocked.
+  Esc saves an active goal as paused; errors stop it as blocked and incomplete
+  responses stop it as paused. Ordinary messages do not resume stopped goals.
 - Continuation is armed by *you*: a goal the model creates through its tools
-  doesn't start any rounds until you run `/goal resume`. The SDK never starts a
-  turn on its own; the driver here does.
+  starts paused and waits for `/goal resume`; the model cannot set it active.
+  Restoring a session also saves previously active goals as paused before
+  binding the session. The SDK never starts a turn on its own; the driver here does.
 
 
 ## Steering
