@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-09-24
+
 ### Added
 
 - The composer border's top-left now carries `abylab.ai`, like a window title. That cell used to stay
@@ -571,7 +573,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/zhang0098/abylab/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/zhang0098/abylab/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/zhang0098/abylab/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/zhang0098/abylab/compare/v0.1.11...v0.1.12

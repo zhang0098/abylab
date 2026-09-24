@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-09-24
+
 ### 新增
 
 - 输入框边框左上角常驻一个 `abylab.ai`（站点地址），像窗口标题那样。空着的那一格以前什么都不写，
@@ -423,7 +425,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/zhang0098/abylab/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/zhang0098/abylab/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/zhang0098/abylab/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/zhang0098/abylab/compare/v0.1.11...v0.1.12
