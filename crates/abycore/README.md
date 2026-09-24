@@ -58,7 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   SDK 压缩或修剪请求视图而不改写持久化记录，提供商确认的溢出会"硬压缩"
   （只留当前回合）并重试同一回合。
 - **目标** — 每会话一个持久完成目标（`get_goal`/`create_goal`/`update_goal`），
-  带版本号校验的完成协议；轮次由宿主驱动。
+  带版本号校验的完成协议；轮次由宿主驱动。`Goal.max_rounds` 和
+  `remaining_rounds()` 为 `Option<u64>`，`None` 表示不限轮数；旧快照的数字配额保留。
+  模型创建的目标初始 paused，恢复执行由宿主 `resume_goal` 控制；
+  `set_goal_rounds(Some(n))` 修改总配额，`set_goal_rounds(None)` 取消限制。
 - **技能** — `SkillCatalog::discover` 读用户写的 `SKILL.md`（工作区的
   `.agents/skills/`，可选 frontmatter 写名字、描述、参数提示；正文上限 64 KiB，
   超出按字符边界截断并留标记），`expand` 把

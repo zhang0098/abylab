@@ -70,7 +70,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   recovers by condensing hard and retrying the same open turn.
 - **Goals** — one durable completion objective per session
   (`get_goal`/`create_goal`/`update_goal`) with a revision-checked completion
-  protocol; the host drives rounds.
+  protocol; the host drives rounds. `Goal.max_rounds` and `remaining_rounds()`
+  are `Option<u64>`: `None` means unlimited, while numeric limits in older
+  snapshots are preserved. Model-created goals start paused; the host resumes
+  them with `resume_goal`. `set_goal_rounds(Some(n))` changes the total allowance,
+  and `set_goal_rounds(None)` removes the limit.
 - **Skills** — `SkillCatalog::discover` reads the `SKILL.md` documents a user
   wrote under the workspace's `.agents/skills/` directory (optional frontmatter
   for name, description and argument hint; bodies cap at 64 KiB and are

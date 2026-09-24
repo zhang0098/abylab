@@ -41,10 +41,7 @@ pub use config::{
 pub use deepseek::{DeepSeekClient, MessageRequest, MessageStream};
 pub use error::{Error, ErrorKind, Result};
 pub use event::{AgentEvent, RunOutcome, StopReason, StreamEvent};
-pub use goal::{
-    CreateGoalTool, DEFAULT_MAX_ROUNDS, GetGoalTool, Goal, GoalStatus, MAX_MAX_ROUNDS,
-    UpdateGoalTool,
-};
+pub use goal::{CreateGoalTool, GetGoalTool, Goal, GoalStatus, UpdateGoalTool};
 pub use hooks::{AgentHooks, CheckpointKind, ToolDecision};
 pub use local_tools::{
     BashJob, BashJobOutput, BashJobStatus, BashOutputCursor, BashResult, BashStreamOutput,
