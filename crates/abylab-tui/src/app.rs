@@ -5886,6 +5886,11 @@ impl App {
     fn fold_queue(&mut self, items: Vec<crate::bus::QueueRow>) {
         let mut next: VecDeque<QueuedPrompt> = VecDeque::new();
         for row in items {
+            // A queue acknowledgement can arrive after the user promoted its
+            // optimistic row to a steer. Its pending echo already exists.
+            if self.pending_steer_cells.contains_key(&row.item_id) {
+                continue;
+            }
             let existing = self
                 .prompt_queue
                 .iter()
@@ -10910,6 +10915,52 @@ mod mode_tests {
                 crate::transcript::CellKind::User { text, .. } if text == "from another client"
             )),
             "a row the host dropped took its echo with it"
+        );
+    }
+
+    #[test]
+    fn a_queue_acknowledgement_does_not_duplicate_a_pending_steer() {
+        let (mut app, _demo, _rx) = test_app();
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.state = RunState::Running;
+        app.send_agent_text("follow-up".into(), &ctl);
+        let item_id = app.prompt_queue[0].id;
+        assert!(app.steer_queued(0, &ctl));
+        app.handle(
+            AppEvent::Ctl(CtlEvent::Queue {
+                items: vec![crate::bus::QueueRow {
+                    item_id,
+                    text: "follow-up".into(),
+                    parts: None,
+                    steering: false,
+                }],
+            }),
+            &ctl,
+        );
+        assert_eq!(app.queued, 0);
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SteerSettled {
+                message_id: item_id,
+                deferred: false,
+            }),
+            &ctl,
+        );
+        app.handle(AppEvent::Ctl(CtlEvent::QueueClaimed { item_id }), &ctl);
+        app.handle(AppEvent::Ctl(CtlEvent::Queue { items: vec![] }), &ctl);
+        let echoes: Vec<_> = app
+            .transcript
+            .cells
+            .iter()
+            .filter_map(|cell| match &cell.kind {
+                crate::transcript::CellKind::User { text, delivery } => {
+                    Some((text.as_str(), *delivery))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            echoes,
+            [("follow-up", crate::transcript::Delivery::Delivered)]
         );
     }
 

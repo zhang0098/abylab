@@ -45,6 +45,7 @@ dependencies = [
  "abylab-backend",
  "anyhow",
  "base64 0.22.1",
+ "cap-std",
  "crossterm",
  "image",
  "libc",

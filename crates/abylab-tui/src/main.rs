@@ -1196,7 +1196,7 @@ mod cli_args_tests {
         std::fs::write(home.join(".credentials.yaml"), "version: 1\n").expect("key");
         std::fs::write(home.join("sessions/ws-abc/aby-1/session.jsonl"), "log").expect("log");
         std::fs::write(home.join("AGENTS.md"), "be terse").expect("instructions");
-        home
+        std::fs::canonicalize(home).unwrap()
     }
 
     /// The harness analogy: its agent loop has no turn budget, and the caps it
@@ -1212,3 +1212,7 @@ mod cli_args_tests {
         assert_eq!(limits, abylab_backend::TurnLimits::watchdog());
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/session_queue__tests.rs"]
+mod session_queue_tests;
