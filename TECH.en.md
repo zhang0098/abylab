@@ -292,11 +292,11 @@ for the turn in flight to end) or `Steering` (the running turn already has it).
   removal, an edit, a new steer), then rows the turn took (`settle_taken`), and
   only then is the head shipped as the next prompt. A removal can therefore
   never lose a race with the boundary that drains the row it changes.
-- Steering rides its own channel (`DriverHandle::steer`): it is the only one a
-  *running* turn reads, taking the message at its next step boundary, while
-  queue commands are read at the idle wait. Clients no longer have to guess
-  whether the agent is busy: the `⌥↑` list's enter / ctrl+enter / ctrl+d just
-  send commands.
+- Steering rides its own channel (`DriverHandle::steer`), checks the session
+  identity, and takes the message at the next step boundary. Queue additions,
+  edits and removals are processed and saved during running turns, questions,
+  retries and compaction. Ordinary commands, including session switches, wait for
+  that work to finish. The `⌥↑` list's enter / ctrl+enter / ctrl+d just send commands.
 - Taken ids stay in a tombstone set: a client's "queue it, then steer it" pair
   can be in flight at once, and the late queue command must not turn a delivered
   row back into a queued one.
@@ -326,7 +326,10 @@ half lives in `data.rs` (`data::scan` / `data::wipe`), the program half in
   abycore reads out of the home, which belongs to the user) and a session store
   `--session-root` put outside the home (the command cleans ABYHOME). The home
   itself is never a target, not even when someone points `--session-root` at
-  it — that path is reported as kept, with the reason.
+  it — that path is reported as kept, with the reason. Ownership checks resolve
+  `..` and parent symlinks. Deletion uses the home directory handle opened by
+  the scan, so replacing a parent with a symlink cannot redirect it outside.
+  A final symlink is unlinked without deleting its target.
 - **Measure first, then execute that list**: `scan` counts files and bytes with
   `lstat` (a symlink counts as the link itself, which is what `remove_dir_all`
   will unlink; one entry walks at most `MAX_WALK` files and then reads `N+`, so

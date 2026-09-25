@@ -27,7 +27,9 @@ use crate::contract::{
 use crate::user_questions::AskUserQuestionTool;
 
 mod goal;
+mod queue;
 use goal::{GoalCommand, GoalControl};
+use queue::{Commands, QueueContext};
 
 const SERVER_LABEL: &str = "abycore · deepseek-responses";
 
@@ -666,16 +668,21 @@ fn settle_taken(
     session: &str,
     ctl: &impl Fn(CtlEvent),
 ) {
-    let ids = taken.take();
-    if ids.is_empty() {
+    // Keep the bounded tombstones until the session changes: a queue command
+    // may arrive after this settlement, even after the turn has finished.
+    let claimed: Vec<_> = queue
+        .iter()
+        .filter(|item| taken.contains(item.item_id))
+        .map(|item| item.item_id)
+        .collect();
+    if claimed.is_empty() {
         return;
     }
-    let before = queue.len();
-    queue.retain(|item| !ids.contains(&item.item_id));
-    if queue.len() == before {
-        return;
-    }
+    queue.retain(|item| !taken.contains(item.item_id));
     save_queue_or_report(cfg, session, queue, ctl);
+    for item_id in claimed {
+        ctl(CtlEvent::QueueClaimed { item_id });
+    }
     publish_queue(queue, session, ctl);
 }
 
@@ -702,7 +709,7 @@ fn claim_queued(
 /// harness turns a steer that missed its window into the next waking turn).
 #[allow(clippy::too_many_arguments)] // the queue's owners live in drive's scope
 async fn next_command(
-    cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    cmd_rx: &mut Commands,
     goal_rx: &mut mpsc::UnboundedReceiver<GoalControl>,
     steer_rx: &mut mpsc::UnboundedReceiver<SteerRequest>,
     queue: &mut VecDeque<QueuedItem>,
@@ -760,13 +767,14 @@ async fn next_command(
 
 async fn drive(
     cfg: DriverConfig,
-    mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     query_rx: mpsc::UnboundedReceiver<Cmd>,
     mut interrupt_rx: mpsc::UnboundedReceiver<()>,
     mut steer_rx: mpsc::UnboundedReceiver<SteerRequest>,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
 ) {
     let ctl = |event: CtlEvent| sink(Event::Ctl(event));
+    let mut cmd_rx = Commands::new(cmd_rx);
     // Turn budgets are fixed at launch (CLI/env): a mid-session change would
     // silently alter how the next segment behaves.
     let limits = cfg.limits;
@@ -982,6 +990,17 @@ async fn drive(
     )
     .await
     {
+        let Some(cmd) = (QueueContext {
+            cfg: &cfg,
+            session: &active_session,
+            queue: &mut queue,
+            taken: &taken,
+            admitted: &admitted,
+            sink: &sink,
+        })
+        .apply(cmd) else {
+            continue;
+        };
         let cmd = match cmd {
             Cmd::PromptForSession { session_id, text } => {
                 if session_id != active_session {
@@ -1091,7 +1110,19 @@ async fn drive(
                             limits,
                             compaction,
                         };
-                        goal::drive_rounds(agent, &mut ctx, &ctl).await;
+                        cmd_rx
+                            .during(
+                                goal::drive_rounds(agent, &mut ctx, &ctl),
+                                QueueContext {
+                                    cfg: &cfg,
+                                    session: &active_session,
+                                    queue: &mut queue,
+                                    taken: &taken,
+                                    admitted: &admitted,
+                                    sink: &sink,
+                                },
+                            )
+                            .await;
                     }
                     Ok(false) => {}
                     Err(error) => ctl(CtlEvent::TuiOpFailed(format!(
@@ -1111,15 +1142,26 @@ async fn drive(
                     session: active_session.clone(),
                     running: true,
                 }));
-                let result = compact_history(
-                    agent,
-                    compaction,
-                    CompactTrigger::Manual,
-                    &mut interrupt_rx,
-                    &mut goal_rx,
-                    &sink,
-                )
-                .await;
+                let result = cmd_rx
+                    .during(
+                        compact_history(
+                            agent,
+                            compaction,
+                            CompactTrigger::Manual,
+                            &mut interrupt_rx,
+                            &mut goal_rx,
+                            &sink,
+                        ),
+                        QueueContext {
+                            cfg: &cfg,
+                            session: &active_session,
+                            queue: &mut queue,
+                            taken: &taken,
+                            admitted: &admitted,
+                            sink: &sink,
+                        },
+                    )
+                    .await;
                 sink(Event::Ui(UiEvent::SessionStatus {
                     session: active_session.clone(),
                     running: false,
@@ -1245,7 +1287,6 @@ async fn drive(
                         taken.take();
                         admitted.take();
                         queue = load_session_queue(&cfg, &active_session, &ctl);
-                        publish_queue(&queue, &active_session, &ctl);
                         bind_session(
                             agent.as_ref().unwrap(),
                             &active_session,
@@ -1253,6 +1294,7 @@ async fn drive(
                             restoring,
                             &sink,
                         );
+                        publish_queue(&queue, &active_session, &ctl);
                         emit_permission_facts(&sink, &active_session, permission_mode);
                     }
                     Err(error) => ctl(CtlEvent::SessionSwitchFailed(format!(
@@ -1397,122 +1439,9 @@ async fn drive(
                     ));
                 }
             }
-            Cmd::QueueForSession {
-                session_id,
-                item_id,
-                text,
-            } => {
-                if session_id != active_session || text.trim().is_empty() {
-                    // The session moved on, or there is nothing to send: the
-                    // client's optimistic row goes away instead of lying.
-                    ctl(CtlEvent::QueueRemoved { item_id });
-                    continue;
-                }
-                if taken.contains(item_id) || admitted.contains(item_id) {
-                    // The running turn already took this id (the client queued
-                    // and steered it in the same breath): it is being delivered,
-                    // so say that instead of queueing a duplicate.
-                    ctl(CtlEvent::QueueClaimed { item_id });
-                    continue;
-                }
-                queue.push_back(QueuedItem {
-                    item_id,
-                    text,
-                    parts: None,
-                    placement: QueuePlacement::Queued,
-                    held: false,
-                });
-                if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
-                    queue.pop_back();
-                    ctl(CtlEvent::QueueRemoved { item_id });
-                    continue;
-                }
-                publish_queue(&queue, &active_session, &ctl);
-            }
-            Cmd::QueuePartsForSession {
-                session_id,
-                item_id,
-                text,
-                parts,
-            } => {
-                if session_id != active_session || parts.is_empty() {
-                    ctl(CtlEvent::QueueRemoved { item_id });
-                    continue;
-                }
-                if taken.contains(item_id) || admitted.contains(item_id) {
-                    ctl(CtlEvent::QueueClaimed { item_id });
-                    continue;
-                }
-                queue.push_back(QueuedItem {
-                    item_id,
-                    text,
-                    parts: Some(parts),
-                    placement: QueuePlacement::Queued,
-                    held: false,
-                });
-                if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
-                    queue.pop_back();
-                    ctl(CtlEvent::QueueRemoved { item_id });
-                    continue;
-                }
-                publish_queue(&queue, &active_session, &ctl);
-            }
-            Cmd::UpdateQueue {
-                session_id,
-                item_id,
-                action,
-            } => {
-                if session_id != active_session {
-                    ctl(CtlEvent::QueueRemoved { item_id });
-                    continue;
-                }
-                let before_edit = queue.clone();
-                match action {
-                    QueueAction::Remove => {
-                        if let Some(index) = queue.iter().position(|item| item.item_id == item_id) {
-                            queue.remove(index);
-                        }
-                        ctl(CtlEvent::QueueRemoved { item_id });
-                    }
-                    QueueAction::Edit(text) => {
-                        match queue.iter().position(|item| item.item_id == item_id) {
-                            Some(index) if text.trim().is_empty() => {
-                                queue.remove(index);
-                                ctl(CtlEvent::QueueRemoved { item_id });
-                            }
-                            Some(index) => {
-                                queue[index].text = text.clone();
-                                if let Some(parts) = &mut queue[index].parts {
-                                    parts.retain(|part| {
-                                        matches!(part, abycore::ContentPart::InputImage { .. })
-                                    });
-                                    parts.insert(0, abycore::ContentPart::InputText { text });
-                                }
-                            }
-                            // Already delivered or removed: the client's row is
-                            // stale, and saying so is cheaper than resurrecting it.
-                            None => ctl(CtlEvent::QueueRemoved { item_id }),
-                        }
-                    }
-                    QueueAction::EditParts { text, parts } => {
-                        if let Some(index) = queue.iter().position(|item| item.item_id == item_id) {
-                            if parts.is_empty() {
-                                queue.remove(index);
-                                ctl(CtlEvent::QueueRemoved { item_id });
-                            } else {
-                                queue[index].text = text;
-                                queue[index].parts = Some(parts);
-                            }
-                        } else {
-                            ctl(CtlEvent::QueueRemoved { item_id });
-                        }
-                    }
-                }
-                if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
-                    queue = before_edit;
-                }
-                publish_queue(&queue, &active_session, &ctl);
-            }
+            Cmd::QueueForSession { .. }
+            | Cmd::QueuePartsForSession { .. }
+            | Cmd::UpdateQueue { .. } => unreachable!("queue commands handled above"),
             Cmd::Prompt { text } => {
                 let Some(agent) = agent.as_mut() else {
                     // A steer that cannot start a turn stays the client's queue
@@ -1566,7 +1495,20 @@ async fn drive(
                     Some(parts) => PromptInput::Parts(parts),
                     None => PromptInput::Text(text),
                 };
-                if let Err(error) = turn(agent, Some(input), &mut ctx, true).await {
+                if let Err(error) = cmd_rx
+                    .during(
+                        turn(agent, Some(input), &mut ctx, true),
+                        QueueContext {
+                            cfg: &cfg,
+                            session: &active_session,
+                            queue: &mut queue,
+                            taken: &taken,
+                            admitted: &admitted,
+                            sink: &sink,
+                        },
+                    )
+                    .await
+                {
                     report_turn_err(&ctl, &error, limits);
                 }
                 // This process has run a turn: restored items are no longer
@@ -2408,6 +2350,13 @@ async fn run_segment(
 /// continues one more step instead of stopping. Nothing is cancelled and no
 /// event from the in-flight step is discarded.
 fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
+    if request.session_id != ctx.session {
+        (ctx.sink)(Event::Ctl(CtlEvent::SteerSettled {
+            message_id: request.message_id,
+            deferred: true,
+        }));
+        return;
+    }
     // Same seam every prompt crosses: `/name` naming a skill ships that skill's
     // body, not the bare command line.
     let result = match request.parts {
@@ -2438,6 +2387,11 @@ fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
         message_id: request.message_id,
         deferred,
     }));
+    if !deferred {
+        (ctx.sink)(Event::Ctl(CtlEvent::QueueClaimed {
+            item_id: request.message_id,
+        }));
+    }
 }
 
 /// Drive one turn: `Some(text)` adds a prompt to a fresh or unfinished turn;
@@ -4204,7 +4158,7 @@ mod tests {
                     text: "send me now".into(),
                 })
                 .expect("queue follow-up");
-            // The steer rides its own channel: only that reaches a running turn.
+            // The steer rides its own channel into the running turn's inbox.
             steer_tx
                 .send(SteerRequest {
                     session_id: "steer-test".into(),
@@ -4236,9 +4190,8 @@ mod tests {
             )),
             "the steer settled as accepted"
         );
-        // The steer beat the queue command: the driver never queued the item,
-        // it told the client it was already taken (so the optimistic row can
-        // settle as delivered instead of lingering).
+        // The queue may now be saved before the running turn sees its steer.
+        // It still leaves the FIFO and must never become a second turn.
         let snapshots: Vec<Vec<QueueRow>> = events
             .iter()
             .filter_map(|event| match event {
@@ -4248,9 +4201,9 @@ mod tests {
             .collect();
         assert!(
             snapshots
-                .iter()
-                .all(|items| items.iter().all(|row| row.item_id != 9)),
-            "a steered item is never queued: {snapshots:?}"
+                .last()
+                .is_some_and(|items| items.iter().all(|row| row.item_id != 9)),
+            "a steered row must leave the queue: {snapshots:?}"
         );
         assert!(
             events
@@ -4847,7 +4800,8 @@ mod tests {
     #[tokio::test]
     async fn the_idle_wait_turns_a_steer_into_the_next_turn() {
         let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let mut cmd_rx = Commands::new(cmd_rx);
         let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let mut queue = VecDeque::new();
         let taken = OutstandingSteers::default();
@@ -4903,7 +4857,8 @@ mod tests {
     #[tokio::test]
     async fn the_idle_wait_drains_the_queue_after_pending_commands() {
         let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let mut cmd_rx = Commands::new(cmd_rx);
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let mut queue = VecDeque::new();
         let taken = OutstandingSteers::default();
@@ -4976,7 +4931,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_pending_goal_start_precedes_its_followup_pause() {
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let mut cmd_rx = Commands::new(cmd_rx);
         let (goal_tx, mut goal_rx) = mpsc::unbounded_channel();
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let mut queue = VecDeque::new();
@@ -5058,10 +5014,13 @@ mod tests {
         assert!(!steer.is_empty(), "the message waits for the next boundary");
         assert!(matches!(
             events.lock().expect("event lock").as_slice(),
-            [Event::Ctl(CtlEvent::SteerSettled {
-                message_id: 5,
-                deferred: false
-            })]
+            [
+                Event::Ctl(CtlEvent::SteerSettled {
+                    message_id: 5,
+                    deferred: false
+                }),
+                Event::Ctl(CtlEvent::QueueClaimed { item_id: 5 })
+            ]
         ));
 
         // Rejection is honest: the inbox stays empty and the client keeps the

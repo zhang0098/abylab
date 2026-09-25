@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 abylab-backend = { path = "../abylab-backend" }
 anyhow = "1"
+cap-std = "4.0.3"
 libc = "0.2"
 signal-hook = "0.3"
 crossterm = "0.29"

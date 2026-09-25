@@ -5,3 +5,6 @@
 # Cloudflare Pages staging output (scripts/stage-site.sh <dest>).
 /staging
 /staging-check
+.codex
+.abylab
+

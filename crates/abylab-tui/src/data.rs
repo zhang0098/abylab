@@ -26,7 +26,12 @@
 //! measured with `lstat`, so a symlink counts as the file it is instead of the
 //! tree it names — exactly what `remove_dir_all` will unlink.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use cap_std::{ambient_authority, fs::Dir};
 
 use crate::locale::Locale;
 
@@ -77,6 +82,8 @@ pub enum DataKeepWhy {
     RootIsHome,
     /// A file the user wrote by hand; the program only reads it.
     HandWritten,
+    /// The filesystem could not establish the store's location safely.
+    UnresolvedPath,
 }
 
 impl DataKeepWhy {
@@ -93,6 +100,10 @@ impl DataKeepWhy {
             Self::HandWritten => locale.tr(
                 "written by hand, not saved by abylab",
                 "手写文件，不是本程序保存的",
+            ),
+            Self::UnresolvedPath => locale.tr(
+                "cannot verify the session store path; kept for safety",
+                "无法确认会话库的实际路径，已保留",
             ),
         }
     }
@@ -162,12 +173,15 @@ pub struct DataKeep {
 
 /// What a wipe would remove, and what it would not: measured once, shown to
 /// the user, then handed to [`wipe`] — so what was listed is what goes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DataPlan {
     pub home: PathBuf,
     /// The entries that exist right now; absent ones are not listed.
     pub items: Vec<DataItem>,
     pub kept: Vec<DataKeep>,
+    /// Pin the scanned home. Deletion stays relative to this capability even
+    /// if a parent directory is replaced by a symlink after the plan is shown.
+    root: Option<Arc<Dir>>,
 }
 
 impl DataPlan {
@@ -201,30 +215,30 @@ pub struct DataOutcome {
 
 /// Measure the home and the session store the launcher was pointed at.
 pub fn scan(home: &Path, sessions_root: &Path) -> DataPlan {
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let root = Dir::open_ambient_dir(&home, ambient_authority())
+        .ok()
+        .map(Arc::new);
     let mut items = Vec::new();
     for owned in OWNED {
-        include(&mut items, home, owned.what, home.join(owned.name));
+        include(&mut items, &home, owned.what, home.join(owned.name));
     }
     let mut kept = Vec::new();
-    if sessions_root == home {
-        kept.push(DataKeep {
-            path: home.to_path_buf(),
-            why: DataKeepWhy::RootIsHome,
-        });
-    } else if sessions_root.starts_with(home) {
-        // The default `$ABYLAB_HOME/sessions` is one of the entries above, so
-        // this only adds a store the launcher pointed somewhere else inside
-        // the home. `include` dedupes the two by path.
-        include(
-            &mut items,
-            home,
-            DataWhat::Sessions,
-            sessions_root.to_path_buf(),
-        );
-    } else if sessions_root.exists() {
+    let keep = match resolved_entry(sessions_root) {
+        Ok(path) if path == home => Some(DataKeepWhy::RootIsHome),
+        Ok(path) if path == home.join(INSTRUCTIONS_FILE) => Some(DataKeepWhy::HandWritten),
+        Ok(path) if path.starts_with(&home) => {
+            include(&mut items, &home, DataWhat::Sessions, path);
+            None
+        }
+        Ok(_) => Some(DataKeepWhy::OutsideHome),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(DataKeepWhy::UnresolvedPath),
+    };
+    if let Some(why) = keep {
         kept.push(DataKeep {
             path: sessions_root.to_path_buf(),
-            why: DataKeepWhy::OutsideHome,
+            why,
         });
     }
     let instructions = home.join(INSTRUCTIONS_FILE);
@@ -235,16 +249,37 @@ pub fn scan(home: &Path, sessions_root: &Path) -> DataPlan {
         });
     }
     DataPlan {
-        home: home.to_path_buf(),
+        home,
         items,
         kept,
+        root,
+    }
+}
+
+/// Resolve parent aliases and `..`, but retain a final symlink: uninstall
+/// unlinks that entry and must never delete its referent.
+fn resolved_entry(path: &Path) -> std::io::Result<PathBuf> {
+    if std::fs::symlink_metadata(path)?.is_symlink() {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(std::fs::canonicalize(parent)?.join(path.file_name().expect("symlink name")))
+    } else {
+        std::fs::canonicalize(path)
     }
 }
 
 /// Add one existing path to the plan. The home itself is never a target: the
 /// command removes the entries it put in there, not the directory they live in.
 fn include(items: &mut Vec<DataItem>, home: &Path, what: DataWhat, path: PathBuf) {
-    if path == home || items.iter().any(|item| item.path == path) {
+    let Ok(path) = resolved_entry(&path) else {
+        return;
+    };
+    if path == home
+        || !path.starts_with(home)
+        || items.iter().any(|item| path.starts_with(&item.path))
+    {
         return;
     }
     if let Some(item) = measure(what, path) {
@@ -300,12 +335,7 @@ fn walk(path: &Path) -> (u64, u64, bool) {
 pub fn wipe(plan: &DataPlan) -> DataOutcome {
     let mut outcome = DataOutcome::default();
     for item in &plan.items {
-        let result = match std::fs::symlink_metadata(&item.path) {
-            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&item.path),
-            Ok(_) => std::fs::remove_file(&item.path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        };
+        let result = wipe_item(plan, item);
         match result {
             Ok(()) => {
                 outcome.removed += 1;
@@ -318,6 +348,30 @@ pub fn wipe(plan: &DataPlan) -> DataOutcome {
         }
     }
     outcome
+}
+
+fn wipe_item(plan: &DataPlan, item: &DataItem) -> std::io::Result<()> {
+    let denied = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "deletion is outside the scanned aby home",
+        )
+    };
+    let root = plan.root.as_ref().ok_or_else(denied)?;
+    let relative = item.path.strip_prefix(&plan.home).map_err(|_| denied())?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(denied());
+    }
+    match root.symlink_metadata(relative) {
+        Ok(meta) if meta.is_dir() => root.remove_dir_all(relative),
+        Ok(_) => root.remove_file(relative),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Apparent size in the units the installer prints: whole KB below a megabyte,
@@ -374,7 +428,7 @@ mod tests {
         .unwrap();
         std::fs::write(home.join("queued/aby-1.json"), "[]").unwrap();
         std::fs::write(home.join("AGENTS.md"), "be terse").unwrap();
-        home
+        std::fs::canonicalize(home).unwrap()
     }
 
     #[test]
@@ -524,6 +578,87 @@ mod tests {
         assert_eq!(wipe(&scan(&home, &outside)), DataOutcome::default());
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn parent_components_cannot_make_an_external_store_owned() {
+        let root = scratch("parent-paths");
+        let home = root.join("home");
+        let external = root.join("external");
+        std::fs::create_dir_all(home.join("child")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("user-data"), "keep").unwrap();
+        std::fs::write(home.join("AGENTS.md"), "keep").unwrap();
+        for (path, why) in [
+            (home.join("../external"), DataKeepWhy::OutsideHome),
+            (home.join("child/.."), DataKeepWhy::RootIsHome),
+            (home.join("child/../AGENTS.md"), DataKeepWhy::HandWritten),
+        ] {
+            let plan = scan(&home, &path);
+            assert!(plan.items.is_empty(), "{plan:?}");
+            assert!(plan
+                .kept
+                .iter()
+                .any(|kept| kept.path == path && kept.why == why));
+            assert!(wipe(&plan).failures.is_empty());
+            assert!(external.join("user-data").exists());
+            assert!(home.join("AGENTS.md").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_symlinks_cannot_escape_home_before_or_after_scan() {
+        use std::os::unix::fs::symlink;
+        let root = scratch("symlink-paths");
+        let home = root.join("home");
+        let external = root.join("external");
+        std::fs::create_dir_all(home.join("parent/store")).unwrap();
+        std::fs::create_dir_all(external.join("store")).unwrap();
+        std::fs::write(external.join("store/user-data"), "keep").unwrap();
+        symlink(&external, home.join("alias")).unwrap();
+        let plan = scan(&home, &home.join("alias/store"));
+        assert!(plan.items.is_empty(), "{plan:?}");
+        assert!(plan
+            .kept
+            .iter()
+            .any(|kept| kept.why == DataKeepWhy::OutsideHome));
+        assert!(wipe(&plan).failures.is_empty());
+        assert!(external.join("store/user-data").exists());
+
+        let plan = scan(&home, &home.join("parent/store"));
+        assert_eq!(plan.items.len(), 1);
+        std::fs::rename(home.join("parent"), home.join("original-parent")).unwrap();
+        symlink(&external, home.join("parent")).unwrap();
+        assert_eq!(
+            wipe(&plan).failures.len(),
+            1,
+            "changed parent must be refused"
+        );
+        assert!(external.join("store/user-data").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlinks_are_unlinked_without_deleting_their_targets() {
+        use std::os::unix::fs::symlink;
+        let root = scratch("leaf-symlinks");
+        let home = root.join("home");
+        let external = root.join("external");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("user-data"), "keep").unwrap();
+        symlink(&external, home.join("sessions")).unwrap();
+        symlink(&home, root.join("home-alias")).unwrap();
+        let plan = scan(&root.join("home-alias"), &home.join("sessions"));
+        assert_eq!(plan.items.len(), 1);
+        assert!(wipe(&plan).failures.is_empty());
+        assert!(!home.join("sessions").exists());
+        assert!(external.join("user-data").exists());
+        assert!(home.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
