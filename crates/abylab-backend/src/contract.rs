@@ -541,6 +541,11 @@ pub enum Cmd {
         session_id: String,
         text: String,
     },
+    /// Reject an image prompt if a queued session switch changed its owner.
+    PromptPartsForSession {
+        session_id: String,
+        parts: Vec<PromptPart>,
+    },
     /// Append a follow-up to the session's FIFO.
     ///
     /// The queue lives here, not in the client: the driver owns delivery order,

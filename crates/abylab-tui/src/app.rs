@@ -5984,16 +5984,9 @@ impl App {
         true
     }
 
-    /// Fire one prompt at the driver: a lone text block takes the plain
-    /// `Cmd::Prompt` (so a `/`-prefixed line still reaches the skill path),
-    /// anything carrying images rides the image variants, and a steer carries
-    /// its pending-bubble id.
-    /// Hand one message to the host.
-    ///
-    /// Both forms end up in the driver, which owns delivery: `steer` names a
-    /// message the running turn should take at its next step boundary (Send
-    /// Now), anything else joins the session's FIFO and ships when the turn in
-    /// flight ends — or right away, when none is running.
+    /// Hand an idle prompt or a Send Now steer to the driver. Busy prompts
+    /// enter the FIFO through `send_queued_wire` after their echo is enrolled
+    /// in `prompt_queue`, so queue snapshots can match that echo by item id.
     fn send_wire_prompt(
         &mut self,
         blocks: Vec<crate::bus::PromptBlock>,
@@ -6026,10 +6019,8 @@ impl App {
                 message_id,
                 text,
             }),
-            None => {
-                let item_id = self.next_prompt_id();
-                self.send_queued_wire(item_id, text, blocks, ctl);
-            }
+            None if has_image => ctl.send(Cmd::PromptParts { session_id, blocks }),
+            None => ctl.send(Cmd::Prompt { session_id, text }),
         }
     }
 
@@ -11199,12 +11190,22 @@ mod mode_tests {
             String::new(),
         );
         app.submit(&ctl);
-        let crate::bus::Cmd::QueueParts { text, blocks, .. } = commands.try_recv().unwrap() else {
-            panic!("image prompt was not queued with its payload")
+        let crate::bus::Cmd::PromptParts { blocks, .. } = commands.try_recv().unwrap() else {
+            panic!("image prompt was not sent with its payload")
         };
-        assert!(text.is_empty());
         assert!(
             matches!(&blocks[0], crate::bus::PromptBlock::Image(image) if image.media_type == "image/png" && !image.data.is_empty())
+        );
+        assert!(commands.try_recv().is_err(), "image prompt sent only once");
+        assert!(app.prompt_queue.is_empty(), "idle prompt has no queue echo");
+        assert_eq!(
+            app.transcript
+                .cells
+                .iter()
+                .filter(|cell| matches!(&cell.kind, crate::transcript::CellKind::Image { .. }))
+                .count(),
+            1,
+            "idle image has one transcript row"
         );
     }
 

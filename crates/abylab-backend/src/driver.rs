@@ -1011,6 +1011,15 @@ async fn drive(
                 }
                 Cmd::Prompt { text }
             }
+            Cmd::PromptPartsForSession { session_id, parts } => {
+                if session_id != active_session {
+                    ctl(CtlEvent::Error(
+                        "prompt rejected: the active session changed".into(),
+                    ));
+                    continue;
+                }
+                Cmd::PromptParts { parts }
+            }
             cmd => cmd,
         };
         // A steer reaches this loop only with no turn in flight: `next_command`
@@ -1072,6 +1081,7 @@ async fn drive(
         let restoring = matches!(cmd, Cmd::Resume { .. });
         match cmd {
             Cmd::PromptForSession { .. } => unreachable!("normalized above"),
+            Cmd::PromptPartsForSession { .. } => unreachable!("normalized above"),
             Cmd::SteerForSession { .. } => unreachable!("normalized above"),
             Cmd::PromptParts { .. } => unreachable!("normalized above"),
             // The skill catalog is a pure read of the launch snapshot and the handle

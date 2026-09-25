@@ -192,6 +192,10 @@ pub enum Cmd {
         session_id: String,
         text: String,
     },
+    PromptParts {
+        session_id: String,
+        blocks: Vec<PromptBlock>,
+    },
     /// Queue one message in the session's host-owned FIFO. The driver owns
     /// delivery order: the item ships when the turn in flight ends, or right
     /// away when none is running. `item_id` names the optimistic echo the
