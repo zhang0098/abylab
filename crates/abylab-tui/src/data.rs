@@ -67,7 +67,7 @@ impl DataWhat {
             Self::Modes => locale.tr("mode cache", "模式缓存"),
             Self::Credentials => locale.tr("api key", "api key"),
             Self::Sessions => locale.tr("session logs", "会话日志"),
-            Self::Queue => locale.tr("queued prompts", "排队消息"),
+            Self::Queue => locale.tr("queued prompts", "排队命令"),
         }
     }
 }

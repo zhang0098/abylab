@@ -271,7 +271,7 @@ impl KeyGroup {
             (KeyGroup::Navigate, false) => "scroll · navigate",
             (KeyGroup::Navigate, true) => "滚动 · 导航",
             (KeyGroup::Composer, false) => "composer textarea",
-            (KeyGroup::Composer, true) => "输入框 · textarea",
+            (KeyGroup::Composer, true) => "输入框编辑",
             (KeyGroup::App, false) => "app shortcuts",
             (KeyGroup::App, true) => "应用快捷键",
             (KeyGroup::Mouse, false) => "mouse",
@@ -353,21 +353,8 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_other: &["enter"],
         ctx: CtxNote::Always,
         desc_en: "send · busy: the /enter mode · empty Enter sends the Queue head now",
-        desc_zh: "发送；繁忙时用 /enter 选定的模式；空输入立即发送 Queue 队首",
+        desc_zh: "发送；运行中按 /enter 的设置排队或插话；输入框为空时发送排队的第一条命令",
         probes: &[p(KeyCode::Enter, NONE, false)],
-    },
-    KeyRow {
-        action: Newline,
-        group: KeyGroup::Send,
-        chords_mac: &["shift+enter", "ctrl+j"],
-        chords_other: &["shift+enter", "ctrl+j"],
-        ctx: CtxNote::Always,
-        desc_en: "newline in the draft",
-        desc_zh: "草稿内换行",
-        probes: &[
-            p(KeyCode::Enter, SHIFT, false),
-            p(KeyCode::Char('j'), CTRL, false),
-        ],
     },
     KeyRow {
         action: SendNow,
@@ -376,7 +363,7 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_other: &["ctrl+enter"],
         ctx: CtxNote::Always,
         desc_en: "send now — busy: the other /enter mode (steers by default)",
-        desc_zh: "立即发送；繁忙时用 /enter 的另一模式（默认 steer）",
+        desc_zh: "立即发送；运行中执行与 enter 相反的操作（默认立即插话）",
         probes: &[
             p(KeyCode::Enter, CTRL, false),
             p(KeyCode::Enter, SUPER, false),
@@ -389,7 +376,7 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_other: &["alt+↑"],
         ctx: CtxNote::Always,
         desc_en: "queued follow-ups: ↑/↓ select · enter edit · ctrl+enter steers · ctrl+d deletes",
-        desc_zh: "排队消息：↑/↓ 选择 · enter 编辑 · ctrl+enter 插话 · ctrl+d 删除",
+        desc_zh: "排队命令：↑/↓ 选择 · enter 编辑 · ctrl+enter 插话 · ctrl+d 删除",
         probes: &[p(KeyCode::Up, ALT, true)],
     },
     KeyRow {
@@ -418,8 +405,8 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_mac: &["ctrl+q"],
         chords_other: &["ctrl+q"],
         ctx: CtxNote::Always,
-        desc_en: "quit martty",
-        desc_zh: "退出 martty",
+        desc_en: "quit abylab",
+        desc_zh: "退出 abylab",
         probes: &[p(KeyCode::Char('q'), CTRL, false)],
     },
     // --- scroll · navigate ------------------------------------------------
@@ -504,6 +491,19 @@ pub const KEY_ROWS: &[KeyRow] = &[
         probes: &[p(KeyCode::PageDown, NONE, false)],
     },
     // --- composer textarea -------------------------------------------------
+    KeyRow {
+        action: Newline,
+        group: KeyGroup::Composer,
+        chords_mac: &["shift+enter", "ctrl+j"],
+        chords_other: &["shift+enter", "ctrl+j"],
+        ctx: CtxNote::Always,
+        desc_en: "newline in the draft",
+        desc_zh: "草稿内换行",
+        probes: &[
+            p(KeyCode::Enter, SHIFT, false),
+            p(KeyCode::Char('j'), CTRL, false),
+        ],
+    },
     KeyRow {
         action: LineStart,
         group: KeyGroup::Composer,
@@ -833,7 +833,7 @@ pub const KEY_ROWS: &[KeyRow] = &[
         // launch default lands on read only. `/help` carries the wait — a turn
         // holds the switch to its end — and points at `/permission`.
         desc_en: "cycle permission: read only → workspace write → full access",
-        desc_zh: "轮换权限：只读 → 工作区可写 → 完全访问",
+        desc_zh: "切换权限：只读 → 工作区可写 → 完全访问",
         probes: &[p(KeyCode::BackTab, NONE, false)],
     },
     KeyRow {
@@ -863,7 +863,7 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_other: &["ctrl+o"],
         ctx: CtxNote::Always,
         desc_en: "cycle tool output: summary → preview → full",
-        desc_zh: "轮换工具输出：摘要 → 预览 → 全展开",
+        desc_zh: "切换工具输出显示：摘要 → 预览 → 全展开",
         probes: &[p(KeyCode::Char('o'), CTRL, false)],
     },
     KeyRow {
@@ -976,7 +976,7 @@ pub fn keys_markdown(zh: bool, mac: bool) -> String {
     out.push_str(if zh {
         "### vim 模式（`/vim` 开启 · 默认关闭 · 输入框 meta 行显示 `-- INSERT --` / `-- NORMAL --`）\n\n\
          - normal：`h/j/k/l` 移动 · `w/b/e` 词跳 · `0/$` 行首尾 · `x/X` 删除 · `dd` 删行 · `u` 撤销 · `p` 粘贴 · `gg/G` 文档首尾 · `i/a/A` 插入 · `o/O` 新行 · `esc` 返回 normal\n\
-         - Ctrl/⌘ · 组合键始终保留（steer、undo 等）。\n"
+         - Ctrl/⌘ · 组合键始终可用（插话、撤销等）。\n"
     } else {
         "### vim mode (`/vim` toggles · off by default · the meta row shows `-- INSERT --` / `-- NORMAL --`)\n\n\
          - normal: `h/j/k/l` move · `w/b/e` word · `0/$` line head/tail · `x/X` delete · `dd` kill line · `u` undo · `p` paste · `gg/G` document head/tail · `i/a/A` insert · `o/O` new line · `esc` back\n\

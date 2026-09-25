@@ -385,5 +385,5 @@ fn keys_markdown_lists_ctrl_j_and_the_composer_section() {
     assert!(en.contains("ctrl+shift+k"), "kill-line row is present");
     let zh = crate::input::keymap::keys_markdown(true, false);
     assert!(zh.contains("ctrl+j"), "zh keys must list ctrl+j");
-    assert!(zh.contains("输入框 · textarea"), "zh section title");
+    assert!(zh.contains("输入框编辑"), "zh section title");
 }
