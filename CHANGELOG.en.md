@@ -10,6 +10,18 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Changed
+
+- A finished thought no longer keeps a row. Each one used to end with `✻ thought · 9.1s · 91 lines` —
+  when the thinking happened, how long it ran, how many lines came out. None of it is anything you
+  read the transcript for, and a turn that thinks a dozen times paid a dozen rows of height for it. The
+  row is gone, and so is the blank line above it: thoughts take up no room at all in summary and
+  preview. `ctrl+o` (full) still opens them — each thought then leads with a plain `✻ thought` divider
+  (the seconds and the line count do not come back; the lines under the divider are the count). The
+  live row stays, since it is what tells you the model is quiet rather than stuck, and it now follows
+  the interface language: `✻ 思考中… 3s` in Chinese, `✻ thinking… 3s` in English — it used to say
+  `thinking…` in every language.
+
 ## [0.1.15] - 2026-09-24
 
 ### Added
