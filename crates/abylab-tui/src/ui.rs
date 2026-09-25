@@ -4043,10 +4043,15 @@ mod tests {
         );
         let line = frame.lines().nth(row as usize).expect("caret row");
         let at = col as usize;
+        let hint_first = app
+            .locale
+            .tr("Enter any command", "输入你的任何命令")
+            .chars()
+            .next();
         assert_eq!(line.chars().nth(at), Some(' '), "an empty cell: {line}");
         assert_eq!(
             line.chars().nth(at + 1),
-            Some('d'),
+            hint_first,
             "the hint follows the caret: {line}"
         );
         assert!(
