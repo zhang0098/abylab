@@ -1422,7 +1422,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
         let placeholder = match app.state {
             RunState::Idle => app
                 .locale
-                .tr("describe what you want to build…", "描述你想构建的内容…")
+                .tr("Enter any command", "输入你的任何命令")
                 .to_string(),
             _ => {
                 // The draft's own gesture pair: Enter follows `/enter`, the
@@ -1431,8 +1431,8 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                 let chord = app.enter.flipped().label(app.locale);
                 app.locale
                     .tr(
-                        "next message — ⏎ {enter} · ctrl+⏎ {chord}",
-                        "后续消息 —— ⏎ {enter} · ctrl+⏎ {chord}",
+                        "next command — ⏎ {enter} · ctrl+⏎ {chord}",
+                        "后续命令 —— ⏎ {enter} · ctrl+⏎ {chord}",
                     )
                     .replace("{enter}", enter)
                     .replace("{chord}", chord)
@@ -3425,10 +3425,7 @@ mod tests {
         assert!(frame.contains("child-only output"), "{frame}");
         assert!(frame.contains("read-only"), "{frame}");
         assert!(frame.contains("esc back"), "{frame}");
-        assert!(
-            !frame.contains("describe what you want to build"),
-            "{frame}"
-        );
+        assert!(!frame.contains("Enter any command"), "{frame}");
         assert!(!frame.contains("send a prompt"), "{frame}");
     }
 
@@ -4046,10 +4043,15 @@ mod tests {
         );
         let line = frame.lines().nth(row as usize).expect("caret row");
         let at = col as usize;
+        let hint_first = app
+            .locale
+            .tr("Enter any command", "输入你的任何命令")
+            .chars()
+            .next();
         assert_eq!(line.chars().nth(at), Some(' '), "an empty cell: {line}");
         assert_eq!(
             line.chars().nth(at + 1),
-            Some('d'),
+            hint_first,
             "the hint follows the caret: {line}"
         );
         assert!(

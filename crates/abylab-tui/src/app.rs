@@ -201,11 +201,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "permission preset picker · shift+tab cycles",
     },
     SlashCommand {
-        name: "plan",
-        usage: "/plan [on|off]",
-        desc: "toggle host plan mode",
-    },
-    SlashCommand {
         name: "image",
         usage: "/image <path> [text]",
         desc: "send a local image (png/jpeg/webp/gif)",
@@ -1563,11 +1558,11 @@ impl App {
         let Some(behavior) = crate::locale::EnterBehavior::parse(arg) else {
             self.show_tip(format!(
                 "{}: {} · {}",
-                self.locale.tr("enter while busy", "繁忙时 Enter"),
-                self.enter.as_str(),
+                self.locale.tr("enter while busy", "运行中按 Enter"),
+                self.enter.label(self.locale),
                 self.locale.tr(
                     "/enter queue|steer — the other mode rides ctrl+enter",
-                    "/enter queue|steer —— 另一种模式走 ctrl+enter",
+                    "/enter queue|steer —— 另一种操作用 ctrl+enter",
                 )
             ));
             return;
@@ -1576,10 +1571,10 @@ impl App {
         self.save_settings();
         self.show_tip(format!(
             "{}: {} · {}",
-            self.locale.tr("enter while busy", "繁忙时 Enter"),
-            behavior.as_str(),
+            self.locale.tr("enter while busy", "运行中按 Enter"),
+            behavior.label(self.locale),
             self.locale
-                .tr("the other mode rides ctrl+enter", "另一种模式走 ctrl+enter",)
+                .tr("the other mode rides ctrl+enter", "另一种操作用 ctrl+enter",)
         ));
     }
 
@@ -1743,10 +1738,6 @@ impl App {
                 .iter()
                 .map(|(id, _)| plain(id, permission_desc(self.locale, id).unwrap_or_default()))
                 .collect(),
-            "plan" => vec![
-                plain("on", self.locale.tr("enable plan mode", "打开计划模式")),
-                plain("off", self.locale.tr("disable plan mode", "关闭计划模式")),
-            ],
             "theme" => {
                 let mut choices = vec![
                     plain("dark", self.locale.tr("dark appearance", "深色外观")),
@@ -4167,7 +4158,7 @@ impl App {
         if self.prompt_queue.is_empty() {
             self.show_tip(
                 self.locale
-                    .tr("no queued prompt to edit", "没有可编辑的排队消息"),
+                    .tr("no queued prompt to edit", "没有可编辑的排队命令"),
             );
             return;
         }
@@ -4227,7 +4218,7 @@ impl App {
                 .locale
                 .tr(
                     " queued prompts · ↑/↓ · enter edit · ctrl+enter steer · ctrl+d delete · esc close ",
-                    " 排队消息 · ↑/↓ · enter 编辑 · ctrl+enter 插话 · ctrl+d 删除 · esc 关闭 ",
+                    " 排队命令 · ↑/↓ · enter 编辑 · ctrl+enter 插话 · ctrl+d 删除 · esc 关闭 ",
                 )
                 .into(),
             sel,
@@ -4311,7 +4302,7 @@ impl App {
         self.reconcile_attachments();
         self.show_tip(self.locale.tr(
             "editing queued prompt · enter save · ctrl+d delete · esc cancel",
-            "编辑排队消息 · enter 保存 · ctrl+d 删除 · esc 取消",
+            "编辑排队命令 · enter 保存 · ctrl+d 删除 · esc 取消",
         ));
     }
 
@@ -4329,7 +4320,7 @@ impl App {
         if raw.is_empty() && self.pending_images.is_empty() {
             self.show_tip(self.locale.tr(
                 "queued prompt cannot be empty · ctrl+d deletes it",
-                "排队消息不能为空 · ctrl+d 可删除",
+                "排队命令不能为空 · ctrl+d 可删除",
             ));
             return;
         }
@@ -4374,7 +4365,7 @@ impl App {
         self.finish_queue_edit();
         self.show_tip(
             self.locale
-                .tr("queued prompt #{n} updated", "排队消息 #{n} 已更新")
+                .tr("queued prompt #{n} updated", "排队命令 #{n} 已更新")
                 .replace("{n}", &(index + 1).to_string()),
         );
     }
@@ -4388,7 +4379,7 @@ impl App {
             edit.delete_confirm = true;
             self.show_tip(self.locale.tr(
                 "ctrl+d again deletes this queued prompt · esc cancels",
-                "再按一次 ctrl+d 删除这条排队消息 · esc 取消",
+                "再按一次 ctrl+d 删除这条排队命令 · esc 取消",
             ));
             return;
         }
@@ -4419,7 +4410,7 @@ impl App {
         self.update_queue_row(prompt.id, crate::bus::QueueAction::Remove, ctl);
         self.show_tip(
             self.locale
-                .tr("queued prompt #{n} deleted", "排队消息 #{n} 已删除")
+                .tr("queued prompt #{n} deleted", "排队命令 #{n} 已删除")
                 .replace("{n}", &(index + 1).to_string()),
         );
     }
@@ -4587,7 +4578,7 @@ impl App {
             self.locale
                 .tr(
                     "steered {n} queued — lands at the next agent step",
-                    "已 steer {n} 条排队消息 —— 在 Agent 下一步生效",
+                    "已将 {n} 条排队命令插入当前轮次，Agent 下一步会处理",
                 )
                 .replace("{n}", &count.to_string()),
         );
@@ -4625,7 +4616,7 @@ impl App {
         );
         self.show_tip(self.locale.tr(
             "queue head sent now — lands at the next agent step",
-            "队首已立即发送 —— 在下一步 Agent 处生效",
+            "已发送排队的第一条命令，Agent 下一步会处理",
         ));
         self.send_wire_prompt(wire, Some(message_id), ctl);
     }
@@ -4821,7 +4812,7 @@ impl App {
                 self.locale
                     .tr(
                         "no durable sessions for this workspace yet — finish a turn and /resume finds it",
-                        "这个工作区还没有持久会话 —— 先跑完一轮，/resume 就能看到",
+                        "这个工作区还没有可恢复的会话 —— 完成一轮后，可用 /resume 查看",
                     )
                     .into(),
             );
@@ -5054,7 +5045,7 @@ impl App {
             self.finish_queue_edit();
             self.show_tip(
                 self.locale
-                    .tr("queued prompt edit cancelled", "已取消编辑排队消息"),
+                    .tr("queued prompt edit cancelled", "已取消编辑排队命令"),
             );
             return;
         }
@@ -5326,14 +5317,6 @@ impl App {
                     self.set_permission(arg.to_string(), ctl);
                 }
             }
-            "plan" => {
-                let text = if arg.is_empty() {
-                    "/plan".to_string()
-                } else {
-                    format!("/plan {arg}")
-                };
-                self.send_agent_text(text, ctl);
-            }
             "image" => self.send_image(arg, ctl),
             "clip" => self.clip_image(arg, ctl),
             other => {
@@ -5401,27 +5384,27 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
         // the body is the list itself — the same surface `/keys` uses.
         let text = if self.locale == Locale::Zh {
             "\
-- enter · 发送；当前轮次运行时将后续消息排队（草稿为空时立即发送队首）
-- ctrl+enter · 与 enter 相反的模式：默认立即 steer 当前轮次（老终端会退化成普通 enter）
+- enter · 发送；当前轮次运行时将后续命令排队（草稿为空时立即发送队首）
+- ctrl+enter · 与 enter 相反的模式：默认立即插话（老终端会退化成普通 enter）
 - /enter · 繁忙时 enter 的模式：queue 排队 / steer 立即插话 · ctrl+enter 始终是另一种
-- ⌥↑ · 排队的后续消息：↑/↓ 选择 · enter 编辑 · ctrl+enter 立即插话 · 列表中 ctrl+d 连按两次删除 · esc 关闭
+- ⌥↑ · 排队命令：↑/↓ 选择 · enter 编辑 · ctrl+enter 立即插话 · 列表中 ctrl+d 连按两次删除 · esc 关闭
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 连按两次中断本轮（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
-- shift+tab · 轮换权限预设（只读 → 工作区可写 → 完全访问，一轮结束后生效）· /permission 打开选择器
+- shift+tab · 切换权限（只读 → 工作区可写 → 完全访问，一轮结束后生效）· /permission 打开选择器
 - ctrl+p · 打开模型选择器，然后选择推理强度
 - /lang · 切换界面语言：/lang zh 或 /lang en
 - /login · 保存 API key 到 aby 主目录，不回显明文
 - /logout · 删除已保存的 API key
-- /effort · 推理强度 · /permission 权限预设 · /plan 计划模式
+- /effort · 推理强度 · /permission 权限预设
 - /vim · 切换 vim 模态编辑（/vim on|off，默认关闭）
-- /resume · 恢复持久会话并继续写入原日志
+- /resume · 恢复之前的会话
 - /image · 暂存本地图片：/image ./pic.png [说明]
 - /clip · 暂存剪贴板图片并弹出预览（⌫ 删除图片）· ctrl+v 同样可用
 - !cmd · 在会话级本地 shell 中运行命令，不经过 Agent；初始目录为 workspace，cd/环境变量跨命令保留
 - /<skill> · 手打的技能行由 Agent 注入技能正文（技能不进 / 菜单）
 - /skill · 列出/调用本工作区的技能（`.agents/skills/`）：/skill <名字> [参数]；空格后是候选清单
-- ctrl+o · 轮换工具输出：摘要（默认）→ 预览 → 全展开 · ctrl+l · 清屏
+- ctrl+o · 切换工具输出显示：摘要（默认）→ 预览 → 全展开 · ctrl+l · 清屏
 - 编辑 · readline 组合键 + ⌘/⌥ 方向键 · 完整映射见 /keys
 - 点击工具 · 展开/折叠 · 滚轮滚动对话
 - pgup/pgdn · 翻页 · end 回到最新消息
@@ -5440,7 +5423,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
 - shift+tab · cycle permission (read only → workspace write → full access, takes effect after a turn) · /permission opens the preset picker
 - ctrl+p · model picker → effort picker
-- /effort · reasoning effort · /permission preset · /plan plan mode
+- /effort · reasoning effort · /permission preset
 - /vim · toggle vim modal editing (/vim on|off, off by default)
 - /login · store the API key in the aby home (never echoed in full)
 - /logout · remove the stored API key (a --api-key override keeps running)
@@ -5802,8 +5785,8 @@ impl App {
         true
     }
 
-    /// Send raw text as an agent prompt (shared by submit and command
-    /// passthroughs like /plan). While a turn runs the text joins the client's
+    /// Send raw text as an agent prompt (shared by submit and skill lines).
+    /// While a turn runs the text joins the client's
     /// FIFO instead of the driver's channel, so `⌥↑` can still edit it.
     fn send_agent_text(&mut self, text: String, ctl: &Controller) {
         if self.waiting_for_session_switch() {
@@ -6001,16 +5984,9 @@ impl App {
         true
     }
 
-    /// Fire one prompt at the driver: a lone text block takes the plain
-    /// `Cmd::Prompt` (so a `/`-prefixed line still reaches the skill path),
-    /// anything carrying images rides the image variants, and a steer carries
-    /// its pending-bubble id.
-    /// Hand one message to the host.
-    ///
-    /// Both forms end up in the driver, which owns delivery: `steer` names a
-    /// message the running turn should take at its next step boundary (Send
-    /// Now), anything else joins the session's FIFO and ships when the turn in
-    /// flight ends — or right away, when none is running.
+    /// Hand an idle prompt or a Send Now steer to the driver. Busy prompts
+    /// enter the FIFO through `send_queued_wire` after their echo is enrolled
+    /// in `prompt_queue`, so queue snapshots can match that echo by item id.
     fn send_wire_prompt(
         &mut self,
         blocks: Vec<crate::bus::PromptBlock>,
@@ -6043,10 +6019,8 @@ impl App {
                 message_id,
                 text,
             }),
-            None => {
-                let item_id = self.next_prompt_id();
-                self.send_queued_wire(item_id, text, blocks, ctl);
-            }
+            None if has_image => ctl.send(Cmd::PromptParts { session_id, blocks }),
+            None => ctl.send(Cmd::Prompt { session_id, text }),
         }
     }
 
@@ -6358,7 +6332,7 @@ impl App {
             if running {
                 self.show_tip(self.locale.tr(
                     "steered with image — lands at the next agent step",
-                    "已 steer（带图片）—— 在 Agent 下一步生效",
+                    "已插话（含图片），Agent 下一步会处理",
                 ));
             } else {
                 self.prompt_pending = true;
@@ -6384,7 +6358,7 @@ impl App {
             if running {
                 self.show_tip(self.locale.tr(
                     "steered — lands at the next agent step",
-                    "已 steer —— 在 Agent 下一步生效",
+                    "已插话，Agent 下一步会处理",
                 ));
             } else {
                 self.prompt_pending = true;
@@ -6644,7 +6618,7 @@ mod resume_tests {
         // The card covers the middle of the screen, not the composer: the
         // draft well (and its placeholder) is still painted.
         assert!(
-            frame.contains("describe what you want to build"),
+            frame.contains("Enter any command"),
             "composer well:\n{frame}"
         );
 
@@ -7499,8 +7473,9 @@ mod mode_tests {
             &ctl,
         );
         assert!(
-            notices_tail(&app)
-                .contains(&"这个工作区还没有持久会话 —— 先跑完一轮，/resume 就能看到".to_string()),
+            notices_tail(&app).contains(
+                &"这个工作区还没有可恢复的会话 —— 完成一轮后，可用 /resume 查看".to_string()
+            ),
             "{:?}",
             notices_tail(&app)
         );
@@ -7595,14 +7570,14 @@ mod mode_tests {
 
         let frame = crate::ui::dump_frame(&mut app, 100, 24);
         assert!(
-            frame.replace(' ', "").contains("描述你想构建的内容"),
+            frame.replace(' ', "").contains("输入你的任何命令"),
             "{frame}"
         );
 
         let mut restarted = App::new(Theme::dark(), cfg, "s2".into());
         let frame = crate::ui::dump_frame(&mut restarted, 100, 24);
         assert!(
-            frame.replace(' ', "").contains("描述你想构建的内容"),
+            frame.replace(' ', "").contains("输入你的任何命令"),
             "{frame}"
         );
         let current = std::path::Path::new(&restarted.cfg.home).join("settings.json");
@@ -10762,7 +10737,7 @@ mod mode_tests {
         // but main.rs gates the call on has_credentials — covered upstream.
     }
     #[test]
-    fn plan_message_keeps_the_slash_prompt_transport() {
+    fn plan_skill_line_ships_without_a_builtin_command() {
         let (mut app, ctl, _rx) = test_app();
         app.skills = vec![crate::bus::SkillInfo {
             name: "plan".into(),
@@ -10771,7 +10746,8 @@ mod mode_tests {
             source: None,
         }];
 
-        app.run_slash("plan", "focus on the parser", &ctl);
+        app.input.set("/plan focus on the parser".into());
+        app.submit(&ctl);
 
         assert!(matches!(app.state, RunState::Starting));
         assert!(matches!(
@@ -11014,7 +10990,7 @@ mod mode_tests {
             },
             crate::bus::SkillInfo {
                 name: "plan".into(),
-                description: "shadowed by the builtin".into(),
+                description: "plan work".into(),
                 input_hint: None,
                 source: None,
             },
@@ -11037,9 +11013,8 @@ mod mode_tests {
             "the shipped line is what the transcript shows"
         );
 
-        // `/plan on` would be swallowed by the builtin; the two-word form is
-        // how a skill of that name still runs. (The first send marked the app
-        // busy, so settle it back to idle first.)
+        // The two-word form runs a named skill too. The first send marked the
+        // app busy, so settle it back to idle first.
         app.state = RunState::Idle;
         app.prompt_pending = false;
         app.run_slash("skill", "plan on", &ctl);
@@ -11216,12 +11191,22 @@ mod mode_tests {
             String::new(),
         );
         app.submit(&ctl);
-        let crate::bus::Cmd::QueueParts { text, blocks, .. } = commands.try_recv().unwrap() else {
-            panic!("image prompt was not queued with its payload")
+        let crate::bus::Cmd::PromptParts { blocks, .. } = commands.try_recv().unwrap() else {
+            panic!("image prompt was not sent with its payload")
         };
-        assert!(text.is_empty());
         assert!(
             matches!(&blocks[0], crate::bus::PromptBlock::Image(image) if image.media_type == "image/png" && !image.data.is_empty())
+        );
+        assert!(commands.try_recv().is_err(), "image prompt sent only once");
+        assert!(app.prompt_queue.is_empty(), "idle prompt has no queue echo");
+        assert_eq!(
+            app.transcript
+                .cells
+                .iter()
+                .filter(|cell| matches!(&cell.kind, crate::transcript::CellKind::Image { .. }))
+                .count(),
+            1,
+            "idle image has one transcript row"
         );
     }
 
@@ -11302,18 +11287,18 @@ mod mode_tests {
     fn tab_completes_a_slash_argument_without_running_it() {
         let (mut app, _demo_ctl, _rx) = test_app();
         let (ctl, commands) = crate::controller::test_controller();
-        app.input.set("/plan o".into());
+        app.input.set("/lang e".into());
 
         let menu = app.slash_matches();
         assert_eq!(
             menu.iter()
                 .map(|entry| entry.usage.as_str())
                 .collect::<Vec<_>>(),
-            ["on", "off"]
+            ["en"]
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctl);
-        assert_eq!(app.input.buf(), "/plan on");
+        assert_eq!(app.input.buf(), "/lang en");
         assert!(matches!(
             commands.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)

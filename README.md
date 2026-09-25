@@ -66,15 +66,15 @@ curl -fsSL https://abylab.ai/install.sh | bash
 | `@` | 文件提及 |
 | `ctrl+p` | 切换模型 |
 | `ctrl+t` | 切换主题 |
-| `alt+↑`（mac `⌥↑`） | 编辑排队消息 |
+| `alt+↑`（mac `⌥↑`） | 编辑排队命令 |
 | `shift+tab` | 切换权限预设 |
 
 完整映射见 TUI 里的 `/keys`，命令帮助见 `/help`。
 
 <details>
-<summary><strong>排队消息与交互问答</strong></summary>
+<summary><strong>排队命令与交互问答</strong></summary>
 
-`alt+↑` 只在有排队消息、草稿为空时打开列表：`↑/↓` 选择 · `enter` 编辑 ·
+`alt+↑` 只在有排队命令、草稿为空时打开列表：`↑/↓` 选择 · `enter` 编辑 ·
 `ctrl+enter` 把这条插话进正在跑的轮次 · `ctrl+d` 删除（同一行按两次）。
 
 任务执行中，abylab 可以弹出问题并等待你的回答。问题可以是是/否、多个选项的单选或多选，

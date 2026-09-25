@@ -106,6 +106,12 @@ fn aby_loop(
             Cmd::Prompt { session_id, text } => {
                 handle.send(abylab_backend::Cmd::PromptForSession { session_id, text })
             }
+            Cmd::PromptParts { session_id, blocks } => {
+                handle.send(abylab_backend::Cmd::PromptPartsForSession {
+                    session_id,
+                    parts: parts_from_blocks(blocks),
+                })
+            }
             Cmd::Steer {
                 session_id,
                 message_id,
