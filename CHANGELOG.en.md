@@ -10,6 +10,37 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Changed
+
+- `/plan` is no longer one of abylab's own commands. It is gone from the `/` menu, tab completion (its
+  `on`/`off` argument list with it), `/help`, and the command list on abylab.ai. Where that line goes has
+  not changed: hand-typed it still ships as a prompt, and a workspace skill carrying the name is injected
+  like every other `/name`. Host plan mode is untouched — the transcript still reports the `plan mode`
+  facts the driver sends — so what is gone is the client's own offer of a command the skill path already
+  covered. `/help` and `/keys` list one command less.
+- The queue goes by one name: what `alt+↑` opens is 排队命令 in Chinese, not 排队消息 — the list header,
+  the edit and delete tips, `/help`, the `/data` panel and both READMEs. `shift+enter` and `ctrl+j` moved
+  into the composer's editing group in `/keys`, beside the draft's own keys: they type a newline, they
+  never sent anything, and they sat under send.
+- An empty composer hints `Enter any command` / 输入你的任何命令, where it used to say "describe what you
+  want to build…" / 描述你想构建的内容….
+- The Chinese interface caught up with a few English phrasings: 轮换 becomes 切换 for `shift+tab` and
+  `ctrl+o`, `/resume` is described as 恢复当前工作区之前的会话, steer is translated as 插话 instead of
+  being left in English (`已插话，Agent 下一步会处理`), and the Enter-while-busy setting reads
+  运行中按 Enter rather than 繁忙时 Enter — in `/help`, `/keys`, the tips and the READMEs.
+
+### Fixed
+
+- An image-only prompt sent while nothing was running no longer lands in the transcript twice. It used to
+  take the queue path: an item was enrolled with its own optimistic echo, and the driver then delivered
+  the prompt, so a `/clip` send painted the picture and painted it again once the turn started. It now
+  leaves as one prompt with one row — and only if the session it was composed in is still the active one:
+  switching sessions (or `/resume`) between staging the image and pressing enter is refused with a
+  `prompt rejected: the active session changed` notice instead of being handed to whichever session is
+  open by then.
+- The `ctrl+q` row in `/keys` called abylab `martty`, the name this code carried before it was abylab. It
+  now reads `quit abylab` / 退出 abylab.
+
 ## [0.1.17] - 2026-09-25
 
 ### Fixed
