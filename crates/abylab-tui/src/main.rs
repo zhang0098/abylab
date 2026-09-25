@@ -623,13 +623,9 @@ fn pick_limit(name: &str, env: Option<String>, default: usize) -> Result<usize> 
 }
 
 fn main() -> Result<()> {
-    // Die quietly on closed pipes (dsh-tui --dump-frame | head) instead of
-    // panicking in println!.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
+    // Keep Rust's default SIGPIPE ignore behavior: a clipboard helper that
+    // closes stdin must return BrokenPipe, letting copying fall back without
+    // terminating the UI and its running agents.
     let args = parse_args()?;
 
     // `--uninstall` never reaches the screen: it lists what it would delete,
