@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="300" viewBox="0 0 1120 300" role="img" aria-labelledby="title desc">
   <title id="title">abylab — DeepSeek, at home in your terminal.</title>
-  <desc id="desc">A minimalist DeepSeek harness. One executable, one process. Open source under the MIT license.</desc>
+  <desc id="desc">A free, open-source, minimalist AI assistant. One executable, one process. MIT licensed.</desc>
   <rect width="1120" height="300" rx="16" fill="#f0f3e9"/>
   <rect x="0.5" y="0.5" width="1119" height="299" rx="15.5" fill="none" stroke="#dce1d7"/>
   <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">

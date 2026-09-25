@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/readme-banner.svg" alt="abylab — a minimalist DeepSeek harness" width="100%">
+  <img src="docs/assets/readme-banner.svg" alt="abylab — a free, open-source, minimalist AI assistant" width="100%">
 </p>
 
 <p align="center">
@@ -13,8 +13,8 @@
 
 ---
 
-abylab is a minimalist DeepSeek harness, built with Rust, ratatui, and the abycore DeepSeek SDK.
-Streaming, tool execution, and session persistence all happen in one process.
+abylab is a free, open-source, minimalist AI assistant: use it to write code, edit Excel files,
+write reports, or adjust your computer's settings. A DeepSeek API key is all it takes to get to work.
 
 - **Small** — One executable, ready to run.
 - **Familiar** — A native terminal UI, file mentions, and themes.

@@ -18,6 +18,12 @@
   那时每段思考顶上留一行 `✻ 思考` 当标题（秒数与行数不再回来——正文摊开后行数就是它自己）。还在跑的
   那句照旧显示，`✻ 思考中… 3s`（英文界面 `✻ thinking… 3s`）：它此前不管界面语言一律写英文，现在
   跟着界面语言走。
+- 项目自我介绍换了口径。README 与 abylab.ai 首页此前写「极简主义的 DeepSeek harness，基于 Rust、
+  ratatui 和 abycore DeepSeek SDK」，说的都是它由什么拼成；现在说的是拿它能干什么——「开源免费的
+  极简主义 AI 助理：你可以用它来编程、修改 Excel 文件、写报告、调整电脑设置，只需要给它配上
+  DeepSeek API Key 就可以开始干活」。站点的标题、meta 描述、分享卡片（`og:title`）以及 README
+  banner 的 alt 与 SVG 描述一并跟上；`abycore`、`ratatui` 这些实现细节从门面退到 [TECH.md](TECH.md)
+  （那里一直写着），README 末尾「参考了 DeepSeek Harness」的致谢照旧。
 
 ## [0.1.15] - 2026-09-24
 

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/readme-banner.svg" alt="abylab — 极简主义的 DeepSeek harness" width="100%">
+  <img src="docs/assets/readme-banner.svg" alt="abylab — 开源免费的极简主义 AI 助理" width="100%">
 </p>
 
 <p align="center">
@@ -13,8 +13,8 @@
 
 ---
 
-abylab 是一个极简主义的 DeepSeek harness，基于 Rust、ratatui 和 abycore DeepSeek SDK。
-流式输出、工具执行和会话持久化，都在同一个进程里完成。
+abylab 是一个开源免费的极简主义 AI 助理：你可以用它来编程、修改 Excel 文件、写报告、调整电脑设置，
+只需要给它配上 DeepSeek API Key 就可以开始干活。
 
 - **轻巧** — 一个可执行文件，安装后即可运行。
 - **顺手** — 终端原生界面、文件提及、主题切换。
