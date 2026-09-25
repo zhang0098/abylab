@@ -10,6 +10,26 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Changed
+
+- A finished thought no longer keeps a row. Each one used to end with `✻ thought · 9.1s · 91 lines` —
+  when the thinking happened, how long it ran, how many lines came out. None of it is anything you
+  read the transcript for, and a turn that thinks a dozen times paid a dozen rows of height for it. The
+  row is gone, and so is the blank line above it: thoughts take up no room at all in summary and
+  preview. `ctrl+o` (full) still opens them — each thought then leads with a plain `✻ thought` divider
+  (the seconds and the line count do not come back; the lines under the divider are the count). The
+  live row stays, since it is what tells you the model is quiet rather than stuck, and it now follows
+  the interface language: `✻ 思考中… 3s` in Chinese, `✻ thinking… 3s` in English — it used to say
+  `thinking…` in every language.
+- abylab introduces itself differently now. The READMEs and the homepage used to say what it is built
+  from — "a minimalist DeepSeek harness, built with Rust, ratatui, and the abycore DeepSeek SDK" — and
+  now say what you can do with it: a free, open-source, minimalist AI assistant for writing code,
+  editing Excel files, writing reports, or adjusting your computer's settings, with nothing to set up
+  beyond a DeepSeek API key. The site's title, meta description and `og:title`, and the README banner's
+  alt text and SVG description, carry the same line. The implementation pedigree (`abycore`, `ratatui`)
+  moves off the front page into [TECH.en.md](TECH.en.md), where it already lived; the credit to DeepSeek
+  Harness at the end of the README stays.
+
 ## [0.1.15] - 2026-09-24
 
 ### Added

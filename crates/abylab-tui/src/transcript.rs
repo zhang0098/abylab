@@ -122,7 +122,6 @@ pub enum CellKind {
         text: String,
         done: bool,
         started: Instant,
-        seconds: Option<f32>,
         agent: Option<String>,
     },
     Assistant {
@@ -552,14 +551,8 @@ impl Transcript {
                         *result = "cancelled".into();
                     }
                 }
-                CellKind::Reasoning {
-                    done,
-                    started,
-                    seconds,
-                    ..
-                } if !*done => {
+                CellKind::Reasoning { done, .. } if !*done => {
                     *done = true;
-                    *seconds = Some(started.elapsed().as_secs_f32());
                 }
                 CellKind::Assistant { done, .. } if !*done => {
                     *done = true;
@@ -618,15 +611,8 @@ impl Transcript {
         }
         if let Some(idx) = self.open_reasoning.remove(session) {
             if let Some(cell) = self.cells.get_mut(idx) {
-                if let CellKind::Reasoning {
-                    done,
-                    started,
-                    seconds,
-                    ..
-                } = &mut cell.kind
-                {
+                if let CellKind::Reasoning { done, .. } = &mut cell.kind {
                     *done = true;
-                    *seconds = Some(started.elapsed().as_secs_f32());
                 }
             }
         }
@@ -696,15 +682,8 @@ impl Transcript {
                 // Reasoning for this step is over once visible text streams.
                 if let Some(idx) = self.open_reasoning.remove(&session) {
                     if let Some(cell) = self.cells.get_mut(idx) {
-                        if let CellKind::Reasoning {
-                            done,
-                            started,
-                            seconds,
-                            ..
-                        } = &mut cell.kind
-                        {
+                        if let CellKind::Reasoning { done, .. } = &mut cell.kind {
                             *done = true;
-                            *seconds = Some(started.elapsed().as_secs_f32());
                         }
                     }
                 }
@@ -739,7 +718,6 @@ impl Transcript {
                             text: String::new(),
                             done: false,
                             started: Instant::now(),
-                            seconds: None,
                             agent,
                         }));
                         let idx = self.cells.len() - 1;
@@ -1247,16 +1225,27 @@ impl Transcript {
                     text,
                     done,
                     started,
-                    seconds,
                     agent,
                 } => {
+                    // A finished thought paints nothing until its body is
+                    // expanded. Its divider used to spend a row reporting when
+                    // the thinking happened, how long it ran and how many lines
+                    // came out (`✻ 思考 · 9.1s · 91 行`) — nothing about the work,
+                    // and a turn that thinks a dozen times paid a dozen rows for
+                    // it. The thought itself is still there: ctrl+o opens it,
+                    // divider and all. Bailing out this early also skips the
+                    // cell's blank separator, so a collapsed thought leaves no
+                    // gap behind, and skips wrapping a body nobody will see.
+                    if *done && !expanded {
+                        continue;
+                    }
                     emit(&mut out, &mut owners, Line::default(), None);
                     let head_style = Style::default().fg(theme.caption);
                     let body_style = Style::default()
                         .fg(theme.fg_tertiary)
                         .add_modifier(Modifier::ITALIC);
                     // A reasoning stream can open with an empty/whitespace
-                    // delta. The heading is enough for that frame; an empty
+                    // delta. The divider is enough for that frame; an empty
                     // body must not make its height jump from one row to two.
                     let body = text.trim();
                     let lines = if body.is_empty() {
@@ -1264,37 +1253,41 @@ impl Transcript {
                     } else {
                         wrap(body, width.saturating_sub(2))
                     };
-                    let n = lines.len();
                     if *done {
-                        let dur = seconds.map(|s| format!(" · {s:.1}s")).unwrap_or_default();
+                        // Expanded, and only expanded: the guard above sent
+                        // every collapsed thought away. The divider carries no
+                        // duration and no line count — the lines under it are
+                        // the count.
                         let agent = agent_prefix(agent);
                         emit(
                             &mut out,
                             &mut owners,
                             Line::from(Span::styled(
-                                reasoning_heading(self.locale, &agent, &dur, n),
+                                reasoning_divider(self.locale, &agent),
                                 head_style,
                             )),
                             None,
                         );
-                        if expanded {
-                            for l in lines {
-                                emit(
-                                    &mut out,
-                                    &mut owners,
-                                    Line::from(vec![Span::raw("  "), Span::styled(l, body_style)]),
-                                    None,
-                                );
-                            }
+                        for l in lines {
+                            emit(
+                                &mut out,
+                                &mut owners,
+                                Line::from(vec![Span::raw("  "), Span::styled(l, body_style)]),
+                                None,
+                            );
                         }
                     } else {
+                        // The one thought row left standing. It is the only sign
+                        // that the model is quiet rather than stuck, so it stays
+                        // — in the interface language, like the divider was.
                         emit(
                             &mut out,
                             &mut owners,
                             Line::from(Span::styled(
                                 format!(
-                                    "✻ {}thinking… {}s",
+                                    "✻ {}{} {}s",
                                     agent_prefix(agent),
+                                    self.locale.tr("thinking…", "思考中…"),
                                     started.elapsed().as_secs()
                                 ),
                                 Style::default().fg(theme.brand_soft),
@@ -1710,20 +1703,13 @@ fn thumb_rows(cols: usize, w: u32, h: u32) -> usize {
     rows.clamp(2, 12)
 }
 
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
-/// The reasoning divider, in the interface language: `✻ thought · 12 lines`
-/// in English, `✻ 思考 · 12 行` in Chinese (no plural to agree with).
-fn reasoning_heading(locale: Locale, agent: &str, dur: &str, lines: usize) -> String {
+/// The divider that labels an *expanded* thought, in the interface language:
+/// `✻ thought` in English, `✻ 思考` in Chinese. Collapsed thoughts paint no
+/// divider, so neither seconds nor a line count belongs here.
+fn reasoning_divider(locale: Locale, agent: &str) -> String {
     match locale {
-        Locale::En => format!("✻ {agent}thought{dur} · {lines} line{}", plural(lines)),
-        Locale::Zh => format!("✻ {agent}思考{dur} · {lines} 行"),
+        Locale::En => format!("✻ {agent}thought"),
+        Locale::Zh => format!("✻ {agent}思考"),
     }
 }
 
@@ -2669,6 +2655,71 @@ mod tests {
             CellKind::Reasoning { done, .. } => assert!(done),
             other => panic!("unexpected cell {other:?}"),
         }
+    }
+
+    /// A finished thought is invisible while collapsed: the transcript reads
+    /// line for line as if the step had never thought. The divider
+    /// (`✻ 思考 · 9.1s · 91 行`) is gone, and so is the blank separator that
+    /// used to sit above it — no leftover gap where the thought was.
+    #[test]
+    fn a_finished_thought_paints_nothing_until_it_is_expanded() {
+        let theme = Theme::dark();
+        let build = |thought: bool| {
+            let mut tr = t("s");
+            tr.set_locale(Locale::En);
+            tr.push_user("hi".into(), Delivery::Delivered);
+            if thought {
+                tr.apply(UiEvent::ReasoningDelta {
+                    session: "s".into(),
+                    text: "weigh the two options, take one".into(),
+                });
+            }
+            tr.apply(UiEvent::TextDelta {
+                session: "s".into(),
+                text: "answer".into(),
+            });
+            tr.apply(UiEvent::AssistantFinal {
+                session: "s".into(),
+                text: "answer".into(),
+                model: None,
+            });
+            tr
+        };
+        let text = |tr: &Transcript| -> Vec<String> {
+            tr.lines(&theme, 40, ' ')
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let collapsed = build(true);
+        assert_eq!(
+            text(&collapsed),
+            text(&build(false)),
+            "a collapsed thought leaves no row and no gap"
+        );
+
+        // The live row is the one thought row left: it is what says the model is
+        // quiet rather than stuck, and it speaks the interface language.
+        let mut live = t("s");
+        live.set_locale(Locale::Zh);
+        live.apply(UiEvent::ReasoningDelta {
+            session: "s".into(),
+            text: "想一下".into(),
+        });
+        let lines = text(&live);
+        assert!(lines.contains(&"✻ 思考中… 0s".into()), "{lines:?}");
+
+        // ctrl+o (full) is what brings a thought back, divider and all. Neither
+        // the seconds it ran nor its line count comes back with it: the divider
+        // is exactly `✻ thought`, and the body under it is the line count.
+        let mut expanded = collapsed;
+        expanded.tool_output = ToolOutput::Full;
+        let lines = text(&expanded);
+        assert!(lines.contains(&"✻ thought".into()), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("weigh the two options")),
+            "the thought body is back: {lines:?}"
+        );
     }
 
     #[test]
