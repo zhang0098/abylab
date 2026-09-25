@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-09-25
+
 ### 修复
 
 - 剪贴板命令提前退出、关闭输入管道时，不再因 SIGPIPE 终止整个 abylab 和运行中的任务；
@@ -447,7 +449,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/zhang0098/abylab/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/zhang0098/abylab/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/zhang0098/abylab/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/zhang0098/abylab/compare/v0.1.13...v0.1.14
