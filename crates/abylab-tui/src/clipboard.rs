@@ -132,6 +132,24 @@ fn base64(data: &[u8]) -> String {
 mod tests {
     use super::base64;
 
+    #[cfg(unix)]
+    #[test]
+    fn closed_clipboard_pipe_returns_failure_and_allows_another_copy() {
+        // Larger than the pipe buffer: the writer must encounter the closed
+        // read end when the clipboard helper exits without consuming stdin.
+        let text = "x".repeat(2 * 1024 * 1024);
+        assert!(!super::pipe_cmd(
+            "/bin/sh",
+            &["-c", "exec 0<&-; exit 1"],
+            &text
+        ));
+        assert!(super::pipe_cmd(
+            "/bin/sh",
+            &["-c", "IFS= read -r text && test \"$text\" = 'still alive'"],
+            "still alive\n",
+        ));
+    }
+
     #[test]
     fn base64_matches_rfc4648_vectors() {
         assert_eq!(base64(b""), "");

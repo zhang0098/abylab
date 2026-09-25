@@ -10,6 +10,11 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Fixed
+
+- A clipboard helper that exits early and closes its input pipe no longer terminates abylab and
+  its running tasks with SIGPIPE. A failed copy continues through the fallback routes.
+
 ## [0.1.16] - 2026-09-25
 
 ### Changed
