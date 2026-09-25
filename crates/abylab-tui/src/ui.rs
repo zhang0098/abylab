@@ -3425,10 +3425,7 @@ mod tests {
         assert!(frame.contains("child-only output"), "{frame}");
         assert!(frame.contains("read-only"), "{frame}");
         assert!(frame.contains("esc back"), "{frame}");
-        assert!(
-            !frame.contains("Enter any command"),
-            "{frame}"
-        );
+        assert!(!frame.contains("Enter any command"), "{frame}");
         assert!(!frame.contains("send a prompt"), "{frame}");
     }
 

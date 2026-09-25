@@ -7473,8 +7473,9 @@ mod mode_tests {
             &ctl,
         );
         assert!(
-            notices_tail(&app)
-                .contains(&"这个工作区还没有可恢复的会话 —— 完成一轮后，可用 /resume 查看".to_string()),
+            notices_tail(&app).contains(
+                &"这个工作区还没有可恢复的会话 —— 完成一轮后，可用 /resume 查看".to_string()
+            ),
             "{:?}",
             notices_tail(&app)
         );
