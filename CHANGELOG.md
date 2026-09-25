@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-09-26
+
 ### 变更
 
 - `/plan` 不再是 abylab 自带的命令：`/` 菜单、Tab 补全（连同它的 `on`/`off` 参数）、`/help` 和
@@ -474,7 +476,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/zhang0098/abylab/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/zhang0098/abylab/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/zhang0098/abylab/compare/v0.1.14...v0.1.15

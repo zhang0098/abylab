@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-09-26
+
 ### Changed
 
 - `/plan` is no longer one of abylab's own commands. It is gone from the `/` menu, tab completion (its
@@ -633,7 +635,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/zhang0098/abylab/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/zhang0098/abylab/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/zhang0098/abylab/compare/v0.1.14...v0.1.15
