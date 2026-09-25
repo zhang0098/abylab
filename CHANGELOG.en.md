@@ -10,6 +10,8 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-09-25
+
 ### Changed
 
 - A finished thought no longer keeps a row. Each one used to end with `✻ thought · 9.1s · 91 lines` —
@@ -593,7 +595,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/zhang0098/abylab/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/zhang0098/abylab/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/zhang0098/abylab/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/zhang0098/abylab/compare/v0.1.12...v0.1.13

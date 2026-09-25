@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-09-25
+
 ### 变更
 
 - 思考结束后不再占一行。以前每段思考收尾都留一行 `✻ 思考 · 9.1s · 91 行`：它只说了这段思考什么时候
@@ -440,7 +442,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/zhang0098/abylab/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/zhang0098/abylab/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/zhang0098/abylab/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/zhang0098/abylab/compare/v0.1.12...v0.1.13
