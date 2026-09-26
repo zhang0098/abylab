@@ -390,6 +390,21 @@ fn indent_wrapped(
 
 fn draw_child_navigation(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
+    // A live tip (the ctrl+q quit chord asking for its second press, a theme
+    // toggle, …) takes the row, the same priority the main composer's cap
+    // line gives it.
+    if let Some((text, _)) = &app.tip {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(text.clone(), Style::default().fg(theme.fg)),
+                Span::raw(" "),
+            ]))
+            .style(Style::default().bg(theme.panel)),
+            area,
+        );
+        return;
+    }
     let label = app
         .active_subagent
         .as_deref()
@@ -3427,6 +3442,30 @@ mod tests {
         assert!(frame.contains("esc back"), "{frame}");
         assert!(!frame.contains("Enter any command"), "{frame}");
         assert!(!frame.contains("send a prompt"), "{frame}");
+    }
+
+    /// The main view's tip lives in the composer cap; the child view keeps
+    /// the same surface in its one navigation row, so a chord like ctrl+q's
+    /// quit confirmation is visible while a subagent view owns the screen.
+    #[test]
+    fn child_view_shows_a_live_tip_in_its_navigation_row() {
+        let mut app = test_app();
+        app.subagents.push(crate::app::SubagentView {
+            id: "child-1".into(),
+            parent: "dsh-test".into(),
+            label: "subagent 1".into(),
+            running: true,
+            transcript: crate::transcript::Transcript::new("child-1".into()),
+        });
+        app.active_subagent = Some("child-1".into());
+        app.show_tip("press ctrl+q again to exit");
+
+        let frame = dump_frame(&mut app, 100, 24);
+        assert!(frame.contains("press ctrl+q again to exit"), "{frame}");
+        assert!(
+            !frame.contains("esc back"),
+            "the tip replaces the navigation hint: {frame}"
+        );
     }
 
     #[test]

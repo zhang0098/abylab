@@ -60,6 +60,7 @@ curl -fsSL https://abylab.ai/install.sh | bash
 | `ctrl+enter` | 插话 |
 | `esc` 连按两次 | 中断 / 清空草稿 |
 | `ctrl+c` | 清空 / 退出 |
+| `ctrl+q` | 退出（再按一次确认） |
 | `↑` | 输入历史 |
 | `ctrl+z` | 撤销 |
 | `/` | 命令 |

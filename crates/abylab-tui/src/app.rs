@@ -34,8 +34,12 @@ const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// from firing on a stray keypress otherwise).
 const DOUBLE_PRESS_WINDOW: Duration = Duration::from_millis(1500);
 
+/// A two-press quit chord: `ctrl+c` with an empty draft and `ctrl+q` both
+/// arm on the first press and quit on the second inside
+/// [`DOUBLE_PRESS_WINDOW`]. The struct carries the press count so a chord
+/// that needs more presses later only changes `required`.
 #[derive(Clone, Copy)]
-struct CtrlCQuitChord {
+struct QuitChord {
     started: Instant,
     presses: u8,
     required: u8,
@@ -781,7 +785,10 @@ pub struct App {
     /// What plain Enter does while busy (`/enter`); the accelerated chord
     /// always does the other one (harness's `busyEnter` preference).
     pub enter: crate::locale::EnterBehavior,
-    ctrl_c_armed: Option<CtrlCQuitChord>,
+    ctrl_c_armed: Option<QuitChord>,
+    /// The `ctrl+q` quit chord: first press arms, second quits. Kept apart
+    /// from `ctrl_c_armed` so the tip names the key that armed it.
+    quit_armed: Option<QuitChord>,
     /// When the first `esc` of an interrupt chord landed. Esc never cancels a
     /// running turn on its own: the first press arms (and says so), a second
     /// inside [`DOUBLE_PRESS_WINDOW`] interrupts. Anything else leaves it to
@@ -1140,6 +1147,30 @@ fn prompt_blocks_from_staged(staged: &[StagedBlock]) -> Vec<crate::bus::PromptBl
         .collect()
 }
 
+/// Feed one press into a quit chord (`ctrl+c` on an empty draft, `ctrl+q`).
+/// `Some(remaining)` = armed, press that many more times; `None` = the chord
+/// completed and the caller quits. A stale arm never counts: the holder
+/// re-arms from now instead (both are disarmed by `tick` after
+/// [`DOUBLE_PRESS_WINDOW`]).
+fn arm_quit_chord(armed: &mut Option<QuitChord>) -> Option<u8> {
+    let required = 2;
+    let mut chord = armed
+        .take()
+        .filter(|chord| chord.started.elapsed() <= DOUBLE_PRESS_WINDOW)
+        .unwrap_or(QuitChord {
+            started: Instant::now(),
+            presses: 0,
+            required,
+        });
+    chord.presses += 1;
+    if chord.presses >= chord.required {
+        return None;
+    }
+    let remaining = chord.required - chord.presses;
+    *armed = Some(chord);
+    Some(remaining)
+}
+
 impl App {
     pub fn new(theme: Theme, cfg: RuntimeConfig, session_id: String) -> Self {
         let mut palettes = vec![crate::theme::PalettePack::builtin_default()];
@@ -1240,6 +1271,7 @@ impl App {
             vim: crate::input::VimState::default(),
             enter,
             ctrl_c_armed: None,
+            quit_armed: None,
             esc_armed: None,
             queue_delete_armed: None,
             session_id,
@@ -1348,6 +1380,11 @@ impl App {
                 self.ctrl_c_armed = None;
             }
         }
+        if let Some(chord) = self.quit_armed {
+            if chord.started.elapsed() > DOUBLE_PRESS_WINDOW {
+                self.quit_armed = None;
+            }
+        }
         if self
             .esc_armed
             .is_some_and(|at| at.elapsed() > DOUBLE_PRESS_WINDOW)
@@ -1361,28 +1398,25 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// The band the shell gets once the alternate screen is gone: a ruled line
-    /// naming the session, the command that picks it up again, and the in-app
+    /// The band the shell gets once the alternate screen is gone: the session
+    /// that was on screen, the command that picks it up again, and the in-app
     /// way to it. The command sits alone on its line, so selecting that line
-    /// copies the command and nothing else; `width` is the terminal's (clamped)
-    /// so the rules match the window they were printed into rather than a magic
-    /// 80 columns.
+    /// copies the command and nothing else.
     ///
     /// The id is the one on screen at exit — a `/resume` switch moves it — so a
     /// session entered mid-run is the one named. Both routes need the launch's
     /// workspace and session root: resume from the same directory, or use
     /// `/resume`, which lists exactly the sessions this one can still open.
-    pub fn exit_notice(&self, width: usize) -> String {
+    pub fn exit_notice(&self) -> String {
         let id = &self.session_id;
-        let rule = "─".repeat(width.clamp(24, 72));
         match self.locale {
             Locale::En => format!(
-                "{rule}\nabylab · session closed · {id}\n\nResume it later:\n\
-                 abylab --session-id {id}\n\nOr pick it with /resume in the app\n{rule}"
+                "abylab · session closed · {id}\n\nResume it later:\n\
+                 abylab --session-id {id}\n\nOr pick it with /resume in the app"
             ),
             Locale::Zh => format!(
-                "{rule}\nabylab · 会话已结束 · {id}\n\n下次继续：\n\
-                 abylab --session-id {id}\n\n或在程序里用 /resume 选择\n{rule}"
+                "abylab · 会话已结束 · {id}\n\n下次继续：\n\
+                 abylab --session-id {id}\n\n或在程序里用 /resume 选择"
             ),
         }
     }
@@ -3589,7 +3623,7 @@ impl App {
             }
             Action::Esc => self.handle_esc(ctl),
             Action::CtrlC => self.handle_ctrl_c(ctl),
-            Action::Quit => self.quit = true,
+            Action::Quit => self.handle_quit(),
             Action::ClearScrollback => {
                 self.transcript.clear();
                 self.sel = None;
@@ -5120,19 +5154,10 @@ impl App {
             );
             return;
         }
-        let required = 2;
-        let mut chord = self.ctrl_c_armed.take().unwrap_or(CtrlCQuitChord {
-            started: Instant::now(),
-            presses: 0,
-            required,
-        });
-        chord.presses += 1;
-        if chord.presses >= chord.required {
+        let Some(remaining) = arm_quit_chord(&mut self.ctrl_c_armed) else {
             self.quit = true;
             return;
-        }
-        let remaining = chord.required - chord.presses;
-        self.ctrl_c_armed = Some(chord);
+        };
         self.show_tip(if remaining == 1 {
             self.locale
                 .tr("press ctrl+c again to exit", "再按一次 ctrl+c 退出")
@@ -5145,6 +5170,21 @@ impl App {
                 )
                 .replace("{n}", &remaining.to_string())
         });
+    }
+
+    /// `ctrl+q`: quitting is a two-press chord like the empty-draft `ctrl+c`,
+    /// so a stray chord never kills the session mid-turn. The first press
+    /// shows the tip and the second inside [`DOUBLE_PRESS_WINDOW`] quits. The
+    /// slash-command `/quit` stays immediate: a typed command is deliberate.
+    fn handle_quit(&mut self) {
+        if arm_quit_chord(&mut self.quit_armed).is_none() {
+            self.quit = true;
+            return;
+        }
+        self.show_tip(
+            self.locale
+                .tr("press ctrl+q again to exit", "再按一次 ctrl+q 退出"),
+        );
     }
 
     fn history_prev(&mut self) {
@@ -5391,6 +5431,7 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 连按两次中断本轮（保留草稿）；空闲时清除草稿
 - ctrl+c · 有草稿先清除；无草稿时连按 2 次退出（不中断）
+- ctrl+q · 退出：再按一次确认（手打 /quit 仍是立即退出）
 - shift+tab · 切换权限（只读 → 工作区可写 → 完全访问，一轮结束后生效）· /permission 打开选择器
 - ctrl+p · 打开模型选择器，然后选择推理强度
 - /lang · 切换界面语言：/lang zh 或 /lang en
@@ -5421,6 +5462,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · twice interrupts the running turn (draft survives) · clears the draft when idle
 - ctrl+c · clear a draft; 2× quits with no draft (never interrupts)
+- ctrl+q · quit: press again to confirm (typed /quit stays immediate)
 - shift+tab · cycle permission (read only → workspace write → full access, takes effect after a turn) · /permission opens the preset picker
 - ctrl+p · model picker → effort picker
 - /effort · reasoning effort · /permission preset
@@ -6484,9 +6526,9 @@ mod resume_tests {
     }
 
     /// Leaving prints the session that was on screen — a `/resume` switch moves
-    /// the id — plus the two ways back, in the interface language, inside a
-    /// ruled band. The resume command sits alone on its line, so selecting that
-    /// line copies the command and nothing else.
+    /// the id — plus the two ways back, in the interface language. No rules
+    /// frame the band: the notice is plain lines. The resume command sits alone
+    /// on its line, so selecting that line copies the command and nothing else.
     #[test]
     fn the_exit_notice_names_the_session_and_the_way_back() {
         let root = tmp_root("exit-notice");
@@ -6497,20 +6539,8 @@ mod resume_tests {
         ] {
             app.locale = locale;
             app.session_id = id.into();
-            let notice = app.exit_notice(80);
-            // 80 columns of terminal become a 72-cell rule (the cap keeps a
-            // wide window from drawing a line across the whole screen).
-            let rule = "─".repeat(72);
-            assert_eq!(
-                notice.lines().next(),
-                Some(rule.as_str()),
-                "the band opens with a rule: {notice}"
-            );
-            assert_eq!(
-                notice.lines().last(),
-                Some(rule.as_str()),
-                "…and closes with one: {notice}"
-            );
+            let notice = app.exit_notice();
+            assert!(!notice.contains('─'), "the band carries no rules: {notice}");
             assert!(notice.contains(id), "{notice}");
             assert!(
                 notice
@@ -6520,19 +6550,6 @@ mod resume_tests {
             );
             assert!(notice.contains("/resume"), "{notice}");
         }
-
-        // The rule follows the window, and keeps a floor on absurdly narrow
-        // ones (24 cells) so a one-column band still reads as a band.
-        assert_eq!(
-            app.exit_notice(30).lines().next(),
-            Some("─".repeat(30).as_str()),
-            "a narrow terminal gets a shorter rule"
-        );
-        assert_eq!(
-            app.exit_notice(10).lines().next(),
-            Some("─".repeat(24).as_str()),
-            "a tiny one gets the floor"
-        );
     }
 
     #[test]
@@ -10227,7 +10244,7 @@ mod mode_tests {
     #[test]
     fn ctrl_c_with_a_draft_clears_it_before_starting_a_fresh_double_press_to_quit() {
         let (mut app, ctl, _rx) = test_app();
-        app.ctrl_c_armed = Some(CtrlCQuitChord {
+        app.ctrl_c_armed = Some(QuitChord {
             started: Instant::now(),
             presses: 1,
             required: 2,
@@ -10248,6 +10265,59 @@ mod mode_tests {
 
         app.handle_ctrl_c(&ctl);
         assert!(app.quit);
+    }
+    /// `ctrl+q` is a two-press quit chord: a lone chord only arms (and says
+    /// so) — a stray keypress must never kill the session — and the second
+    /// inside the window quits.
+    #[test]
+    fn ctrl_q_quits_on_the_second_press_inside_the_window() {
+        let (mut app, ctl, _rx) = test_app();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(app.quit_armed.is_some(), "the first ctrl+q arms the chord");
+        assert!(!app.quit, "the first press never quits");
+        assert!(
+            app.tip
+                .as_ref()
+                .is_some_and(|(tip, _)| tip.contains("ctrl+q")),
+            "the armed chord says so: {:?}",
+            app.tip
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(app.quit_armed.is_none(), "the chord is spent");
+        assert!(app.quit, "the second press quits");
+    }
+    /// A first ctrl+q older than the window never counts: it re-arms from
+    /// now, and `tick` drops the stale arm entirely.
+    #[test]
+    fn a_stale_ctrl_q_press_re_arms_instead_of_quitting() {
+        let (mut app, ctl, _rx) = test_app();
+        let stale = || {
+            Some(QuitChord {
+                started: Instant::now() - DOUBLE_PRESS_WINDOW - Duration::from_millis(1),
+                presses: 1,
+                required: 2,
+            })
+        };
+
+        app.quit_armed = stale();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &ctl,
+        );
+        assert!(!app.quit, "an expired arm never quits");
+        assert!(app.quit_armed.is_some(), "it re-arms from now");
+
+        app.quit_armed = stale();
+        app.tick();
+        assert!(app.quit_armed.is_none(), "tick drops the stale arm");
     }
     #[test]
     fn direct_plan_mode_facts_fold_once_into_client_state() {

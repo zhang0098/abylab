@@ -405,8 +405,8 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_mac: &["ctrl+q"],
         chords_other: &["ctrl+q"],
         ctx: CtxNote::Always,
-        desc_en: "quit abylab",
-        desc_zh: "退出 abylab",
+        desc_en: "quit abylab · press again to confirm",
+        desc_zh: "退出 abylab；再按一次确认",
         probes: &[p(KeyCode::Char('q'), CTRL, false)],
     },
     // --- scroll · navigate ------------------------------------------------
