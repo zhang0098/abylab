@@ -254,10 +254,13 @@ One durable objective per session, unlimited by default unless a round allowance
 ## Steering
 
 While a turn is running, your next message takes one of two paths: queue, or
-steer. `/enter` picks which one plain Enter takes and ctrl+enter always takes
-the other; an idle session sends either way. This is deepseek-harness's
-busy-Enter preference (the `ui-conversation` `resolveSubmitMode` policy), and
-the default matches: queue.
+steer. Which one plain Enter takes comes from the persisted busy-Enter
+preference (the `enter` field in `settings.json`: `queue` or `steer`);
+ctrl+enter always takes the other; an idle session sends either way. This is
+deepseek-harness's busy-Enter preference (the `ui-conversation`
+`resolveSubmitMode` policy), and the default matches: queue. There is no slash
+command for it — edit settings.json to change it, and a hand-typed `/enter …`
+resolves like any other unknown `/name`.
 
 A steer **cancels nothing**:
 

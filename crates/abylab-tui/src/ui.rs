@@ -765,9 +765,9 @@ pub(crate) fn context_hints(app: &App) -> Vec<Span<'static>> {
     let pairs: Vec<(&str, &str)> = match (running, app.input.is_empty()) {
         // Working, nothing typed: stop it — and nothing else.
         (true, true) => vec![("esc", app.locale.tr("interrupt", "中断"))],
-        // Working with a draft: enter does what `/enter` selected and the
-        // accelerated chord does the other one — neither cancels the turn
-        // (ctrl+x cuts the selection instead).
+        // Working with a draft: enter does what the saved busy-Enter
+        // preference selected and the accelerated chord does the other one —
+        // neither cancels the turn (ctrl+x cuts the selection instead).
         (true, false) => {
             let enter = app.enter.label(app.locale);
             let chord = app.enter.flipped().label(app.locale);
@@ -1443,8 +1443,9 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                 .tr("Enter any command", "输入你的任何命令")
                 .to_string(),
             _ => {
-                // The draft's own gesture pair: Enter follows `/enter`, the
-                // accelerated chord does the other one.
+                // The draft's own gesture pair: Enter follows the saved
+                // busy-Enter preference, the accelerated chord does the other
+                // one.
                 let enter = app.enter.label(app.locale);
                 let chord = app.enter.flipped().label(app.locale);
                 app.locale
