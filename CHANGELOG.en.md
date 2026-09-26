@@ -10,6 +10,15 @@ context compaction, session persistence, goal rounds, uninstall) live in
 
 ## [Unreleased]
 
+### Changed
+
+- `ctrl+q` no longer quits on a single press: the first press only shows "press ctrl+q again to
+  exit" in the tip row, and a second press within 1.5s really quits — the same chord `ctrl+c`
+  wears on an empty draft, so a stray keypress cannot end the session. Typed `/quit` is still
+  immediate.
+- The notice printed after leaving the alternate screen no longer draws its two `─` rules; the
+  session id, the `abylab --session-id` command and the `/resume` hint remain.
+
 ## [0.1.18] - 2026-09-26
 
 ### Changed

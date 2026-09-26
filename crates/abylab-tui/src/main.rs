@@ -788,13 +788,10 @@ fn main() -> Result<()> {
 
     controller.send(Cmd::Shutdown);
     restore_terminal();
-    // Back on the normal screen: the session id and the two ways back, in a
-    // ruled band. The app owns the wording (locale + the session it ended on),
-    // the shell writes it, so it survives the alternate screen (see
-    // `App::exit_notice`). The width is still the terminal's — this is the last
-    // chance to ask before the process is gone.
-    let width = crossterm::terminal::size().map_or(48, |(w, _)| w as usize);
-    println!("{}", app.exit_notice(width));
+    // Back on the normal screen: the session id and the two ways back. The app
+    // owns the wording (locale + the session it ended on), the shell writes it,
+    // so it survives the alternate screen (see `App::exit_notice`).
+    println!("{}", app.exit_notice());
     run
 }
 

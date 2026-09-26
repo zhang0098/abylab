@@ -60,6 +60,7 @@ Type what you want done, and get to work.
 | `ctrl+enter` | Steer |
 | `esc` twice | Interrupt / clear draft |
 | `ctrl+c` | Clear / quit |
+| `ctrl+q` | Quit (press again to confirm) |
 | `↑` | Prompt history |
 | `ctrl+z` | Undo |
 | `/` | Commands |
