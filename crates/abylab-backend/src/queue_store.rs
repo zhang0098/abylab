@@ -143,6 +143,18 @@ pub fn load(cfg: &crate::contract::DriverConfig, session: &str) -> Vec<QueuedRec
     load_checked(cfg, session).unwrap_or_default()
 }
 
+/// Remove `session`'s persisted queue. A missing file is a no-op; unlike
+/// [`save`] with an empty list, a malformed store is removed too — the
+/// session it belongs to is being deleted, and refusing would leave the file
+/// behind forever.
+pub fn remove(home: &str, workspace: &str, session: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path(home, workspace, session)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Replace `session`'s queue with `items`. An empty list removes the file, so a
 /// drained queue leaves nothing behind for the next start to resurrect.
 pub fn save(
@@ -237,6 +249,24 @@ mod tests {
             !path(&home, "/tmp", "aby-1").exists(),
             "the file went with the queue"
         );
+    }
+
+    /// `/delete` removes the queue file even when it is malformed: the
+    /// session is gone, and `save`'s recovery guard must not keep the file.
+    #[test]
+    fn remove_deletes_a_queue_file_whatever_its_shape() {
+        let home = home("remove");
+        save(&home, "/tmp", "aby-1", &["kept".into()]).unwrap();
+        remove(&home, "/tmp", "aby-1").unwrap();
+        assert!(!path(&home, "/tmp", "aby-1").exists());
+        assert!(read(&home, "aby-1").is_empty());
+        remove(&home, "/tmp", "aby-1").unwrap(); // missing is a no-op
+
+        let file = path(&home, "/tmp", "aby-2");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{ not json").unwrap();
+        remove(&home, "/tmp", "aby-2").unwrap();
+        assert!(!file.exists(), "a broken store still goes with its session");
     }
 
     #[test]

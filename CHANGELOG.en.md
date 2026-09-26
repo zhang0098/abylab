@@ -18,6 +18,11 @@ context compaction, session persistence, goal rounds, uninstall) live in
   immediate.
 - The notice printed after leaving the alternate screen no longer draws its two `─` rules; the
   session id, the `abylab --session-id` command and the `/resume` hint remain.
+- New `/delete`: permanently deletes the current session — the snapshot log under `.abycore` and
+  the queued-prompts file go together — then opens a fresh session. A confirmation card guards the
+  removal (cancel starts selected, Esc closes), and only choosing "Delete permanently" and pressing
+  enter acts. If the files cannot be removed (another process holds the session), they stay, and the
+  reason lands as a notice on the new session.
 
 ## [0.1.18] - 2026-09-26
 

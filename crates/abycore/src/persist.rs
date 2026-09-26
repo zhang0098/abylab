@@ -408,6 +408,43 @@ impl SessionStore {
         Ok((header, snapshot))
     }
 
+    /// Permanently remove a session's directory: header, checkpoints, title,
+    /// index and lock file.
+    ///
+    /// The writer lock is taken first, so a session another live writer holds
+    /// open is refused instead of being deleted under its feet; the caller
+    /// must release its own writer before asking. A session that is already
+    /// gone is a no-op, so a retried delete settles.
+    pub fn delete(&self, id: &str) -> Result<()> {
+        let dir = self.dir_of(id)?;
+        let lock = match fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("session.lock"))
+        {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error("open session lock", error)),
+        };
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |_| {
+                invalid(format!(
+                    "session {id} is open by another writer (lock held)"
+                ))
+            },
+        )?;
+        fs::remove_dir_all(&dir).map_err(|e| io_error("delete session", e))?;
+        drop(lock);
+        // The directory entry itself must be durable, or a crash could
+        // resurrect a path whose files are already gone.
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent).map_err(|e| io_error("sync session store", e))?;
+        }
+        Ok(())
+    }
+
     /// Return the most recent committed title, or None for absent/invalid logs.
     pub fn title_of(&self, id: &str) -> Option<String> {
         let dir = self.dir_of(id).ok()?;

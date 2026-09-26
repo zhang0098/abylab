@@ -598,6 +598,13 @@ pub enum Cmd {
     Resume {
         session_id: String,
     },
+    /// Permanently delete a session's persisted files: the checkpoint log
+    /// directory and the session's queued prompts. Only the active session can
+    /// be deleted; the driver releases its writer, removes the files and binds
+    /// a fresh session in its place (a `SessionBound` with a new id).
+    DeleteSession {
+        session_id: String,
+    },
     /// List persisted sessions under `workspace/.abycore/sessions`.
     ListSessions {
         /// `/resume <prefix>` id prefix, echoed back in `SessionList`.

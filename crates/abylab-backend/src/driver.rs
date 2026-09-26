@@ -1312,6 +1312,81 @@ async fn drive(
                     ))),
                 }
             }
+            Cmd::DeleteSession { session_id } => {
+                if session_id != active_session {
+                    ctl(CtlEvent::SessionSwitchFailed(format!(
+                        "session delete failed: {session_id} is not the active session"
+                    )));
+                    continue;
+                }
+                // The writer holds the session log's lock, and the store
+                // refuses to delete under a live writer: close this session
+                // first, then remove its files.
+                let deleted = active_session.clone();
+                agent = None;
+                let mut delete_error = None;
+                if let Some(store) = store.as_ref()
+                    && let Err(error) = store.delete(&deleted)
+                {
+                    delete_error = Some(format!("session delete failed: {error}"));
+                }
+                if let Some(home) = cfg.home.as_deref()
+                    && let Err(error) = crate::queue_store::remove(home, &cfg.workspace, &deleted)
+                {
+                    delete_error = Some(match delete_error {
+                        Some(existing) => format!("{existing}; queue delete failed: {error}"),
+                        None => format!("queued prompts were not deleted: {error}"),
+                    });
+                }
+                // A fresh session replaces the deleted one even when a file
+                // could not be removed: the user asked to start over, and the
+                // old writer is already gone.
+                let next_id = fresh_session_id();
+                let result = (|| -> abycore::Result<SessionAgent> {
+                    let local = local.as_ref().ok_or_else(|| {
+                        abycore::Error::new(ErrorKind::Configuration, "local tools unavailable")
+                    })?;
+                    let ctx = AgentContext {
+                        local,
+                        api_key: &api_key,
+                        base_url: cfg.base_url.as_deref(),
+                        store: store.as_ref(),
+                        session_id: &next_id,
+                        subagents: subagents.as_ref(),
+                        host: &host,
+                    };
+                    fresh_agent(&ctx, &model, effort)
+                })();
+                match result {
+                    Ok(next) => {
+                        agent = Some(next);
+                        active_session = next_id;
+                        resume_target = None;
+                        queue.clear();
+                        taken.take();
+                        admitted.take();
+                        queue = load_session_queue(&cfg, &active_session, &ctl);
+                        bind_session(
+                            agent.as_ref().unwrap(),
+                            &active_session,
+                            Some(format!("session {deleted} deleted · fresh session")),
+                            false,
+                            &sink,
+                        );
+                        publish_queue(&queue, &active_session, &ctl);
+                        emit_permission_facts(&sink, &active_session, permission_mode);
+                        // After the bind: binding resets the client's
+                        // transcript, and a warning sent before it would be
+                        // wiped with the deleted session's view.
+                        if let Some(error) = delete_error {
+                            ctl(CtlEvent::TuiOpFailed(error));
+                        }
+                    }
+                    Err(error) => ctl(CtlEvent::SessionSwitchFailed(format!(
+                        "session {deleted} deleted, but a fresh session could not open: {error}"
+                    ))),
+                }
+            }
             Cmd::ListSessions { prefix } => {
                 // The handle routes this to the query task so a running turn
                 // can't hold the picker; this arm serves a caller that pokes
@@ -1751,6 +1826,24 @@ struct AgentContext<'a> {
 /// otherwise get wrong. Sessions ship no search tool, so the prompt names the
 /// shell commands that do the searching and the one file tool that reads.
 pub(crate) const SYSTEM_PROMPT: &str = "You are abylab, a coding agent in the user's terminal. Keep answers tight. Read files with read — not cat or sed. Change them with write and edit. Search, list and run with bash: `rg`, `grep` and `find` are how you look around the workspace. Plan multi-step work with todo_write and keep the list current.";
+
+/// A fresh session id for the replacement `/delete` binds. The TUI mints ids
+/// for `/new`; the delete's follow-up session is the driver's own, so it mints
+/// this one — same shape as the TUI's `aby-<nanos>-<pid>-<seq>`.
+fn fresh_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "aby-{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// A fresh session reserves its id before it is published to the UI.
 fn fresh_agent(

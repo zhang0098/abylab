@@ -596,3 +596,119 @@ fn model_catalog_answers_while_a_turn_is_running() {
         |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "completed"),
     );
 }
+
+/// `/delete`: the session's snapshot log and its queued prompts are removed
+/// for good, and a fresh session takes over under a new id. The delete lands
+/// at the turn boundary ahead of the queued item it also removes.
+#[test]
+fn delete_removes_the_session_files_and_binds_a_fresh_session() {
+    let server = MockServer::start(vec![
+        // The first turn holds the driver open long enough to queue behind it.
+        Reply::sse(text_body("first", "hello")).delayed(Duration::from_millis(200)),
+        Reply::sse(text_body("second", "again")),
+    ]);
+    let live = Live::start(&server);
+    let store = SessionStore::new(&live.workspace).unwrap();
+    live.send(Cmd::Prompt {
+        text: "first".into(),
+    });
+    live.wait(|event| matches!(event, Event::Ui(UiEvent::TurnStart { .. })));
+    live.send(Cmd::QueueForSession {
+        session_id: "session".into(),
+        item_id: 7,
+        text: "queued behind the turn".into(),
+    });
+    live.wait(
+        |event| matches!(event, Event::Ctl(CtlEvent::Queue { items, .. }) if items.len() == 1),
+    );
+    let queue_file = queued_file(&live.workspace, "session");
+    assert!(queue_file.exists(), "the queued prompt is on disk");
+
+    live.send(Cmd::DeleteSession {
+        session_id: "session".into(),
+    });
+    let event = live.wait(|event| {
+        matches!(event, Event::Ctl(CtlEvent::SessionBound { session_id, .. }) if session_id != "session")
+    });
+    let Event::Ctl(CtlEvent::SessionBound {
+        session_id: next,
+        notice,
+        ..
+    }) = event
+    else {
+        unreachable!()
+    };
+    assert!(
+        notice.unwrap_or_default().contains("deleted"),
+        "the bind names the deletion"
+    );
+    assert!(store.load("session").is_err(), "the snapshot log is gone");
+    assert!(!queue_file.exists(), "the queued prompt went with it");
+    assert!(
+        store.list().unwrap().iter().all(|row| row.id != "session"),
+        "nothing left to resume"
+    );
+
+    // The replacement session works and persists on its own id.
+    live.send(Cmd::Prompt {
+        text: "again".into(),
+    });
+    live.wait(|event| matches!(event, Event::Ui(UiEvent::TurnEnd { session, kind }) if *session == next && kind == "completed"));
+    let fresh = store.load(&next).unwrap().1;
+    assert_eq!(
+        fresh.items[0],
+        abycore::Item::user("again"),
+        "the fresh session starts with its own history"
+    );
+    assert!(
+        !serde_json::to_string(&fresh.items)
+            .unwrap()
+            .contains("first"),
+        "nothing of the deleted session leaked into the replacement"
+    );
+    assert!(
+        store.load("session").is_err(),
+        "no write resurrected the deleted log"
+    );
+    assert_eq!(
+        server.bodies().len(),
+        2,
+        "the queued prompt died with its session instead of shipping"
+    );
+}
+
+/// Where `queue_store` puts a session's durable queue, recomputed from its
+/// public contract (workspace sha256 partition + escaped id).
+fn queued_file(workspace: &std::path::Path, session: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let key: String = Sha256::digest(workspace.to_string_lossy().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    workspace
+        .join("home/queued")
+        .join(key)
+        .join(format!("{session}.json"))
+}
+
+/// Only the active session is deletable: a stale id must not remove a log the
+/// driver is not holding (that session belongs to whoever holds it).
+#[test]
+fn delete_refuses_a_session_that_is_not_active() {
+    let server = MockServer::start(vec![Reply::sse(text_body("first", "hello"))]);
+    let live = Live::start(&server);
+    live.prompt("first");
+    live.send(Cmd::DeleteSession {
+        session_id: "someone-else".into(),
+    });
+    live.wait(|event| {
+        matches!(event, Event::Ctl(CtlEvent::SessionSwitchFailed(message)) if message.contains("not the active session"))
+    });
+    assert!(
+        SessionStore::new(&live.workspace)
+            .unwrap()
+            .load("session")
+            .is_ok(),
+        "the refused delete left the active session alone"
+    );
+}

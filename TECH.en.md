@@ -208,6 +208,12 @@ workspace slug:
   end. `/model`'s live catalog (the `/models` request) takes the same channel,
   so it fills the picker mid-turn too.
 - A non-blocking `flock` on `session.lock` keeps it to a single writer.
+- `/delete` permanently removes the active session: the driver drops its writer,
+  `SessionStore::delete` takes the same `session.lock` (so a session another
+  process holds open is refused) and removes the whole session directory; the
+  queued-prompts file (`$ABYLAB_HOME/queued/…`) goes with it, and the driver
+  mints a new id for the replacement session — the deleted log is never
+  resurrected by the next message.
 
 Changing permissions or the API key at runtime keeps the parent's runtime
 identity, inbox and session writer. Existing children keep the credentials and
