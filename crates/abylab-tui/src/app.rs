@@ -175,6 +175,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "resume a durable session from this workspace",
     },
     SlashCommand {
+        name: "delete",
+        usage: "/delete",
+        desc: "permanently delete this session and its saved files",
+    },
+    SlashCommand {
         name: "compact",
         usage: "/compact",
         desc: "condense older history into a summary",
@@ -593,6 +598,28 @@ pub struct PermissionAskOverlay {
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<PermissionAskReply>>,
 }
 
+/// One TUI-local yes/no card. The permission overlay answers the host; this
+/// one carries the action Enter performs, so a destructive command can be
+/// confirmed without a round trip to the driver.
+pub struct ConfirmOverlay {
+    pub title: String,
+    pub detail: String,
+    pub action: ConfirmAction,
+    /// 0 = confirm, 1 = cancel. Cancel starts selected: Enter on a freshly
+    /// opened card never destroys anything.
+    pub sel: usize,
+}
+
+/// The actions a [`ConfirmOverlay`] can confirm. One variant today; the card
+/// is the shared surface future destructive commands should use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmAction {
+    DeleteSession,
+}
+
+/// Rows a [`ConfirmOverlay`] draws: confirm first, cancel second.
+pub const CONFIRM_ROWS: usize = 2;
+
 /// The answer is sent exactly once; dropping the overlay cancels the ask.
 pub struct UserQuestionOverlay {
     pub question: abylab_backend::UserQuestion,
@@ -707,6 +734,8 @@ pub struct App {
     pending_permission_asks: VecDeque<PermissionAskOverlay>,
     pub user_question: Option<UserQuestionOverlay>,
     pending_user_questions: VecDeque<UserQuestionOverlay>,
+    /// TUI-local destructive-action confirmation (`/delete`), drawn as a card.
+    pub confirm: Option<ConfirmOverlay>,
     /// Read-only modal rendered from a semantic TuiNode tree. Builtin chrome
     /// such as `/keys` uses this surface.
     pub view_overlay: Option<ViewOverlay>,
@@ -835,6 +864,9 @@ pub struct App {
 enum SessionSwitch {
     New,
     Resume(String),
+    /// `/delete`: the driver removes the old session's files and binds a
+    /// replacement. Settles like `New` — any new id acknowledges it.
+    Delete,
 }
 
 fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
@@ -1245,6 +1277,7 @@ impl App {
             pending_permission_asks: VecDeque::new(),
             user_question: None,
             pending_user_questions: VecDeque::new(),
+            confirm: None,
             view_overlay: None,
             pending_images: crate::attachments::Staged::default(),
             att_chips: Vec::new(),
@@ -2053,7 +2086,9 @@ impl App {
                         effort,
                     } => {
                         let switched = match &self.session_switch {
-                            Some(SessionSwitch::New) => self.session_id != session_id,
+                            Some(SessionSwitch::New | SessionSwitch::Delete) => {
+                                self.session_id != session_id
+                            }
                             Some(SessionSwitch::Resume(target)) => *target == session_id,
                             None => false,
                         };
@@ -3263,6 +3298,13 @@ impl App {
             return;
         }
 
+        // A local destructive-action card (`/delete`) owns input next: the
+        // host asks above win because they block a running tool.
+        if self.confirm.is_some() {
+            self.handle_confirm_key(key, ctl);
+            return;
+        }
+
         if self.todo_dialog.is_some() {
             self.handle_todo_dialog_key(key);
             return;
@@ -3823,6 +3865,72 @@ impl App {
                 });
             }
             _ => {}
+        }
+    }
+
+    /// `/delete`: the card that guards the permanent removal. The command
+    /// itself never deletes — Enter on the card does.
+    fn open_delete_confirm(&mut self) {
+        if self.session_switch.is_some() {
+            return;
+        }
+        self.confirm = Some(ConfirmOverlay {
+            title: self.locale.tr("Delete this session?", "删除当前会话？").into(),
+            detail: self
+                .locale
+                .tr(
+                    "Session {id} and its saved files (snapshot log + queued prompts) are removed for good; a fresh session opens in its place.",
+                    "会话 {id} 及其存档（快照日志 + 排队命令文件）将被永久删除，随后自动新开一个会话。",
+                )
+                .replace("{id}", &self.session_id),
+            action: ConfirmAction::DeleteSession,
+            // Cancel is preselected: Enter on a freshly opened card is safe.
+            sel: 1,
+        });
+        self.needs_redraw = true;
+    }
+
+    fn handle_confirm_key(&mut self, key: KeyEvent, ctl: &Controller) {
+        match key.code {
+            KeyCode::Esc => self.confirm = None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.confirm = None;
+            }
+            KeyCode::Up | KeyCode::Left | KeyCode::BackTab => {
+                if let Some(confirm) = self.confirm.as_mut() {
+                    confirm.sel = confirm.sel.checked_sub(1).unwrap_or(CONFIRM_ROWS - 1);
+                }
+            }
+            KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                if let Some(confirm) = self.confirm.as_mut() {
+                    confirm.sel = (confirm.sel + 1) % CONFIRM_ROWS;
+                }
+            }
+            KeyCode::Enter => {
+                let confirmed = self.confirm.as_ref().is_some_and(|card| card.sel == 0);
+                let action = self.confirm.take().map(|card| card.action);
+                if confirmed {
+                    if let Some(action) = action {
+                        self.run_confirm(action, ctl);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_confirm(&mut self, action: ConfirmAction, ctl: &Controller) {
+        match action {
+            ConfirmAction::DeleteSession => {
+                if self.session_switch.is_some() {
+                    return;
+                }
+                self.session_switch = Some(SessionSwitch::Delete);
+                ctl.send(Cmd::DeleteSession {
+                    session_id: self.session_id.clone(),
+                });
+                self.show_tip(self.locale.tr("deleting session…", "正在删除会话…"));
+            }
         }
     }
 
@@ -4751,6 +4859,7 @@ impl App {
     /// keeps appending to the same log.
     fn reset_session_ui(&mut self) {
         self.session_switch = None;
+        self.confirm = None;
         self.vim.reset_pending();
         self.reset_subagent_views();
         self.transcript.clear();
@@ -5330,6 +5439,7 @@ impl App {
                     self.show_tip(self.locale.tr("listing sessions…", "正在列出会话…"));
                 }
             }
+            "delete" => self.open_delete_confirm(),
             "effort" => {
                 if arg.is_empty() {
                     ctl.send(Cmd::FetchEfforts {
@@ -5440,6 +5550,7 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - /effort · 推理强度 · /permission 权限预设
 - /vim · 切换 vim 模态编辑（/vim on|off，默认关闭）
 - /resume · 恢复之前的会话
+- /delete · 永久删除当前会话及其存档（快照 + 排队命令文件），随后自动新开一个会话
 - /image · 暂存本地图片：/image ./pic.png [说明]
 - /clip · 暂存剪贴板图片并弹出预览（⌫ 删除图片）· ctrl+v 同样可用
 - !cmd · 在会话级本地 shell 中运行命令，不经过 Agent；初始目录为 workspace，cd/环境变量跨命令保留
@@ -5470,6 +5581,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - /login · store the API key in the aby home (never echoed in full)
 - /logout · remove the stored API key (a --api-key override keeps running)
 - /resume · pick up a durable session — transcript replays, log continues
+- /delete · permanently delete this session and its saved files (snapshot + queued prompts), then open a fresh one
 - /image · stage a local image — /image ./pic.png [caption]
 - /clip · stage the clipboard image — its preview pops up (⌫ drops the chip) · /clip [caption] · ctrl+v also works
 - !cmd · run in the session's local shell (not the agent); starts in the workspace, keeps cd/env across commands
@@ -6696,6 +6808,104 @@ mod resume_tests {
             assert_eq!(app.input.buf(), "unsent draft");
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn delete_confirms_before_deleting_and_binds_the_fresh_session() {
+        let root = tmp_root("delete-confirm");
+        let (mut app, _demo_ctl) = test_app_with_root(root.to_str().unwrap(), "/w");
+        let (ctl, commands) = crate::controller::test_controller();
+        let previous = app.session_id.clone();
+
+        app.run_slash("delete", "", &ctl);
+        let card = app
+            .confirm
+            .as_ref()
+            .expect("/delete opens the confirm card");
+        assert_eq!(card.sel, 1, "cancel starts selected");
+        assert!(
+            card.detail.contains(&previous),
+            "the card names the session"
+        );
+        assert!(card.detail.contains("snapshot"), "and what is removed");
+        assert!(
+            commands.try_recv().is_err(),
+            "no command before the confirm"
+        );
+
+        // Esc cancels: nothing is sent, the session stays.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.confirm.is_none());
+        assert!(commands.try_recv().is_err());
+
+        // Reopen, move off the safe row and confirm.
+        app.run_slash("delete", "", &ctl);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctl);
+        assert_eq!(app.confirm.as_ref().unwrap().sel, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
+        assert!(app.confirm.is_none());
+        assert!(
+            matches!(commands.try_recv(), Ok(Cmd::DeleteSession { session_id }) if session_id == previous)
+        );
+
+        // A switch is in flight: prompts wait instead of racing the delete.
+        app.input.set("late draft".into());
+        app.submit(&ctl);
+        assert_eq!(app.input.buf(), "late draft");
+        assert!(commands.try_recv().is_err(), "no prompt during the switch");
+
+        // The driver acknowledges with a fresh id: the deleted view is gone.
+        app.transcript.push_user(
+            "deleted history".into(),
+            crate::transcript::Delivery::Delivered,
+        );
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SessionBound {
+                session_id: "aby-fresh".into(),
+                notice: Some("session session deleted · fresh session".into()),
+                model: None,
+                effort: None,
+            }),
+            &ctl,
+        );
+        assert_eq!(app.session_id, "aby-fresh");
+        assert!(app.session_switch.is_none());
+        assert!(
+            !app.transcript.cells.iter().any(|cell| matches!(&cell.kind,
+                crate::transcript::CellKind::User { text, .. } if text == "deleted history")),
+            "the old view is cleared"
+        );
+        assert!(
+            app.transcript.cells.iter().any(|cell| matches!(&cell.kind,
+                crate::transcript::CellKind::Notice { text, .. } if text.contains("deleted"))),
+            "the driver's notice lands on the fresh view"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_confirm_card_draws_both_choices_and_esc_closes_it() {
+        let root = tmp_root("delete-card");
+        let (mut app, _demo_ctl) = test_app_with_root(root.to_str().unwrap(), "/w");
+        let (ctl, _commands) = crate::controller::test_controller();
+        app.session_id = "aby-42".into();
+        app.run_slash("delete", "", &ctl);
+
+        let frame = crate::ui::dump_frame(&mut app, 100, 30);
+        assert!(frame.contains("Delete this session?"), "card:\n{frame}");
+        assert!(frame.contains("aby-42"), "names the session:\n{frame}");
+        assert!(
+            frame.contains("Delete permanently"),
+            "confirm row:\n{frame}"
+        );
+        assert!(frame.contains("Cancel"), "cancel row:\n{frame}");
+        assert!(frame.contains("esc cancel"), "keys hint:\n{frame}");
+        // The composer stays readable under the card.
+        assert!(frame.contains("Enter any command"), "composer:\n{frame}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
+        assert!(app.confirm.is_none(), "esc closes the card");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

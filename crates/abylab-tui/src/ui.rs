@@ -168,6 +168,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_view_overlay(f, app, cards);
     draw_todo_dialog(f, app, cards);
     draw_user_question(f, app, cards);
+    // The local destructive-action card (`/delete`) sits above the transcript
+    // but below a host permission ask, which owns input while it is open.
+    draw_confirm(f, app, cards);
     // Permission owns keyboard input while both asks are present.
     draw_permission_ask(f, app, cards);
 }
@@ -1966,6 +1969,62 @@ fn draw_model_picker(f: &mut Frame, app: &mut App, screen: Rect) {
         // Page keys jump a screenful: the rows the popup actually shows.
         app.picker_page_rows = h.saturating_sub(2) as usize;
     }
+}
+
+/// The TUI-local yes/no card (`/delete`): the detail line names exactly what
+/// will be destroyed, and the safe row starts selected.
+fn draw_confirm(f: &mut Frame, app: &App, screen: Rect) {
+    let Some(card) = &app.confirm else {
+        return;
+    };
+    let theme = app.theme;
+    let screen = dialog_area(screen);
+    let w = screen
+        .width
+        .saturating_sub(2)
+        .min(72)
+        .max(DIALOG_MIN_W.min(screen.width));
+    let text_w = w.saturating_sub(4).max(4) as usize;
+    let mut lines = Vec::new();
+    for text in wrap(&card.detail, text_w) {
+        lines.push(Line::styled(text, Style::default().fg(theme.fg_secondary)));
+    }
+    lines.push(Line::raw(""));
+    let options = [
+        (app.locale.tr("Delete permanently", "永久删除"), theme.err),
+        (app.locale.tr("Cancel", "取消"), theme.fg_secondary),
+    ];
+    for (i, (label, color)) in options.iter().enumerate() {
+        let selected = i == card.sel;
+        let marker = if selected { "▸ " } else { "  " };
+        let style = if selected {
+            Style::default().fg(*color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(*color)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), Style::default().fg(theme.brand)),
+            Span::styled((*label).to_string(), style),
+        ]));
+    }
+    let h = (lines.len() as u16 + 2).min(screen.height);
+    let x = screen.x + (screen.width - w) / 2;
+    let y = screen.y + (screen.height - h) / 3;
+    let area = Rect::new(x, y, w, h);
+    f.render_widget(Clear, area);
+    let title = format!(
+        "{} · {} ",
+        card.title,
+        app.locale
+            .tr("enter select · esc cancel", "enter 选择 · esc 取消")
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.warn))
+        .title(Span::styled(title, Style::default().fg(theme.caption)))
+        .style(Style::default().bg(theme.panel));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_permission_ask(f: &mut Frame, app: &App, screen: Rect) {

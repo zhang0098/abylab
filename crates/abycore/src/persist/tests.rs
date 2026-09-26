@@ -687,6 +687,54 @@ fn a_second_title_keeps_the_committed_checkpoint() {
     );
 }
 
+/// `/delete`'s store half: the whole session directory goes away, a retry
+/// settles, and the listing no longer offers the id.
+#[test]
+fn delete_removes_the_session_directory_and_settles_on_retry() {
+    let workspace = temp_workspace("delete");
+    let store = SessionStore::new(&workspace).unwrap();
+    let mut writer = store.create("s", &store_snapshot("seed")).unwrap();
+    let snapshot = store_snapshot("hello");
+    store.append_checkpoint(&mut writer, 0, &snapshot).unwrap();
+    store.set_title(&mut writer, "doomed").unwrap();
+    let dir = writer.path().parent().unwrap().to_path_buf();
+    drop(writer);
+    assert_eq!(store.list().unwrap().len(), 1);
+
+    store.delete("s").unwrap();
+    assert!(!dir.exists(), "the session directory is gone");
+    assert!(store.load("s").is_err());
+    assert!(store.list().unwrap().is_empty(), "nothing left to resume");
+    store.delete("s").unwrap(); // a retried delete is a no-op
+
+    // The id can be reused: nothing of the old session is left to collide.
+    let mut writer = store.create_new("s", &store_snapshot("again")).unwrap();
+    store
+        .append_checkpoint(&mut writer, 0, &store_snapshot("again"))
+        .unwrap();
+    drop(writer);
+    assert_eq!(store.load("s").unwrap().1.items[0], Item::user("again"));
+}
+
+/// A live writer owns the session: deleting under it would leave it writing
+/// into unlinked files, so the store refuses until the writer is released.
+#[test]
+fn delete_refuses_a_session_a_live_writer_holds_open() {
+    let workspace = temp_workspace("delete-locked");
+    let store = SessionStore::new(&workspace).unwrap();
+    let mut writer = store.create("s", &store_snapshot("seed")).unwrap();
+    store
+        .append_checkpoint(&mut writer, 0, &store_snapshot("held"))
+        .unwrap();
+
+    let error = store.delete("s").expect_err("a held session is refused");
+    assert!(error.to_string().contains("lock held"), "{error}");
+    assert!(store.load("s").is_ok(), "the refused delete left the log");
+
+    drop(writer);
+    store.delete("s").expect("released sessions delete");
+}
+
 /// A writer whose log file disappeared must fail the next delta, not panic:
 /// `adopt_existing_log` reports a missing log as success (the first commit
 /// materializes it), which is only valid for a rewrite.

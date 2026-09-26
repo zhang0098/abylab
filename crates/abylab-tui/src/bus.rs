@@ -270,6 +270,12 @@ pub enum Cmd {
     LoadSession {
         session_id: String,
     },
+    /// `/delete`: permanently remove the active session's saved files. The
+    /// driver releases its writer, deletes the snapshot log and the queued
+    /// prompts, then binds a fresh session.
+    DeleteSession {
+        session_id: String,
+    },
     /// `/compact`: condense older history on demand.
     Compact,
     /// `/goal ...`: the session's goal and the round driver's arm switch.

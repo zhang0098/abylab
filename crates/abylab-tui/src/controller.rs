@@ -223,6 +223,9 @@ fn aby_loop(
             Cmd::LoadSession { session_id } => {
                 handle.send(abylab_backend::Cmd::Resume { session_id });
             }
+            Cmd::DeleteSession { session_id } => {
+                handle.send(abylab_backend::Cmd::DeleteSession { session_id });
+            }
             Cmd::SetPermission { preset, .. } => {
                 handle.send(abylab_backend::Cmd::SetPermission { preset });
             }
