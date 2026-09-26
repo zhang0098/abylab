@@ -82,7 +82,7 @@ pub struct UiSettings {
     pub theme: Option<String>,
     /// Active palette pack id (`/theme <pack>`).
     pub palette: Option<String>,
-    /// What plain Enter does while the agent is busy (`/enter queue|steer`).
+    /// What plain Enter does while the agent is busy (`queue` or `steer`).
     /// The accelerated ctrl+enter chord always uses the other one. Stored as a
     /// string so an unknown value costs the default, never the whole file.
     pub enter: Option<String>,
@@ -110,7 +110,7 @@ impl EnterBehavior {
         }
     }
 
-    /// Parse a `/enter` argument or a persisted value; `None` is unknown.
+    /// Parse a persisted value; `None` is unknown.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "queue" | "q" => Some(EnterBehavior::Queue),

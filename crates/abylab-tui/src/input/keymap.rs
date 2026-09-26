@@ -93,11 +93,11 @@ pub fn classify(key: &KeyEvent, ctx: KeyCtx) -> Option<Action> {
 
     let action = match key.code {
         // ctrl+enter / ⌘⏎ is the accelerated submit: while a turn runs it
-        // takes the mode the busy-Enter preference (`/enter`) left free —
-        // steer by default, queue under `/enter steer` — and it never
-        // cancels. Legacy terminals collapse ctrl+enter to plain enter,
-        // which degrades to a normal send/queue. shift+enter stays a draft
-        // newline.
+        // takes the mode the persisted busy-Enter preference left free —
+        // steer while the preference is queue, queue once it is steer — and
+        // it never cancels. Legacy terminals collapse ctrl+enter to plain
+        // enter, which degrades to a normal send/queue. shift+enter stays a
+        // draft newline.
         KeyCode::Enter if sup => SendNow,
         KeyCode::Enter if ctrl => SendNow,
         // ctrl+j is the readline newline byte (issue #55) — reliable in
@@ -352,8 +352,8 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_mac: &["enter"],
         chords_other: &["enter"],
         ctx: CtxNote::Always,
-        desc_en: "send · busy: the /enter mode · empty Enter sends the Queue head now",
-        desc_zh: "发送；运行中按 /enter 的设置排队或插话；输入框为空时发送排队的第一条命令",
+        desc_en: "send · busy: the saved enter mode · empty Enter sends the Queue head now",
+        desc_zh: "发送；运行中按已保存的偏好排队或插话；输入框为空时发送排队的第一条命令",
         probes: &[p(KeyCode::Enter, NONE, false)],
     },
     KeyRow {
@@ -362,7 +362,7 @@ pub const KEY_ROWS: &[KeyRow] = &[
         chords_mac: &["ctrl+enter", "⌘⏎"],
         chords_other: &["ctrl+enter"],
         ctx: CtxNote::Always,
-        desc_en: "send now — busy: the other /enter mode (steers by default)",
+        desc_en: "send now — busy: the other enter mode (steers by default)",
         desc_zh: "立即发送；运行中执行与 enter 相反的操作（默认立即插话）",
         probes: &[
             p(KeyCode::Enter, CTRL, false),

@@ -23,6 +23,11 @@ context compaction, session persistence, goal rounds, uninstall) live in
   removal (cancel starts selected, Esc closes), and only choosing "Delete permanently" and pressing
   enter acts. If the files cannot be removed (another process holds the session), they stay, and the
   reason lands as a notice on the new session.
+- `/enter` is no longer one of abylab's own commands: it is gone from the `/` menu, tab completion
+  and `/help`, and a hand-typed `/enter …` resolves like any other unknown `/name` (skill injection,
+  else the unknown-command notice). The busy-Enter preference itself is untouched — the `enter` value
+  in `settings.json` still decides whether plain Enter queues or steers while a turn runs (queue by
+  default; ctrl+enter is always the other), there is just no command left that changes it.
 
 ## [0.1.18] - 2026-09-26
 

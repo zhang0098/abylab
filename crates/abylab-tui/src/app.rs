@@ -1,10 +1,11 @@
 //! App state and input handling — the grok-build interaction homage.
 //!
-//! Enter sends (or queues mid-turn, client-side, unless `/enter steer`); the
-//! accelerated Ctrl+Enter takes the other mode and steers the active turn at its
-//! next step boundary — never by cancelling it; Esc is the only interrupt and
-//! preserves the draft; Ctrl+C clears a draft, then needs two empty presses to quit;
-//! `/` opens the slash menu; Up recalls history on an empty prompt.
+//! Enter sends (or queues mid-turn, client-side, unless the persisted busy-Enter
+//! preference steers); the accelerated Ctrl+Enter takes the other mode and steers
+//! the active turn at its next step boundary — never by cancelling it; Esc is the
+//! only interrupt and preserves the draft; Ctrl+C clears a draft, then needs two
+//! empty presses to quit; `/` opens the slash menu; Up recalls history on an
+//! empty prompt.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -223,11 +224,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "vim",
         usage: "/vim [on|off]",
         desc: "toggle vim modal editing in the composer",
-    },
-    SlashCommand {
-        name: "enter",
-        usage: "/enter [queue|steer]",
-        desc: "what Enter does while the agent is busy",
     },
     SlashCommand {
         name: "theme",
@@ -811,8 +807,8 @@ pub struct App {
     key_debug: bool,
     /// Optional vim modal editing for the composer (`/vim`).
     pub vim: crate::input::VimState,
-    /// What plain Enter does while busy (`/enter`); the accelerated chord
-    /// always does the other one (harness's `busyEnter` preference).
+    /// What plain Enter does while busy (read back from `settings.json`); the
+    /// accelerated chord always does the other one (harness's `busyEnter`).
     pub enter: crate::locale::EnterBehavior,
     ctrl_c_armed: Option<QuitChord>,
     /// The `ctrl+q` quit chord: first press arms, second quits. Kept apart
@@ -1615,34 +1611,6 @@ impl App {
         if !still_highlighted {
             self.clear_theme_preview();
         }
-    }
-
-    /// `/enter queue|steer`: what plain Enter does while a turn is running.
-    ///
-    /// The accelerated ctrl+enter chord always does the other one, and an idle
-    /// session sends either way — deepseek-harness's busy-Enter preference.
-    fn apply_enter_arg(&mut self, arg: &str) {
-        let Some(behavior) = crate::locale::EnterBehavior::parse(arg) else {
-            self.show_tip(format!(
-                "{}: {} · {}",
-                self.locale.tr("enter while busy", "运行中按 Enter"),
-                self.enter.label(self.locale),
-                self.locale.tr(
-                    "/enter queue|steer — the other mode rides ctrl+enter",
-                    "/enter queue|steer —— 另一种操作用 ctrl+enter",
-                )
-            ));
-            return;
-        };
-        self.enter = behavior;
-        self.save_settings();
-        self.show_tip(format!(
-            "{}: {} · {}",
-            self.locale.tr("enter while busy", "运行中按 Enter"),
-            behavior.label(self.locale),
-            self.locale
-                .tr("the other mode rides ctrl+enter", "另一种操作用 ctrl+enter",)
-        ));
     }
 
     fn apply_theme_arg(&mut self, arg: &str) {
@@ -5399,7 +5367,6 @@ impl App {
             }
             "quit" => self.quit = true,
             "theme" => self.apply_theme_arg(arg),
-            "enter" => self.apply_enter_arg(arg),
             "vim" => {
                 let on = match arg {
                     "on" | "1" => true,
@@ -5534,9 +5501,8 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
         // the body is the list itself — the same surface `/keys` uses.
         let text = if self.locale == Locale::Zh {
             "\
-- enter · 发送；当前轮次运行时将后续命令排队（草稿为空时立即发送队首）
-- ctrl+enter · 与 enter 相反的模式：默认立即插话（老终端会退化成普通 enter）
-- /enter · 繁忙时 enter 的模式：queue 排队 / steer 立即插话 · ctrl+enter 始终是另一种
+- enter · 发送；运行中{enter}（草稿为空时立即发送队首）
+- ctrl+enter · 与 enter 相反：{chord}（老终端会退化成普通 enter）
 - ⌥↑ · 排队命令：↑/↓ 选择 · enter 编辑 · ctrl+enter 立即插话 · 列表中 ctrl+d 连按两次删除 · esc 关闭
 - ctrl+x · 剪切选区 · ctrl+shift+c · 复制选区
 - esc · 连按两次中断本轮（保留草稿）；空闲时清除草稿
@@ -5566,9 +5532,8 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 token 用量（含缓存命中）以及轮次结束原因。"
         } else {
             "\
-- enter · send · queues a follow-up while a turn runs (an empty draft sends the queue head now)
-- ctrl+enter · the opposite of enter: by default it steers the active turn (legacy terminals fall back to plain enter)
-- /enter · what enter does while busy: queue / steer · ctrl+enter is always the other mode
+- enter · send · while a turn runs: {enter} (an empty draft sends the queue head now)
+- ctrl+enter · the opposite of enter: {chord} (legacy terminals fall back to plain enter)
 - ⌥↑ · queued follow-ups: ↑/↓ select · enter edit · ctrl+enter steers one now · ctrl+d twice deletes a row · esc close
 - ctrl+x · cut the selection · ctrl+shift+c · copy it
 - esc · twice interrupts the running turn (draft survives) · clears the draft when idle
@@ -5596,10 +5561,15 @@ token 用量（含缓存命中）以及轮次结束原因。"
 Per turn: streamed reasoning, answer, tool calls with results, injected
 context, subagent lifecycles, token usage (incl. cache hits), end reason."
         };
+        // The gesture pair is live data: the persisted busy-Enter preference
+        // decides which word each key gets.
+        let text = text
+            .replace("{enter}", self.enter.label(self.locale))
+            .replace("{chord}", self.enter.flipped().label(self.locale));
         self.view_overlay = Some(ViewOverlay {
             title: self.locale.tr("Help", "帮助").to_string(),
             nodes: vec![crate::slots::TuiNode::Markdown {
-                text: text.to_string(),
+                text,
                 streaming: false,
             }],
             scroll: 0,
@@ -8831,8 +8801,8 @@ mod mode_tests {
         assert_eq!(app.submit_mode(true), SubmitMode::Queue);
     }
 
-    /// The chord steers without touching the interrupt channel, and with
-    /// `/enter steer` the same key queues instead.
+    /// The chord steers without touching the interrupt channel, and with the
+    /// preference set to steer the same key queues instead.
     #[test]
     fn the_accelerated_chord_steers_while_enter_queues() {
         let (mut app, _demo, _rx) = test_app();
@@ -9111,37 +9081,68 @@ mod mode_tests {
         );
     }
 
-    /// `/enter` sets and persists the busy mode, and an unknown argument keeps
-    /// the current one instead of silently changing behavior.
+    /// `/enter` is gone as a builtin: its menu row with it, and a hand-typed
+    /// line resolves through the skill/prompt path. The persisted busy-Enter
+    /// preference still decides what plain Enter does.
     #[test]
-    fn the_enter_command_sets_and_persists_the_busy_mode() {
+    fn the_enter_line_ships_without_the_builtin_command() {
         let (mut app, ctl, _rx) = test_app();
+        app.skills = vec![crate::bus::SkillInfo {
+            name: "enter".into(),
+            description: "queue or steer".into(),
+            input_hint: None,
+            source: None,
+        }];
         assert_eq!(app.enter, crate::locale::EnterBehavior::Queue);
+        assert!(
+            !SLASH_COMMANDS.iter().any(|c| c.name == "enter"),
+            "the command is gone"
+        );
+        app.input.set("/enter steer".into());
+        assert!(app.slash_matches().is_empty(), "so is its menu row");
 
-        app.run_slash("enter", "steer", &ctl);
-        assert_eq!(app.enter, crate::locale::EnterBehavior::Steer);
+        app.submit(&ctl);
+
+        assert!(matches!(app.state, RunState::Starting));
+        assert!(matches!(
+            &app.transcript.cells[0].kind,
+            crate::transcript::CellKind::User { text, .. } if text == "/enter steer"
+        ));
+
+        // The preference is read back from settings.json, so a stored choice
+        // outlives the command and a restart.
+        app.enter = crate::locale::EnterBehavior::Steer;
+        app.save_settings();
         assert_eq!(
             crate::locale::UiSettings::load(&app.cfg.home)
                 .enter
                 .as_deref(),
-            Some("steer"),
-            "the choice survives a restart"
+            Some("steer")
         );
         let restarted = App::new(crate::theme::Theme::dark(), app.cfg.clone(), "next".into());
         assert_eq!(restarted.enter, crate::locale::EnterBehavior::Steer);
+    }
 
-        // No argument: the tip reports the live mode instead of changing it.
-        app.run_slash("enter", "", &ctl);
-        assert_eq!(app.enter, crate::locale::EnterBehavior::Steer);
+    /// `/help` names the live gesture pair, not a fixed default: the persisted
+    /// preference decides which word lands on each key.
+    #[test]
+    fn the_help_lines_follow_the_enter_preference() {
+        let (mut app, ctl, _rx) = test_app();
+        app.locale = crate::locale::Locale::Zh;
+        app.enter = crate::locale::EnterBehavior::Steer;
+
+        app.run_slash("help", "", &ctl);
+
+        let overlay = app.view_overlay.as_ref().expect("/help opens");
+        let crate::slots::TuiNode::Markdown { text, .. } = &overlay.nodes[0] else {
+            panic!("the help body is markdown");
+        };
         assert!(
-            app.tip.as_ref().expect("tip").0.contains("steer"),
-            "{:?}",
-            app.tip
+            !text.contains("{enter}") && !text.contains("{chord}"),
+            "no unexpanded placeholder: {text}"
         );
-
-        // An unknown value is a typo, not a mode.
-        app.run_slash("enter", "sometimes", &ctl);
-        assert_eq!(app.enter, crate::locale::EnterBehavior::Steer);
+        assert!(text.contains("运行中插话"), "{text}");
+        assert!(text.contains("与 enter 相反：排队"), "{text}");
     }
 
     /// The composer hint names the pair the preference actually installed.

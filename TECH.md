@@ -194,10 +194,12 @@ incomplete/错误退出）都会在对外公布结算状态之前存好。
 
 ## 插话（steer）
 
-一轮正在跑的时候，你的下一条消息有两条路：排队（queue）或插话（steer）。`/enter`
-决定普通 Enter 走哪条，ctrl+enter 永远走另一条；空闲会话两种手势都是直接发送。
-这是 deepseek-harness 的 busy-Enter 偏好（`ui-conversation` 的
-`resolveSubmitMode`）的等价物，默认值也一样是 queue。
+一轮正在跑的时候，你的下一条消息有两条路：排队（queue）或插话（steer）。普通 Enter
+走哪条由持久化的 busy-Enter 偏好决定（`settings.json` 的 `enter` 字段，`queue` 或
+`steer`），ctrl+enter 永远走另一条；空闲会话两种手势都是直接发送。这是
+deepseek-harness 的 busy-Enter 偏好（`ui-conversation` 的 `resolveSubmitMode`）的
+等价物，默认值也一样是 queue。偏好没有对应的斜杠命令：改它要手编 settings.json，
+手打 `/enter …` 和其它未知 `/名字` 一样走技能或提示未知命令的路。
 
 插话**不取消**任何东西：
 
