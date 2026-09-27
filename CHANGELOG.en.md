@@ -5,10 +5,24 @@
 What each abylab release changed, from the user's side. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/). Internals (workspace instructions,
-context compaction, session persistence, goal rounds, uninstall) live in
+context compaction, session persistence, goal rounds, the headless one-shot,
+uninstall) live in
 [TECH.en.md](TECH.en.md); day-to-day usage is in [README.en.md](README.en.md).
 
 ## [Unreleased]
+
+### Added
+
+- New `abylab ask "<question>"`: ask once without opening the interface — one turn runs, the answer
+  goes to stdout and abylab exits. Only the answer is printed; thinking, tool cards and progress are
+  not. A run that does not finish says why on stderr and exits non-zero — only a finished turn is 0,
+  an answer cut off by the output limit is still printed but exits 1, and a failed or interrupted turn
+  prints nothing at all, so a script cannot take half a sentence for the reply. Nobody is at the
+  keyboard, so an operation that needs approval follows the permission preset in `settings.json`
+  (the tools are still bounded by that preset's own sandbox), and a question the agent asks is
+  declined, leaving it to decide. The session is saved like any other: `--session-id <id>` asks again
+  in that same conversation. `-w/--workspace`, `--model`, `--base-url`, `--api-key` and the rest keep
+  their meaning; only `--theme`, which paints a screen, does nothing.
 
 ### Changed
 
@@ -28,6 +42,12 @@ context compaction, session persistence, goal rounds, uninstall) live in
   else the unknown-command notice). The busy-Enter preference itself is untouched — the `enter` value
   in `settings.json` still decides whether plain Enter queues or steers while a turn runs (queue by
   default; ctrl+enter is always the other), there is just no command left that changes it.
+
+### Fixed
+
+- A discovery advisory — an `AGENTS.md` or `SKILL.md` that could not be read in full — is no longer
+  painted as a red error row, and no longer marks the session as failing: it is what it always was,
+  a warning, and the agent continues without that part of the workspace.
 
 ## [0.1.18] - 2026-09-26
 

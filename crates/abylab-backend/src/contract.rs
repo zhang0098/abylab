@@ -176,7 +176,14 @@ pub enum CtlEvent {
     SteerAdmitted {
         message_ids: Vec<u64>,
     },
+    /// Something went wrong with the command at hand. A front end whose user is
+    /// not at the keyboard (the headless `abylab ask`) reads this as the end of
+    /// the run, so only failures belong here.
     Error(String),
+    /// A startup advisory — a workspace instruction file or a skill discovery
+    /// could not be read in full — worth showing, but not a failure: the run
+    /// continues with the rest of what discovery found.
+    Warning(String),
     CancelRequested,
     Interrupted,
     TuiOpDone(String),

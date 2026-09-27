@@ -1,6 +1,7 @@
 //! abylab — terminal-native agent harness UI.
 
 mod app;
+mod ask;
 mod attachments;
 mod bus;
 mod clipboard;
@@ -49,6 +50,23 @@ abylab — terminal-native agent harness UI
 
 USAGE:
   abylab [OPTIONS]
+  abylab ask \"<question>\" [OPTIONS]
+
+COMMANDS:
+  ask \"<question>\"          ask once, headless: the turn runs with no screen, the
+                            answer goes to stdout and abylab exits. Only the last
+                            answer is printed — reasoning, tool cards and progress
+                            never are — and a run that does not finish says why on
+                            stderr with a non-zero exit code. Nobody is at the
+                            keyboard, so a permission ask follows the saved
+                            permission preset and a model question is declined.
+                            The session is saved like any other: `--session-id
+                            <id>` asks again in that conversation, and the same id
+                            twice continues one conversation. The question may be
+                            given unwrapped (`abylab ask what changed`), or after
+                            `--` if it starts with a dash. Launch options mean
+                            what they mean below; --theme, which only paints a
+                            screen, is ignored.
 
 OPTIONS:
   -w, --workspace <dir>     agent workspace (default: cwd)
@@ -85,6 +103,9 @@ struct Args {
     api_key: Option<String>,
     /// `--theme` override; absent falls back to the persisted appearance.
     theme: Option<String>,
+    /// `ask "<question>"`: one headless turn, the answer on stdout, then exit.
+    /// Several unwrapped words are joined with single spaces.
+    ask: Option<String>,
     /// `--uninstall`: take back the data and the program itself, then exit.
     uninstall: bool,
     /// `--keep-data`: with `--uninstall`, leave the saved state alone.
@@ -106,16 +127,24 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
         base_url: None,
         api_key: None,
         theme: None,
+        ask: None,
         uninstall: false,
         keep_data: false,
         yes: false,
     };
+    // `ask` is the one subcommand. Bare words are only ever legal in it (the
+    // TUI takes no operands), so seeing the word anywhere — before or after
+    // the other options — can only mean the subcommand.
+    let mut asking = false;
+    let mut literal = false;
+    let mut question: Vec<String> = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let mut take = |name: &str| -> Result<String> {
             it.next().with_context(|| format!("{name} needs a value"))
         };
         match arg.as_str() {
+            _ if literal => question.push(arg),
             "-w" | "--workspace" => args_out.workspace = Some(take("--workspace")?),
             "--session-root" => args_out.sessions_root = Some(take("--session-root")?),
             "--session-id" => args_out.session_id = Some(take("--session-id")?),
@@ -134,8 +163,25 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
                 print!("{HELP}");
                 std::process::exit(0);
             }
+            "ask" if !asking && question.is_empty() => asking = true,
+            // `--`: everything after it is the question, dashes and all.
+            "--" if asking => literal = true,
+            // Unwrapped words are joined with single spaces, so
+            // `abylab ask what changed` asks what `abylab ask "what changed"`
+            // asks. Quoting is how a run of spaces survives.
+            other if asking => question.push(other.to_string()),
             other => bail!("unknown argument {other} (see --help)"),
         }
+    }
+    if asking {
+        let question = question.join(" ");
+        if question.trim().is_empty() {
+            bail!("ask needs a question: abylab ask \"…\" (see --help)");
+        }
+        args_out.ask = Some(question);
+    }
+    if args_out.ask.is_some() && (args_out.uninstall || args_out.keep_data || args_out.yes) {
+        bail!("ask runs a turn and --uninstall removes abylab: pick one (see --help)");
     }
     if args_out.keep_data && !args_out.uninstall {
         bail!("--keep-data only means something with --uninstall (see --help)");
@@ -642,6 +688,13 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("aby-{}", app::timestamp()));
 
+    // `ask` never reaches the screen either: one turn with no interface, the
+    // answer on stdout, then exit. Same config, same driver, same session store
+    // as the TUI — only the front end differs.
+    if let Some(question) = &args.ask {
+        return ask::run(&cfg, &session_id, question, limits, compaction);
+    }
+
     let (bus_tx, bus_rx) = mpsc::channel::<AppEvent>();
     install_termination_handler(bus_tx.clone())?;
 
@@ -1019,6 +1072,82 @@ mod cli_args_tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("--yes"), "{err:#}");
+    }
+
+    /// `ask` is a subcommand, not a flag: the words after it are the question,
+    /// unwrapped tokens are joined, and options still parse on either side of
+    /// it. What is refused is a bare word anywhere else, and `ask` with nothing
+    /// to ask.
+    #[test]
+    fn ask_takes_a_question_and_refuses_to_run_without_one() {
+        assert!(HELP.contains("abylab ask"), "{HELP}");
+
+        let args = parse_args_from(["ask".into(), "what changed".into()]).expect("ask parses");
+        assert_eq!(args.ask.as_deref(), Some("what changed"));
+
+        // Unwrapped words are one question; options keep working around them.
+        let args = parse_args_from([
+            "-w".into(),
+            "/srv/app".into(),
+            "ask".into(),
+            "what".into(),
+            "changed".into(),
+            "--model".into(),
+            "deepseek-pro".into(),
+        ])
+        .expect("ask parses with options");
+        assert_eq!(args.ask.as_deref(), Some("what changed"));
+        assert_eq!(args.workspace.as_deref(), Some("/srv/app"));
+        assert_eq!(args.model.as_deref(), Some("deepseek-pro"));
+
+        // `--` lets a question start with a dash.
+        let args = parse_args_from([
+            "ask".into(),
+            "--".into(),
+            "--model".into(),
+            "is".into(),
+            "gone".into(),
+        ])
+        .expect("a literal question parses");
+        assert_eq!(args.ask.as_deref(), Some("--model is gone"));
+        assert_eq!(args.model, None);
+
+        // The same dash elsewhere is still a launch option, not a question.
+        let args = parse_args_from([
+            "ask".into(),
+            "--session-id".into(),
+            "aby-1".into(),
+            "hi".into(),
+        ])
+        .expect("options after the subcommand parse");
+        assert_eq!(args.ask.as_deref(), Some("hi"));
+        assert_eq!(args.session_id.as_deref(), Some("aby-1"));
+
+        let err = match parse_args_from(["ask".into()]) {
+            Ok(_) => panic!("ask without a question must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("needs a question"), "{err:#}");
+
+        let err = match parse_args_from(["ask".into(), "   ".into()]) {
+            Ok(_) => panic!("a blank question must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("needs a question"), "{err:#}");
+
+        // A question and a wipe are two different runs.
+        let err = match parse_args_from(["ask".into(), "hi".into(), "--uninstall".into()]) {
+            Ok(_) => panic!("ask and --uninstall must not combine"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--uninstall"), "{err:#}");
+
+        // Nothing else takes a bare word; the subcommand must not soften that.
+        let err = match parse_args_from(["hello".into()]) {
+            Ok(_) => panic!("a bare word outside ask is still refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unknown argument"), "{err:#}");
     }
 
     /// The plan reads as a contract here too: the data half and the program

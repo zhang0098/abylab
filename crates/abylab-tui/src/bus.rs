@@ -97,8 +97,12 @@ pub enum CtlEvent {
     /// The agent appended steered messages at a step boundary: their pending
     /// rows are ordinary parts of the conversation from here on.
     SteerAdmitted { message_ids: Vec<u64> },
-    /// A command failed.
+    /// A command failed. A front end with nobody at the keyboard reads this as
+    /// the end of its run (see `ask`).
     Error(String),
+    /// A startup advisory (an instruction file or a skill discovery warning):
+    /// shown as a warning row, never as a failure.
+    Warning(String),
     /// Backchat `session.cancel_requested`: user stop accepted; `session/cancel`
     /// is on the wire. The in-flight `session/prompt` has not unwound yet.
     CancelRequested,
