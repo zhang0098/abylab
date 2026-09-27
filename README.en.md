@@ -48,6 +48,8 @@ Run `abylab` in your terminal, then log in once from the composer:
 
 Type what you want done, and get to work.
 
+To ask once without opening the interface: `abylab ask "what does this repo do?"` runs one turn, prints the answer on stdout and exits.
+
 > Building from source: `cargo build --release`. The installer also takes `--bin-dir`, `--version`, `--no-path`, `--path-file`, and `--help`.
 >
 > To uninstall abylab, run `abylab --uninstall`.

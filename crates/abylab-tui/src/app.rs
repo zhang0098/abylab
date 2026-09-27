@@ -1971,6 +1971,11 @@ impl App {
                         self.run_started = None;
                         self.transcript.push_notice(NoticeLevel::Error, err);
                     }
+                    // An advisory is not a failure: nothing about the run state
+                    // changes, the line is just painted quieter than an error.
+                    CtlEvent::Warning(note) => {
+                        self.transcript.push_notice(NoticeLevel::Warn, note);
+                    }
                     CtlEvent::CancelRequested => {
                         self.state_note = self.locale.tr("cancelling", "正在取消").into();
                         self.transcript.cancel_open_work();

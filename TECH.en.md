@@ -378,6 +378,54 @@ half lives in `data.rs` (`data::scan` / `data::wipe`), the program half in
   `current_exe` all come in through `ScanInput`, so a test run can never touch a
   real installation.
 
+## One question, no screen (`abylab ask`)
+
+`abylab ask "<question>"` is the second front end beside the TUI
+(`crates/abylab-tui/src/ask.rs`), over the same driver: `main.rs` parses the
+question and calls `ask::run`, whose driver configuration comes from
+`controller::driver_config` — the same workspace, session store, model,
+permission preset, turn budgets and compaction policy. Only the reader differs.
+
+- **One turn, then exit**: a single `Cmd::PromptForSession`, and the run is over
+  at `TurnEnd` — no queuing, no steering, no `/` commands, no images. `ask` is
+  the one subcommand and may sit among the options (the TUI takes no positional
+  argument at all, so the word cannot mean anything else); unwrapped words are
+  joined with single spaces, and everything after `--` is the question, which is
+  how a question that starts with a dash gets through.
+- **stdout carries the answer and nothing else**: the answer is the *last*
+  assistant message — every `StreamEvent::Finished` ends a message, so the first
+  delta after it starts a new one and replaces what was buffered (the "let me
+  look first" before a tool call gives way to the answer, and a tool-only step,
+  which says nothing, does not throw it away). Thinking (`ReasoningDelta`), tool
+  cards, usage and the plan never reach stdout; only the spoken text does.
+- **Three endings**: `completed` prints the answer and exits 0; `incomplete` (cut
+  off by `max_tokens`) still prints it and exits 1; `interrupted` / `failed` /
+  `error` print no answer at all, only the reason on stderr and exit 1. A failed
+  turn's reason comes from `report_turn_err`, which the driver emits *after*
+  `TurnEnd`, so the end of the run reads on for up to 200ms to catch it and name
+  it in the exit message.
+- **The two asks with nobody at the keyboard**: a permission ask
+  (`Event::PermissionAsk`) follows the launch preset — the `allow_once` option is
+  picked, and an ask that offers no way to say yes is `Cancelled` (so the tool is
+  denied), with the preset's own sandbox still bounding what the tool may do. A
+  model question (`Event::UserQuestion`) is answered with `None`, which the tool
+  reports as a cancelled question, leaving the agent to decide rather than
+  inventing a choice the user never made. `CtlEvent::Error` ends the run with that
+  reason and exit code 1, while `CtlEvent::Warning` writes one line to stderr and
+  carries on — which is exactly why the startup advisories (workspace
+  instructions, skill discovery) are warnings.
+- **No key is refused first**: with neither `--api-key` nor a stored `/login`
+  key, the run fails before a session is opened and sends no request at all.
+- **The session is saved as usual**: the shared `$ABYLAB_HOME/sessions`, where
+  `--session-id <id>` resumes a snapshot when one exists (replayed history is
+  context for the question, never printed) and opens a fresh session otherwise —
+  so repeated `abylab ask --session-id work "…"` calls continue one conversation.
+  Options that only paint a screen, `--theme` above all, do nothing here.
+- **Tests**: `ask.rs` unit-tests the state machine (which message is the answer,
+  the three endings, both asks), and `crates/abylab-tui/tests/ask_cli.rs` starts a
+  scripted provider and runs the real binary to assert stdout carries only the
+  answer, the exit codes, and `--session-id` continuation.
+
 ## Packaging and releases
 
 Linux ships one kind of asset: a single musl static binary per architecture

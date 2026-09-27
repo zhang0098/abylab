@@ -284,6 +284,41 @@ TUI 还开着没有意义；也没有单独的 `/reset` —— 清数据就是�
   退出；发行目标（Linux musl、macOS）都在这个前提下。测试里扫的目录、`current_exe` 全部
   由调用方传入（`ScanInput`），所以测试不可能碰到真实安装。
 
+## 一次问答，没有界面（`abylab ask`）
+
+`abylab ask "<问题>"` 是 TUI 之外的第二条前端路径（`crates/abylab-tui/src/ask.rs`），
+和界面共用同一个 driver：`main.rs` 解析出问题后直接走 `ask::run`，driver 配置来自
+`controller::driver_config` —— 同一个工作区、会话库、模型、权限预设、回合预算和压缩策略，
+差别只在谁读事件。
+
+- **一轮，然后退出**：只发一条 `Cmd::PromptForSession`，等到 `TurnEnd` 就收工——不排队、不
+  插话、没有 `/` 命令，也不带图片。`ask` 是唯一的子命令，只能出现在选项之间（TUI 不接受
+  任何位置参数，所以这个词不会有第二种含义）；没加引号的词按空格拼成问题，`--` 之后的
+  一律当问题（问题本身以 `-` 开头时用得上）。
+- **stdout 只有答案**：答案取"最后一条 assistant 消息"——每次 `StreamEvent::Finished` 落在
+  上一条消息的结束处，之后第一个 delta 就是新消息，会清掉上一条（工具调用前那句"我先看看"
+  让位给真正的回答，纯工具的一步不写文字、也不会把上一条冲掉）。思考
+  （`ReasoningDelta`）、工具卡片、用量、计划都不进 stdout，只有正文进去。
+- **三种收尾**：`completed` 打印答案、退出码 0；`incomplete`（被 `max_tokens` 截断）照样
+  打印、退出码 1；`interrupted` / `failed` / `error` 一个字都不打印，原因写 stderr、退出码
+  1。失败的那一行来自 `report_turn_err`，它在 `TurnEnd` 之后才发，所以结束时还会再读最多
+  200ms 把原因捞进来当退出信息。
+- **没有键盘可问的两个问题在这里落地**：权限询问（`Event::PermissionAsk`）按会话权限预设
+  放行——选 `allow_once` 那个选项，选项里没有"同意"就回 `Cancelled`（工具于是被拒绝），
+  工具本身仍受该预设自己的沙箱约束；模型反问（`Event::UserQuestion`）回 `None`，工具把
+  "用户取消了这个问题"交给模型，由它自己定夺，而不是替用户编一个答案。`CtlEvent::Error`
+  直接结束这一轮（原因照抄、退出码 1），`CtlEvent::Warning` 只写一行 stderr 继续跑——
+  启动期的告警（工作区指令、技能发现）走后者正是为了这件事。
+- **没有 key 先拒绝**：`--api-key` 或 `/login` 存下的 key 都没有时，在开会话之前就报错退出，
+  一个请求都不发。
+- **会话照常落盘**：和 TUI 共用 `$ABYLAB_HOME/sessions`，`--session-id <id>` 有快照就恢复
+  （恢复出来的历史只用来接着问，不会打印），没有就当新会话来开，所以
+  `abylab ask --session-id work "…"` 连问几次就是同一段对话。`--theme` 这类只对屏幕有意义的
+  开关在这里不起作用。
+- **测试**：`ask.rs` 内部测状态机（答案取哪条消息、三种收尾、两个询问怎么回），
+  `crates/abylab-tui/tests/ask_cli.rs` 起一个脚本化的 provider、跑真的二进制，断言 stdout
+  只有答案、退出码和 `--session-id` 的接续。
+
 ## 构建与发布
 
 Linux 只发一种包：musl 静态链接的单一二进制（`x86_64`、`aarch64` 各一个），

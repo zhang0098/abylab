@@ -391,7 +391,7 @@ impl SessionAgent {
             instructions.text = Some(crate::instructions::EMPTY_BASELINE.into());
         }
         for warning in instructions.warnings {
-            (host.sink)(Event::Ctl(CtlEvent::Error(format!(
+            (host.sink)(Event::Ctl(CtlEvent::Warning(format!(
                 "workspace instructions: {warning}"
             ))));
         }
@@ -787,7 +787,7 @@ async fn drive(
         &cfg.workspace,
     )));
     for warning in skills.warnings() {
-        ctl(CtlEvent::Error(format!("skills: {warning}")));
+        ctl(CtlEvent::Warning(format!("skills: {warning}")));
     }
     // Steers the running turn has taken but not spent (see OutstandingSteers).
     let admitted: Arc<OutstandingSteers> = Arc::default();

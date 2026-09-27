@@ -48,6 +48,8 @@ curl -fsSL https://abylab.ai/install.sh | bash
 
 直接输入你的要求，开始工作。
 
+想只问一句、不进界面：`abylab ask "这个仓库是做什么的？"` 一轮跑完，把答案写到标准输出就退出。
+
 > 想从源码构建：`cargo build --release`。安装脚本支持 `--bin-dir`、`--version`、`--no-path`、`--path-file`、`--help`。
 >
 > 想卸载 abylab：运行 `abylab --uninstall`。

@@ -23,35 +23,7 @@ impl Controller {
         compaction: Option<abylab_backend::CompactionConfig>,
     ) -> Controller {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-        // Persisted UI settings supply the launch defaults with no CLI flag
-        // (reasoning effort, permission preset); flags win where they exist.
-        let settings = crate::locale::UiSettings::load(&cfg.home);
-        let driver_cfg = abylab_backend::DriverConfig {
-            session_id: session_id.clone(),
-            // The app's session id is the single source of truth: a shell
-            // `--session-id` resumes its persisted snapshot when one exists
-            // in the shared session store.
-            resume: abylab_backend::persisted_session_id(
-                &cfg.sessions_root,
-                &cfg.workspace,
-                &session_id,
-            ),
-            sessions_root: Some(cfg.sessions_root.clone()),
-            home: Some(cfg.home.clone()),
-            workspace: cfg.workspace.clone(),
-            model: if cfg.model.is_empty() {
-                "deepseek-flash".into()
-            } else {
-                cfg.model.clone()
-            },
-            reasoning: settings.effort.clone().unwrap_or_else(|| "high".into()),
-            permission: settings.permission.clone(),
-            max_tokens: cfg.max_tokens,
-            api_key: cfg.api_key.clone(),
-            base_url: cfg.base_url.clone(),
-            limits,
-            compaction,
-        };
+        let driver_cfg = driver_config(&cfg, &session_id, limits, compaction);
         let sink_bus = bus.clone();
         let spawn_result =
             abylab_backend::driver::spawn(driver_cfg, move |event: abylab_backend::Event| {
@@ -91,6 +63,45 @@ impl Controller {
             return true;
         }
         false
+    }
+}
+
+/// The driver configuration both front ends share: the TUI's in-process
+/// controller and the headless `abylab ask`.
+///
+/// Persisted UI settings supply the launch defaults with no CLI flag
+/// (reasoning effort, permission preset); flags win where they exist. The
+/// session id is the app's single source of truth — a shell `--session-id`
+/// resumes its persisted snapshot when one exists in the shared session store.
+pub fn driver_config(
+    cfg: &RuntimeConfig,
+    session_id: &str,
+    limits: abylab_backend::TurnLimits,
+    compaction: Option<abylab_backend::CompactionConfig>,
+) -> abylab_backend::DriverConfig {
+    let settings = crate::locale::UiSettings::load(&cfg.home);
+    abylab_backend::DriverConfig {
+        session_id: session_id.to_string(),
+        resume: abylab_backend::persisted_session_id(
+            &cfg.sessions_root,
+            &cfg.workspace,
+            session_id,
+        ),
+        sessions_root: Some(cfg.sessions_root.clone()),
+        home: Some(cfg.home.clone()),
+        workspace: cfg.workspace.clone(),
+        model: if cfg.model.is_empty() {
+            "deepseek-flash".into()
+        } else {
+            cfg.model.clone()
+        },
+        reasoning: settings.effort.clone().unwrap_or_else(|| "high".into()),
+        permission: settings.permission.clone(),
+        max_tokens: cfg.max_tokens,
+        api_key: cfg.api_key.clone(),
+        base_url: cfg.base_url.clone(),
+        limits,
+        compaction,
     }
 }
 
@@ -305,6 +316,7 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                     CtlEvent::QueueRemoved { item_id }
                 }
                 abylab_backend::CtlEvent::Error(err) => CtlEvent::Error(err),
+                abylab_backend::CtlEvent::Warning(message) => CtlEvent::Warning(message),
                 abylab_backend::CtlEvent::CancelRequested => CtlEvent::CancelRequested,
                 abylab_backend::CtlEvent::Interrupted => CtlEvent::Interrupted,
                 abylab_backend::CtlEvent::TuiOpDone(message) => CtlEvent::TuiOpDone(message),
