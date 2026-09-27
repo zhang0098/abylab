@@ -11,6 +11,8 @@ uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-09-27
+
 ### Added
 
 - New `abylab ask "<question>"`: ask once without opening the interface — one turn runs, the answer
@@ -674,7 +676,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/zhang0098/abylab/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/zhang0098/abylab/compare/v0.1.15...v0.1.16

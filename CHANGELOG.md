@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-09-27
+
 ### 新增
 
 - 新增 `abylab ask "<问题>"`：只问一次，不进界面——一轮问答跑完，答案写到标准输出，abylab 随即退出。
@@ -506,7 +508,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/zhang0098/abylab/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/zhang0098/abylab/compare/v0.1.15...v0.1.16
