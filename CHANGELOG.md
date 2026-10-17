@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-10-17
+
 - 保留并默认使用 Messages 服务端搜索；直连 Search API 可显式选择，新增直连 `web_fetch`，
   保留 `queries` 接口且失败不切换模式。独立端点、直连有限重试/共享限速、请求前落盘及取消均覆盖子代理。
 - Messages 流空闲超时改为 300 秒；加入模型能力/窗口表、Files 图片上传与凭据隔离缓存，
@@ -515,7 +517,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/zhang0098/abylab/compare/v0.1.16...v0.1.17

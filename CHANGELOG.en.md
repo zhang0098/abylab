@@ -11,6 +11,8 @@ uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-10-17
+
 - Retain Messages server-side search as the default, with explicit opt-in to the direct
   Search API and no cross-mode fallback. New direct `web_fetch`, unchanged `queries`
   search interface, independent endpoints, direct-API retries/rate gates, cancellation
@@ -687,7 +689,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/zhang0098/abylab/compare/v0.1.16...v0.1.17
