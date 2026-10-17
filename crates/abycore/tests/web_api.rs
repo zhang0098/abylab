@@ -495,7 +495,109 @@ async fn provider_errors_have_operation_specific_classification_and_finite_retri
         assert_eq!(error.kind, kind, "{status}");
         assert_eq!(server.captured().len(), attempts, "{status}");
         assert!(!error.to_string().contains("fixture-secret"));
+        assert!(!error.message.contains("web.api_base_url"), "{status}");
     }
+}
+
+#[tokio::test]
+async fn fetch_unavailable_explains_page_failures_without_blaming_endpoint_configuration() {
+    for (status, body) in [
+        (
+            404,
+            json!({"error":{"code":"fetch_failed","message":"fixture-secret private page details"}}),
+        ),
+        (404, json!("Not Found")),
+        (200, json!({"title":"Empty page","content":"  "})),
+    ] {
+        let server = Server::start_with_handler(move |_| {
+            let mut reply = Reply::raw(status, "application/json", body.to_string());
+            reply
+                .headers
+                .push(("x-request-id".into(), "fetch-request".into()));
+            reply
+        })
+        .await;
+        let mut cfg = config(&server);
+        cfg.max_retries = 1;
+        let error = DeepSeekWebApi::new("fixture-secret", cfg)
+            .unwrap()
+            .fetch(
+                "https://example.org/private?token=page-secret",
+                RequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::WebUnavailable);
+        assert_eq!(error.status, (status == 404).then_some(404));
+        if status == 404 {
+            assert_eq!(error.request_id.as_deref(), Some("fetch-request"));
+            assert!(error.message.contains("HTTP 404"));
+        }
+        assert!(error.message.contains("page"));
+        assert!(error.message.contains("try another source"));
+        assert!(
+            error
+                .message
+                .starts_with("failed to fetch https://example.org/private?")
+        );
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(
+            error
+                .message
+                .contains(&format!("{}/gateway/v1/tools/fetch", server.url))
+        );
+        assert!(!error.message.contains("web.api_base_url"));
+        assert!(!error.to_string().contains("fixture-secret"));
+        assert!(!error.to_string().contains("page-secret"));
+        assert!(!error.to_string().contains("private page details"));
+        assert_eq!(server.captured().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn fetch_errors_identify_the_target_url_without_exposing_credentials() {
+    let server = Server::start_with_handler(|_| Reply::raw(404, "text/plain", "Not Found")).await;
+    let api = DeepSeekWebApi::new("fixture-secret", config(&server)).unwrap();
+    for (url, displayed) in [
+        ("https://example.org/company", "https://example.org/company"),
+        (
+            "https://example.org/company#page-secret",
+            "https://example.org/company#[REDACTED]",
+        ),
+        (
+            "https://example.org/fixture-secret?token=page-secret",
+            "https://example.org/[REDACTED]?[REDACTED]",
+        ),
+    ] {
+        let error = api.fetch(url, RequestOptions::default()).await.unwrap_err();
+        assert!(error.message.starts_with(&format!(
+            "failed to fetch {displayed}: API returned HTTP 404"
+        )));
+        assert!(!error.to_string().contains("fixture-secret"));
+        assert!(!error.to_string().contains("page-secret"));
+        assert_eq!(server.captured().last().unwrap().body["url"], url);
+    }
+    assert_eq!(server.captured().len(), 3);
+}
+
+#[tokio::test]
+async fn search_not_found_keeps_endpoint_configuration_guidance() {
+    let server = Server::start(vec![Reply::raw(404, "text/plain", "Not Found")]).await;
+    let error = DeepSeekWebApi::new("fixture-secret", config(&server))
+        .unwrap()
+        .search("q", None, RequestOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, Some(404));
+    assert!(error.message.contains("web.api_base_url"));
+    assert!(
+        error
+            .message
+            .contains(&format!("{}/gateway/v1/tools/search", server.url))
+    );
+    assert!(!error.message.contains("try another source"));
+    assert!(!error.message.contains("failed to fetch"));
+    assert_eq!(server.captured().len(), 1);
 }
 
 #[tokio::test]

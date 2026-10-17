@@ -92,10 +92,11 @@ impl DeepSeekWebApi {
                 Ok(())
             })
         }));
-        let (http, index) = self.transport.send(operation, &body, &context, RequestPurpose::WebSearch).await.map_err(|mut error| {
-            error.message = format!("{} (web endpoint: {endpoint}; configure web.api_base_url independently of chat)", error.message);
-            error
-        })?;
+        let (http, index) = self
+            .transport
+            .send(operation, &body, &context, RequestPurpose::WebSearch)
+            .await
+            .map_err(|error| annotate_error(error, operation, &endpoint))?;
         let result = async {
             let bytes = self.transport.body(http, &context).await?;
             let value = serde_json::from_slice(&bytes)
@@ -113,13 +114,7 @@ impl DeepSeekWebApi {
             },
             None,
         );
-        result.map_err(|mut error: Error| {
-            error.message = format!(
-                "{} (web endpoint: {endpoint}; configure web.api_base_url independently of chat)",
-                error.message
-            );
-            error
-        })
+        result.map_err(|error| annotate_error(error, operation, &endpoint))
     }
 
     pub(super) async fn search_with_context(
@@ -214,5 +209,33 @@ impl DeepSeekWebApi {
             })
         })
         .await
+        .map_err(|mut error| {
+            let mut target = reqwest::Url::parse(url).expect("validated fetch URL");
+            // Query strings and fragments can contain signed links or access tokens.
+            if target.query().is_some() {
+                target.set_query(Some("[REDACTED]"));
+            }
+            if target.fragment().is_some() {
+                target.set_fragment(Some("[REDACTED]"));
+            }
+            let target = self.transport.redact(target.as_str());
+            error.message = format!("failed to fetch {target}: {}", error.message);
+            error
+        })
     }
+}
+
+fn annotate_error(mut error: Error, operation: &str, endpoint: &str) -> Error {
+    let hint = match (operation, error.kind) {
+        // Fetch uses 404 for unavailable page content, not just a missing API route.
+        ("fetch", ErrorKind::WebUnavailable) => {
+            "; the requested page may be unavailable, blocked by site policy, unsupported, or have no extractable content; check the page URL or try another source"
+        }
+        ("search", _) if error.status == Some(404) => {
+            "; check web.api_base_url independently of chat"
+        }
+        _ => "",
+    };
+    error.message = format!("{}{hint} (web endpoint: {endpoint})", error.message);
+    error
 }

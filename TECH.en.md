@@ -73,6 +73,13 @@ Key rotation replaces both web tools; running children keep their credential sna
   respecting `Retry-After`; 402 means quota, Fetch 403 means policy denial, and
   404 means unavailable content. Other 4xx are not retried. Empty search results
   succeed. Failures never silently switch providers.
+  Fetch 404 can mean an unavailable target, site access restrictions, an unsupported
+  content type, or no extractable content; it does not by itself indicate an incorrect
+  `web.api_base_url`. Check the target URL or try another source.
+  Fetch errors include the target URL, with its query and fragment replaced by
+  `[REDACTED]` to avoid exposing access tokens.
+  `https://api.deepseek.com/v1/tools/fetch` is the endpoint in the
+  [official documentation](https://api-docs.deepseek.com/guides/search/).
 - Direct Search and Fetch have separate rate gates (default 5 QPS each), shared by the
   host and children, including retries. Separate processes cannot coordinate
   account quotas and may still receive 429. Each attempt is recorded and
