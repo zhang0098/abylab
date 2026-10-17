@@ -9,6 +9,13 @@ pub enum MessageRole {
     Assistant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSource {
+    User,
+    Context,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -34,6 +41,9 @@ impl ContentPart {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
     Message {
+        /// Distinguishes admitted prompts from injected reminders; absent in older sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<MessageSource>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         role: MessageRole,
@@ -78,6 +88,7 @@ impl Item {
 
     pub fn user_parts(content: Vec<ContentPart>) -> Self {
         Self::Message {
+            source: Some(MessageSource::User),
             id: None,
             role: MessageRole::User,
             content,
@@ -224,6 +235,7 @@ impl Response {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestPurpose {
     Conversation,
+    /// Auxiliary web requests; `RequestRecord.web.operation` distinguishes search and fetch.
     WebSearch,
     /// A host-driven summarization call for context compaction.
     Compaction,
@@ -241,6 +253,9 @@ pub struct ModelInfo {
 /// One HTTP dispatch. Missing usage remains unknown, including interrupted attempts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestRecord {
+    /// Configuration at a model dispatch boundary. Absent when unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context: Option<ModelContext>,
     pub purpose: RequestPurpose,
     pub attempt: u32,
     pub response_id: Option<String>,
@@ -252,6 +267,40 @@ pub struct RequestRecord {
     /// this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_bytes: Option<usize>,
+    /// Secret-free auxiliary request. Older readers ignore this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<WebRequestRecord>,
+    /// Preparatory resource operation, excluded from model token measurements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
+/// Replayable configuration, indexed into the durable transcript (no credentials).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelContext {
+    pub through: usize,
+    pub model: String,
+    pub system: String,
+    pub host_context: String,
+    pub tools: Vec<crate::ToolDefinition>,
+}
+
+impl ModelContext {
+    pub(crate) fn same_configuration(&self, other: &Self) -> bool {
+        self.model == other.model
+            && self.system == other.system
+            && self.host_context == other.host_context
+            && self.tools == other.tools
+    }
+}
+
+/// Exact auxiliary input, captured before dispatch. Never contains authentication headers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebRequestRecord {
+    pub provider: String,
+    pub operation: String,
+    pub endpoint: String,
+    pub body: Value,
 }
 
 #[cfg(test)]

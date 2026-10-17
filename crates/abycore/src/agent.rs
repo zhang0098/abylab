@@ -241,9 +241,7 @@ impl Agent {
     fn receive_messages(&mut self) -> bool {
         let messages = self.inbox.drain();
         let received = !messages.is_empty();
-        self.state
-            .items
-            .extend(messages.into_iter().map(Item::user_parts));
+        self.state.items.extend(messages);
         if received {
             self.state.needs_response = true;
         }
@@ -345,16 +343,33 @@ impl Agent {
     }
 
     /// The exact request envelope the loop would send for `history`.
-    fn build_request(&self, mut history: Vec<Item>) -> MessageRequest {
-        if let Some(context) = self
-            .hooks
-            .as_ref()
-            .and_then(|hooks| hooks.request_context())
-            && !context.is_empty()
+    fn build_request(&self, history: Vec<Item>) -> MessageRequest {
+        let current = self.model_context();
+        // A compacted or partial summary view establishes a fresh prefix: raw
+        // transcript offsets must never be applied to replacement summaries.
+        let mut contexts = if self.state.compactions.is_empty() && history == self.request_view() {
+            records(&self.ledger)
+                .into_iter()
+                .filter(|record| {
+                    record.resource.is_none() && record.status.as_deref() == Some("Completed")
+                })
+                .filter_map(|record| record.model_context)
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        if let Some(last_other_model) = contexts.iter().rposition(|c| c.model != current.model) {
+            contexts.drain(..=last_other_model);
+        }
+        contexts.dedup_by(|a, b| a.same_configuration(b));
+        if contexts
+            .last()
+            .is_none_or(|c| !c.same_configuration(&current))
         {
-            history.insert(0, Item::user(context));
+            contexts.push(current);
         }
         MessageRequest {
+            contexts,
             system: self.state.system_prompt.clone(),
             history,
             options: self.state.model.clone(),
@@ -364,6 +379,45 @@ impl Agent {
                 .map(|tool| tool.definition.clone())
                 .collect(),
         }
+    }
+
+    fn model_context(&self) -> crate::ModelContext {
+        crate::ModelContext {
+            through: self.state.items.len(),
+            model: self.state.model.model.clone(),
+            system: self.state.system_prompt.clone(),
+            host_context: self
+                .hooks
+                .as_ref()
+                .and_then(|h| h.request_context())
+                .unwrap_or_default()
+                .into(),
+            tools: self
+                .tools
+                .values()
+                .map(|tool| tool.definition.clone())
+                .collect(),
+        }
+    }
+
+    fn dispatch_context(&self, context: &RequestContext, kind: CheckpointKind) -> RequestContext {
+        let mut request = context.clone();
+        if let Some(hooks) = self.hooks.clone() {
+            let snapshot = self.snapshot();
+            let ledger = self.ledger.clone();
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            request.dispatch_barrier = Some(Arc::new(move || {
+                let mut snapshot = snapshot.clone();
+                let (hooks, ledger, lock, kind) =
+                    (hooks.clone(), ledger.clone(), lock.clone(), kind.clone());
+                Box::pin(async move {
+                    let _guard = lock.lock().await;
+                    snapshot.requests = records(&ledger);
+                    hooks.checkpoint(kind, snapshot).await
+                })
+            }));
+        }
+        request
     }
 
     /// The model-visible transcript of the next request: every compacted span
@@ -686,6 +740,7 @@ impl Agent {
             .collect();
         let (last_input_tokens, last_request_bytes) = self.measured_conversation();
         Ok(ViewEstimate {
+            model: self.state.model.model.clone(),
             request_bytes,
             history_bytes,
             items: self.state.items.len(),
@@ -1057,9 +1112,20 @@ impl Agent {
                     "serialized request exceeds the host input budget",
                 ));
             }
+            let mut model_context = self.dispatch_context(context, CheckpointKind::ModelRequest);
+            let current = self.model_context();
+            if records(&self.ledger)
+                .iter()
+                .rev()
+                .filter(|r| r.status.as_deref() == Some("Completed"))
+                .find_map(|r| r.model_context.as_ref())
+                .is_none_or(|old| !old.same_configuration(&current))
+            {
+                model_context.model_context = Some(current);
+            }
             let mut stream = self
                 .client
-                .stream_with_context(request, context.clone())
+                .stream_with_context(request, model_context)
                 .await?;
             let mut final_response = None;
             while let Some(event) = stream.next().await {
@@ -1154,13 +1220,17 @@ impl Agent {
                                 let cancellation = context.cancellation.child_token();
                                 let _cancel_on_drop = cancellation.clone().drop_guard();
                                 let budget = call_budget(&*tool, &arguments, options);
-                                let mut tool_request = context.clone();
+                                let mut tool_request = self.dispatch_context(context, CheckpointKind::WebRequest);
                                 tool_request.cancellation = cancellation.clone();
+                                let original_question = self.state.items.iter().rev().find_map(|item| match item {
+                                    Item::Message { role: crate::MessageRole::User, source, content, .. } if *source != Some(crate::MessageSource::Context) => Some(content.iter().map(ContentPart::text).collect::<Vec<_>>().join("\n")),
+                                    _ => None,
+                                });
                                 let deadline = budget.map_or(
                                     tokio::time::Instant::now() + crate::NO_DEADLINE,
                                     |budget| tokio::time::Instant::now() + budget,
                                 );
-                                let tool_context = ToolContext { call_id: call.call_id.clone(), cancellation: cancellation.clone(), deadline, max_output_bytes: options.max_tool_output_bytes, request: tool_request, local_session: self.local_session.clone(), parent: parent.clone() };
+                                let tool_context = ToolContext { call_id: call.call_id.clone(), cancellation: cancellation.clone(), deadline, max_output_bytes: options.max_tool_output_bytes, original_question, request: tool_request, local_session: self.local_session.clone(), parent: parent.clone() };
                                 match run_tool(tool, arguments, tool_context, context, cancellation, budget).await? {
                                     // The call's budget expired: the model is told, and the
                                     // turn goes on with the rest of the batch.

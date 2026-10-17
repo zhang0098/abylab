@@ -115,6 +115,8 @@ pub struct ViewCut {
 /// view: the live measurement plus every safe cut, priced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewEstimate {
+    /// Current routed model, for a host's capability/window lookup (including children).
+    pub model: String,
     /// Serialized bytes of the request as it would be sent right now.
     pub request_bytes: usize,
     /// Serialized bytes of the model-visible history alone.
@@ -279,6 +281,7 @@ impl ContextEstimate {
 
     fn view_estimate(&self) -> ViewEstimate {
         ViewEstimate {
+            model: String::new(),
             request_bytes: self.request_bytes,
             history_bytes: self.history_bytes,
             items: 0,

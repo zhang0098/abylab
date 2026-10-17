@@ -884,6 +884,9 @@ fn in_place_record_updates_survive_the_delta_fold() {
     // A committed record whose usage fields fill in later (reserve pushes an
     // empty record; record() rewrites it in place).
     snapshot.requests.push(RequestRecord {
+        model_context: None,
+        resource: None,
+        web: None,
         purpose: RequestPurpose::Conversation,
         attempt: 1,
         response_id: None,

@@ -71,6 +71,9 @@ impl Locale {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiSettings {
+    pub messages: abylab_backend::MessagesConfig,
+    /// Shared Search/Fetch settings, without credentials.
+    pub web: abylab_backend::WebConfig,
     pub language: Locale,
     /// Last selected model id (`/model`, `--model` overrides it per run).
     pub model: Option<String>,
@@ -146,6 +149,36 @@ impl EnterBehavior {
 }
 
 impl UiSettings {
+    /// Endpoints must not silently fall back after malformed settings.
+    pub fn load_network(
+        home: &str,
+    ) -> Result<(abylab_backend::WebConfig, abylab_backend::MessagesConfig), String> {
+        let text = match std::fs::read_to_string(crate::runtime::settings_path(home)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Default::default())
+            }
+            Err(_) => return Err("cannot read settings.json for web configuration".into()),
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|_| "invalid settings.json; fix it before making API requests".to_owned())?;
+        if !value.is_object() {
+            return Err("settings.json must contain an object".into());
+        }
+        let web = value
+            .get("web")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| "invalid web settings in settings.json".to_owned())?
+            .unwrap_or_default();
+        let messages = value
+            .get("messages")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| "invalid Messages settings in settings.json".to_owned())?
+            .unwrap_or_default();
+        Ok((web, messages))
+    }
     /// Load `$ABYLAB_HOME/settings.json`; absent or malformed files fall back
     /// to defaults (settings are a convenience, never a requirement).
     pub fn load(home: &str) -> Self {

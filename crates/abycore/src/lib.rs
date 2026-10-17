@@ -26,7 +26,7 @@ mod todo;
 mod tool;
 mod types;
 #[cfg(feature = "web-search")]
-mod web_search;
+mod web;
 
 pub use agent::Agent;
 pub use compaction::{
@@ -35,8 +35,8 @@ pub use compaction::{
     ViewChange, ViewCut, ViewEstimate, ViewRequest,
 };
 pub use config::{
-    ClientConfig, ModelOptions, ReasoningEffort, RequestOptions, RetryPolicy, RunOptions,
-    ToolChoice,
+    ClientConfig, FilesConfig, MessagesConfig, ModelCapabilities, ModelOptions, ReasoningEffort,
+    RequestOptions, RetryPolicy, RunOptions, ToolChoice, model_capabilities,
 };
 pub use deepseek::{DeepSeekClient, MessageRequest, MessageStream};
 pub use error::{Error, ErrorKind, Result};
@@ -62,8 +62,11 @@ pub use tool::{
     CallBudget, NO_DEADLINE, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolOutput,
 };
 pub use types::{
-    ContentPart, Item, MessageRole, ModelInfo, RequestPurpose, RequestRecord, Response,
-    ResponseStatus, ThinkingSignature, Usage,
+    ContentPart, Item, MessageRole, MessageSource, ModelContext, ModelInfo, RequestPurpose,
+    RequestRecord, Response, ResponseStatus, ThinkingSignature, Usage, WebRequestRecord,
 };
 #[cfg(feature = "web-search")]
-pub use web_search::{DeepSeekWebSearch, SearchConfig, SearchRequest, SearchResult, SearchSource};
+pub use web::{
+    DeepSeekMessagesSearch, DeepSeekWebApi, FetchResult, MessagesSearchConfig, SearchProvider,
+    SearchResult, SearchSource, WebConfig, WebRateLimiter,
+};

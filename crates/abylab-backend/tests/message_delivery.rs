@@ -73,6 +73,8 @@ impl Live {
 
 fn config(root: &Path, base_url: Option<String>, key: String) -> DriverConfig {
     DriverConfig {
+        messages: Default::default(),
+        web: Default::default(),
         session_id: "active".into(),
         resume: None,
         sessions_root: None,

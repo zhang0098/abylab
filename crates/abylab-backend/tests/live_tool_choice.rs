@@ -108,6 +108,8 @@ fn which_tools_the_model_reaches_for() {
         };
         let handle = spawn(
             DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: format!("probe-{arm}-{index}"),
                 resume: None,
                 sessions_root: Some(store.to_string_lossy().into_owned()),

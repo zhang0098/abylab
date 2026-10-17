@@ -73,6 +73,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例程序
 
+`web-search` 默认 feature 还提供 `WebConfig::tools(key, WebRateLimiter::default())`，
+可用 `agent.register_tools(...)` 一次注册 `web_search` 和直连 `web_fetch`。
+搜索默认使用 Messages 服务端工具，设置 `WebConfig.search_provider = SearchProvider::Api`
+可选择直连；两者不自动回退。`DeepSeekMessagesSearch` 提供独立 Messages 搜索，
+`DeepSeekWebApi` 提供独立直连 `search` / `fetch` 调用。
+`ClientConfig.files` 控制图片上传、过期和内联回退，默认启用；流空闲超时默认 300 秒。
+`model_capabilities` 公开已知模型能力；会话内配置更新与辅助请求写入可选账本字段，
+宿主的 `AgentHooks::checkpoint` 必须在返回前完成持久化。完整策略见 [TECH.md](../../TECH.md)。
+
 `examples/` 提供可运行的示例：`basic.rs`（单次完成）、`todo.rs`（计划驱动的
 回合）、`tools.rs`（工具包）、`local_tools.rs`（沙箱文件工具）、`session.rs`
 （快照存储）、`cancel.rs`（取消）、`subagent.rs`（委托）、`web_search.rs`

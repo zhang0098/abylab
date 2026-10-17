@@ -75,6 +75,8 @@ fn invalid_output_limits_are_rejected_before_starting_the_driver() {
     for max_tokens in [0, u32::MAX as u64 + 1] {
         let result = abylab_backend::driver::spawn(
             abylab_backend::DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: "invalid-limit".into(),
                 resume: None,
                 sessions_root: None,

@@ -669,6 +669,7 @@ mod tests {
             RequestContext::new(cancellation.clone(), None, 16, Arc::new(Mutex::new(vec![])))
                 .unwrap();
         ToolContext {
+            original_question: None,
             call_id: "skill-test".into(),
             cancellation,
             deadline: tokio::time::Instant::now() + Duration::from_secs(30),

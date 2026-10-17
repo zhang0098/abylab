@@ -2319,6 +2319,8 @@ mod tests {
 
     fn test_app() -> App {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: fresh_root(),
             sessions_root: fresh_root(),
@@ -2337,6 +2339,8 @@ mod tests {
 
     fn live_test_app() -> App {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: fresh_root(),
             sessions_root: fresh_root(),
@@ -4282,6 +4286,8 @@ mod rpc_probe {
 
     fn probe_app() -> App {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/w".into(),
             home: std::env::temp_dir()
                 .join(format!("abylab-rpc-probe-{}", std::process::id()))

@@ -11,6 +11,17 @@ uninstall) live in
 
 ## [Unreleased]
 
+- Retain Messages server-side search as the default, with explicit opt-in to the direct
+  Search API and no cross-mode fallback. New direct `web_fetch`, unchanged `queries`
+  search interface, independent endpoints, direct-API retries/rate gates, cancellation
+  and pre-dispatch persistence, including children.
+- Messages stream idle timeout is now 300 seconds. Added model capabilities/windows,
+  Files uploads with credential-scoped caching, and replayable in-history system/tool
+  additions. Existing sessions remain readable without re-executing completed tools.
+- Non-secret `web` / `messages` settings and temporary `--search-provider`,
+  `--search-base-url` and `--web-api-base-url` overrides.
+  Invalid network settings fail instead of silently falling back.
+
 ## [0.1.19] - 2026-09-27
 
 ### Added

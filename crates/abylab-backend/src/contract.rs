@@ -381,8 +381,7 @@ impl Default for TurnLimits {
 /// abylab owns the numbers and the trigger.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompactionConfig {
-    /// Context window of the routed model, in tokens. The host must know it —
-    /// abycore has no model table.
+    /// Context window of the routed model, in tokens. Overrides the known-model catalog.
     pub context_window: u64,
     /// Start compacting once the conservative estimate reaches this fraction of
     /// the window.
@@ -431,6 +430,8 @@ impl CompactionConfig {
 /// Launch configuration for one abycore agent session.
 #[derive(Debug, Clone)]
 pub struct DriverConfig {
+    pub messages: abycore::MessagesConfig,
+    pub web: abycore::WebConfig,
     pub session_id: String,
     /// Session id to restore from the workspace's session store, if any.
     pub resume: Option<String>,
@@ -456,7 +457,7 @@ pub struct DriverConfig {
     pub base_url: Option<String>,
     /// Per-turn budgets and auto-continuation headroom.
     pub limits: TurnLimits,
-    /// Context compaction policy; `None` disables automatic compaction.
+    /// Context compaction override; `None` uses known-model windows, otherwise stays off.
     pub compaction: Option<CompactionConfig>,
 }
 

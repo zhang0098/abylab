@@ -81,6 +81,8 @@ pub fn driver_config(
 ) -> abylab_backend::DriverConfig {
     let settings = crate::locale::UiSettings::load(&cfg.home);
     abylab_backend::DriverConfig {
+        messages: cfg.messages.clone(),
+        web: cfg.web.clone(),
         session_id: session_id.to_string(),
         resume: abylab_backend::persisted_session_id(
             &cfg.sessions_root,

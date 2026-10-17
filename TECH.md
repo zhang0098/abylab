@@ -5,6 +5,82 @@
 这份文档讲内部行为,日常使用不需要读;安装看 [README.md](README.md),命令、按键和
 体积数字在 [abylab.ai](https://abylab.ai/)。
 
+## DeepSeek 网络协议
+
+主对话保持原生 Messages：`/anthropic/v1/messages`，`x-api-key`，流式 SSE。
+搜索与 Harness `0.2.1-rc.2` 一样默认使用辅助 Messages 请求中的服务端搜索工具，
+保留直连 Search API 作为显式可选项。`web_fetch` 始终使用独立 Fetch API，
+不随搜索模式切换；没有引入 Harness 的本地 HTTP 抓取实现。
+
+`settings.json` 可增量加入以下配置（其余偏好无需删除；不要把 key 放进去）：
+
+```json
+{
+  "web": {
+    "search_provider": "messages",
+    "messages_search": {
+      "base_url": "https://api.deepseek.com/anthropic/v1",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "max_uses": 5,
+      "max_retries": 0
+    },
+    "api_base_url": "https://api.deepseek.com/v1/tools",
+    "search_timeout_secs": 60,
+    "fetch_timeout_secs": 30,
+    "max_retries": 2,
+    "requests_per_second": 5,
+    "send_original_question": true
+  },
+  "messages": {
+    "stream_idle_timeout_secs": 300,
+    "files": { "enabled": true }
+  }
+}
+```
+
+网络配置无效会拒绝启动，不静默回退到官方地址。命令行覆盖不回写偏好。
+`--base-url` 只控制主对话；`--search-base-url` 覆盖 Messages 搜索的完整前缀，只追加
+`/messages`；`--web-api-base-url` 覆盖完整 Search / Fetch 前缀。三者互相独立。
+`--search-provider messages|api` 临时选择搜索实现，也可在配置中设置 `web.search_provider`。
+未设置该字段的旧配置默认使用 Messages 搜索；保留直连需显式设为 `api`。
+新建、恢复、`ask`、子代理共享这套配置；换 key 后新调用
+更换两个联网工具，已经运行的子代理保留自己的凭据快照。
+
+- Messages 搜索向独立 `/anthropic/v1/messages` 发送一轮辅助模型请求，默认
+  `deepseek-v4-flash`、4096 输出 token、`web_search_20250305`、最多 5 次服务端搜索，
+  关闭 thinking。使用 `x-api-key`、Bearer 和 `anthropic-version: 2023-06-01`。
+  只解析 `web_search_tool_result` 结构化来源及 citation 片段，不把模型正文当搜索结果。
+  默认不重试；`web.messages_search.max_retries` 可单独调整。辅助模型 token 用量计入账本，
+  即使返回无效搜索结果也保留已收到的 usage。失败不切换直连 API。
+- `web_search` 保持 `queries`（1–4 条）的工具接口：完全相同的查询去重，查询并发执行，
+  按查询顺序轮流合并、按 URL 去重，默认最多 8 个来源。一条失败会取消并收齐其它请求。
+  直连模式请求为 `{query,count,need_content:false,ori_question?}`；该模式 query 最多 128 个 Unicode
+  字符，原始用户问题压平空白后取前 128 字符，不用系统提示、工具提醒替代。可以关闭发送原问题。
+- `web_fetch` 发送 `{url}`，返回标题与 Markdown；只接受不含用户凭据的 HTTP(S) URL，
+  不伪造重定向最终地址。两种工具都标明外部内容不可信、要求引用来源；输出默认上限 64 KiB。
+- 直连工具 API 只使用 Bearer 认证，和 Messages 的头分离；两种搜索都不跟随 HTTP 重定向，避免泄漏 key。
+  408、429、5xx 和连接失败有限重试，尊重 `Retry-After`；402 是额度不足，Fetch 的 403 是
+  抓取策略拒绝，404 是无可用内容，其它 4xx 不重试。空搜索结果是成功。没有自动跨提供商回退。
+- 直连 Search / Fetch 各自限速，默认每秒 5 次；同一宿主及子代理共用限速器，重试也经过限速。
+  跨进程不能协调账号配额，仍可能收到 429。每次辅助 HTTP 尝试先记账、经过持久化屏障，
+  才发出去；重试和上传都消耗本轮请求预算。直连工具没有 token 用量，不把它伪装成零 token。
+  两种模式的费用均取决于账号与服务端规则，不根据客户端名称承诺免费。
+
+图片默认先通过 Files API 上传，使用 `files-api-2025-04-14`。缓存按客户端凭据和端点隔离，
+同一图片哈希复用 file id；默认寿命 7 天，提前 1 小时刷新。恢复进程或换 key 会重新上传。
+持久化历史一直保留原始图片；上传暂时不可用或引用失效时，可在 20 MiB 内联上限内回退一次。
+鉴权、额度、取消、预算、落盘失败不回退。默认原始图片总量上限 128 MiB、最多 600 张；
+宿主输入预算仍然生效，不会因上传自动放宽。`messages.files.enabled=false` 禁用上传。
+
+已知 `deepseek-flash` 支持图片和会话内系统/工具追加；`deepseek-v4-pro` 为文本模型，
+两者窗口均为 1,000,000 token。未知模型不猜能力。支持时保留原始前缀，把系统提示更新和
+新增工具放在用户/工具结果之后、下一个 assistant 之前，工具变更发送
+`mid-conversation-tool-changes-2026-07-01`。工作区指令更新仍是 user 权限，不升级为 system。
+工具删除、定义替换、初始工具为空、历史已压缩或模型不支持时，使用完整当前配置。
+配置变更记录在请求账本，可随会话恢复；未变更的配置不重复存。快照仍是 v2，日志仍是 v1，
+新增可选字段允许读取旧会话；恢复不会重新执行已完成工具。
+
 ## 工作区指令
 
 第一次向模型发请求之前，abylab 会先读 `$ABYLAB_HOME/AGENTS.md`（默认
@@ -80,8 +156,8 @@
 长会话会被压掉，而不是直接失败，行为对齐 harness 的 `dsh-compaction-basic`
 （到窗口 80% 就压，最新 16% 原样留着）：
 
-- 设了 `ABY_CONTEXT_WINDOW=<tokens>` 才会启用。只有宿主知道路由模型的窗口有
-  多大；abycore 没有模型表，不给这个数就没法衡量压力。
+- 已知模型使用能力表中的窗口；`ABY_CONTEXT_WINDOW=<tokens>` 显式覆盖。
+  未知路由仍需提供窗口，否则只做手动或溢出压缩。
 - 策略在**每一次模型请求**时都会问一遍，而不是只在回合之间
   （`abycore::AgentHooks::view_request`），所以一个很长的回合在步骤之间也会
   被压缩。agent 发问，abylab 决策，SDK 负责总结并换上新的视图。
@@ -115,7 +191,7 @@
 所以「这个回合跑了多久」从来不是它的规则，也不是我们的规则：harness 的 agent loop 对
 单个步骤没有任何时限，abylab 同样不设。真正会卡住的地方各有其主：
 
-- 每条请求归传输层管：连接 15 秒、首字节 120 秒、流空闲 60 秒（`ClientConfig`）。
+- 每条请求归传输层管：连接 15 秒、首字节 120 秒、流空闲 300 秒（`ClientConfig`）。
   提供商那侧顶多影响**单条请求**——`max_tokens` 截断（而且这个数是我们发过去的）、
   429 的 `Retry-After`、5xx，网关也可能掐断某条流；这些都会落成一次请求失败，再由
   `ABY_AUTO_CONTINUE` 在同一回合里续跑。

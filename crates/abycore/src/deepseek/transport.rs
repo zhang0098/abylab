@@ -12,7 +12,15 @@ pub(crate) struct Transport {
     client: reqwest::Client,
     config: Arc<ClientConfig>,
     root: Url,
-    search_api_version: Option<String>,
+    protocol: Protocol,
+}
+
+#[derive(Clone)]
+enum Protocol {
+    Messages,
+    #[cfg(feature = "web-search")]
+    MessagesSearch,
+    Web,
 }
 
 impl std::fmt::Debug for Transport {
@@ -23,15 +31,20 @@ impl std::fmt::Debug for Transport {
 
 impl Transport {
     pub fn new(config: ClientConfig) -> Result<Self> {
-        Self::build(config, None)
+        Self::build(config, Protocol::Messages)
     }
 
     #[cfg(feature = "web-search")]
-    pub fn new_search(config: ClientConfig, api_version: String) -> Result<Self> {
-        Self::build(config, Some(api_version))
+    pub fn new_web(config: ClientConfig) -> Result<Self> {
+        Self::build(config, Protocol::Web)
     }
 
-    fn build(config: ClientConfig, search_api_version: Option<String>) -> Result<Self> {
+    #[cfg(feature = "web-search")]
+    pub fn new_search(config: ClientConfig) -> Result<Self> {
+        Self::build(config, Protocol::MessagesSearch)
+    }
+
+    fn build(config: ClientConfig, protocol: Protocol) -> Result<Self> {
         config.validate()?;
         let mut root = Url::parse(&config.base_url)
             .map_err(|_| Error::new(ErrorKind::Configuration, "invalid API base URL"))?;
@@ -48,7 +61,7 @@ impl Transport {
             ));
         }
         let prefix = root.path().trim_end_matches('/');
-        let path = if search_api_version.is_some() || prefix.ends_with("/v1") {
+        let path = if !matches!(protocol, Protocol::Messages) || prefix.ends_with("/v1") {
             format!("{prefix}/")
         } else {
             format!("{prefix}/v1/")
@@ -69,7 +82,7 @@ impl Transport {
             client,
             config: Arc::new(config),
             root,
-            search_api_version,
+            protocol,
         })
     }
 
@@ -84,6 +97,66 @@ impl Transport {
         self.root
             .join(path)
             .map_err(|_| Error::new(ErrorKind::Configuration, "invalid endpoint path"))
+    }
+
+    pub async fn upload_image(
+        &self,
+        data: Vec<u8>,
+        media_type: &str,
+        context: &RequestContext,
+    ) -> Result<Value> {
+        let mut context = context.clone();
+        context.resource = Some("file_upload".into());
+        context.model_context = None;
+        let index = context.reserve(RequestPurpose::Conversation, 1, Some(data.len()))?;
+        if let Err(error) = context.before_dispatch().await {
+            context.record(index, None, "not_dispatched", None);
+            return Err(error);
+        }
+        let result = async {
+            let part = reqwest::multipart::Part::bytes(data)
+                .file_name("abylab-image")
+                .mime_str(media_type)
+                .map_err(|_| Error::protocol("invalid image media type"))?;
+            let form = reqwest::multipart::Form::new()
+                .text("expires_after[anchor]", "created_at")
+                .text(
+                    "expires_after[seconds]",
+                    self.config.files.expires_after_secs.to_string(),
+                )
+                .part("file", part);
+            let response = context
+                .timed(
+                    Duration::from_secs(self.config.files.timeout_secs),
+                    self.client
+                        .post(self.endpoint("files")?)
+                        .header("x-api-key", &self.config.api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .header("anthropic-beta", "files-api-2025-04-14")
+                        .multipart(form)
+                        .send(),
+                )
+                .await?
+                .map_err(|_| Error::new(ErrorKind::Transport, "Files API upload failed"))?;
+            if !response.status().is_success() {
+                return Err(self.http_error(response, &context).await);
+            }
+            let bytes = self.body(response, &context).await?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| Error::protocol("invalid Files API response"))
+        }
+        .await;
+        context.record(
+            index,
+            None,
+            if result.is_ok() {
+                "uploaded"
+            } else {
+                "upload_failed"
+            },
+            None,
+        );
+        result
     }
 
     /// `GET {origin}/models`: the provider's advertised model listing in the
@@ -165,41 +238,70 @@ impl Transport {
         context: &RequestContext,
         purpose: RequestPurpose,
     ) -> Result<(reqwest::Response, usize)> {
-        self.send_recorded(path, body, context, purpose, || Ok(()))
-            .await
-    }
-
-    /// The synchronous pre-dispatch barrier runs for each attempt, including retries.
-    pub async fn send_recorded(
-        &self,
-        path: &str,
-        body: &Value,
-        context: &RequestContext,
-        purpose: RequestPurpose,
-        before_dispatch: impl Fn() -> Result<()> + Send + Sync,
-    ) -> Result<(reqwest::Response, usize)> {
         let url = self.endpoint(path)?;
         // Measured once per dispatch: the provider's token count for this exact
         // envelope is what makes a host's byte-based estimate calibratable.
         let request_bytes = serde_json::to_vec(body).ok().map(|bytes| bytes.len());
         for attempt in 0..=self.config.retry.max_retries {
             context.check()?;
-            before_dispatch()?;
             let index = context.reserve(purpose, attempt.saturating_add(1), request_bytes)?;
+            if let Err(error) = context.before_dispatch().await {
+                context.record(index, None, "not_dispatched", None);
+                return Err(error);
+            }
+            if let Some(gate) = &context.dispatch_gate
+                && let Err(error) = context.wait(gate()).await.and_then(|v| v)
+            {
+                context.record(index, None, "not_dispatched", None);
+                return Err(error);
+            }
             let mut request = self
                 .client
                 .post(url.clone())
                 .json(body)
-                .header("x-api-key", &self.config.api_key)
-                .header(
-                    "anthropic-version",
-                    self.search_api_version.as_deref().unwrap_or("2023-06-01"),
-                );
-            if self.search_api_version.is_some() {
-                request = request
+                .header("user-agent", concat!("abycore/", env!("CARGO_PKG_VERSION")));
+            request = match &self.protocol {
+                Protocol::Messages => request
+                    .header("x-api-key", &self.config.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header(
+                        "accept",
+                        if body["stream"] == true {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    ),
+                Protocol::Web => request
                     .bearer_auth(&self.config.api_key)
-                    .header("accept", "application/json")
-                    .header("user-agent", concat!("abycore/", env!("CARGO_PKG_VERSION")));
+                    .header("accept", "application/json"),
+                #[cfg(feature = "web-search")]
+                Protocol::MessagesSearch => request
+                    .header("x-api-key", &self.config.api_key)
+                    .bearer_auth(&self.config.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("accept", "application/json"),
+            };
+            if matches!(self.protocol, Protocol::Messages) {
+                let messages = body["messages"].as_array();
+                let blocks = || {
+                    messages
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+                };
+                let mut betas = Vec::new();
+                if blocks().any(|b| b["source"]["type"] == "file") {
+                    betas.push("files-api-2025-04-14");
+                }
+                if blocks()
+                    .any(|b| matches!(b["type"].as_str(), Some("tool_addition" | "tool_removal")))
+                {
+                    betas.push("mid-conversation-tool-changes-2026-07-01");
+                }
+                if !betas.is_empty() {
+                    request = request.header("anthropic-beta", betas.join(","));
+                }
             }
             let result = context
                 .timed(self.config.first_byte_timeout, request.send())
@@ -308,11 +410,29 @@ impl Transport {
             .and_then(Value::as_str)
             .map(|s| self.redact(s));
         let kind = match (status, code.as_deref()) {
+            (400 | 404 | 410, _)
+                if matches!(self.protocol, Protocol::Messages)
+                    && json
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| {
+                            let message = message.to_ascii_lowercase();
+                            message.contains("file")
+                                && (message.contains("expired")
+                                    || message.contains("not found")
+                                    || message.contains("not exist"))
+                        }) =>
+            {
+                ErrorKind::FileUnavailable
+            }
             (_, Some("context_length_exceeded" | "context_limit_exceeded")) => {
                 ErrorKind::ContextLimitExceeded
             }
             (402, _) | (_, Some("insufficient_quota" | "quota_exceeded")) => ErrorKind::Quota,
+            (403, _) if matches!(self.protocol, Protocol::Web) => ErrorKind::AccessDenied,
             (401 | 403, _) => ErrorKind::Authentication,
+            (404, _) if matches!(self.protocol, Protocol::Web) => ErrorKind::WebUnavailable,
+            (408, _) => ErrorKind::Timeout,
             (429, _) => ErrorKind::RateLimit,
             (500..=599, _) => ErrorKind::Server,
             (300..=399, _) => ErrorKind::Protocol,

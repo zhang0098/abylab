@@ -1,4 +1,5 @@
 mod assembler;
+mod files;
 mod messages;
 mod sse;
 pub(crate) mod transport;
@@ -20,6 +21,9 @@ pub type MessageStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>
 /// A native Messages request built from the SDK's provider-neutral transcript.
 #[derive(Clone, Debug)]
 pub struct MessageRequest {
+    /// Optional configuration timeline. `through` indexes this request's history.
+    /// Only supported, addition-only timelines use native in-history updates.
+    pub contexts: Vec<crate::ModelContext>,
     pub system: String,
     pub history: Vec<Item>,
     pub options: ModelOptions,
@@ -29,6 +33,7 @@ pub struct MessageRequest {
 impl MessageRequest {
     pub fn new(input: impl Into<String>) -> Self {
         Self {
+            contexts: vec![],
             system: String::new(),
             history: vec![Item::user(input)],
             options: ModelOptions::default(),
@@ -41,6 +46,7 @@ impl MessageRequest {
             &self.history,
             &self.options,
             &self.tools,
+            &self.contexts,
             stream,
         )
     }
@@ -48,19 +54,27 @@ impl MessageRequest {
     /// The wire body without the non-empty-history dispatch rule, for pricing a
     /// request the host has not sent yet.
     pub(crate) fn measurement_body(&self) -> Result<Value> {
-        messages::measurement_body(&self.system, &self.history, &self.options, &self.tools)
+        messages::measurement_body(
+            &self.system,
+            &self.history,
+            &self.options,
+            &self.tools,
+            &self.contexts,
+        )
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct DeepSeekClient {
     transport: Transport,
+    files: Arc<files::FileStore>,
 }
 
 impl DeepSeekClient {
     pub fn new(config: crate::ClientConfig) -> Result<Self> {
         Ok(Self {
             transport: Transport::new(config)?,
+            files: Arc::default(),
         })
     }
 
@@ -85,8 +99,7 @@ impl DeepSeekClient {
         )?;
         let body = request.body(false)?;
         let (http, index) = self
-            .transport
-            .send("messages", &body, &context, RequestPurpose::Conversation)
+            .send_message(&body, &context, RequestPurpose::Conversation)
             .await?;
         let bytes = self.transport.body(http, &context).await?;
         let wire =
@@ -133,10 +146,7 @@ impl DeepSeekClient {
         purpose: RequestPurpose,
     ) -> Result<MessageStream> {
         let body = request.body(true)?;
-        let (http, index) = self
-            .transport
-            .send("messages", &body, &context, purpose)
-            .await?;
+        let (http, index) = self.send_message(&body, &context, purpose).await?;
         if !http
             .headers()
             .get("content-type")
@@ -182,5 +192,28 @@ impl DeepSeekClient {
                 }
             }
         }))
+    }
+
+    async fn send_message(
+        &self,
+        body: &Value,
+        context: &RequestContext,
+        purpose: RequestPurpose,
+    ) -> Result<(reqwest::Response, usize)> {
+        let prepared = self.files.prepare(&self.transport, body, context).await?;
+        match self
+            .transport
+            .send("messages", &prepared, context, purpose)
+            .await
+        {
+            Err(error) if error.kind == ErrorKind::FileUnavailable && prepared != *body => {
+                self.files.clear().await;
+                let inline = files::FileStore::inline(&self.transport, body)?;
+                self.transport
+                    .send("messages", &inline, context, purpose)
+                    .await
+            }
+            result => result,
+        }
     }
 }

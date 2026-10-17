@@ -13,6 +13,7 @@ use tokio::{
 
 #[derive(Clone, Debug)]
 pub struct Request {
+    pub raw_body: Vec<u8>,
     pub path: String,
     pub headers: String,
     pub body: Value,
@@ -148,13 +149,16 @@ impl Server {
                     }
                     bytes.extend_from_slice(&chunk[..count]);
                 }
-                let body = if length == 0 {
+                let body = if length == 0
+                    || headers.to_ascii_lowercase().contains("multipart/form-data")
+                {
                     Value::Null
                 } else {
                     serde_json::from_slice(&bytes[end..end + length]).unwrap()
                 };
                 let path = headers.split_whitespace().nth(1).unwrap().into();
                 let request = Request {
+                    raw_body: bytes[end..end + length].to_vec(),
                     path,
                     headers,
                     body,
@@ -192,6 +196,7 @@ impl Server {
     }
     pub fn config(&self) -> ClientConfig {
         let mut config = ClientConfig::new("fixture-secret");
+        config.files.enabled = false;
         config.base_url = format!("{}/gateway/v1", self.url);
         config.retry.max_retries = 0;
         config.retry.initial_delay = Duration::from_millis(1);

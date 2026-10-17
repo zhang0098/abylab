@@ -5,6 +5,104 @@
 Internals only — install is in [README.en.md](README.en.md); commands, keys and
 size numbers are on [abylab.ai](https://abylab.ai/).
 
+## DeepSeek network protocols
+
+Conversation traffic stays on native Messages (`/anthropic/v1/messages`,
+`x-api-key`, SSE). Like Harness `0.2.1-rc.2`, search defaults to an auxiliary
+Messages request with server-side search, retaining the direct Search API as
+an explicit alternative. `web_fetch` always uses the independent Fetch API;
+changing search mode does not change fetch or introduce local HTTP scraping.
+
+Merge these non-secret settings into `settings.json`, preserving other preferences:
+
+```json
+{
+  "web": {
+    "search_provider": "messages",
+    "messages_search": {
+      "base_url": "https://api.deepseek.com/anthropic/v1",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "max_uses": 5,
+      "max_retries": 0
+    },
+    "api_base_url": "https://api.deepseek.com/v1/tools",
+    "search_timeout_secs": 60,
+    "fetch_timeout_secs": 30,
+    "max_retries": 2,
+    "requests_per_second": 5,
+    "send_original_question": true
+  },
+  "messages": {
+    "stream_idle_timeout_secs": 300,
+    "files": { "enabled": true }
+  }
+}
+```
+
+Invalid network settings stop startup instead of silently selecting an official
+endpoint. CLI overrides are not saved. `--base-url` only controls chat;
+`--search-base-url` overrides the complete Messages search prefix (only `/messages`
+is appended); `--web-api-base-url` overrides the full Search / Fetch prefix.
+All three are independent. `--search-provider messages|api` overrides
+`web.search_provider` for this run. Existing settings without that field select
+Messages search; set it to `api` to retain direct search. New sessions, resume,
+`ask`, and children use this configuration.
+Key rotation replaces both web tools; running children keep their credential snapshot.
+
+- Messages search sends an auxiliary `/anthropic/v1/messages` request with
+  `deepseek-v4-flash`, 4096 output tokens, `web_search_20250305`, at most five
+  server-tool uses, and thinking disabled. Headers are `x-api-key`, Bearer and
+  `anthropic-version: 2023-06-01`. Only native `web_search_tool_result` blocks
+  and citation snippets become sources; prose alone is never a search result.
+  Retries default to zero and use `web.messages_search.max_retries`. Auxiliary
+  model usage is recorded even when structured search output is invalid.
+  Failure never switches to the direct API.
+- `web_search` retains `queries` (1–4 strings): exact deduplication, concurrent
+  queries, round-robin merging in input order, URL deduplication, eight sources
+  by default. Failure cancels and drains siblings. Direct payloads are
+  `{query,count,need_content:false,ori_question?}`. Direct queries allow 128 Unicode
+  characters; the latest user prompt is whitespace-normalized and capped at
+  128 characters. Host context and tool reminders never replace it. Sending
+  the original question can be disabled.
+- `web_fetch` sends `{url}` and returns a title and Markdown. URLs must be
+  HTTP(S) without userinfo; no final redirect URL is invented. Both tools label
+  external content as untrusted and request citations; output defaults to 64 KiB.
+- Direct APIs use Bearer authentication, independently of Messages headers. Redirects
+  are never followed. 408, 429, 5xx and connection failures get finite retries
+  respecting `Retry-After`; 402 means quota, Fetch 403 means policy denial, and
+  404 means unavailable content. Other 4xx are not retried. Empty search results
+  succeed. Failures never silently switch providers.
+- Direct Search and Fetch have separate rate gates (default 5 QPS each), shared by the
+  host and children, including retries. Separate processes cannot coordinate
+  account quotas and may still receive 429. Each attempt is recorded and
+  checkpointed before dispatch; retries and uploads consume the request budget.
+  Direct web requests carry no token usage, not fabricated zero usage. Billing
+  follows the account's service rules for either mode; no free usage is promised
+  based on the client name.
+
+Images default to Files uploads with `files-api-2025-04-14`. Image-hash caches
+are scoped to client credentials and endpoint; default lifetime is seven days,
+refreshed one hour early. Restart or key rotation uploads again. Durable history
+retains original images. Temporary upload failure or stale references can fall
+back to inline data within the 20 MiB inline cap. Auth, quota, cancellation,
+budget and persistence failures do not fall back. Raw-image limits default to
+128 MiB and 600 images; the host's input budget still applies.
+`messages.files.enabled=false` disables uploads.
+
+The catalog gives `deepseek-flash` image and in-history update support, and
+`deepseek-v4-pro` text-only support; both have 1,000,000-token context windows.
+Unknown routes are not assumed to support extensions. Supported system changes
+and tool additions preserve the baseline prefix and appear after the preceding
+user/tool-result turn, before the next assistant. Tool changes send
+`mid-conversation-tool-changes-2026-07-01`. Workspace context retains user
+authority. Tool removal/replacement, initially empty tool lists, compacted
+history and unsupported models use the complete current configuration.
+Configuration changes are recorded in the ledger for resume; unchanged
+configurations are not duplicated. Snapshot v2 and journal v1 remain unchanged;
+additive optional fields permit old sessions to load, and completed tools are
+never re-executed by restoration.
+
 ## Workspace instructions
 
 Before the first model request, abylab reads `$ABYLAB_HOME/AGENTS.md` (default
@@ -103,9 +201,9 @@ Long sessions get condensed instead of failing, matching harness's
 `dsh-compaction-basic` (condense at 80% of the window, keep the newest 16%
 verbatim):
 
-- `ABY_CONTEXT_WINDOW=<tokens>` turns it on. Only the host knows the routed
-  model's window; abycore has no model table, and without the number there is no
-  way to price pressure.
+- Known models use the capability catalog's window; `ABY_CONTEXT_WINDOW=<tokens>`
+  explicitly overrides it. Unknown routes still need a configured window;
+  otherwise only manual and overflow compaction apply.
 - The policy is asked at **every model request**, not just between turns
   (`abycore::AgentHooks::view_request`), so one long turn gets condensed between
   its steps too. The agent asks, abylab decides, and the SDK summarizes and swaps
@@ -151,7 +249,7 @@ this turn has been running" was never its rule, and it is not abylab's either:
 harness's agent loop has no deadline over a step, and abylab sets none. What can
 actually get stuck each has an owner:
 
-- Every request belongs to the transport: 15s connect, 120s first byte, 60s
+- Every request belongs to the transport: 15s connect, 120s first byte, 300s
   stream idle (`ClientConfig`). The provider can only affect a *single* request —
   `max_tokens` truncation (a number we send), `Retry-After` on a 429, 5xx, or a
   gateway cutting one stream — and each of those becomes one failed request that

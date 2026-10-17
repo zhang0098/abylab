@@ -138,6 +138,10 @@ pub(super) fn launch(
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .pop_front()
+                                .and_then(|item| match item {
+                                    crate::Item::Message { content, .. } => Some(content),
+                                    _ => None,
+                                })
                         })
                         .ok_or_else(|| invalid("subagent has no input"))?;
                     agent
