@@ -62,6 +62,10 @@
 - 直连工具 API 只使用 Bearer 认证，和 Messages 的头分离；两种搜索都不跟随 HTTP 重定向，避免泄漏 key。
   408、429、5xx 和连接失败有限重试，尊重 `Retry-After`；402 是额度不足，Fetch 的 403 是
   抓取策略拒绝，404 是无可用内容，其它 4xx 不重试。空搜索结果是成功。没有自动跨提供商回退。
+  Fetch 的 404 可能来自目标网页不可用、站点禁止抓取、不支持的内容类型或无法提取正文，
+  不能仅凭它判断 `web.api_base_url` 配错。先检查目标 URL，或换一个来源；
+  抓取失败提示会显示目标 URL，查询参数和片段替换为 `[REDACTED]`，避免暴露访问令牌。
+  `https://api.deepseek.com/v1/tools/fetch` 是[官方文档](https://api-docs.deepseek.com/zh-cn/guides/search/)中的抓取地址。
 - 直连 Search / Fetch 各自限速，默认每秒 5 次；同一宿主及子代理共用限速器，重试也经过限速。
   跨进程不能协调账号配额，仍可能收到 429。每次辅助 HTTP 尝试先记账、经过持久化屏障，
   才发出去；重试和上传都消耗本轮请求预算。直连工具没有 token 用量，不把它伪装成零 token。
