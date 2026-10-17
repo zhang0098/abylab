@@ -3013,7 +3013,13 @@ impl App {
     /// are silent: settings are a convenience, never a requirement.
     fn save_settings(&self) {
         let path = Self::locale_settings_path(&self.cfg);
+        let Ok((web, messages)) = UiSettings::load_network(&self.cfg.home) else {
+            return;
+        };
         let settings = UiSettings {
+            messages,
+            // CLI overrides are one-run choices; preserve the saved web section.
+            web,
             language: self.locale,
             model: Some(self.cfg.model.clone()),
             effort: self.modes.effort.clone(),
@@ -6590,6 +6596,8 @@ mod resume_tests {
 
     fn test_app_with_root(root: &str, workspace: &str) -> (App, Controller) {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: workspace.into(),
             home: root.into(),
             sessions_root: root.into(),
@@ -7136,6 +7144,8 @@ mod selection_tests {
 
     fn test_app() -> App {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: fresh_root(),
             sessions_root: fresh_root(),
@@ -7396,6 +7406,8 @@ mod mode_tests {
 
     fn test_cfg() -> RuntimeConfig {
         RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: fresh_root(),
             sessions_root: fresh_root(),
@@ -11637,6 +11649,8 @@ mod palette_tests {
 
     fn test_app() -> (App, Controller, Receiver<AppEvent>) {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: fresh_root(),
             sessions_root: fresh_root(),
@@ -11931,6 +11945,8 @@ mod right_slot_tests {
 
     fn test_app() -> (App, Controller, Receiver<AppEvent>) {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: std::env::temp_dir()
                 .join(format!("abylab-right-slot-{}", std::process::id()))
@@ -12124,6 +12140,8 @@ mod at_menu_tests {
 
     fn test_cfg() -> RuntimeConfig {
         RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: fresh_root(),
             sessions_root: fresh_root(),
@@ -12472,6 +12490,8 @@ mod resume_replay_tests {
 
     fn test_cfg() -> RuntimeConfig {
         RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: "/tmp".into(),
             home: fresh_root(),
             sessions_root: fresh_root(),
@@ -12910,6 +12930,8 @@ mod git_branch_tests {
 
     fn test_app(workspace: &str) -> App {
         let cfg = RuntimeConfig {
+            messages: Default::default(),
+            web: Default::default(),
             workspace: workspace.into(),
             home: fresh_root(),
             sessions_root: fresh_root(),

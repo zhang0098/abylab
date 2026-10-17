@@ -207,6 +207,8 @@ mod tests {
 
     fn cfg(home: &str) -> crate::contract::DriverConfig {
         crate::contract::DriverConfig {
+            messages: Default::default(),
+            web: Default::default(),
             session_id: "s".into(),
             resume: None,
             sessions_root: None,

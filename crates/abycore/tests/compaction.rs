@@ -372,6 +372,7 @@ fn calibration_carries_a_measured_count_forward() {
     let measured = |request_bytes: usize,
                     last_request_bytes: Option<usize>,
                     last_input_tokens: Option<u64>| ViewEstimate {
+        model: String::new(),
         request_bytes,
         history_bytes: 0,
         items: 0,
@@ -633,6 +634,7 @@ fn seeded_agent(server: &Server) -> Agent {
     snapshot.items = vec![
         Item::user("original context ".repeat(1000)),
         Item::Message {
+            source: None,
             id: None,
             role: MessageRole::Assistant,
             content: vec![ContentPart::OutputText {
@@ -847,6 +849,9 @@ async fn a_replacement_must_shrink_the_current_view_and_invalidates_old_calibrat
 
     let mut snapshot = seeded_agent(&server).snapshot();
     snapshot.requests.push(RequestRecord {
+        model_context: None,
+        resource: None,
+        web: None,
         purpose: RequestPurpose::Conversation,
         attempt: 1,
         response_id: None,

@@ -35,6 +35,8 @@ pub fn settings_path(home: &str) -> PathBuf {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    pub messages: abylab_backend::MessagesConfig,
+    pub web: abylab_backend::WebConfig,
     pub workspace: String,
     /// aby home directory: `settings.json` and the modes cache live here.
     pub home: String,

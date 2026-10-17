@@ -186,6 +186,7 @@ async fn fork_seeds_a_compaction_summary_that_ends_at_the_active_prompt() {
     snapshot.items = vec![
         Item::user("previous question"),
         Item::Message {
+            source: None,
             id: None,
             role: MessageRole::Assistant,
             content: vec![ContentPart::OutputText {

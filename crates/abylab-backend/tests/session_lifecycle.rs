@@ -55,6 +55,8 @@ impl Live {
         let (tx, rx) = mpsc::channel();
         let handle = abylab_backend::driver::spawn(
             DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: "session".into(),
                 resume: None,
                 sessions_root: None,

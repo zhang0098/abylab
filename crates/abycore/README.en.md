@@ -87,6 +87,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Example programs
 
+The default `web-search` feature provides
+`WebConfig::tools(key, WebRateLimiter::default())`; pass the result to
+`agent.register_tools(...)` for `web_search` and direct `web_fetch`. Search defaults
+to the Messages server tool; set `WebConfig.search_provider = SearchProvider::Api`
+for direct search, without automatic fallback. `DeepSeekMessagesSearch` exposes
+standalone Messages search; `DeepSeekWebApi` exposes standalone direct `search` / `fetch`.
+`ClientConfig.files` controls uploads, expiry and inline fallback
+(enabled by default); stream idle timeout defaults to 300 seconds.
+`model_capabilities` exposes the catalog. Configuration updates and auxiliary
+attempts use optional ledger fields; hosts must persist checkpoints before
+returning from `AgentHooks::checkpoint`. See [TECH.en.md](../../TECH.en.md).
+
 `examples/` ships runnable snippets: `basic.rs` (one completion), `todo.rs`
 (plan-driven turn), `tools.rs` (tool bundle), `local_tools.rs` (sandboxed
 filesystem tools), `session.rs` (snapshot store), `cancel.rs` (cancellation),

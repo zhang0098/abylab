@@ -13,10 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use abycore::{
-    Agent, AgentEvent, AgentHooks, CancellationToken, ClientConfig, DeepSeekClient,
-    DeepSeekWebSearch, ErrorKind, LocalToolConfig, LocalTools, ModelOptions, PermissionMode,
-    ReasoningEffort, RunOptions, RunOutcome, SearchConfig, StopReason, TodoWriteTool, ToolDecision,
-    ToolOutput,
+    Agent, AgentEvent, AgentHooks, CancellationToken, ClientConfig, DeepSeekClient, ErrorKind,
+    LocalToolConfig, LocalTools, ModelOptions, PermissionMode, ReasoningEffort, RunOptions,
+    RunOutcome, StopReason, TodoWriteTool, ToolDecision, ToolOutput,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -31,7 +30,7 @@ mod queue;
 use goal::{GoalCommand, GoalControl};
 use queue::{Commands, QueueContext};
 
-const SERVER_LABEL: &str = "abycore · deepseek-responses";
+const SERVER_LABEL: &str = "abycore · deepseek-messages";
 
 /// Handle to one running driver. `send` never blocks; turns serialize inside
 /// the driver, so a prompt sent mid-turn queues after it. Read-only queries
@@ -94,6 +93,8 @@ pub fn spawn(
     cfg: DriverConfig,
     sink: impl Fn(Event) + Send + Sync + 'static,
 ) -> Result<DriverHandle, String> {
+    cfg.web.validate().map_err(|error| error.to_string())?;
+    cfg.messages.validate().map_err(|error| error.to_string())?;
     if cfg
         .max_tokens
         .is_some_and(|tokens| tokens == 0 || tokens > u32::MAX as u64)
@@ -221,6 +222,9 @@ fn queue_rows(queue: &VecDeque<QueuedItem>) -> Vec<QueueRow> {
 /// its model-visible view may be reshaped at request boundaries.
 #[derive(Clone)]
 struct HostPolicy {
+    messages: abycore::MessagesConfig,
+    web: abycore::WebConfig,
+    web_limiter: abycore::WebRateLimiter,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
     compaction: Option<CompactionConfig>,
     max_tokens: Option<u32>,
@@ -467,7 +471,10 @@ impl AgentHooks for UiHooks {
         &'a self,
         estimate: &'a abycore::ViewEstimate,
     ) -> futures_util::future::BoxFuture<'a, abycore::Result<Option<abycore::ViewRequest>>> {
-        let Some(policy) = self.compaction else {
+        let Some(policy) = self
+            .compaction
+            .or_else(|| model_compaction(&estimate.model))
+        else {
             return Box::pin(async { Ok(None) });
         };
         // Provider-calibrated when a measured envelope is available, bounded by
@@ -795,6 +802,9 @@ async fn drive(
     // clients hear about it through the next snapshot.
     let taken: Arc<OutstandingSteers> = Arc::default();
     let host = HostPolicy {
+        messages: cfg.messages.clone(),
+        web: cfg.web.clone(),
+        web_limiter: Default::default(),
         sink: Arc::clone(&sink),
         compaction,
         max_tokens: cfg
@@ -1464,12 +1474,13 @@ async fn drive(
                 if let Some(current) = agent.as_mut() {
                     let rotate = (|| -> abycore::Result<()> {
                         let mut config = ClientConfig::new(&api_key);
+                        host.messages.configure(&mut config)?;
                         if let Some(url) = &cfg.base_url {
                             config.base_url = url.clone();
                         }
                         let client = DeepSeekClient::new(config)?;
-                        let search = DeepSeekWebSearch::new(SearchConfig::new(&api_key))?;
-                        current.replace_tools([Arc::new(search) as Arc<dyn abycore::Tool>])?;
+                        current
+                            .replace_tools(host.web.tools(&api_key, host.web_limiter.clone())?)?;
                         current.set_client(client);
                         Ok(())
                     })();
@@ -1901,6 +1912,7 @@ fn build_agent(
     persist: Option<Arc<PersistState>>,
 ) -> abycore::Result<SessionAgent> {
     let mut config = ClientConfig::new(ctx.api_key);
+    ctx.host.messages.configure(&mut config)?;
     if let Some(url) = ctx.base_url {
         config.base_url = url.to_string();
     }
@@ -1921,7 +1933,11 @@ fn build_agent(
     if let Some(subagents) = ctx.subagents {
         subagents.register(&mut inner)?;
     }
-    inner.register_tool(DeepSeekWebSearch::new(SearchConfig::new(ctx.api_key))?)?;
+    inner.register_tools(
+        ctx.host
+            .web
+            .tools(ctx.api_key, ctx.host.web_limiter.clone())?,
+    )?;
     let mut agent = SessionAgent { inner, persist };
     agent.set_policy(ctx.local.permission_mode(), ctx.host);
     ctx.host
@@ -2026,6 +2042,13 @@ fn replay_events(session: &str, snapshot: &abycore::SessionSnapshot) -> Vec<UiEv
         out.push(plan_event(session, Some(&plan)));
     }
     out
+}
+
+fn model_compaction(model: &str) -> Option<CompactionConfig> {
+    abycore::model_capabilities(model).map(|capabilities| CompactionConfig {
+        context_window: capabilities.context_window,
+        ..CompactionConfig::default()
+    })
 }
 
 fn parse_effort(raw: &str) -> ReasoningEffort {
@@ -3491,6 +3514,8 @@ mod tests {
         cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
         drive(
             DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: "permission-test".into(),
                 resume: None,
                 sessions_root: None,
@@ -3552,6 +3577,8 @@ mod tests {
         cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
         drive(
             DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: "bind-test".into(),
                 resume: None,
                 sessions_root: None,
@@ -3623,6 +3650,8 @@ mod tests {
         cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
         drive(
             DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: "login-test".into(),
                 resume: None,
                 sessions_root: None,
@@ -3708,6 +3737,9 @@ mod tests {
 
         // The tool registers only when there is something to read.
         let host = HostPolicy {
+            messages: Default::default(),
+            web: Default::default(),
+            web_limiter: Default::default(),
             sink: Arc::new(|_| {}),
             compaction: None,
             max_tokens: None,
@@ -3781,6 +3813,8 @@ mod tests {
         cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
         drive(
             DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: "skills-list-test".into(),
                 resume: None,
                 sessions_root: Some(workspace.join("store").to_string_lossy().into_owned()),
@@ -3858,6 +3892,8 @@ mod tests {
         cmd_tx.send(Cmd::Shutdown).expect("queue shutdown");
         drive(
             DriverConfig {
+                messages: Default::default(),
+                web: Default::default(),
                 session_id: "list-test".into(),
                 resume: None,
                 sessions_root: Some(workspace.join("store").to_string_lossy().into_owned()),
@@ -4038,6 +4074,14 @@ mod tests {
         // The workspace doubles as the aby home: the durable queue writes under
         // it, and the scratch directory is removed by each test.
         DriverConfig {
+            messages: abycore::MessagesConfig {
+                files: abycore::FilesConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            web: Default::default(),
             session_id: "steer-test".into(),
             resume: None,
             sessions_root: None,

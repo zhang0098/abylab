@@ -397,8 +397,210 @@ fn ask_prints_the_final_answer_and_nothing_else() {
     );
 }
 
-/// An answer cut off at the output limit is still printed — it is what the
-/// model said — but the run is not a success.
+/// The real CLI routes web requests independently and replays completed tools.
+#[test]
+fn ask_uses_independent_web_endpoint_and_restores_results_without_repeating_tools() {
+    let sandbox = Sandbox::new("web-api");
+    let tool = |id: &str, name: &str, input: serde_json::Value| {
+        block_start(
+            0,
+            &serde_json::json!({"type":"tool_use","id":id,"name":name,"input":input}).to_string(),
+        ) + &block_stop(0)
+    };
+    let provider = Provider::start(vec![
+        Reply::sse(sse(
+            "search",
+            &[tool(
+                "s",
+                "web_search",
+                serde_json::json!({"queries":["official docs"]}),
+            )],
+            "tool_use",
+        )),
+        Reply::sse(sse(
+            "fetch",
+            &[tool(
+                "f",
+                "web_fetch",
+                serde_json::json!({"url":"https://example.org/docs"}),
+            )],
+            "tool_use",
+        )),
+        Reply::sse(sse(
+            "answer",
+            &[text_block(0, "[Docs](https://example.org/docs)")],
+            "end_turn",
+        )),
+        Reply::sse(sse("replay", &[text_block(0, "restored")], "end_turn")),
+    ]);
+    let web = Provider::start(vec![
+        Reply { status:200, content_type:"application/json", body:serde_json::json!({"results":[{"url":"https://example.org/docs","title":"Docs","snippet":"excerpt","date":null}]}).to_string() },
+        Reply { status:200, content_type:"application/json", body:serde_json::json!({"title":"Docs","content":"# fetched body"}).to_string() },
+    ]);
+    let endpoint = format!("{}/v1/tools", web.base_url);
+    let settings = r#"{"web":{"api_base_url":"http://127.0.0.1:1/unused"},"messages":{"stream_idle_timeout_secs":300}}"#;
+    std::fs::write(sandbox.home.join("settings.json"), settings).unwrap();
+    let run = sandbox.ask(
+        &[
+            "original question",
+            "--search-provider",
+            "api",
+            "--web-api-base-url",
+            &endpoint,
+            "--session-id",
+            "web-session",
+        ],
+        &provider.base_url,
+        Some("fixture-key"),
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "[Docs](https://example.org/docs)\n");
+    let calls = web.bodies();
+    assert_eq!(calls.len(), 2);
+    let search: serde_json::Value = serde_json::from_str(&calls[0]).unwrap();
+    assert_eq!(
+        search,
+        serde_json::json!({"query":"official docs","count":8,"need_content":false,"ori_question":"original question"})
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&calls[1]).unwrap(),
+        serde_json::json!({"url":"https://example.org/docs"})
+    );
+    assert!(provider.bodies()[2].contains("# fetched body"));
+    let run = sandbox.ask(
+        &[
+            "recall",
+            "--search-provider",
+            "api",
+            "--web-api-base-url",
+            &endpoint,
+            "--session-id",
+            "web-session",
+        ],
+        &provider.base_url,
+        Some("rotated-fixture-key"),
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "restored\n");
+    assert_eq!(web.bodies().len(), 2);
+    assert!(provider.bodies()[3].contains("# fetched body"));
+    assert_eq!(
+        std::fs::read_to_string(sandbox.home.join("settings.json")).unwrap(),
+        settings
+    );
+}
+
+#[test]
+fn ask_defaults_to_messages_search_and_can_override_a_saved_api_selection() {
+    for override_api in [false, true] {
+        let sandbox = Sandbox::new(if override_api {
+            "native-search-override"
+        } else {
+            "native-search-default"
+        });
+        let tool = block_start(
+            0,
+            r#"{"type":"tool_use","id":"s","name":"web_search","input":{"queries":["official docs"]}}"#,
+        ) + &block_stop(0);
+        let provider = Provider::start(vec![
+            Reply::sse(sse("search", &[tool], "tool_use")),
+            Reply::sse(sse(
+                "answer",
+                &[text_block(0, "[Docs](https://example.org/docs)")],
+                "end_turn",
+            )),
+            Reply::sse(sse("resume", &[text_block(0, "remembered")], "end_turn")),
+        ]);
+        let native = Provider::start(vec![Reply {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::json!({
+                "id":"aux", "stop_reason":"end_turn",
+                "content":[{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"https://example.org/docs","title":"Native source"}]}],
+                "usage":{"input_tokens":7,"output_tokens":3}
+            }).to_string(),
+        }]);
+        let direct = Provider::start(vec![]);
+        let endpoint = format!("{}/anthropic/v1", native.base_url);
+        let direct_endpoint = format!("{}/v1/tools", direct.base_url);
+        let settings = if override_api {
+            r#"{"web":{"search_provider":"api"}}"#
+        } else {
+            r#"{"web":{}}"#
+        };
+        std::fs::write(sandbox.home.join("settings.json"), settings).unwrap();
+        let mut args = vec![
+            "find docs",
+            "--search-base-url",
+            &endpoint,
+            "--web-api-base-url",
+            &direct_endpoint,
+            "--session-id",
+            "native-session",
+        ];
+        if override_api {
+            args.extend(["--search-provider", "messages"]);
+        }
+        let run = sandbox.ask(&args, &provider.base_url, Some("fixture-key"));
+        assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
+        assert_eq!(run.stdout, "[Docs](https://example.org/docs)\n");
+        assert_eq!(native.bodies().len(), 1);
+        assert!(direct.bodies().is_empty());
+        let request: serde_json::Value = serde_json::from_str(&native.bodies()[0]).unwrap();
+        assert_eq!(request["tools"][0]["type"], "web_search_20250305");
+        assert_eq!(request["model"], "deepseek-v4-flash");
+        assert_eq!(request["thinking"]["type"], "disabled");
+        assert!(provider.bodies()[1].contains("Native source"));
+        args[0] = "recall";
+        let run = sandbox.ask(&args, &provider.base_url, Some("rotated-fixture-key"));
+        assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
+        assert_eq!(run.stdout, "remembered\n");
+        assert_eq!(native.bodies().len(), 1);
+        assert!(provider.bodies()[2].contains("Native source"));
+        assert_eq!(
+            std::fs::read_to_string(sandbox.home.join("settings.json")).unwrap(),
+            settings
+        );
+    }
+}
+
+#[test]
+fn invalid_search_provider_flag_fails_without_network_requests() {
+    let sandbox = Sandbox::new("bad-search-provider");
+    let provider = Provider::start(vec![]);
+    let run = sandbox.ask(
+        &["question", "--search-provider", "fallback"],
+        &provider.base_url,
+        Some("fixture-key"),
+    );
+    assert_ne!(run.status.code(), Some(0));
+    assert!(run
+        .stderr
+        .contains("--search-provider must be messages or api"));
+    assert!(provider.bodies().is_empty());
+}
+
+#[test]
+fn malformed_network_settings_fail_before_any_model_request() {
+    let sandbox = Sandbox::new("bad-network-settings");
+    let provider = Provider::start(vec![]);
+    for settings in [
+        r#"{"web":{"unknown_option":true}}"#,
+        r#"{"web":{"api_base_url":"file:///tmp/tools"}}"#,
+        r#"{"web":{"search_provider":"unknown"}}"#,
+        r#"{"web":{"messages_search":{"base_url":"https://user:password@example.org"}}}"#,
+        r#"{"web":{"messages_search":{"max_uses":0}}}"#,
+        r#"{"messages":{"stream_idle_timeout_secs":0}}"#,
+    ] {
+        std::fs::write(sandbox.home.join("settings.json"), settings).unwrap();
+        let run = sandbox.ask(&["question"], &provider.base_url, Some("fixture-key"));
+        assert_ne!(run.status.code(), Some(0));
+        assert_eq!(run.stdout, "");
+    }
+    assert!(provider.bodies().is_empty());
+}
+
+/// An answer cut off at the output limit is printed but is not a success.
 #[test]
 fn a_truncated_answer_exits_non_zero() {
     let sandbox = Sandbox::new("truncated");

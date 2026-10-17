@@ -8,6 +8,7 @@ pub(super) fn context(output_limit: usize) -> ToolContext {
     let request =
         RequestContext::new(cancellation.clone(), None, 16, Arc::new(Mutex::new(vec![]))).unwrap();
     ToolContext {
+        original_question: None,
         call_id: "local-test".into(),
         cancellation,
         deadline: tokio::time::Instant::now() + Duration::from_secs(30),

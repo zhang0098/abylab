@@ -10,6 +10,7 @@ mod queue_store;
 mod user_questions;
 
 pub use abycore::MIN_PRUNE_BYTES;
+pub use abycore::{MessagesConfig, SearchProvider, WebConfig, model_capabilities};
 pub use contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
     PlanStatus, PromptPart, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits,

@@ -26,6 +26,8 @@ fn resume_keeps_the_restored_queue_visible() {
         common::MockServer::start(vec![common::Reply::sse(common::text_body("first", "done"))
             .delayed(Duration::from_millis(400))]);
     let cfg = runtime::RuntimeConfig {
+        messages: Default::default(),
+        web: Default::default(),
         workspace: root.to_string_lossy().into_owned(),
         home: root.join("home").to_string_lossy().into_owned(),
         sessions_root: root.join("sessions").to_string_lossy().into_owned(),

@@ -11,9 +11,10 @@ pub(super) fn request(
     history: &[Item],
     options: &ModelOptions,
     tools: &[ToolDefinition],
+    contexts: &[crate::ModelContext],
     stream: bool,
 ) -> Result<Value> {
-    let body = request_body(system, history, options, tools, stream)?;
+    let body = request_body(system, history, options, tools, contexts, stream)?;
     if body["messages"]
         .as_array()
         .is_none_or(|messages| messages.is_empty())
@@ -33,8 +34,9 @@ pub(super) fn measurement_body(
     history: &[Item],
     options: &ModelOptions,
     tools: &[ToolDefinition],
+    contexts: &[crate::ModelContext],
 ) -> Result<Value> {
-    request_body(system, history, options, tools, true)
+    request_body(system, history, options, tools, contexts, true)
 }
 
 fn request_body(
@@ -42,6 +44,7 @@ fn request_body(
     history: &[Item],
     options: &ModelOptions,
     tools: &[ToolDefinition],
+    contexts: &[crate::ModelContext],
     stream: bool,
 ) -> Result<Value> {
     options.validate()?;
@@ -58,8 +61,37 @@ fn request_body(
             return Err(Error::new(ErrorKind::Configuration, "duplicate tool name"));
         }
     }
+    // Replacements/removals and models without this capability establish a new
+    // full prefix. Never emit a protocol feature the selected model cannot use.
+    let incremental = crate::model_capabilities(&options.model).is_some_and(|c| c.in_history_updates)
+        && contexts.len() > 1
+        // The endpoint rejects a declaration where every tool is deferred.
+        && (!contexts[0].tools.is_empty() || tools.is_empty())
+        && contexts.iter().all(|c| c.model == options.model && c.through <= history.len())
+        && contexts.windows(2).all(|pair| {
+            pair[0].through <= pair[1].through
+                && pair[0].tools.iter().all(|old| pair[1].tools.contains(old))
+                && (pair[0].system == pair[1].system || !pair[1].system.is_empty())
+                && (pair[0].host_context == pair[1].host_context || !pair[1].host_context.is_empty())
+                && pair[1].through > 0
+                && matches!(history.get(pair[1].through - 1), Some(Item::Message { role: MessageRole::User, .. } | Item::FunctionCallOutput { .. }))
+        })
+        && contexts.last().is_some_and(|c| c.tools == tools && c.system == system);
+    let baseline = if incremental {
+        contexts.first()
+    } else {
+        contexts.last()
+    };
+    let system = baseline.map_or(system, |c| c.system.as_str());
     let mut messages: Vec<Value> = vec![];
-    for item in history {
+    if let Some(context) = baseline.filter(|c| !c.host_context.is_empty()) {
+        messages
+            .push(json!({"role":"user","content":[{"type":"text","text":context.host_context}]}));
+    }
+    for (index, item) in history.iter().enumerate() {
+        if incremental {
+            append_updates(&mut messages, contexts, index);
+        }
         let (role, blocks) = match item {
             Item::Message { role, content, .. } => (
                 if *role == MessageRole::User {
@@ -133,6 +165,9 @@ fn request_body(
             messages.push(json!({"role":role,"content":blocks}));
         }
     }
+    if incremental {
+        append_updates(&mut messages, contexts, history.len());
+    }
     // Native tool_result blocks precede other user content in the same turn.
     for message in &mut messages {
         if message["role"] == "user" {
@@ -153,11 +188,50 @@ fn request_body(
     if !tools.is_empty() {
         body["tools"] = tools
             .iter()
-            .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.parameters}))
+            .map(|t| {
+                let mut value =
+                    json!({"name":t.name,"description":t.description,"input_schema":t.parameters});
+                if incremental && !contexts[0].tools.iter().any(|old| old.name == t.name) {
+                    value["defer_loading"] = json!(true);
+                }
+                value
+            })
             .collect();
         body["tool_choice"] = json!({"type":options.tool_choice});
     }
     Ok(body)
+}
+
+fn append_updates(messages: &mut Vec<Value>, contexts: &[crate::ModelContext], index: usize) {
+    for pair in contexts.windows(2).filter(|pair| pair[1].through == index) {
+        let (old, new) = (&pair[0], &pair[1]);
+        let mut blocks = vec![];
+        if old.system != new.system {
+            blocks.push(json!({"type":"text","text":new.system}));
+        }
+        if old.host_context != new.host_context {
+            // Workspace/skill context has user authority. A refreshed file
+            // must not be promoted to a system instruction by this protocol.
+            let block = json!({"type":"text","text":format!("Updated host context:\n{}", new.host_context)});
+            if let Some(user) = messages.last_mut().filter(|m| m["role"] == "user") {
+                user["content"].as_array_mut().unwrap().push(block);
+            } else {
+                messages.push(json!({"role":"user","content":[block]}));
+            }
+        }
+        for tool in new
+            .tools
+            .iter()
+            .filter(|t| !old.tools.iter().any(|old| old.name == t.name))
+        {
+            blocks.push(
+                json!({"type":"tool_addition","tool":{"type":"tool_reference","name":tool.name}}),
+            );
+        }
+        if !blocks.is_empty() {
+            messages.push(json!({"role":"system","content":blocks}));
+        }
+    }
 }
 
 pub(super) fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -183,6 +257,7 @@ pub(super) fn block(value: &Value, id: &str, index: usize, model: &str) -> Resul
     let item_id = format!("{id}:{index}");
     let item = match string(value, "type")? {
         "text" => Item::Message {
+            source: None,
             id: Some(item_id),
             role: MessageRole::Assistant,
             content: vec![ContentPart::OutputText {

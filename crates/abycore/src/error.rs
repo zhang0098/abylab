@@ -25,6 +25,11 @@ pub enum ErrorKind {
     NeedsResolution,
     EventHandler,
     SearchUnavailable,
+    /// A web target was rejected by the provider's security policy.
+    AccessDenied,
+    /// A web target did not yield retrievable content.
+    WebUnavailable,
+    FileUnavailable,
 }
 
 /// A sanitized SDK error. Request bodies and credentials are never attached.

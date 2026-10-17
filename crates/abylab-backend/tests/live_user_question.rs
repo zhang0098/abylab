@@ -71,6 +71,8 @@ fn model_asks_and_continues_after_a_real_answer() {
     };
     let handle = spawn(
         DriverConfig {
+            messages: Default::default(),
+            web: Default::default(),
             session_id: "live-user-question".into(),
             resume: None,
             sessions_root: Some(root.join("sessions").to_string_lossy().into_owned()),

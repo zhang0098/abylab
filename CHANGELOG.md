@@ -10,6 +10,13 @@
 
 ## [Unreleased]
 
+- 保留并默认使用 Messages 服务端搜索；直连 Search API 可显式选择，新增直连 `web_fetch`，
+  保留 `queries` 接口且失败不切换模式。独立端点、直连有限重试/共享限速、请求前落盘及取消均覆盖子代理。
+- Messages 流空闲超时改为 300 秒；加入模型能力/窗口表、Files 图片上传与凭据隔离缓存，
+  以及可恢复的会话内系统提示/工具追加。旧会话继续兼容，不会重跑已完成工具。
+- `settings.json` 增加非敏感 `web` / `messages` 配置；支持 `--search-provider`、`--search-base-url`、`--web-api-base-url`
+  临时覆盖，网络配置错误不再静默回退。
+
 ## [0.1.19] - 2026-09-27
 
 ### 新增

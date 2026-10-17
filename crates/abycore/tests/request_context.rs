@@ -1,5 +1,5 @@
-//! Host context stays outside compactable/durable history, but is included in
-//! every request and its byte measurement, including summaries and children.
+//! Host context stays outside compactable item history, but its configuration
+//! timeline is durable in the request ledger for incremental replay.
 mod common;
 
 use abycore::*;
@@ -56,10 +56,15 @@ async fn context_is_measured_survives_compaction_and_is_reloaded_on_restore() {
         .unwrap();
     let snapshot = agent.snapshot();
     assert!(
-        !serde_json::to_string(&snapshot)
+        !serde_json::to_string(&snapshot.items)
             .unwrap()
             .contains("HOST_RULE_OLD")
     );
+    assert!(snapshot.requests.iter().any(|r| {
+        r.model_context
+            .as_ref()
+            .is_some_and(|c| c.host_context == "HOST_RULE_OLD")
+    }));
     let mut resumed = Agent::restore(server.client(), snapshot).unwrap();
     resumed.set_hooks(Arc::new(Context("HOST_RULE_NEW")));
     assert!(

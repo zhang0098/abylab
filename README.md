@@ -95,6 +95,12 @@ curl -fsSL https://abylab.ai/install.sh | bash
 你的偏好存在 `$ABYLAB_HOME/settings.json`：界面语言（默认中文）、模型、推理强度、
 权限预设，以及外观（明暗 + 主题包）。命令行开关只覆盖本次运行。
 
+搜索默认使用 Messages 服务端搜索；`--search-provider api` 可切换为直连 Search API，
+`--search-provider messages` 显式选择默认方式。`--search-base-url` 设置独立的 Messages
+搜索前缀。`web_fetch` 始终直连 Fetch API；`--web-api-base-url` 设置 Search/Fetch
+前缀（默认 `https://api.deepseek.com/v1/tools`）。两种搜索不会自动互相回退。
+搜索和抓取可能单独计费。详细配置见 [TECH.md](TECH.md)。
+
 </details>
 
 ## 许可与致谢

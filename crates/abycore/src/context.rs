@@ -38,6 +38,13 @@ pub(crate) struct RequestContext {
     count: Arc<AtomicUsize>,
     max_requests: usize,
     pub ledger: Ledger,
+    pub web: Option<crate::WebRequestRecord>,
+    pub resource: Option<String>,
+    pub model_context: Option<crate::ModelContext>,
+    pub dispatch_barrier:
+        Option<Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync>>,
+    pub dispatch_gate:
+        Option<Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync>>,
 }
 
 impl RequestContext {
@@ -70,6 +77,11 @@ impl RequestContext {
             count: Arc::new(AtomicUsize::new(0)),
             max_requests,
             ledger,
+            web: None,
+            resource: None,
+            model_context: None,
+            dispatch_barrier: None,
+            dispatch_gate: None,
         })
     }
 
@@ -168,21 +180,31 @@ impl RequestContext {
     ) -> Result<usize> {
         self.check()?;
         self.count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < self.max_requests).then(|| n + 1)
             })
             .map_err(|_| Error::new(ErrorKind::BudgetExceeded, "HTTP request budget exhausted"))?;
         let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
         let index = ledger.len();
         ledger.push(RequestRecord {
+            model_context: self.model_context.clone(),
             purpose,
             attempt,
             response_id: None,
             status: None,
             usage: None,
             request_bytes,
+            web: self.web.clone(),
+            resource: self.resource.clone(),
         });
         Ok(index)
+    }
+
+    pub async fn before_dispatch(&self) -> Result<()> {
+        if let Some(barrier) = &self.dispatch_barrier {
+            self.wait(barrier()).await??;
+        }
+        self.check()
     }
 
     pub fn record(

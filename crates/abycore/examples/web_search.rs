@@ -1,6 +1,6 @@
 use abycore::{
-    Agent, AgentEvent, ClientConfig, DeepSeekClient, DeepSeekWebSearch, ModelOptions, RunOptions,
-    SearchConfig, StreamEvent,
+    Agent, AgentEvent, ClientConfig, DeepSeekClient, ModelOptions, RunOptions, SearchProvider,
+    StreamEvent, WebConfig, WebRateLimiter,
 };
 
 #[tokio::main]
@@ -17,14 +17,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ModelOptions::default(),
     )?;
     // Explicitly reuse the credential. The search endpoint is configured independently.
-    let mut search = SearchConfig::new(key);
+    let mut web = WebConfig::default();
+    if std::env::var("DEEPSEEK_SEARCH_PROVIDER").as_deref() == Ok("api") {
+        web.search_provider = SearchProvider::Api;
+    }
     if let Ok(url) = std::env::var("DEEPSEEK_SEARCH_BASE_URL") {
-        search.client.base_url = url;
+        web.messages_search.base_url = url;
     }
-    if let Ok(model) = std::env::var("DEEPSEEK_SEARCH_MODEL") {
-        search.model = model;
+    if let Ok(url) = std::env::var("DEEPSEEK_WEB_API_BASE_URL") {
+        web.api_base_url = url;
     }
-    agent.register_tool(DeepSeekWebSearch::new(search)?)?;
+    agent.register_tools(web.tools(&key, WebRateLimiter::default())?)?;
     agent
         .run(
             "查询 DeepSeek 官方最新 API 公告。",

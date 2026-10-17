@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::time::Instant;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolDefinition {
     pub name: String,
@@ -39,6 +39,8 @@ pub struct ToolContext {
     /// deadline" rather than a very generous one.
     pub deadline: Instant,
     pub max_output_bytes: usize,
+    /// Latest prompt admitted in this agent, excluding host request context.
+    pub original_question: Option<String>,
     #[cfg_attr(not(feature = "web-search"), allow(dead_code))]
     pub(crate) request: RequestContext,
     pub(crate) local_session: std::sync::Arc<crate::local_tools::LocalSession>,

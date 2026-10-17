@@ -127,7 +127,7 @@ pub enum SubagentEvent {
 }
 
 #[derive(Default)]
-pub(crate) struct Inbox(Mutex<VecDeque<Vec<crate::ContentPart>>>);
+pub(crate) struct Inbox(Mutex<VecDeque<crate::Item>>);
 
 impl Inbox {
     fn validate_message(message: &str) -> Result<()> {
@@ -143,6 +143,10 @@ impl Inbox {
     }
 
     pub(crate) fn send_parts(&self, parts: Vec<crate::ContentPart>) -> Result<()> {
+        self.enqueue(parts, crate::MessageSource::Context)
+    }
+
+    fn enqueue(&self, parts: Vec<crate::ContentPart>, source: crate::MessageSource) -> Result<()> {
         if parts.is_empty()
             || !parts.iter().any(|part| match part {
                 crate::ContentPart::InputText { text } => !text.trim().is_empty(),
@@ -152,20 +156,21 @@ impl Inbox {
         {
             return Err(invalid("message must contain text or an image"));
         }
-        let input = crate::Item::user_parts(parts);
+        let mut input = crate::Item::user_parts(parts);
         input.validate()?;
-        let crate::Item::Message { content, .. } = input else {
+        let crate::Item::Message { source: origin, .. } = &mut input else {
             unreachable!("user_parts makes a message")
         };
+        *origin = Some(source);
         let mut queue = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if queue.len() >= 32 {
             return Err(Error::new(ErrorKind::BudgetExceeded, "agent inbox is full"));
         }
-        queue.push_back(content);
+        queue.push_back(input);
         Ok(())
     }
 
-    pub(crate) fn drain(&self) -> Vec<Vec<crate::ContentPart>> {
+    pub(crate) fn drain(&self) -> Vec<crate::Item> {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -197,11 +202,13 @@ impl SteerHandle {
     /// Queue one steering message. Errors only for empty/oversized text or a
     /// full inbox (32 pending), never because the agent is idle.
     pub fn send(&self, text: impl Into<String>) -> Result<()> {
-        self.0.send(text.into())
+        let text = text.into();
+        Inbox::validate_message(&text)?;
+        self.send_parts(vec![crate::ContentPart::InputText { text }])
     }
 
     pub fn send_parts(&self, parts: Vec<crate::ContentPart>) -> Result<()> {
-        self.0.send_parts(parts)
+        self.0.enqueue(parts, crate::MessageSource::User)
     }
 
     /// Whether a message is waiting for the next step boundary.

@@ -12,6 +12,10 @@ pub enum CheckpointKind {
     ModelResponse,
     /// A prune or compaction was committed before the next model request.
     ViewChanged,
+    /// Auxiliary HTTP request was recorded; a failed save prevents dispatch.
+    WebRequest,
+    /// Model or image-upload attempt recorded before its network dispatch.
+    ModelRequest,
     ToolIntent {
         call: PendingCall,
     },
@@ -34,8 +38,9 @@ pub enum ToolDecision {
 pub trait AgentHooks: Send + Sync {
     /// Stable host context prepended as a user message to every conversation
     /// and summary request, including token/byte measurements. This is outside
-    /// the compactable transcript and is not saved in snapshots: the host must
-    /// reload it on restore. Keep it unchanged until installing new hooks with
+    /// the compactable transcript. Configuration history is saved in the
+    /// request ledger; the host must still reload the current context on restore.
+    /// Keep it unchanged until installing new hooks with
     /// `Agent::set_hooks`, so provider calibration remains valid.
     ///
     /// Children inherit this context unless their own hooks return `Some`.

@@ -614,6 +614,8 @@ pub fn drive(scenario: Scenario) -> Run {
     let events: Captured = Arc::new(Mutex::new(Vec::new()));
     let handle = spawn(
         DriverConfig {
+            messages: Default::default(),
+            web: Default::default(),
             session_id: format!("{tag}-test"),
             resume,
             sessions_root: None,

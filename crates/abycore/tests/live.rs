@@ -82,38 +82,3 @@ async fn image_message_live() {
     assert_eq!(response.status, ResponseStatus::Completed);
     assert!(!response.output_text().trim().is_empty());
 }
-
-#[cfg(feature = "web-search")]
-#[tokio::test]
-#[ignore = "paid native search probe; verified independently of conversation"]
-async fn search_live() {
-    let mut config = SearchConfig::new(
-        std::env::var("DEEPSEEK_API_KEY").expect("set DEEPSEEK_API_KEY explicitly"),
-    );
-    if let Ok(url) = std::env::var("DEEPSEEK_SEARCH_BASE_URL") {
-        config.client.base_url = url;
-    }
-    if let Ok(model) = std::env::var("DEEPSEEK_SEARCH_MODEL") {
-        config.model = model;
-    }
-    eprintln!(
-        "Search probe: endpoint={}, model={}, unix_time={}",
-        config.client.base_url,
-        config.model,
-        timestamp()
-    );
-    let result = DeepSeekWebSearch::new(config)
-        .unwrap()
-        .search(
-            "DeepSeek official API documentation",
-            RequestOptions::default(),
-        )
-        .await;
-    match result {
-        Ok(result) => {
-            assert!(!result.sources.is_empty());
-            eprintln!("Search probe: verified, {} sources", result.sources.len());
-        }
-        Err(error) => panic!("Search probe: unavailable or failed: {error}"),
-    }
-}

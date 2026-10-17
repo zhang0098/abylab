@@ -5,6 +5,7 @@ use std::{fmt, time::Duration};
 /// HTTP configuration. Debug deliberately excludes credentials and proxy URLs.
 #[derive(Clone)]
 pub struct ClientConfig {
+    pub files: FilesConfig,
     pub api_key: String,
     /// Messages API root, like Harness: append `/v1/messages` unless already ending in `/v1`.
     pub base_url: String,
@@ -20,12 +21,13 @@ pub struct ClientConfig {
 impl ClientConfig {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
+            files: FilesConfig::default(),
             api_key: api_key.into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
             proxy: None,
             connect_timeout: Duration::from_secs(15),
             first_byte_timeout: Duration::from_secs(120),
-            stream_idle_timeout: Duration::from_secs(60),
+            stream_idle_timeout: Duration::from_secs(300),
             max_response_bytes: 16 * 1024 * 1024,
             max_event_bytes: 1024 * 1024,
             retry: RetryPolicy::default(),
@@ -33,6 +35,7 @@ impl ClientConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        self.files.validate()?;
         if self.api_key.trim().is_empty() || self.api_key.chars().any(char::is_control) {
             return Err(Error::new(
                 ErrorKind::Configuration,
@@ -52,6 +55,106 @@ impl ClientConfig {
                 "timeouts, size limits and retry delays must be positive and ordered",
             ));
         }
+        Ok(())
+    }
+}
+
+/// DeepSeek Messages image upload policy. Cached file references stay scoped to one client credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilesConfig {
+    pub enabled: bool,
+    pub expires_after_secs: u64,
+    pub refresh_margin_secs: u64,
+    pub timeout_secs: u64,
+    pub max_request_bytes: usize,
+    pub max_inline_bytes: usize,
+    pub max_images: usize,
+}
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            expires_after_secs: 604800,
+            refresh_margin_secs: 3600,
+            timeout_secs: 60,
+            max_request_bytes: 128 * 1024 * 1024,
+            max_inline_bytes: 20 * 1024 * 1024,
+            max_images: 600,
+        }
+    }
+}
+impl FilesConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(3600..=2592000).contains(&self.expires_after_secs)
+            || self.refresh_margin_secs >= self.expires_after_secs
+            || !(1..=3600).contains(&self.timeout_secs)
+            || self.max_request_bytes == 0
+            || self.max_inline_bytes == 0
+            || self.max_images == 0
+        {
+            return Err(Error::new(
+                ErrorKind::Configuration,
+                "invalid Files API lifetime, timeout or image limits",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Public catalog capabilities; unknown routes require explicit host policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub context_window: u64,
+    pub images: bool,
+    pub in_history_updates: bool,
+}
+pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
+    match model {
+        "deepseek-flash" => Some(ModelCapabilities {
+            context_window: 1_000_000,
+            images: true,
+            in_history_updates: true,
+        }),
+        "deepseek-v4-pro" => Some(ModelCapabilities {
+            context_window: 1_000_000,
+            images: false,
+            in_history_updates: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Credential-free transport settings persisted by the host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessagesConfig {
+    pub stream_idle_timeout_secs: u64,
+    pub files: FilesConfig,
+}
+impl Default for MessagesConfig {
+    fn default() -> Self {
+        Self {
+            stream_idle_timeout_secs: 300,
+            files: FilesConfig::default(),
+        }
+    }
+}
+impl MessagesConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=3600).contains(&self.stream_idle_timeout_secs) {
+            return Err(Error::new(
+                ErrorKind::Configuration,
+                "Messages idle timeout must be 1..3600 seconds",
+            ));
+        }
+        self.files.validate()?;
+        Ok(())
+    }
+    pub fn configure(&self, client: &mut ClientConfig) -> Result<()> {
+        self.validate()?;
+        client.stream_idle_timeout = Duration::from_secs(self.stream_idle_timeout_secs);
+        client.files = self.files.clone();
         Ok(())
     }
 }

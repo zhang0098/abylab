@@ -74,7 +74,10 @@ OPTIONS:
       --session-root <dir>  abycore session store root
                             (default: $ABYLAB_HOME/sessions)
       --model <id>          model id (default: $ABY_MODEL or deepseek-flash)
-      --base-url <url>      sets DEEPSEEK_BASE_URL for the agent
+      --base-url <url>      Messages API base URL for this run
+      --search-provider <messages|api>  search backend (default: messages)
+      --search-base-url <url>  Messages search prefix (default: https://api.deepseek.com/anthropic/v1)
+      --web-api-base-url <url>  Search/Fetch API prefix (default: https://api.deepseek.com/v1/tools)
       --api-key <key>       override the agent API key for this run
                             (/login persists one instead)
       --theme <dark|light>  DeepSeek Web UI palette (default: persisted, else dark)
@@ -95,6 +98,9 @@ OPTIONS:
 ";
 
 struct Args {
+    search_provider: Option<abylab_backend::SearchProvider>,
+    search_base_url: Option<String>,
+    web_api_base_url: Option<String>,
     workspace: Option<String>,
     sessions_root: Option<String>,
     session_id: Option<String>,
@@ -120,6 +126,9 @@ fn parse_args() -> Result<Args> {
 
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut args_out = Args {
+        search_provider: None,
+        search_base_url: None,
+        web_api_base_url: None,
         workspace: None,
         sessions_root: None,
         session_id: None,
@@ -150,6 +159,15 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--session-id" => args_out.session_id = Some(take("--session-id")?),
             "--model" => args_out.model = Some(take("--model")?),
             "--base-url" => args_out.base_url = Some(take("--base-url")?),
+            "--search-provider" => {
+                args_out.search_provider = Some(match take("--search-provider")?.as_str() {
+                    "messages" => abylab_backend::SearchProvider::Messages,
+                    "api" => abylab_backend::SearchProvider::Api,
+                    _ => anyhow::bail!("--search-provider must be messages or api"),
+                });
+            }
+            "--search-base-url" => args_out.search_base_url = Some(take("--search-base-url")?),
+            "--web-api-base-url" => args_out.web_api_base_url = Some(take("--web-api-base-url")?),
             "--api-key" => args_out.api_key = Some(take("--api-key")?),
             "--theme" => args_out.theme = Some(take("--theme")?),
             "--uninstall" => args_out.uninstall = true,
@@ -213,7 +231,25 @@ fn build_config(args: &Args) -> Result<RuntimeConfig> {
     let (api_key, key_origin) = RuntimeConfig::resolve_credentials(args.api_key.as_deref(), &home)
         .map_err(|err| anyhow::anyhow!("{err}"))?;
 
+    let (mut web, messages) =
+        UiSettings::load_network(&home).map_err(|error| anyhow::anyhow!("{error}"))?;
+    messages
+        .validate()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(url) = &args.web_api_base_url {
+        web.api_base_url = url.clone();
+    }
+    if let Some(provider) = args.search_provider {
+        web.search_provider = provider;
+    }
+    if let Some(url) = &args.search_base_url {
+        web.messages_search.base_url = url.clone();
+    }
+    web.validate().map_err(|error| anyhow::anyhow!("{error}"))?;
+
     Ok(RuntimeConfig {
+        messages,
+        web,
         workspace,
         home,
         sessions_root,
@@ -572,9 +608,8 @@ fn cap_or_unlimited(value: usize) -> usize {
     }
 }
 
-/// Resolve the host compaction policy from the environment. Without a context
-/// window the policy is `None`, so automatic compaction stays off and only
-/// `/compact` condenses.
+/// Resolve an explicit host compaction override. `None` lets the backend use
+/// the currently routed model's known window (also for resumed sessions/children).
 fn resolve_compaction() -> Result<Option<abylab_backend::CompactionConfig>> {
     let Some(raw) = std::env::var("ABY_CONTEXT_WINDOW")
         .ok()
