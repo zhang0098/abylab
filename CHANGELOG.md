@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-10-19
+
 - `/image` 接受文件浏览器插入的 `@路径`：`/image @../pics/a.jpg`（名字带空格时是
   `@"my pics/a.jpg"`）和 `/image ../pics/a.jpg` 指的是同一个文件，`@` 和引号按语法去掉；
   相对路径按 workspace 解析，和浏览器列出的根、Agent 工具看到的根一致。
@@ -527,7 +529,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19

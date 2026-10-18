@@ -11,6 +11,8 @@ uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-10-19
+
 - `/image` accepts the `@path` the file browser inserts: `/image @../pics/a.jpg` (or
   `@"my pics/a.jpg"` when the name has spaces) names the same file as `/image ../pics/a.jpg` —
   the marker and the quotes are grammar and are dropped. Relative paths resolve against the
@@ -701,7 +703,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19
