@@ -38,8 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   回合/工具截止时间，以及通过 `CancellationToken` 的协作式取消。
 - **本地工具包** — `LocalTools` 原子注册 `read`、`write`、`edit`、`bash`
   四个工具，也可单独注册：
-  - `read`/`write`/`edit` 基于 cap-std 目录能力运行：版本守卫（拒绝改动已过期
-    文件）、staging 目录原子发布、字节/行数上限。
+  - `read`/`write`/`edit` 基于 cap-std 目录能力运行：版本守卫（元数据变化时
+    比较整个文件原始字节的 SHA-256 摘要，内容未变可继续；内容改变仍需重读）、
+    staging 目录原子发布、字节/行数上限。操作进行中的版本变化仍会被拒绝。
   - `bash` 生成沙箱化子进程（Linux 上用 Landlock + seccomp），支持增量读取
     输出的后台任务，溢出输出自动落盘。
   - 每次工具调用都要经过 `AgentHooks::authorize`；三档权限
