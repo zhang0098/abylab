@@ -11,6 +11,8 @@ uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-10-18
+
 - The READMEs and the abylab.ai homepage now name the current release: a latest-release badge on
   GitHub, and a version line above the hero linking to the release and the changelog. The site's
   line is stamped from the release tag at deploy time and the badge follows GitHub's latest
@@ -694,7 +696,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18

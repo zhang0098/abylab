@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-10-18
+
 - README 顶部和 abylab.ai 首页现在都标出当前版本：README 是最新版本徽章，首页是标题上方
   一行「最新版本」加版本号，都链到 GitHub 的 release 和对应的更新日志。首页那行由部署脚本
   按 tag 覆盖，徽章读 GitHub 的 latest release，发版时两处都不用手动改。
@@ -521,7 +523,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/zhang0098/abylab/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/zhang0098/abylab/compare/v0.1.17...v0.1.18
