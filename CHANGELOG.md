@@ -10,6 +10,10 @@
 
 ## [Unreleased]
 
+- README 顶部和 abylab.ai 首页现在都标出当前版本：README 是最新版本徽章，首页是标题上方
+  一行「最新版本 v0.1.20」，都链到 GitHub 的 release 和对应的更新日志。首页那行由部署脚本
+  按 tag 覆盖，徽章读 GitHub 的 latest release，发版时两处都不用手动改。
+
 ## [0.1.20] - 2026-10-17
 
 - 保留并默认使用 Messages 服务端搜索；直连 Search API 可显式选择，新增直连 `web_fetch`，

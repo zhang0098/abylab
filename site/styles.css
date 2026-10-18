@@ -147,6 +147,14 @@ td, th { padding-block: 0.55rem; }
 /* Hero ---------------------------------------------------------------- */
 
 .hero { padding-block: 3.5rem 2.75rem; }
+/* The release the page is published with. stage-site.sh stamps the tag in at
+   deploy time; the text in site/ is only what a local preview shows. */
+.version-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem; margin: 0 0 1.1rem; font-size: 0.82rem; }
+a.version-chip { display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.1rem 0.7rem; border: 1px solid var(--aby-border); border-radius: 999px; background: var(--aby-soft); color: var(--aby-muted); text-decoration: none; }
+a.version-chip:hover { border-color: var(--aby-accent); color: var(--aby-muted); }
+.version-number { color: var(--aby-accent); font: 0.8rem var(--aby-mono); }
+a.version-changelog { color: var(--aby-muted); text-decoration: none; }
+a.version-changelog:hover { color: var(--aby-accent); }
 .hero h1 { margin: 0 0 1.1rem; font-size: clamp(2rem, 5vw, 2.7rem); font-weight: 650; line-height: 1.3; }
 .hero .lead { margin: 0 0 1.4rem; max-width: 40rem; line-height: 1.85; }
 .bullets { margin: 0 0 1.9rem; padding: 0; list-style: none; display: grid; gap: 0.45rem; color: var(--aby-muted); font-size: 0.95rem; }

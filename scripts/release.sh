@@ -7,8 +7,9 @@
 #
 #   1. preflight — you are on an up-to-date main, the tag is free, the three
 #      crates agree on the previous release, and `[Unreleased]` has entries.
-#   2. bump — the three crate versions, Cargo.lock, and both changelogs
-#      (`[Unreleased]` becomes `[VERSION] - today`, plus the compare links).
+#   2. bump — the three crate versions, Cargo.lock, both changelogs
+#      (`[Unreleased]` becomes `[VERSION] - today`, plus the compare links),
+#      and the release the site's hero names.
 #   3. verify — `cargo metadata --locked` (the lock agrees with the manifests)
 #      and `abylab --version` (the string release.yml's tag gate compares).
 #   4. commit `Release <version>`, whose body inlines the English changelog
@@ -46,7 +47,7 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
         --no-publish) NO_PUBLISH=1 ;;
-        --help|-h) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --help|-h) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     esac
 done
 
@@ -119,8 +120,18 @@ for file in CHANGELOG.md CHANGELOG.en.md; do
     mv "$file.tmp" "$file"
 done
 
-# --------------------------------------------------------------- verify ---
+# The site's hero names the release it is published with — the one place
+# outside the build that spells a version out. stage-site.sh stamps the live
+# page from the tag regardless; bumping the checked-in copy keeps a local
+# preview, and the commit, from reading a release behind.
+for page in site/index.html site/en/index.html; do
+    [ "$(grep -c "data-latest-version>v$OLD<" "$page")" = 1 ] ||
+        die "$page does not carry exactly one data-latest-version>v$OLD< marker"
+    sed "s#data-latest-version>v$OLD<#data-latest-version>v$VERSION<#" "$page" > "$page.tmp"
+    mv "$page.tmp" "$page"
+done
 
+# --------------------------------------------------------------- verify ---
 say "   crates now at $(grep -m1 '^version = ' "$TUI_TOML" | cut -d'"' -f2)"
 BUILT="$(cargo run -q --locked -p abylab-tui -- --version)" || die "abylab --version failed"
 say "   $BUILT"
@@ -136,14 +147,15 @@ notes="$(awk -v ver="$VERSION" '
 ' CHANGELOG.en.md)"
 [ -n "$notes" ] || die "could not read the [$VERSION] section out of CHANGELOG.en.md"
 
-git add "$TUI_TOML" crates/abycore/Cargo.toml crates/abylab-backend/Cargo.toml Cargo.lock CHANGELOG.md CHANGELOG.en.md
+git add "$TUI_TOML" crates/abycore/Cargo.toml crates/abylab-backend/Cargo.toml Cargo.lock CHANGELOG.md CHANGELOG.en.md site/index.html site/en/index.html
 git commit -q -F - <<MSG
 Release $VERSION
 
 Bump the three crates in lockstep so the compiled-in version matches the tag.
 release.yml's \`check\` gate enforces the same invariant, since install.sh
 compares \`abylab --version\` against the release tag to decide whether an
-upgrade is needed.
+upgrade is needed. The site's hero names the same release: stage-site.sh
+restamps it at deploy time, and this keeps the checked-in copy in step.
 
 What this release carries since v$OLD:
 

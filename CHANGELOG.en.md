@@ -11,6 +11,11 @@ uninstall) live in
 
 ## [Unreleased]
 
+- The READMEs and the abylab.ai homepage now name the current release: a latest-release badge on
+  GitHub, and a version line above the hero linking to the release and the changelog. The site's
+  line is stamped from the release tag at deploy time and the badge follows GitHub's latest
+  release, so neither needs a manual edit when a release goes out.
+
 ## [0.1.20] - 2026-10-17
 
 - Retain Messages server-side search as the default, with explicit opt-in to the direct
