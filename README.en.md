@@ -8,6 +8,11 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/zhang0098/abylab/releases/latest"><img src="https://img.shields.io/github/v/release/zhang0098/abylab?style=flat-square&amp;label=latest&amp;color=2f6f4e" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/zhang0098/abylab?style=flat-square&amp;color=2f6f4e" alt="MIT License"></a>
+</p>
+
+<p align="center">
   <strong>English</strong> · <a href="README.md">中文</a> · <a href="https://abylab.ai/en/">Website</a> · <a href="CHANGELOG.en.md">Changelog</a> · <a href="TECH.en.md">Technical docs</a>
 </p>
 

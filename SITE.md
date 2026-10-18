@@ -199,6 +199,11 @@ curl -sO https://abylab.ai/downloads/latest/SHA256SUMS && sha256sum -c --ignore-
   `--pico-code-kbd-color`、`--pico-range-thumb-border-color`。
 - README 的横幅是 `docs/assets/readme-banner.svg`，与站点共用墨绿配色，
   使用系统字体，不依赖外链图片服务。
+- 首页那个「最新版本」不是手写的：`scripts/stage-site.sh` 每次部署都会把
+  `data-latest-version` 里的文字换成正在发布的那条 tag，所以线上永远和
+  `/downloads/latest/VERSION`、`install.sh` 装到的是同一版。仓库里那句由
+  `scripts/release.sh` 跟着版本一起 bump，只影响本地预览。两份 README 的版本
+  徽章读 GitHub 的 latest release，不用改。
 - 加了第三方脚本（统计、字体）记得同步放宽 `_headers` 里的 CSP。
 - 改 CSS / JS 不用改版本号、也不用清缓存：`scripts/stage-site.sh` 在每次部署时
   按文件内容把 HTML 里的 `/styles.css`、`/app.js`、`/vendor/pico.min.css` 改写成

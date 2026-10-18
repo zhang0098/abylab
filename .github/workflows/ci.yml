@@ -39,6 +39,22 @@ jobs:
           fi
           echo "site/install.sh matches install.sh"
 
+      # The hero names the release the page belongs to, and release.sh bumps it
+      # with the crates. Staging stamps the tag in at deploy time either way, so
+      # a drift here never reaches the live site — it reaches every local
+      # preview and the release commit, which is where it is cheapest to catch.
+      - name: Site names the current version
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' crates/abylab-tui/Cargo.toml | cut -d'"' -f2)
+          for page in site/index.html site/en/index.html; do
+            if ! grep -q "data-latest-version>v$version<" "$page"; then
+              echo "::error::$page does not name v$version — run scripts/release.sh to bump both"
+              exit 1
+            fi
+          done
+          echo "site pages name v$version"
+
       # Deploying references the CSS and JS under hashed URLs, so a stale copy
       # can never outlive a deploy. If the rewrite breaks, the deployed HTML
       # points at a file nobody uploaded and every visitor gets an unstyled

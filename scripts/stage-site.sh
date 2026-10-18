@@ -10,7 +10,8 @@
 #
 # Either way the staged HTML references the CSS and JS as `/styles.css?v=<hash>`
 # (see version_assets below) — the staging step is where a deploy learns what it
-# is uploading, and it is the one place both deployers already share.
+# is uploading, and it is the one place both deployers already share. With a tag
+# it also stamps that tag into the hero's version chip (see stamp_version).
 #
 # Both deployers call this — site.yml for site pushes, release.yml's mirror job
 # after a release — because a Pages deployment is a full snapshot of the
@@ -60,6 +61,27 @@ version_assets() {
 
 echo "staged site/ with hashed asset URLs:"
 version_assets
+
+# Stamp the release tag into the pages' version chip.
+#
+# The HTML checked in under site/ carries the version release.sh last bumped,
+# which is what a local preview shows. Stamping at deploy time is what keeps the
+# live page naming the release it ships alongside — the same one
+# /downloads/latest/VERSION and install.sh point at — even when the deploy runs
+# after the tag, or a release was cut without touching the site.
+stamp_version() {
+    local page
+    for page in "$DEST"/*.html "$DEST"/*/*.html; do
+        [ -f "$page" ] || continue
+        sed -E "s#(data-latest-version>)[^<]*#\1$TAG#" "$page" >"$page.tmp"
+        mv "$page.tmp" "$page"
+    done
+    echo "  version chip: $TAG"
+}
+
+if [ -n "$TAG" ]; then
+    stamp_version
+fi
 
 if [ -z "$TAG" ]; then
     echo "staged site/ only, no downloads (no tag given)"
