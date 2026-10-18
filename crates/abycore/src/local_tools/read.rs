@@ -1,10 +1,12 @@
 //! Bounded line windows scanned without buffering an entire file or giant line.
 use super::workspace::{
-    Operation, ToolResult, Workspace, failed, inspect, io_error, open_file, verify, version,
+    FileObservation, Operation, ToolResult, Workspace, failed, inspect, io_error, open_file,
+    verify, version,
 };
 use crate::ToolOutput;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path};
 
 #[derive(Serialize)]
@@ -43,6 +45,7 @@ pub(super) fn execute(
     let mut buffer = [0; 8192];
     let mut pending = Vec::with_capacity(8196);
     let mut bytes = 0usize;
+    let mut digest = Sha256::new();
     loop {
         operation.check()?;
         let count = file
@@ -53,6 +56,7 @@ pub(super) fn execute(
         }
         bytes = bytes.saturating_add(count);
         workspace.check_size(bytes)?;
+        digest.update(&buffer[..count]);
         pending.extend_from_slice(&buffer[..count]);
         let valid = match std::str::from_utf8(&pending) {
             Ok(text) => {
@@ -83,9 +87,13 @@ pub(super) fn execute(
     }
     verify(&workspace.directory, path, Some(&metadata))?;
     operation.check()?;
-    operation
-        .session
-        .observe(key.clone(), Some(version(&metadata)));
+    operation.session.observe(
+        key.clone(),
+        Some(FileObservation {
+            version: version(&metadata),
+            digest: digest.finalize().into(),
+        }),
+    );
     Ok(window.render(&key.to_string_lossy(), operation.output_limit))
 }
 

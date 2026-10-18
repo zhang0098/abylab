@@ -141,7 +141,7 @@ impl Tool for ReadTool {
 }
 impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition { name:"write".into(), description:"Create or fully replace a UTF-8 text file. Parent directories are created automatically. Read an existing file before overwriting it, unless this session just wrote or edited it. Changes since the last read are rejected.".into(),
+        ToolDefinition { name:"write".into(), description:"Create or fully replace a UTF-8 text file. Parent directories are created automatically. Read an existing file before overwriting it, unless this session just wrote or edited it. Content changes since the last read or write are rejected; metadata-only changes are allowed. On FS_STALE_VERSION, read again and reconsider the overwrite.".into(),
             parameters:json!({"type":"object","properties":{"file_path":{"type":"string","minLength":1},"content":{"type":"string"}},"required":["file_path","content"],"additionalProperties":false}) }
     }
     fn validate(&self, value: &Value) -> std::result::Result<(), ToolError> {
@@ -153,7 +153,7 @@ impl Tool for WriteTool {
             run_filesystem(self.workspace.clone(), context, input.file_path, true, move |workspace, path, operation| {
                 let previous = inspect(&workspace.directory, path)?;
                 let key = workspace.absolute(path);
-                operation.session.guard(&key, previous.as_ref(), false)?;
+                operation.session.guard(workspace, path, previous.as_ref(), false, operation)?;
                 let before = previous.as_ref().filter(|m| m.len() < workspace.config.max_diff_bytes as u64)
                     .and_then(|_| read_file_limited(workspace, path, operation, Some(workspace.config.max_diff_bytes)).ok());
                 let committed = replace(workspace, path, &input.content, previous.as_ref(), operation)?;
@@ -170,7 +170,7 @@ impl Tool for WriteTool {
 }
 impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition { name:"edit".into(), description:"Edit an existing UTF-8 text file by replacing literal old_string with new_string. Read it first unless just created or edited in this session. By default old_string must occur exactly once; set replace_all to replace all occurrences. Formatting must match exactly (CRLF/LF are normalized).".into(),
+        ToolDefinition { name:"edit".into(), description:"Edit an existing UTF-8 text file by replacing literal old_string with new_string. Read it first unless just created or edited in this session. By default old_string must occur exactly once; set replace_all to replace all occurrences. Formatting must match exactly (CRLF/LF are normalized). Content changes since the last read or write are rejected; metadata-only changes are allowed. On FS_STALE_VERSION, read again and rebuild the edit from the current content.".into(),
             parameters:json!({"type":"object","properties":{"file_path":{"type":"string","minLength":1},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path","old_string","new_string"],"additionalProperties":false}) }
     }
     fn validate(&self, value: &Value) -> std::result::Result<(), ToolError> {
@@ -182,7 +182,7 @@ impl Tool for EditTool {
             run_filesystem(self.workspace.clone(), context, input.file_path, true, move |workspace, path, operation| {
                 let previous = inspect(&workspace.directory, path)?;
                 let key = workspace.absolute(path);
-                operation.session.guard(&key, previous.as_ref(), true)?;
+                operation.session.guard(workspace, path, previous.as_ref(), true, operation)?;
                 // Literal matching needs the whole file in memory. The host's
                 // `max_file_bytes` bounds the read when set; otherwise the
                 // built-in ceiling keeps an arbitrarily large file from

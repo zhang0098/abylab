@@ -1,6 +1,7 @@
 use super::{LocalToolConfig, PermissionMode};
 use crate::{CancellationToken, ToolContext, ToolError, ToolOutput};
 use cap_std::fs::{Dir, DirBuilder, File, Metadata, OpenOptions};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -14,7 +15,14 @@ pub(super) type ToolResult<T> = Result<T, ToolError>;
 /// Ephemeral observations, owned by an Agent rather than a shared tool bundle.
 #[derive(Default)]
 pub(crate) struct LocalSession {
-    observed: Mutex<HashMap<PathBuf, Option<FileVersion>>>,
+    observed: Mutex<HashMap<PathBuf, Option<FileObservation>>>,
+}
+
+/// Metadata is the fast path; the digest identifies the exact bytes observed.
+#[derive(Clone, Debug)]
+pub(super) struct FileObservation {
+    pub version: FileVersion,
+    pub digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +51,7 @@ pub(super) fn version(metadata: &Metadata) -> FileVersion {
 }
 
 impl LocalSession {
-    pub(super) fn observe(&self, path: PathBuf, value: Option<FileVersion>) {
+    pub(super) fn observe(&self, path: PathBuf, value: Option<FileObservation>) {
         self.observed
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -51,14 +59,33 @@ impl LocalSession {
     }
     pub(super) fn guard(
         &self,
+        workspace: &Workspace,
         path: &Path,
         current: Option<&Metadata>,
         edit: bool,
+        operation: &Operation,
     ) -> ToolResult<()> {
-        let observations = self.observed.lock().unwrap_or_else(|p| p.into_inner());
-        match observations.get(path) {
+        // Never hold the session lock across filesystem I/O.
+        let expected = self
+            .observed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&workspace.absolute(path))
+            .cloned();
+        match expected {
             Some(Some(expected)) => {
-                if current.map(version).as_ref() != Some(expected) {
+                if current.map(version).as_ref() == Some(&expected.version) {
+                    return Ok(());
+                }
+                // A touch, chmod or identical atomic save is not a content conflict.
+                // Use current metadata for the later commit check, which remains strict.
+                let unchanged = match current {
+                    Some(metadata) if metadata.len() == expected.version.len => {
+                        fingerprint(workspace, path, metadata, operation)? == expected.digest
+                    }
+                    _ => false,
+                };
+                if !unchanged {
                     return Err(failed(
                         "FS_STALE_VERSION: file changed since it was read; read it again before modifying it",
                     ));
@@ -402,6 +429,41 @@ pub(super) fn verify(directory: &Dir, path: &Path, previous: Option<&Metadata>) 
     Ok(())
 }
 
+/// Recheck raw bytes only after metadata changes. A concurrent change during
+/// this scan is still a conflict, even if the final bytes happen to match.
+fn fingerprint(
+    workspace: &Workspace,
+    path: &Path,
+    previous: &Metadata,
+    operation: &Operation,
+) -> ToolResult<[u8; 32]> {
+    operation.check()?;
+    let (mut file, metadata) = open_file(workspace, path)?;
+    if version(&metadata) != version(previous) {
+        return Err(failed(
+            "FS_STALE_VERSION: file changed during the operation; read it again",
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 8192];
+    let mut bytes = 0usize;
+    loop {
+        operation.check()?;
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| io_error("verify file content", e))?;
+        if count == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(count);
+        workspace.check_size(bytes)?;
+        digest.update(&buffer[..count]);
+    }
+    verify(&workspace.directory, path, Some(previous))?;
+    operation.check()?;
+    Ok(digest.finalize().into())
+}
+
 /// Private staging plus atomic publication. Creation uses a no-replace hard link.
 pub(super) fn replace(
     workspace: &Workspace,
@@ -409,7 +471,7 @@ pub(super) fn replace(
     content: &str,
     previous: Option<&Metadata>,
     operation: &Operation,
-) -> ToolResult<FileVersion> {
+) -> ToolResult<FileObservation> {
     workspace.check_size(content.len())?;
     operation.check()?;
     let parent = path
@@ -457,10 +519,12 @@ pub(super) fn replace(
     let mut file = staging
         .open_with("content", &options)
         .map_err(|e| io_error("create temporary file", e))?;
+    let mut digest = Sha256::new();
     for chunk in content.as_bytes().chunks(8192) {
         operation.check()?;
         file.write_all(chunk)
             .map_err(|e| io_error("write temporary file", e))?;
+        digest.update(chunk);
     }
     if let Some(previous) = previous {
         file.set_permissions(previous.permissions())
@@ -513,7 +577,10 @@ pub(super) fn replace(
                 "file was replaced but directory sync failed; verify its result".into(),
             )
         })?;
-    Ok(published)
+    Ok(FileObservation {
+        version: published,
+        digest: digest.finalize().into(),
+    })
 }
 
 struct Temporary<'a> {

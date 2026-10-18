@@ -205,6 +205,146 @@ async fn guards_unseen_and_stale_files_before_write_or_literal_matching() {
 }
 
 #[tokio::test]
+async fn unchanged_contents_allow_mutation_after_metadata_or_inode_changes() {
+    for atomic_save in [false, true] {
+        for overwrite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a");
+            // Fingerprints must cover the original bytes, before read strips BOM/CRLF.
+            let original = "\u{feff}one\r\ntwo\r\n";
+            std::fs::write(&path, original).unwrap();
+            let tools = LocalTools::new(dir.path()).unwrap();
+            let ctx = context(4096);
+            read(&tools, "a", &ctx).await;
+            if atomic_save {
+                std::fs::write(dir.path().join("saved"), original).unwrap();
+                std::fs::rename(dir.path().join("saved"), &path).unwrap();
+            } else {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(std::time::UNIX_EPOCH)
+                    .unwrap();
+            }
+            let expected = if overwrite {
+                write(&tools, "a", "replacement", &ctx).await;
+                "replacement"
+            } else {
+                edit(&tools, "a", "two", "second", false, &ctx)
+                    .await
+                    .unwrap();
+                "one\r\nsecond\r\n"
+            };
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn successful_mutations_record_new_content_fingerprints() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = LocalTools::new(dir.path()).unwrap();
+    let ctx = context(4096);
+    let path = dir.path().join("a");
+    write(&tools, "a", "old", &ctx).await;
+    std::fs::write(dir.path().join("saved"), "old").unwrap();
+    std::fs::rename(dir.path().join("saved"), &path).unwrap();
+    edit(&tools, "a", "old", "new", false, &ctx).await.unwrap();
+    std::fs::write(dir.path().join("saved"), "new").unwrap();
+    std::fs::rename(dir.path().join("saved"), &path).unwrap();
+    write(&tools, "a", "end", &ctx).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "end");
+}
+
+#[tokio::test]
+async fn content_changes_outside_read_window_still_block_matching_edits_and_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let original = format!("target\n{}old\n", "x".repeat(20_000));
+    let external = original.replace("old", "new");
+    std::fs::write(&path, &original).unwrap();
+    let tools = LocalTools::new(dir.path()).unwrap();
+    let ctx = context(4096);
+    tools
+        .read()
+        .execute(json!({"file_path":"a","limit":1}), ctx.clone())
+        .await
+        .unwrap();
+    // Same length and mtime, and old_string still matches. Only the unseen tail changed.
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(dir.path().join("saved"), &external).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(dir.path().join("saved"))
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    std::fs::rename(dir.path().join("saved"), &path).unwrap();
+    for all in [false, true] {
+        assert!(
+            edit(&tools, "a", "target", "changed", all, &ctx)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("FS_STALE_VERSION")
+        );
+    }
+    assert!(
+        tools
+            .write()
+            .execute(json!({"file_path":"a","content":original}), ctx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("FS_STALE_VERSION")
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
+}
+
+#[tokio::test]
+async fn content_fallback_does_not_relax_the_commit_version_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = LocalTools::new(dir.path()).unwrap();
+    let ctx = context(4096);
+    write(&tools, "a", "old", &ctx).await;
+    let path = tools.workspace.resolve("a").unwrap();
+    let operation = workspace::Operation {
+        cancellation: ctx.cancellation,
+        deadline: ctx.deadline,
+        output_limit: 4096,
+        session: ctx.local_session,
+    };
+    std::fs::write(dir.path().join("saved"), "old").unwrap();
+    std::fs::rename(dir.path().join("saved"), dir.path().join("a")).unwrap();
+    let previous = workspace::inspect(&tools.workspace.directory, &path).unwrap();
+    operation
+        .session
+        .guard(&tools.workspace, &path, previous.as_ref(), true, &operation)
+        .unwrap();
+    // A second identical save after validation must still stop publication.
+    std::fs::write(dir.path().join("saved"), "old").unwrap();
+    std::fs::rename(dir.path().join("saved"), dir.path().join("a")).unwrap();
+    assert!(
+        workspace::replace(
+            &tools.workspace,
+            &path,
+            "new",
+            previous.as_ref(),
+            &operation
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("FS_STALE_VERSION")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a")).unwrap(),
+        "old"
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
 async fn observations_are_per_session_even_with_one_shared_bundle() {
     let dir = tempfile::tempdir().unwrap();
     let tools = LocalTools::new(dir.path()).unwrap();
