@@ -139,6 +139,31 @@ pub fn format_file_mention(rel: &str, is_dir: bool, quoted: bool) -> Option<Stri
     }
 }
 
+/// Split a slash command's path argument from its trailing caption, taking
+/// the `@` mention form the browser inserts.
+///
+/// The composer's `@` menu rewrites a token into `@path` (or `@"path with
+/// spaces"`), so a path picked through the explorer arrives at a command as
+/// `/image @../pics/a.jpg caption`. That spelling means the same file as
+/// the bare `../pics/a.jpg`: the marker and the quotes are syntax, not path
+/// text. The caption is whatever follows the closing quote, or the first
+/// whitespace in the unquoted form.
+pub fn split_path_caption(arg: &str) -> (String, String) {
+    let arg = arg.trim_start();
+    let rest = arg.strip_prefix('@').unwrap_or(arg);
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let (path, tail) = match quoted.find('"') {
+            Some(end) => (&quoted[..end], &quoted[end + 1..]),
+            None => (quoted, ""),
+        };
+        return (path.to_string(), tail.trim().to_string());
+    }
+    match rest.split_once(char::is_whitespace) {
+        Some((path, tail)) => (path.to_string(), tail.trim().to_string()),
+        None => (rest.to_string(), String::new()),
+    }
+}
+
 /// Workspace-relative spelling of `path` against `base`: `src/main.rs`
 /// under the workspace, `..`-prefixed for ancestors, `.` for the base
 /// itself, and the absolute path when the two share no root.
