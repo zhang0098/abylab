@@ -44,8 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Local tool bundle** — `LocalTools` registers `read`, `write`, `edit` and
   `bash` atomically, or individually:
   - `read`/`write`/`edit` run on a cap-std directory capability with version
-    guards (stale files are rejected), atomic staging + publication, and
-    byte/line caps.
+    guards (metadata changes trigger a SHA-256 comparison of the entire file's
+    raw bytes; unchanged content may proceed, changed content requires a reread),
+    atomic staging + publication, and byte/line caps. Version changes during an
+    operation are still rejected.
   - `bash` spawns sandboxed children (Landlock + seccomp on Linux), supports
     background jobs with incremental output, and saves overflowing output.
   - Every tool call passes `AgentHooks::authorize`; three permission presets
