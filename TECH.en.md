@@ -5,6 +5,48 @@
 Internals only — install is in [README.en.md](README.en.md); commands, keys and
 size numbers are on [abylab.ai](https://abylab.ai/).
 
+## Input, turn and background-task reliability
+
+Host input has a stable `input_id`. Prompts, queued messages and steers first enter a
+workspace/session-scoped durable inbox. A new session commits a resumable empty checkpoint
+before accepting its first input. The user message's `Item::Message.id` is committed
+with its session checkpoint before removing the inbox copy or emitting `QueueClaimed` /
+`SteerAdmitted`. Queue v3 migrates v1/v2 records under the exclusive session writer and
+persists their identities before delivery. Recovery deduplicates committed IDs and holds
+remaining inputs. Session snapshot v2 is unchanged. Replacement, deletion and directory
+creation sync parent directories. Without a session writer, input is rejected.
+Embedded hosts with `home=None` have no independent durable inbox.
+
+`driver/inbox.rs` owns delivery state; `driver/persistence.rs` owns the session writer.
+Each serializes blocking operations on a dedicated thread behind a bounded channel and
+asynchronous receipts. Cancellation cannot revoke an accepted commit. Model requests and
+tool effects wait for the commit; switching/shutdown drain work and release the writer.
+Unadmitted steers are withdrawn from the SDK inbox before becoming editable again.
+Inputs already in live history stay immutable until committed or recovered after restart.
+
+`TurnEnd` includes session, turn, typed `TurnStatus`, error and known aggregate usage for all
+requests in that host turn; `unknown_requests` identifies missing/inconsistent usage. TUI and `ask` share backend semantic event types. `ask` filters
+by session/turn and no longer waits 200 ms for a trailing error. Queue snapshots retain
+session identity and are ignored by other sessions. `queue_view.rs` owns optimistic rows,
+steer acknowledgements and cell-index remapping; `attachment_loader.rs` owns attachment
+jobs, cancellation and draft correlation. Execution and durable state remain backend-owned.
+
+`close_agent` closes a settled direct child; hosts can call `Subagents::close`.
+Closing releases its conversation/tools and keeps a result summary (up to 16 KiB) for
+repeatable `get` / `wait_agent` calls during this process. Archived children reject messages
+and do not consume the 64 resident slots. Descendants must close first; running children,
+unresolved tools and unavailable executors are protected. Session switching archives old
+settled leaves, leaving background work running and archiving it when it settles.
+The eight-running-agent concurrency limit is unchanged.
+
+Attachment IO uses one worker with at most eight outstanding jobs and one buffered result.
+Unix files open nonblocking and must pass metadata checks on the opened handle as regular
+files. Reads stop at 32 MiB; staged attachments still allow eight images and 32 MiB total.
+Each clipboard command has a three-second deadline and bounded output; cancellation or
+timeout kills/reaps its process group. Draft edits/replacement and session changes invalidate
+stale results; Esc cancels loading. Linux uses wl-paste/xclip; macOS uses osascript with
+an isolated temporary directory that is removed on completion.
+
 ## DeepSeek network protocols
 
 Conversation traffic stays on native Messages (`/anthropic/v1/messages`,

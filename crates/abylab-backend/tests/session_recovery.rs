@@ -107,7 +107,7 @@ impl Live {
             session_id: id.into(),
             text: text.into(),
         });
-        self.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind }) if session == id && kind == "completed"));
+        self.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind, .. }) if session == id && kind.as_str() == "completed"));
     }
 }
 impl Drop for Live {

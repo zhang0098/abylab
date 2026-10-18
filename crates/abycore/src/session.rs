@@ -49,6 +49,17 @@ pub struct SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    /// Whether a host input is already in the durable transcript. A host must
+    /// inspect a committed snapshot, not an uncommitted in-memory mutation,
+    /// before acknowledging delivery or deleting its inbox record.
+    pub fn contains_input(&self, input_id: &str) -> bool {
+        self.items.iter().any(|item| {
+            matches!(item,
+                Item::Message { role: crate::MessageRole::User, id: Some(id), .. } if id == input_id
+            )
+        })
+    }
+
     pub fn new(system_prompt: impl Into<String>, model: ModelOptions) -> Self {
         Self {
             version: 2,

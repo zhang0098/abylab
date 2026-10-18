@@ -291,29 +291,32 @@ fn a_steered_row_cannot_be_republished_edited_or_queued_again() {
             })
         )
     });
-    live.wait(|event| matches!(event, Event::Ctl(CtlEvent::QueueClaimed { item_id: 1 })));
+    // Acknowledging the memory handoff must not delete its durable copy.
+    assert_eq!(live.stored_queue()["items"][0]["text"], "STEER_THIS");
     live.handle.send(Cmd::QueueForSession {
         session_id: "active".into(),
         item_id: 2,
         text: "still waiting".into(),
     });
     let updated = live.wait(|event| matches!(event, Event::Ctl(CtlEvent::Queue { items, .. }) if items.iter().any(|item| item.item_id == 2)));
-    assert!(matches!(updated, Event::Ctl(CtlEvent::Queue { items, .. }) if items.len() == 1));
-    assert_eq!(live.stored_queue()["items"].as_array().unwrap().len(), 1);
-    assert_eq!(live.stored_queue()["items"][0]["text"], "still waiting");
+    assert!(matches!(updated, Event::Ctl(CtlEvent::Queue { items, .. }) if items.len() == 2));
+    assert_eq!(live.stored_queue()["items"].as_array().unwrap().len(), 2);
+    assert_eq!(live.stored_queue()["items"][1]["text"], "still waiting");
     live.handle.send(Cmd::UpdateQueue {
         session_id: "active".into(),
         item_id: 1,
         action: QueueAction::Edit("TOO_LATE".into()),
     });
-    live.wait(|event| matches!(event, Event::Ctl(CtlEvent::QueueClaimed { item_id: 1 })));
+    live.queue(2);
+    assert_eq!(live.stored_queue()["items"][0]["text"], "STEER_THIS");
     live.handle.send(Cmd::UpdateQueue {
         session_id: "active".into(),
         item_id: 2,
         action: QueueAction::Remove,
     });
-    live.queue(0);
+    live.queue(1);
     answer(question);
+    live.wait(|event| matches!(event, Event::Ctl(CtlEvent::QueueClaimed { item_id: 1 })));
     live.wait(|event| {
         matches!(
             event,
@@ -423,7 +426,9 @@ fn live_queue_and_session_isolation_while_waiting_for_a_human() {
     answer(question);
     for _ in 0..2 {
         let ended = live.wait(|event| matches!(event, Event::Ui(UiEvent::TurnEnd { .. })));
-        assert!(matches!(ended, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "completed"));
+        assert!(
+            matches!(ended, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind.as_str() == "completed")
+        );
     }
     let snapshot = abycore::SessionStore::new(root.path())
         .unwrap()

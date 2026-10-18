@@ -569,6 +569,8 @@ async fn interrupt_can_resume_without_replaying_uncertain_tools() {
         settled(&agents, &child.id).await.status,
         SubagentStatus::NeedsResolution
     );
+    assert!(agents.close(&child.id).is_err());
+    assert!(agents.forget(&child.id).is_err());
     let snapshot = agents.snapshot(&child.id).unwrap();
     assert_eq!(snapshot.pending[0].state, PendingState::Unknown);
     assert_eq!(
@@ -670,6 +672,7 @@ async fn model_controls_cannot_reach_another_roots_children() {
             "outsider1",
             vec![
                 call("list", "list_agents", "{}"),
+                call("close", "close_agent", &json!({"agent_id":id}).to_string()),
                 call("wait", "wait_agent", &json!({"agent_id":id}).to_string()),
                 call(
                     "send",
@@ -712,7 +715,7 @@ async fn model_controls_cannot_reach_another_roots_children() {
         })
         .collect();
     assert_eq!(outputs[0], ("list".into(), "[]".into(), false));
-    assert_eq!(outputs.len(), 4);
+    assert_eq!(outputs.len(), 5);
     assert!(
         outputs[1..]
             .iter()
@@ -857,6 +860,8 @@ async fn panicking_child_settles_waiters_and_retains_recoverable_snapshot() {
         settled(&agents, &child.id).await.status,
         SubagentStatus::Unavailable
     );
+    assert!(agents.close(&child.id).is_err());
+    assert!(agents.forget(&child.id).is_err());
     let snapshot = agents.snapshot(&child.id).unwrap();
     assert_eq!(snapshot.pending[0].state, PendingState::Unknown);
     snapshot.validate().unwrap();
@@ -1082,6 +1087,7 @@ async fn ancestor_can_interrupt_grandchild_without_interrupting_its_parent() {
         SubagentStatus::Running
     );
     assert!(agents.forget(&middle.id).is_err());
+    assert!(agents.close(&middle.id).is_err());
     agents.shutdown().await;
     assert!(agents.forget(&middle.id).is_err());
     agents.forget(&leaf.id).unwrap();
@@ -1238,4 +1244,143 @@ async fn child_hooks_forward_view_policy_and_tool_reminders_only_to_the_child() 
     );
     assert!(parent.snapshot().items.is_empty());
     agents.shutdown().await;
+}
+
+#[tokio::test]
+async fn closing_releases_capacity_and_preserves_repeatable_results() {
+    let server = Server::start(
+        (0..70)
+            .map(|n| {
+                Reply::sse(response(
+                    &format!("r{n}"),
+                    vec![message("m", &format!("answer {n}"))],
+                ))
+            })
+            .collect(),
+    )
+    .await;
+    let parent = agent(&server);
+    let agents = Subagents::with_config(SubagentConfig {
+        max_agents: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut ids = vec![];
+    for n in 0..70 {
+        let child = agents
+            .start(&parent, SubagentRequest::new("task", "answer"))
+            .unwrap();
+        assert!(
+            agents.close(&child.id).is_err(),
+            "running work is protected"
+        );
+        settled(&agents, &child.id).await;
+        let closed = agents.close(&child.id).unwrap();
+        assert_eq!(closed.status, SubagentStatus::Archived);
+        assert_eq!(closed.result.unwrap().output, format!("answer {n}"));
+        assert!(agents.send_message(&child.id, "again").is_err());
+        assert!(
+            agents.snapshot(&child.id).is_err(),
+            "the heavy transcript was released"
+        );
+        ids.push(child.id);
+    }
+    for (n, id) in ids.iter().enumerate() {
+        for _ in 0..2 {
+            assert_eq!(
+                agents.wait(id).await.unwrap().result.unwrap().output,
+                format!("answer {n}")
+            );
+            assert_eq!(agents.close(id).unwrap().status, SubagentStatus::Archived);
+        }
+    }
+    assert!(agents.list().is_empty());
+}
+
+#[tokio::test]
+async fn retiring_a_session_preserves_running_work_and_reclaims_settled_children() {
+    let server = Server::start(vec![delayed("first"), delayed("second")]).await;
+    let parent = agent(&server);
+    let agents = Subagents::with_config(SubagentConfig {
+        max_agents: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let child = agents
+        .start(&parent, SubagentRequest::new("task", "answer"))
+        .unwrap();
+    assert!(agents.close_session(parent.id()).is_empty());
+    settled(&agents, &child.id).await;
+    assert_eq!(agents.close_session(parent.id()).len(), 1);
+    let next_parent = agent(&server);
+    let next = agents
+        .start(&next_parent, SubagentRequest::new("task", "answer"))
+        .unwrap();
+    settled(&agents, &next.id).await;
+    assert_eq!(
+        agents.get(&child.id).unwrap().result.unwrap().output,
+        "first"
+    );
+    assert_eq!(agents.close_session(next_parent.id()).len(), 1);
+}
+
+#[tokio::test]
+async fn model_can_close_then_repeatedly_read_its_archived_child() {
+    let target = Arc::new(Mutex::new(String::new()));
+    let child_id = target.clone();
+    let server = Server::start_with_handler(move |req| {
+        let first = req.body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        if first == "child task" {
+            return Reply::sse(response("child", vec![message("m", "child final result")]));
+        }
+        if req.body["messages"].to_string().contains("tool_result") {
+            return Reply::sse(response("done", vec![message("m", "collected")]));
+        }
+        let args = json!({"agent_id":child_id.lock().unwrap().clone()}).to_string();
+        Reply::sse(response(
+            "control",
+            vec![
+                call("close", "close_agent", &args),
+                call("wait1", "wait_agent", &args),
+                call("wait2", "wait_agent", &args),
+            ],
+        ))
+    })
+    .await;
+    let agents = Subagents::new();
+    let mut parent = agent(&server);
+    agents.register(&mut parent).unwrap();
+    let child = agents
+        .start(&parent, SubagentRequest::new("child", "child task"))
+        .unwrap();
+    settled(&agents, &child.id).await;
+    *target.lock().unwrap() = child.id.clone();
+    parent
+        .run("close and collect", RunOptions::default(), ignore)
+        .await
+        .unwrap();
+    let outputs: Vec<_> = parent
+        .snapshot()
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::FunctionCallOutput {
+                output, is_error, ..
+            } => Some((output, is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs.len(), 3);
+    assert!(
+        outputs
+            .iter()
+            .all(|(text, error)| !error && text.contains("child final result"))
+    );
+    assert_eq!(
+        agents.get(&child.id).unwrap().status,
+        SubagentStatus::Archived
+    );
+    assert!(agents.list().is_empty());
 }

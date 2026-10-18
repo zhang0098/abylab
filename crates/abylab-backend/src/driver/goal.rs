@@ -111,7 +111,7 @@ pub(super) fn report(goal: Option<&Goal>, ctl: &impl Fn(CtlEvent)) {
 }
 
 /// Returns whether the caller should start autonomous rounds after the saved mutation.
-pub(super) fn apply(
+pub(super) async fn apply(
     agent: &mut SessionAgent,
     command: GoalCommand<'_>,
     ctl: &impl Fn(CtlEvent),
@@ -154,7 +154,7 @@ pub(super) fn apply(
             None
         }
     };
-    if let Err(error) = agent.save() {
+    if let Err(error) = agent.save().await {
         if starts {
             agent.update_goal(
                 GoalStatus::Paused,
@@ -204,7 +204,7 @@ pub(super) async fn drive_rounds(
             Some("goal run stopped; use /goal resume".into()),
         );
     }
-    if let Err(error) = agent.save() {
+    if let Err(error) = agent.save().await {
         ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
     } else if let Some(goal) = agent.goal() {
         ctl(CtlEvent::TuiOpDone(format!(
@@ -219,7 +219,7 @@ pub(super) async fn drive_rounds(
 async fn run_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &impl Fn(CtlEvent)) {
     loop {
         while let Ok(control) = ctx.goal_rx.try_recv() {
-            if let Err(error) = apply(agent, GoalCommand::Control(control), ctl) {
+            if let Err(error) = apply(agent, GoalCommand::Control(control), ctl).await {
                 ctl(CtlEvent::TuiOpFailed(format!(
                     "goal update failed: {error}"
                 )));
@@ -242,7 +242,7 @@ async fn run_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &impl 
                 GoalStatus::Blocked,
                 Some("round allowance exhausted".into()),
             );
-            if let Err(error) = agent.save() {
+            if let Err(error) = agent.save().await {
                 ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
                 return;
             }
@@ -252,7 +252,7 @@ async fn run_rounds(agent: &mut SessionAgent, ctx: &mut TurnCtx<'_>, ctl: &impl 
         let Some(goal) = agent.begin_goal_round().ok().flatten() else {
             return;
         };
-        if let Err(error) = agent.save() {
+        if let Err(error) = agent.save().await {
             ctl(CtlEvent::TuiOpFailed(format!("goal save failed: {error}")));
             return;
         }

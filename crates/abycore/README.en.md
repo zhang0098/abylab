@@ -117,3 +117,12 @@ DEEPSEEK_API_KEY=sk-… cargo run --example basic
 
 Rust 1.90+ (edition 2024). abycore is not published to crates.io; depend on it
 by path from your workspace.
+
+
+Durable hosts can use `UserInput::new(parts)` / `UserInput::text(text)` with
+`Agent::run_input` and `SteerHandle::send_input`. After checkpoint success,
+`SessionSnapshot::contains_input` identifies committed receipts for recovery deduplication.
+`SteerHandle::withdraw_input` removes only inputs not yet admitted to history.
+`Subagents::close` / `close_agent` release settled leaf conversations/tools while retaining
+an in-process result summary capped at 16 KiB. `Subagents::close_session(root_id)` reclaims
+settled old-session trees leaf first, protecting running and unresolved work.

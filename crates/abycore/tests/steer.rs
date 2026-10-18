@@ -311,3 +311,56 @@ async fn a_settled_steer_is_part_of_the_durable_transcript() {
         vec!["start".to_string(), "and then stop".to_string()]
     );
 }
+
+#[tokio::test]
+async fn identified_inputs_survive_restore_and_deduplicate_steering() {
+    let server = Server::start(vec![
+        Reply::sse(response("r1", vec![message("m1", "first")])),
+        Reply::sse(response("r2", vec![message("m2", "second")])),
+    ])
+    .await;
+    let mut agent = Agent::new(server.client(), "test", ModelOptions::default()).unwrap();
+    let input = UserInput::text("identified message");
+    agent.steer_handle().send_input(input.clone()).unwrap();
+    agent.steer_handle().send_input(input.clone()).unwrap();
+    agent
+        .run_input(input.clone(), RunOptions::default(), ignore)
+        .await
+        .unwrap();
+    let snapshot = agent.snapshot();
+    assert!(snapshot.contains_input(&input.id));
+    assert_eq!(
+        snapshot
+            .items
+            .iter()
+            .filter(|item| item.id() == Some(input.id.as_str()))
+            .count(),
+        1
+    );
+    let mut restored = Agent::restore(
+        server.client(),
+        SessionSnapshot::from_json(&snapshot.to_json().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        restored
+            .run_input(input.clone(), RunOptions::default(), ignore)
+            .await
+            .is_err()
+    );
+    restored.steer_handle().send_input(input.clone()).unwrap();
+    restored
+        .run("next turn", RunOptions::default(), ignore)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .snapshot()
+            .items
+            .iter()
+            .filter(|item| item.id() == Some(input.id.as_str()))
+            .count(),
+        1
+    );
+    assert_eq!(server.captured().len(), 2);
+}

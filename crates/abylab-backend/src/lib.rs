@@ -13,8 +13,8 @@ pub use abycore::MIN_PRUNE_BYTES;
 pub use abycore::{MessagesConfig, SearchProvider, WebConfig, model_capabilities};
 pub use contract::{
     AskOption, Cmd, CompactionConfig, CtlEvent, DriverConfig, Event, PermissionReply, PlanItem,
-    PlanStatus, PromptPart, QueueAction, QueuePlacement, QueueRow, SteerRequest, TurnLimits,
-    UiEvent, persisted_session_id,
+    PlanProgress, PlanStatus, PromptPart, QueueAction, QueuePlacement, QueueRow, SteerRequest,
+    TurnLimits, TurnStatus, TurnUsage, UiEvent, persisted_session_id,
 };
 pub use contract::{UserQuestion, UserQuestionOption, UserQuestionReply};
 pub use driver::DriverHandle;

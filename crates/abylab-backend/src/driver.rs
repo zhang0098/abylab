@@ -25,9 +25,18 @@ use crate::contract::{
 };
 use crate::user_questions::AskUserQuestionTool;
 
+mod blocking;
+mod turn;
+use turn::*;
 mod goal;
+mod persistence;
+use persistence::{PersistState, storage_error};
+mod delegation;
+mod inbox;
 mod queue;
+use crate::contract::{TurnStatus, TurnUsage};
 use goal::{GoalCommand, GoalControl};
+use inbox::HostInbox;
 use queue::{Commands, QueueContext};
 
 const SERVER_LABEL: &str = "abycore · deepseek-messages";
@@ -140,82 +149,9 @@ pub fn spawn(
     })
 }
 
-/// Steers a running turn has taken into its inbox but not spent yet.
-///
-/// The agent's inbox drains as a unit at a step boundary, and that drain is
-/// exactly when [`abycore::CheckpointKind::MessagesReceived`] fires, so every
-/// outstanding id is admitted at the same moment — no per-message matching.
-#[derive(Default)]
-struct OutstandingSteers(std::sync::Mutex<std::collections::VecDeque<u64>>);
-
-impl OutstandingSteers {
-    fn push(&self, message_id: u64) {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push_back(message_id);
-    }
-
-    fn take(&self) -> Vec<u64> {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .drain(..)
-            .collect()
-    }
-
-    fn contains(&self, message_id: u64) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&message_id)
-    }
-
-    /// Remember an id without ever draining it (the tombstone set): the oldest
-    /// entries fall off, so a long session cannot grow forever.
-    fn remember(&self, message_id: u64) {
-        const TOMBSTONES: usize = 4096;
-        let mut ids = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if ids.len() >= TOMBSTONES {
-            ids.pop_front();
-        }
-        ids.push_back(message_id);
-    }
-}
-
-/// One item of the session's host-owned FIFO.
-///
-/// The queue lives in the driver — not in the client — so that delivery order
-/// survives a client, and so that every client renders the same rows
-/// ([`CtlEvent::Queue`]). deepseek-harness keeps the same list in its host
-/// inbox; this is that list, with the wire form the driver will send.
-#[derive(Clone)]
-struct QueuedItem {
-    item_id: u64,
-    text: String,
-    parts: Option<Vec<abycore::ContentPart>>,
-    placement: QueuePlacement,
-    /// Restored from disk: it waits for a turn this process actually ran,
-    /// because the turn it was queued behind no longer exists.
-    held: bool,
-}
-
 enum PromptInput {
     Text(String),
-    Parts(Vec<abycore::ContentPart>),
-}
-
-/// The wire rows for one publish.
-fn queue_rows(queue: &VecDeque<QueuedItem>) -> Vec<QueueRow> {
-    queue
-        .iter()
-        .map(|item| QueueRow {
-            item_id: item.item_id,
-            text: item.text.clone(),
-            parts: item.parts.clone(),
-            placement: item.placement,
-        })
-        .collect()
+    Identified(abycore::UserInput),
 }
 
 /// What a freshly built agent needs from the host: where its events go, and how
@@ -228,14 +164,14 @@ struct HostPolicy {
     sink: Arc<dyn Fn(Event) + Send + Sync>,
     compaction: Option<CompactionConfig>,
     max_tokens: Option<u32>,
-    agent_sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    agent_sessions: Arc<delegation::DelegationSessions>,
     instructions: crate::instructions::InstructionSource,
     /// Discovered once at launch; the menu, the `<name>` injection and the
     /// `skill` tool all serve this one snapshot.
     skills: Arc<abycore::SkillCatalog>,
     /// Steers waiting for the next step boundary (the composer's
     /// pending-steering rows).
-    steers: Arc<OutstandingSteers>,
+    inbox: HostInbox,
 }
 
 /// Host hooks: sandboxed modes can route tool calls through the TUI's
@@ -250,7 +186,7 @@ struct UiHooks {
     guard: RepeatGuard,
     /// `Some` for the session's own agent: it reports admitted steers. Children
     /// keep their own inbox, so their hook has nothing to report.
-    steers: Option<Arc<OutstandingSteers>>,
+    inbox: Option<(String, HostInbox)>,
     /// Host context policy answered at every request boundary
     /// ([`abycore::AgentHooks::view_request`]); `None` disables automatic
     /// compaction, leaving only `/compact` and overflow recovery.
@@ -344,26 +280,14 @@ impl RepeatGuard {
     }
 }
 
-/// The exclusive writer is reserved before a session is bound to the UI.
-struct PersistState {
-    store: abycore::SessionStore,
-    writer: std::sync::Mutex<abycore::SessionWriter>,
-}
-
-impl PersistState {
-    fn with_writer(store: &abycore::SessionStore, writer: abycore::SessionWriter) -> Self {
-        Self {
-            store: store.clone(),
-            writer: std::sync::Mutex::new(writer),
-        }
-    }
-}
-
 /// Owns the session writer independently from hooks retained by children.
 /// Settings changes mutate the live Agent; switching sessions drops this owner.
 struct SessionAgent {
     inner: Agent,
     persist: Option<Arc<PersistState>>,
+    session: String,
+    inbox: HostInbox,
+    last_turn: u64,
 }
 
 impl std::ops::Deref for SessionAgent {
@@ -380,11 +304,24 @@ impl std::ops::DerefMut for SessionAgent {
 }
 
 impl SessionAgent {
-    fn save(&self) -> abycore::Result<()> {
-        match &self.persist {
-            Some(persist) => persist.save(&self.snapshot()),
-            None => Ok(()),
+    async fn save(&self) -> abycore::Result<()> {
+        let snapshot = self.snapshot();
+        let receipts = HostInbox::receipts(&snapshot);
+        if let Some(persist) = &self.persist {
+            persist.save(snapshot).await?;
         }
+        self.inbox
+            .committed(&self.session, receipts)
+            .await
+            .map_err(storage_error)
+    }
+
+    async fn close(&self) -> abycore::Result<()> {
+        self.inbox.barrier().await.map_err(storage_error)?;
+        if let Some(persist) = &self.persist {
+            persist.close().await?;
+        }
+        Ok(())
     }
 
     fn set_policy(&mut self, mode: PermissionMode, host: &HostPolicy) {
@@ -410,28 +347,10 @@ impl SessionAgent {
             permission_mode: mode,
             persist: self.persist.as_ref().map(Arc::downgrade),
             guard: RepeatGuard::default(),
-            steers: Some(Arc::clone(&host.steers)),
+            inbox: Some((self.session.clone(), host.inbox.clone())),
             compaction: host.compaction,
             context,
         }));
-    }
-}
-
-impl PersistState {
-    fn save(&self, snapshot: &abycore::SessionSnapshot) -> abycore::Result<()> {
-        let mut writer = self.writer.lock().map_err(|_| {
-            abycore::Error::new(abycore::ErrorKind::Session, "persist lock poisoned")
-        })?;
-        // Preserve stored titles on resume; defer a new title until a prompt exists.
-        if writer.title().is_none()
-            && let Some(title) = first_user_text(snapshot)
-                .map(|text| text.chars().take(48).collect::<String>())
-                .filter(|text| !text.is_empty())
-        {
-            self.store.set_title(&mut writer, &title)?;
-        }
-        self.store
-            .append_checkpoint(&mut writer, snapshot.run_sequence, snapshot)
     }
 }
 
@@ -448,20 +367,19 @@ impl AgentHooks for UiHooks {
         if kind == abycore::CheckpointKind::RunStarted {
             self.guard.reset();
         }
-        // The inbox drained: every steer that was waiting is in the transcript
-        // now, so the composer's pending rows can settle.
-        if matches!(kind, abycore::CheckpointKind::MessagesReceived) {
-            let message_ids = self.steers.as_ref().map(|steers| steers.take());
-            if let Some(message_ids) = message_ids.filter(|ids| !ids.is_empty()) {
-                (self.sink)(Event::Ctl(CtlEvent::SteerAdmitted { message_ids }));
+        Box::pin(async move {
+            let receipts = HostInbox::receipts(&snapshot);
+            if let Some(persist) = self.persist.as_ref().and_then(std::sync::Weak::upgrade) {
+                persist.save(snapshot).await?;
             }
-        }
-        let result = self
-            .persist
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-            .map_or(Ok(()), |persist| persist.save(&snapshot));
-        Box::pin(async move { result })
+            if let Some((session, inbox)) = &self.inbox {
+                inbox
+                    .committed(session, receipts)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            Ok(())
+        })
     }
 
     /// The host's context policy, answered at every request boundary — this is
@@ -598,177 +516,36 @@ fn next_queue_item_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Write the session's FIFO down, so a crash does not swallow prompts the user
-/// already sent — the same promise the client used to keep itself.
-fn persist_queue(
-    cfg: &DriverConfig,
-    session: &str,
-    queue: &VecDeque<QueuedItem>,
-) -> Result<(), String> {
-    let home = cfg.home.as_deref().unwrap_or_default();
-    if home.is_empty() {
-        return Ok(());
-    }
-    let items: Vec<crate::queue_store::QueuedRecord> = queue
-        .iter()
-        .map(|item| crate::queue_store::QueuedRecord {
-            text: item.text.clone(),
-            parts: item.parts.clone(),
-        })
-        .collect();
-    crate::queue_store::save(home, &cfg.workspace, session, &items)
-        .map_err(|error| format!("queue save failed: {error}"))
-}
-
-fn save_queue_or_report(
-    cfg: &DriverConfig,
-    session: &str,
-    queue: &VecDeque<QueuedItem>,
-    ctl: &impl Fn(CtlEvent),
-) -> bool {
-    match persist_queue(cfg, session, queue) {
-        Ok(()) => true,
-        Err(error) => {
-            ctl(CtlEvent::TuiOpFailed(error));
-            false
-        }
-    }
-}
-
-/// Publish the whole queue, the way every client renders it.
-fn publish_queue(queue: &VecDeque<QueuedItem>, session: &str, ctl: &impl Fn(CtlEvent)) {
-    ctl(CtlEvent::Queue {
-        session_id: session.to_string(),
-        items: queue_rows(queue),
-    });
-}
-
-fn load_session_queue(
-    cfg: &DriverConfig,
-    session: &str,
-    ctl: &impl Fn(CtlEvent),
-) -> VecDeque<QueuedItem> {
-    let records = match crate::queue_store::load_checked(cfg, session) {
-        Ok(records) => records,
-        Err(error) => {
-            ctl(CtlEvent::TuiOpFailed(error));
-            return VecDeque::new();
-        }
-    };
-    records
-        .into_iter()
-        .map(|record| QueuedItem {
-            item_id: next_queue_item_id(),
-            text: record.text,
-            parts: record.parts,
-            placement: QueuePlacement::Queued,
-            held: true,
-        })
-        .collect()
-}
-
-/// Drop queue items the running turn has taken, and tell the clients.
-fn settle_taken(
-    queue: &mut VecDeque<QueuedItem>,
-    taken: &OutstandingSteers,
-    cfg: &DriverConfig,
-    session: &str,
-    ctl: &impl Fn(CtlEvent),
-) {
-    // Keep the bounded tombstones until the session changes: a queue command
-    // may arrive after this settlement, even after the turn has finished.
-    let claimed: Vec<_> = queue
-        .iter()
-        .filter(|item| taken.contains(item.item_id))
-        .map(|item| item.item_id)
-        .collect();
-    if claimed.is_empty() {
-        return;
-    }
-    queue.retain(|item| !taken.contains(item.item_id));
-    save_queue_or_report(cfg, session, queue, ctl);
-    for item_id in claimed {
-        ctl(CtlEvent::QueueClaimed { item_id });
-    }
-    publish_queue(queue, session, ctl);
-}
-
-/// Take the first item a turn may be started with: the queue drains in order, a
-/// restored item waits until this process has run a turn, and an item the
-/// running turn already took (a steer whose queue command was still in flight)
-/// is skipped instead of being delivered twice.
-fn claim_queued(
-    queue: &mut VecDeque<QueuedItem>,
-    taken: &OutstandingSteers,
-) -> Option<(usize, QueuedItem)> {
-    let index = queue
-        .iter()
-        .position(|item| !item.held && !taken.contains(item.item_id))?;
-    queue.remove(index).map(|item| (index, item))
-}
-
-/// The driver's idle wait: commands first, then steers.
-///
-/// A steer is not a command — it belongs to the turn that is already running,
-/// and `turn`/`run_segment` poll the same receiver while they stream. Anything
-/// that reaches this wait therefore arrived with no running turn: it becomes a
-/// [`Cmd::SteerForSession`], which the loop admits as the next turn (the
-/// harness turns a steer that missed its window into the next waking turn).
-#[allow(clippy::too_many_arguments)] // the queue's owners live in drive's scope
+/// Idle commands win over FIFO delivery, so edits already in the channel
+/// cannot lose to the row they change. Claiming leaves the durable row intact.
 async fn next_command(
     cmd_rx: &mut Commands,
     goal_rx: &mut mpsc::UnboundedReceiver<GoalControl>,
     steer_rx: &mut mpsc::UnboundedReceiver<SteerRequest>,
-    queue: &mut VecDeque<QueuedItem>,
-    taken: &OutstandingSteers,
-    cfg: &DriverConfig,
-    session: &str,
+    inbox: &HostInbox,
     ctl: &impl Fn(CtlEvent),
 ) -> Option<Cmd> {
-    // Commands first: a removal or an edit that is already waiting must be
-    // applied to the queue before the boundary that drains it, or the item it
-    // changes could ship ahead of the change.
     match cmd_rx.try_recv() {
         Ok(cmd) => return Some(cmd),
         Err(mpsc::error::TryRecvError::Disconnected) => return None,
         Err(mpsc::error::TryRecvError::Empty) => {}
     }
-    // Preserve an already queued create/resume before its follow-up pause.
-    // During execution the run itself services controls before polling work.
     if let Ok(control) = goal_rx.try_recv() {
         return Some(control.command());
     }
-    // Steers the running turn took leave the FIFO before it drains.
-    settle_taken(queue, taken, cfg, session, ctl);
-    if let Some((index, item)) = claim_queued(queue, taken) {
-        if !save_queue_or_report(cfg, session, queue, ctl) {
-            queue.insert(index, item);
-        } else {
-            ctl(CtlEvent::QueueClaimed {
-                item_id: item.item_id,
-            });
-            publish_queue(queue, session, ctl);
-            return Some(match item.parts {
-                Some(parts) => Cmd::PromptParts { parts },
-                None => Cmd::Prompt { text: item.text },
-            });
-        }
+    match inbox.next().await {
+        Ok(Some(cmd)) => return Some(cmd),
+        Ok(None) => {}
+        Err(error) => ctl(CtlEvent::TuiOpFailed(error)),
     }
     tokio::select! {
         biased;
         cmd = cmd_rx.recv() => cmd,
         Some(control) = goal_rx.recv() => Some(control.command()),
-        request = steer_rx.recv() => {
-            // No turn is running (this is the idle wait), so a steer is
-            // admitted as the next turn: the harness's best-effort contract,
-            // and the reason a steer never fails.
-            request.map(|request| Cmd::SteerForSession {
-                session_id: request.session_id,
-                message_id: request.message_id,
-                text: request.text,
-                parts: request.parts,
-            })
-        }
+        request = steer_rx.recv() => request.map(|request| Cmd::SteerForSession {
+            session_id: request.session_id, message_id: request.message_id,
+            text: request.text, parts: request.parts,
+        }),
     }
 }
 
@@ -796,11 +573,13 @@ async fn drive(
     for warning in skills.warnings() {
         ctl(CtlEvent::Warning(format!("skills: {warning}")));
     }
-    // Steers the running turn has taken but not spent (see OutstandingSteers).
-    let admitted: Arc<OutstandingSteers> = Arc::default();
-    // Queue items the running turn has taken: they left the FIFO, and the
-    // clients hear about it through the next snapshot.
-    let taken: Arc<OutstandingSteers> = Arc::default();
+    let inbox = match HostInbox::new(&cfg, Arc::clone(&sink)) {
+        Ok(inbox) => inbox,
+        Err(error) => {
+            ctl(CtlEvent::Error(error));
+            return;
+        }
+    };
     let host = HostPolicy {
         messages: cfg.messages.clone(),
         web: cfg.web.clone(),
@@ -816,7 +595,7 @@ async fn drive(
             home: cfg.home.as_ref().map(Into::into),
         },
         skills: Arc::clone(&skills),
-        steers: Arc::clone(&admitted),
+        inbox: inbox.clone(),
     };
     // Queries and pauses are forwarded to the owner even while it runs a turn.
     let (goal_tx, mut goal_rx) = mpsc::unbounded_channel::<GoalControl>();
@@ -876,7 +655,12 @@ async fn drive(
             while let Some(cmd) = queries.recv().await {
                 match cmd {
                     Cmd::ListSessions { prefix } => sink(Event::Ctl(CtlEvent::SessionList {
-                        sessions: session_rows(store.as_ref()),
+                        sessions: {
+                            let store = store.clone();
+                            tokio::task::spawn_blocking(move || session_rows(store.as_ref()))
+                                .await
+                                .unwrap_or_default()
+                        },
                         prefix,
                     })),
                     Cmd::FetchCatalog => spawn_catalog_fetch(
@@ -917,7 +701,7 @@ async fn drive(
                         permission_mode: PermissionMode::FullAccess,
                         persist: None,
                         guard: RepeatGuard::default(),
-                        steers: None,
+                        inbox: None,
                         compaction,
                         // The SDK inherits the parent's request context, so a
                         // child sees the same skill index; the skill tool
@@ -957,9 +741,9 @@ async fn drive(
             host: &host,
         };
         let result = if resume_target.is_some() {
-            resume_agent(&ctx)
+            resume_agent(&ctx).await
         } else {
-            fresh_agent(&ctx, &model, effort)
+            fresh_agent(&ctx, &model, effort).await
         };
         match result {
             Ok(next) => agent = Some(next),
@@ -979,36 +763,26 @@ async fn drive(
     }
     emit_permission_facts(&sink, &active_session, permission_mode);
 
-    // The session's FIFO, restored from disk. The items wait for a turn this
-    // process actually runs before they are spent: the turn they were queued
-    // behind belongs to a dead process, and spending them unbidden is not the
-    // driver's call.
-    let mut queue = load_session_queue(&cfg, &active_session, &ctl);
-    if !queue.is_empty() {
-        publish_queue(&queue, &active_session, &ctl);
+    if let Err(error) = inbox
+        .bind(
+            &active_session,
+            agent.as_ref().map(|agent| agent.snapshot()),
+        )
+        .await
+    {
+        ctl(CtlEvent::TuiOpFailed(error));
     }
 
-    while let Some(cmd) = next_command(
-        &mut cmd_rx,
-        &mut goal_rx,
-        &mut steer_rx,
-        &mut queue,
-        &taken,
-        &cfg,
-        &active_session,
-        &ctl,
-    )
-    .await
+    while let Some(cmd) = next_command(&mut cmd_rx, &mut goal_rx, &mut steer_rx, &inbox, &ctl).await
     {
         let Some(cmd) = (QueueContext {
-            cfg: &cfg,
             session: &active_session,
-            queue: &mut queue,
-            taken: &taken,
-            admitted: &admitted,
+            inbox: &inbox,
             sink: &sink,
         })
-        .apply(cmd) else {
+        .apply(cmd)
+        .await
+        else {
             continue;
         };
         let cmd = match cmd {
@@ -1032,12 +806,25 @@ async fn drive(
             }
             cmd => cmd,
         };
-        // A steer reaches this loop only with no turn in flight: `next_command`
-        // takes them out of the channel while one runs. It is then admitted as
-        // the next turn — the harness's "missed the window, wake the next turn"
-        // contract — so it rides the ordinary prompt path and settles there,
-        // where the driver knows whether a turn really started.
-        let (cmd, steered) = match cmd {
+        let (cmd, delivery, steered) = match cmd {
+            Cmd::DeliverQueued {
+                session_id,
+                item_id,
+                text,
+                parts,
+            } => {
+                if session_id != active_session {
+                    continue;
+                }
+                (
+                    match parts {
+                        Some(parts) => Cmd::PromptParts { parts },
+                        None => Cmd::Prompt { text },
+                    },
+                    Some(item_id),
+                    false,
+                )
+            }
             Cmd::SteerForSession {
                 session_id,
                 message_id,
@@ -1051,33 +838,16 @@ async fn drive(
                     });
                     continue;
                 }
-                // It may have been a queue row: it is being delivered now, and
-                // the row must leave the FIFO.
-                if let Some(index) = queue.iter().position(|item| item.item_id == message_id) {
-                    let item = queue.remove(index).expect("row index is valid");
-                    if !save_queue_or_report(&cfg, &active_session, &queue, &ctl) {
-                        queue.insert(index, item);
-                        ctl(CtlEvent::SteerSettled {
-                            message_id,
-                            deferred: true,
-                        });
-                        continue;
-                    }
-                    taken.remember(message_id);
-                    ctl(CtlEvent::QueueClaimed {
-                        item_id: message_id,
-                    });
-                    publish_queue(&queue, &active_session, &ctl);
-                }
                 (
                     match parts {
                         Some(parts) => Cmd::PromptParts { parts },
                         None => Cmd::Prompt { text },
                     },
                     Some(message_id),
+                    true,
                 )
             }
-            cmd => (cmd, None),
+            cmd => (cmd, None, false),
         };
         let (cmd, prompt_parts) = match cmd {
             Cmd::PromptParts { parts } => (
@@ -1092,7 +862,9 @@ async fn drive(
         match cmd {
             Cmd::PromptForSession { .. } => unreachable!("normalized above"),
             Cmd::PromptPartsForSession { .. } => unreachable!("normalized above"),
-            Cmd::SteerForSession { .. } => unreachable!("normalized above"),
+            Cmd::SteerForSession { .. } | Cmd::DeliverQueued { .. } => {
+                unreachable!("normalized above")
+            }
             Cmd::PromptParts { .. } => unreachable!("normalized above"),
             // The skill catalog is a pure read of the launch snapshot and the handle
             // routes it to the query task so it answers mid-turn; this arm
@@ -1114,7 +886,7 @@ async fn drive(
                         continue;
                     }
                 };
-                match goal::apply(agent, command, &ctl) {
+                match goal::apply(agent, command, &ctl).await {
                     Ok(true) => {
                         let mut ctx = TurnCtx {
                             session: &active_session,
@@ -1125,8 +897,7 @@ async fn drive(
                             steer_rx: &mut steer_rx,
                             steer: agent.steer_handle(),
                             skills: &skills,
-                            admitted: &admitted,
-                            taken: &taken,
+                            inbox: &inbox,
                             limits,
                             compaction,
                         };
@@ -1134,11 +905,8 @@ async fn drive(
                             .during(
                                 goal::drive_rounds(agent, &mut ctx, &ctl),
                                 QueueContext {
-                                    cfg: &cfg,
                                     session: &active_session,
-                                    queue: &mut queue,
-                                    taken: &taken,
-                                    admitted: &admitted,
+                                    inbox: &inbox,
                                     sink: &sink,
                                 },
                             )
@@ -1173,11 +941,8 @@ async fn drive(
                             &sink,
                         ),
                         QueueContext {
-                            cfg: &cfg,
                             session: &active_session,
-                            queue: &mut queue,
-                            taken: &taken,
-                            admitted: &admitted,
+                            inbox: &inbox,
                             sink: &sink,
                         },
                     )
@@ -1239,10 +1004,7 @@ async fn drive(
                         subagents: subagents.as_ref(),
                         host: &host,
                     };
-                    match build_agent(&ctx, snapshot, current.persist.clone()).and_then(|next| {
-                        next.save()?;
-                        Ok(next)
-                    }) {
+                    match saved_agent(build_agent(&ctx, snapshot, current.persist.clone())).await {
                         Ok(next) => agent = Some(next),
                         Err(error) => {
                             ctl(CtlEvent::TuiOpFailed(format!(
@@ -1271,7 +1033,7 @@ async fn drive(
                     bind_session(current, &id, None, false, &sink);
                     continue;
                 }
-                let result = (|| -> abycore::Result<SessionAgent> {
+                let result = (async {
                     let local = local.as_ref().ok_or_else(|| {
                         abycore::Error::new(ErrorKind::Configuration, "local tools unavailable")
                     })?;
@@ -1285,11 +1047,12 @@ async fn drive(
                         host: &host,
                     };
                     if restoring {
-                        resume_agent(&ctx)
+                        resume_agent(&ctx).await
                     } else {
-                        fresh_agent(&ctx, &model, effort)
+                        fresh_agent(&ctx, &model, effort).await
                     }
-                })();
+                })
+                .await;
                 match result {
                     Ok(next) => {
                         let notice = if restoring {
@@ -1297,16 +1060,20 @@ async fn drive(
                         } else {
                             "new session · abycore".into()
                         };
+                        if let Some(current) = &agent {
+                            if let Some(subagents) = &subagents {
+                                host.agent_sessions.retire(current.id(), subagents);
+                            }
+                            if let Err(error) = current.close().await {
+                                ctl(CtlEvent::TuiOpFailed(error.to_string()));
+                            }
+                        }
                         agent = Some(next);
                         active_session = id;
                         resume_target = restoring.then(|| active_session.clone());
                         // The queue belongs to a session. The old one's items are
                         // already written down (every mutation persists); this
                         // session's own saved queue comes back as held items.
-                        queue.clear();
-                        taken.take();
-                        admitted.take();
-                        queue = load_session_queue(&cfg, &active_session, &ctl);
                         bind_session(
                             agent.as_ref().unwrap(),
                             &active_session,
@@ -1314,7 +1081,15 @@ async fn drive(
                             restoring,
                             &sink,
                         );
-                        publish_queue(&queue, &active_session, &ctl);
+                        if let Err(error) = inbox
+                            .bind(
+                                &active_session,
+                                agent.as_ref().map(|agent| agent.snapshot()),
+                            )
+                            .await
+                        {
+                            ctl(CtlEvent::TuiOpFailed(error));
+                        }
                         emit_permission_facts(&sink, &active_session, permission_mode);
                     }
                     Err(error) => ctl(CtlEvent::SessionSwitchFailed(format!(
@@ -1333,26 +1108,27 @@ async fn drive(
                 // refuses to delete under a live writer: close this session
                 // first, then remove its files.
                 let deleted = active_session.clone();
+                if let Some(current) = &agent {
+                    if let Some(subagents) = &subagents {
+                        host.agent_sessions.retire(current.id(), subagents);
+                    }
+                    if let Err(error) = current.close().await {
+                        ctl(CtlEvent::TuiOpFailed(error.to_string()));
+                    }
+                }
                 agent = None;
-                let mut delete_error = None;
-                if let Some(store) = store.as_ref()
-                    && let Err(error) = store.delete(&deleted)
-                {
-                    delete_error = Some(format!("session delete failed: {error}"));
-                }
-                if let Some(home) = cfg.home.as_deref()
-                    && let Err(error) = crate::queue_store::remove(home, &cfg.workspace, &deleted)
-                {
-                    delete_error = Some(match delete_error {
-                        Some(existing) => format!("{existing}; queue delete failed: {error}"),
-                        None => format!("queued prompts were not deleted: {error}"),
-                    });
-                }
+                let delete_error = persistence::delete_session_files(
+                    store.clone(),
+                    cfg.home.clone(),
+                    cfg.workspace.clone(),
+                    deleted.clone(),
+                )
+                .await;
                 // A fresh session replaces the deleted one even when a file
                 // could not be removed: the user asked to start over, and the
                 // old writer is already gone.
                 let next_id = fresh_session_id();
-                let result = (|| -> abycore::Result<SessionAgent> {
+                let result = (async {
                     let local = local.as_ref().ok_or_else(|| {
                         abycore::Error::new(ErrorKind::Configuration, "local tools unavailable")
                     })?;
@@ -1365,17 +1141,14 @@ async fn drive(
                         subagents: subagents.as_ref(),
                         host: &host,
                     };
-                    fresh_agent(&ctx, &model, effort)
-                })();
+                    fresh_agent(&ctx, &model, effort).await
+                })
+                .await;
                 match result {
                     Ok(next) => {
                         agent = Some(next);
                         active_session = next_id;
                         resume_target = None;
-                        queue.clear();
-                        taken.take();
-                        admitted.take();
-                        queue = load_session_queue(&cfg, &active_session, &ctl);
                         bind_session(
                             agent.as_ref().unwrap(),
                             &active_session,
@@ -1383,7 +1156,15 @@ async fn drive(
                             false,
                             &sink,
                         );
-                        publish_queue(&queue, &active_session, &ctl);
+                        if let Err(error) = inbox
+                            .bind(
+                                &active_session,
+                                agent.as_ref().map(|agent| agent.snapshot()),
+                            )
+                            .await
+                        {
+                            ctl(CtlEvent::TuiOpFailed(error));
+                        }
                         emit_permission_facts(&sink, &active_session, permission_mode);
                         // After the bind: binding resets the client's
                         // transcript, and a warning sent before it would be
@@ -1402,7 +1183,12 @@ async fn drive(
                 // can't hold the picker; this arm serves a caller that pokes
                 // the command channel directly.
                 ctl(CtlEvent::SessionList {
-                    sessions: session_rows(store.as_ref()),
+                    sessions: {
+                        let store = store.clone();
+                        tokio::task::spawn_blocking(move || session_rows(store.as_ref()))
+                            .await
+                            .unwrap_or_default()
+                    },
                     prefix,
                 });
             }
@@ -1501,9 +1287,9 @@ async fn drive(
                         host: &host,
                     };
                     let result = if resume_target.is_some() {
-                        resume_agent(&ctx)
+                        resume_agent(&ctx).await
                     } else {
-                        fresh_agent(&ctx, &model, effort)
+                        fresh_agent(&ctx, &model, effort).await
                     };
                     match result {
                         Ok(next) => {
@@ -1515,6 +1301,15 @@ async fn drive(
                                 resume_target.is_some(),
                                 &sink,
                             );
+                            if let Err(error) = inbox
+                                .bind(
+                                    &active_session,
+                                    agent.as_ref().map(|agent| agent.snapshot()),
+                                )
+                                .await
+                            {
+                                ctl(CtlEvent::TuiOpFailed(error));
+                            }
                             emit_permission_facts(&sink, &active_session, permission_mode);
                         }
                         Err(error) => {
@@ -1540,10 +1335,7 @@ async fn drive(
             | Cmd::UpdateQueue { .. } => unreachable!("queue commands handled above"),
             Cmd::Prompt { text } => {
                 let Some(agent) = agent.as_mut() else {
-                    // A steer that cannot start a turn stays the client's queue
-                    // item; the composer keeps its echo queued instead of
-                    // pretending it was delivered.
-                    if let Some(message_id) = steered {
+                    if steered && let Some(message_id) = delivery {
                         ctl(CtlEvent::SteerSettled {
                             message_id,
                             deferred: true,
@@ -1554,17 +1346,36 @@ async fn drive(
                     ));
                     continue;
                 };
-                // `/name [args]` naming a skill becomes that skill's body: the
-                // host injects it here, at the one seam every prompt crosses
-                // (typed, queued, steered). Any other line ships unchanged.
-                let text = if prompt_parts.is_none() {
-                    skills.expand(&text).unwrap_or(text)
-                } else {
-                    text
+                let mut input = match inbox
+                    .prepare(&active_session, delivery, text, prompt_parts, steered)
+                    .await
+                {
+                    Ok(Some(input)) => input,
+                    Ok(None) => {
+                        if steered && let Some(message_id) = delivery {
+                            ctl(CtlEvent::SteerSettled {
+                                message_id,
+                                deferred: false,
+                            });
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        if steered && let Some(message_id) = delivery {
+                            ctl(CtlEvent::SteerSettled {
+                                message_id,
+                                deferred: true,
+                            });
+                        }
+                        ctl(CtlEvent::Error(error));
+                        continue;
+                    }
                 };
-                let message_id = format!("aby-{}", agent.snapshot().run_sequence + 1);
-                ctl(CtlEvent::PromptQueued { message_id });
-                if let Some(message_id) = steered {
+                expand_input(&mut input, &skills);
+                ctl(CtlEvent::PromptQueued {
+                    message_id: input.id.clone(),
+                });
+                if steered && let Some(message_id) = delivery {
                     ctl(CtlEvent::SteerSettled {
                         message_id,
                         deferred: false,
@@ -1579,41 +1390,22 @@ async fn drive(
                     steer_rx: &mut steer_rx,
                     steer: agent.steer_handle(),
                     skills: &skills,
-                    admitted: &admitted,
-                    taken: &taken,
+                    inbox: &inbox,
                     limits,
                     compaction,
                 };
-                // Context pressure is handled by the agent itself at every
-                // request boundary (`AgentHooks::view_request`), so it applies
-                // inside a turn too; nothing to do before shipping the prompt.
-                let input = match prompt_parts {
-                    Some(parts) => PromptInput::Parts(parts),
-                    None => PromptInput::Text(text),
-                };
                 if let Err(error) = cmd_rx
                     .during(
-                        turn(agent, Some(input), &mut ctx, true),
+                        turn(agent, Some(PromptInput::Identified(input)), &mut ctx, true),
                         QueueContext {
-                            cfg: &cfg,
                             session: &active_session,
-                            queue: &mut queue,
-                            taken: &taken,
-                            admitted: &admitted,
+                            inbox: &inbox,
                             sink: &sink,
                         },
                     )
                     .await
                 {
                     report_turn_err(&ctl, &error, limits);
-                }
-                // This process has run a turn: restored items are no longer
-                // waiting for one, so the next drain may spend them.
-                if queue.iter().any(|item| item.held) {
-                    for item in queue.iter_mut() {
-                        item.held = false;
-                    }
-                    save_queue_or_report(&cfg, &active_session, &queue, &ctl);
                 }
             }
         }
@@ -1625,14 +1417,25 @@ async fn drive(
     if let Some(local) = &local {
         local.shutdown().await;
     }
+    if let Some(agent) = &agent
+        && let Err(error) = agent.close().await
+    {
+        ctl(CtlEvent::TuiOpFailed(error.to_string()));
+    }
+    let _ = inbox.barrier().await;
+}
+
+async fn saved_agent(result: abycore::Result<SessionAgent>) -> abycore::Result<SessionAgent> {
+    let agent = result?;
+    agent.save().await?;
+    Ok(agent)
 }
 
 fn report_turn_err(ctl: &impl Fn(CtlEvent), err: &abycore::Error, limits: TurnLimits) {
     if err.kind == ErrorKind::Cancelled {
         ctl(CtlEvent::Interrupted);
-    } else {
-        ctl(CtlEvent::Error(turn_error_text(err, limits)));
     }
+    let _ = limits;
 }
 
 /// ErrorKind → the user-facing line: one actionable hint per family,
@@ -1783,7 +1586,7 @@ fn emit_permission_facts(
 fn spawn_subagent_forwarder(
     subagents: Arc<abycore::Subagents>,
     sink: Arc<dyn Fn(Event) + Send + Sync>,
-    agent_sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    agent_sessions: Arc<delegation::DelegationSessions>,
 ) {
     let mut rx = subagents.subscribe();
     tokio::spawn(async move {
@@ -1793,12 +1596,7 @@ fn spawn_subagent_forwarder(
                     let label = (!info.description.trim().is_empty())
                         .then(|| info.description.trim().to_string());
                     sink(Event::Ui(UiEvent::SubagentStarted {
-                        parent: agent_sessions
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .get(&info.parent_id)
-                            .cloned()
-                            .unwrap_or(info.parent_id.clone()),
+                        parent: agent_sessions.session(&info.parent_id),
                         child: info.id.clone(),
                         label,
                     }));
@@ -1812,6 +1610,7 @@ fn spawn_subagent_forwarder(
                     sink(Event::Ui(UiEvent::SubagentFinished {
                         child: info.id.clone(),
                     }));
+                    agent_sessions.reap(&subagents);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1857,7 +1656,7 @@ fn fresh_session_id() -> String {
 }
 
 /// A fresh session reserves its id before it is published to the UI.
-fn fresh_agent(
+async fn fresh_agent(
     ctx: &AgentContext<'_>,
     model: &str,
     effort: ReasoningEffort,
@@ -1874,24 +1673,41 @@ fn fresh_agent(
             ..ModelOptions::default()
         },
     );
-    let persist = ctx
+    let store = ctx
         .store
-        .map(|store| {
-            store
-                .create_new(ctx.session_id, &snapshot)
-                .map(|writer| Arc::new(PersistState::with_writer(store, writer)))
-        })
-        .transpose()?;
-    build_agent(ctx, snapshot, persist)
+        .cloned()
+        .ok_or_else(|| storage_error("session store unavailable".into()))?;
+    let id = ctx.session_id.to_string();
+    let (store, writer, snapshot) = tokio::task::spawn_blocking(move || {
+        let writer = store.create_new(&id, &snapshot)?;
+        Ok::<_, abycore::Error>((store, writer, snapshot))
+    })
+    .await
+    .map_err(|error| storage_error(error.to_string()))??;
+    let persist = Arc::new(PersistState::with_writer(&store, writer)?);
+    // An input can be queued before the first run. Commit the empty session
+    // now so a crash in that window still has a resumable owner/configuration.
+    if let Err(error) = persist.save(snapshot.clone()).await {
+        let _ = persist.close().await;
+        return Err(error);
+    }
+    build_agent(ctx, snapshot, Some(persist))
 }
 
 /// The snapshot and writer come from one locked read; no pre-lock state is used.
-fn resume_agent(ctx: &AgentContext<'_>) -> abycore::Result<SessionAgent> {
+async fn resume_agent(ctx: &AgentContext<'_>) -> abycore::Result<SessionAgent> {
     let store = ctx
         .store
-        .ok_or_else(|| abycore::Error::new(ErrorKind::Session, "session store unavailable"))?;
-    let (writer, snapshot) = store.open_for_resume(ctx.session_id)?;
-    let persist = Arc::new(PersistState::with_writer(store, writer));
+        .cloned()
+        .ok_or_else(|| storage_error("session store unavailable".into()))?;
+    let id = ctx.session_id.to_string();
+    let (store, writer, snapshot) = tokio::task::spawn_blocking(move || {
+        let (writer, snapshot) = store.open_for_resume(&id)?;
+        Ok::<_, abycore::Error>((store, writer, snapshot))
+    })
+    .await
+    .map_err(|error| storage_error(error.to_string()))??;
+    let persist = Arc::new(PersistState::with_writer(&store, writer)?);
     let mut agent = build_agent(ctx, snapshot, Some(persist))?;
     if agent
         .goal()
@@ -1901,7 +1717,7 @@ fn resume_agent(ctx: &AgentContext<'_>) -> abycore::Result<SessionAgent> {
             abycore::GoalStatus::Paused,
             Some("session restored; use /goal resume".into()),
         )?;
-        agent.save()?;
+        agent.save().await?;
     }
     Ok(agent)
 }
@@ -1920,6 +1736,7 @@ fn build_agent(
     if let Some(max_tokens) = ctx.host.max_tokens {
         snapshot.model.max_tokens = max_tokens;
     }
+    let last_turn = snapshot.run_sequence;
     let mut inner = Agent::restore(client, snapshot)?;
     ctx.local.register(&mut inner)?;
     inner.register_tool(TodoWriteTool::new(false))?;
@@ -1938,13 +1755,15 @@ fn build_agent(
             .web
             .tools(ctx.api_key, ctx.host.web_limiter.clone())?,
     )?;
-    let mut agent = SessionAgent { inner, persist };
+    let mut agent = SessionAgent {
+        inner,
+        persist,
+        session: ctx.session_id.to_string(),
+        inbox: ctx.host.inbox.clone(),
+        last_turn,
+    };
     agent.set_policy(ctx.local.permission_mode(), ctx.host);
-    ctx.host
-        .agent_sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(agent.id().to_string(), ctx.session_id.to_string());
+    ctx.host.agent_sessions.attach(agent.id(), ctx.session_id);
     Ok(agent)
 }
 
@@ -2206,7 +2025,7 @@ async fn compact_history(
         )?;
     }
     // Save both successful view changes and the ledger/prune left on failure.
-    agent.save()?;
+    agent.save().await?;
     if paused {
         let summary = agent.goal().expect("paused goal").summary();
         sink(Event::Ctl(CtlEvent::TuiOpDone(format!(
@@ -2339,480 +2158,6 @@ fn last_turn_start(items: &[abycore::Item], cuts: &[usize]) -> Option<usize> {
         )
     })?;
     (last_user > 0 && cuts.contains(&last_user)).then_some(last_user)
-}
-
-/// What one turn needs besides the agent: the session label, the event sink,
-/// the interrupt channel, the steer channel and the budgets. Grouped so the
-/// segment helpers do not grow one parameter per turn feature.
-struct TurnCtx<'a> {
-    session: &'a str,
-    sink: &'a Arc<dyn Fn(Event) + Send + Sync>,
-    interrupt_rx: &'a mut mpsc::UnboundedReceiver<()>,
-    goal_rx: &'a mut mpsc::UnboundedReceiver<GoalControl>,
-    pause_requested: bool,
-    steer_rx: &'a mut mpsc::UnboundedReceiver<SteerRequest>,
-    /// Inbox of the live agent: text pushed here is appended at its next step
-    /// boundary, which is what makes Send Now not cancel anything.
-    steer: abycore::SteerHandle,
-    /// The launch skill snapshot: a steered `/<name>` line expands here too,
-    /// because the steer path skips the prompt loop's own expansion.
-    skills: &'a Arc<abycore::SkillCatalog>,
-    /// Steers taken but not yet spent, so the next inbox drain can report them.
-    admitted: &'a Arc<OutstandingSteers>,
-    /// Ids the running turn took out of the host queue; the driver removes them
-    /// from the FIFO when control comes back to it.
-    taken: &'a Arc<OutstandingSteers>,
-    limits: TurnLimits,
-    /// Host compaction policy for overflow recovery inside a turn.
-    compaction: Option<CompactionConfig>,
-}
-
-/// One agent segment racing the interrupt channel. New input is included in
-/// the next request even when the session still has an unfinished turn.
-///
-/// Cancellation races the run future; the losing branch still drains the
-/// outcome so history stays consistent. A steer races it too but never wins:
-/// it rides into the agent's inbox and the run keeps its output, which is the
-/// difference between "change course mid-turn" and "cancel and retype".
-async fn run_segment(
-    agent: &mut Agent,
-    input: Option<PromptInput>,
-    ctx: &mut TurnCtx<'_>,
-) -> abycore::Result<RunOutcome> {
-    let cancellation = CancellationToken::new();
-    let live_goal = Arc::new(std::sync::Mutex::new(agent.goal().cloned()));
-    let event_goal = Arc::clone(&live_goal);
-    let has_image = agent.has_image_input()
-        || matches!(&input,
-            Some(PromptInput::Parts(parts)) if parts.iter().any(|part| matches!(part, abycore::ContentPart::InputImage { .. }))
-        );
-    let options = RunOptions {
-        cancellation: cancellation.clone(),
-        max_requests: ctx.limits.max_requests,
-        max_tool_calls: ctx.limits.max_tool_calls,
-        timeout: ctx.limits.run_timeout,
-        tool_timeout: ctx.limits.tool_timeout,
-        max_input_bytes: if has_image {
-            48 * 1024 * 1024
-        } else {
-            RunOptions::default().max_input_bytes
-        },
-        ..RunOptions::default()
-    };
-    let (sess, sink_for_events) = (ctx.session.to_string(), Arc::clone(ctx.sink));
-    let on_event = move |event: AgentEvent| {
-        let sink = Arc::clone(&sink_for_events);
-        let sess = sess.clone();
-        let event_goal = Arc::clone(&event_goal);
-        async move {
-            if let AgentEvent::GoalChanged { goal } = &event {
-                *event_goal.lock().unwrap_or_else(|p| p.into_inner()) = goal.clone();
-            }
-            // A view change is a control fact, not transcript content: report it
-            // as a notice before the (empty) translation.
-            if let AgentEvent::ViewChanged { change } = &event {
-                match change {
-                    abycore::ViewChange::Failed { message } => {
-                        sink(Event::Ctl(CtlEvent::TuiOpFailed(format!(
-                            "compaction failed: {message} / 压缩失败：{message}"
-                        ))))
-                    }
-                    change => sink(Event::Ctl(CtlEvent::TuiOpDone(view_change_notice(change)))),
-                }
-            }
-            for ui in translate(&sess, event) {
-                sink(Event::Ui(ui));
-            }
-            Ok(())
-        }
-    };
-
-    let mut run_fut: std::pin::Pin<
-        Box<dyn std::future::Future<Output = abycore::Result<RunOutcome>> + '_>,
-    > = match input {
-        Some(PromptInput::Text(text)) if agent.snapshot().needs_response => {
-            Box::pin(agent.continue_run_with_input(text, options, on_event))
-        }
-        Some(PromptInput::Text(text)) => Box::pin(agent.run(text, options, on_event)),
-        Some(PromptInput::Parts(parts)) if agent.snapshot().needs_response => {
-            Box::pin(agent.continue_run_with_parts(parts, options, on_event))
-        }
-        Some(PromptInput::Parts(parts)) => Box::pin(agent.run_parts(parts, options, on_event)),
-        None => Box::pin(agent.continue_run(options, on_event)),
-    };
-    // Controls win before another request can start. After cancellation, keep
-    // polling the run for its cleanup and keep answering status requests.
-    let mut interrupted = false;
-    loop {
-        tokio::select! {
-            biased;
-            Some(control) = ctx.goal_rx.recv() => {
-                let snapshot = live_goal.lock().unwrap_or_else(|p| p.into_inner());
-                if goal::during_turn(control, snapshot.as_ref(), &|event| (ctx.sink)(Event::Ctl(event))) {
-                    ctx.pause_requested = true;
-                    interrupted = true;
-                    cancellation.cancel();
-                }
-            }
-            Some(()) = ctx.interrupt_rx.recv() => {
-                interrupted = true;
-                cancellation.cancel();
-            }
-            result = &mut run_fut => return if interrupted {
-                Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"))
-            } else { result },
-            request = ctx.steer_rx.recv() => {
-                let Some(request) = request else { continue };
-                settle_steer(request, ctx);
-            }
-        }
-    }
-}
-
-/// Take one Send Now request into the live agent.
-///
-/// Success means "the agent holds it": abycore appends it at the next complete
-/// tool-batch boundary, or — when the model was already about to end the turn —
-/// continues one more step instead of stopping. Nothing is cancelled and no
-/// event from the in-flight step is discarded.
-fn settle_steer(request: SteerRequest, ctx: &mut TurnCtx<'_>) {
-    if request.session_id != ctx.session {
-        (ctx.sink)(Event::Ctl(CtlEvent::SteerSettled {
-            message_id: request.message_id,
-            deferred: true,
-        }));
-        return;
-    }
-    // Same seam every prompt crosses: `/name` naming a skill ships that skill's
-    // body, not the bare command line.
-    let result = match request.parts {
-        Some(parts) => ctx.steer.send_parts(parts),
-        None => {
-            let text = ctx.skills.expand(&request.text).unwrap_or(request.text);
-            ctx.steer.send(text)
-        }
-    };
-    let deferred = match result {
-        Ok(()) => {
-            ctx.admitted.push(request.message_id);
-            // It is not a queued item any more: the running turn owns it now.
-            // The id is remembered (never consumed) so a queue command that is
-            // still in flight cannot put the row back.
-            ctx.taken.remember(request.message_id);
-            false
-        }
-
-        Err(error) => {
-            (ctx.sink)(Event::Ctl(CtlEvent::TuiOpFailed(format!(
-                "send now failed: {error} / 立即发送失败：{error}"
-            ))));
-            true
-        }
-    };
-    (ctx.sink)(Event::Ctl(CtlEvent::SteerSettled {
-        message_id: request.message_id,
-        deferred,
-    }));
-    if !deferred {
-        (ctx.sink)(Event::Ctl(CtlEvent::QueueClaimed {
-            item_id: request.message_id,
-        }));
-    }
-}
-
-/// Drive one turn: `Some(text)` adds a prompt to a fresh or unfinished turn;
-/// `None` retries an unfinished turn without new input.
-///
-/// Like deepseek-harness's agent loop, the turn ends when the model stops or
-/// the user interrupts — not because requests ran out. A segment that stops on
-/// the per-run watchdog budget, a timeout or a transient request failure leaves
-/// the session at a continuable boundary (abycore's `continue_run`), so the driver
-/// settles any tool calls the stop left unresolved and resumes the same open
-/// turn, up to [`TurnLimits::continuations`] times, before surfacing the error.
-/// Without that, one cheap `web_search` batch or a dropped connection silently
-/// ends the turn while the model still had work queued.
-async fn turn(
-    agent: &mut SessionAgent,
-    input: Option<PromptInput>,
-    ctx: &mut TurnCtx<'_>,
-    settle_status: bool,
-) -> abycore::Result<RunOutcome> {
-    if input.is_some() && agent.snapshot().needs_response {
-        settle_pending(
-            agent,
-            "previous tool call was interrupted; its result is unverified — check before repeating",
-            ctx,
-        )?;
-    }
-    let session = ctx.session.to_string();
-    let sink = Arc::clone(ctx.sink);
-    let emit = |event: Event| sink(event);
-    let emit_ctl = |event: CtlEvent| sink(Event::Ctl(event));
-    let turn = agent.snapshot().run_sequence + 1;
-    emit(Event::Ui(UiEvent::TurnStart {
-        session: session.clone(),
-        turn,
-    }));
-    emit(Event::Ui(UiEvent::SessionStatus {
-        session: session.clone(),
-        running: true,
-    }));
-
-    // Stale interrupts (sent between turns, e.g. by the steer path) must not
-    // cancel this turn — but an interrupt that arrives while a later segment
-    // runs must still land, so drain only once here.
-    if !agent
-        .goal()
-        .is_some_and(|goal| goal.status == abycore::GoalStatus::Active)
-    {
-        while ctx.interrupt_rx.try_recv().is_ok() {}
-    }
-
-    let mut next = input;
-    let mut continuations = 0usize;
-    let outcome = 'segments: loop {
-        let outcome = run_segment(agent, next.take(), ctx).await;
-        // A context overflow is recoverable: condense hard, then resume the
-        // same open turn (harness retries the request after the surface
-        // replacement generation advances).
-        if matches!(&outcome, Err(err) if err.kind == ErrorKind::ContextLimitExceeded)
-            && continuations < ctx.limits.continuations
-        {
-            match compact_history(
-                agent,
-                ctx.compaction,
-                CompactTrigger::Overflow,
-                ctx.interrupt_rx,
-                ctx.goal_rx,
-                ctx.sink,
-            )
-            .await
-            {
-                Ok(Some(report)) => {
-                    continuations += 1;
-                    emit(Event::Ctl(CtlEvent::TuiOpDone(
-                        report.notice(CompactTrigger::Overflow),
-                    )));
-                    continue;
-                }
-                Ok(None) => {}
-                Err(err) if err.kind == ErrorKind::Cancelled => break Err(err),
-                Err(err) => emit(Event::Ctl(CtlEvent::TuiOpFailed(format!(
-                    "compaction failed: {err} / 压缩失败：{err}"
-                )))),
-            }
-        }
-        // The turn ends on a failure that resuming cannot help, on a stop with
-        // no headroom left, or when the session is no longer continuable.
-        let failure = match &outcome {
-            Err(err) if resumable_failure(err) => err,
-            _ => break outcome,
-        };
-        if continuations >= ctx.limits.continuations || !agent.snapshot().needs_response {
-            break outcome;
-        }
-        // Pending calls may be unstarted or interrupted mid-execution. Settle
-        // each according to its state so a timeout never invites a blind replay.
-        if !agent.snapshot().pending.is_empty() {
-            settle_pending(
-                agent,
-                "the turn stopped before this tool ran — it did not execute; re-issue it if it is still needed",
-                ctx,
-            )?;
-        }
-        // Transient failures carry their own pacing; a cheap retry
-        // storm would only burn the remaining headroom. The wait stays
-        // interruptible so esc still ends the turn.
-        if let Some(delay) = continuation_delay(failure) {
-            let wait = tokio::time::sleep(delay);
-            tokio::pin!(wait);
-            loop {
-                tokio::select! {
-                    biased;
-                    Some(control) = ctx.goal_rx.recv() => {
-                        if goal::during_turn(control, agent.goal(), &emit_ctl) {
-                            ctx.pause_requested = true;
-                            break 'segments Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"));
-                        }
-                    }
-                    Some(()) = ctx.interrupt_rx.recv() => {
-                        break 'segments Err(abycore::Error::new(ErrorKind::Cancelled, "operation cancelled"));
-                    }
-                    _ = &mut wait => break,
-                }
-            }
-        }
-        continuations += 1;
-        emit(Event::Ctl(CtlEvent::TuiOpDone(continuation_notice(
-            failure,
-            continuations,
-            ctx.limits.continuations,
-        ))));
-    };
-
-    let stopped_goal = if agent
-        .goal()
-        .is_some_and(|goal| goal.status == abycore::GoalStatus::Active)
-    {
-        let stopped = match &outcome {
-            Ok(result) if result.stop_reason == StopReason::Completed => None,
-            Ok(_) => Some((
-                abycore::GoalStatus::Paused,
-                "turn stopped; use /goal resume",
-            )),
-            Err(error) if error.kind == ErrorKind::Cancelled => {
-                Some((abycore::GoalStatus::Paused, "interrupted; use /goal resume"))
-            }
-            Err(_) => Some((
-                abycore::GoalStatus::Blocked,
-                "turn failed; resolve the error and use /goal resume",
-            )),
-        };
-        match stopped {
-            Some((status, note)) => {
-                agent.update_goal(status, Some(note.into()))?;
-                true
-            }
-            None => false,
-        }
-    } else {
-        false
-    };
-    // Save final state and the ledger on every exit, including cancellation
-    // while waiting between segments or an incomplete model response.
-    let saved = agent.save();
-    if saved.is_ok()
-        && (stopped_goal || ctx.pause_requested)
-        && let Some(goal) = agent.goal()
-    {
-        emit_ctl(CtlEvent::TuiOpDone(format!(
-            "goal → {} / 目标 → {}",
-            goal.summary(),
-            goal.summary()
-        )));
-    }
-    ctx.pause_requested = false;
-    let outcome = saved.and(outcome);
-    let kind = match &outcome {
-        Ok(outcome) => stop_kind(&outcome.stop_reason),
-        Err(err) if err.kind == ErrorKind::Cancelled => "interrupted",
-        Err(_) => "error",
-    };
-    if matches!(&outcome, Ok(outcome) if outcome.stop_reason == StopReason::Incomplete) {
-        let max_tokens = agent.snapshot().model.max_tokens;
-        emit_ctl(CtlEvent::TuiOpDone(format!(
-            "response reached its output limit (max_tokens={max_tokens}); send a shorter instruction or resume with a larger --max-tokens / 回答达到输出上限；可继续输入缩短回答的指令，或提高 --max-tokens 后恢复会话"
-        )));
-    }
-    emit(Event::Ui(UiEvent::TurnEnd {
-        session: session.clone(),
-        kind: kind.into(),
-    }));
-    if let Ok(outcome) = &outcome {
-        let usage = outcome.response.usage.as_ref();
-        emit(Event::Ui(UiEvent::Usage {
-            session: session.clone(),
-            input: usage.and_then(|u| u.input_tokens).unwrap_or(0),
-            output: usage.and_then(|u| u.output_tokens).unwrap_or(0),
-            cached: usage.and_then(|u| u.cached_tokens).unwrap_or(0),
-            reasoning: usage.and_then(|u| u.reasoning_tokens).unwrap_or(0),
-        }));
-    }
-    // The goal-round sequence owns exactly one idle status: a `running:false`
-    // after every round told the UI the session was idle while the driver was
-    // still inside the loop (and it dispatched queued prompts early).
-    if settle_status {
-        emit(Event::Ui(UiEvent::SessionStatus {
-            session,
-            running: false,
-        }));
-    }
-    outcome
-}
-
-/// Whether a failed segment is worth resuming inside the same open turn.
-///
-/// Mirrors deepseek-harness's retryable step failures (`dsh-llm-retry`:
-/// `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`). A timeout — the run's
-/// own no-progress window, or a request that reached its deadline — also leaves
-/// the turn resumable: a segment that went quiet can need a fresh one, and the
-/// work already committed is unaffected. Timeout continuations share the same
-/// finite headroom as all other retries. `BudgetExceeded` is abylab's own
-/// watchdog.
-fn resumable_failure(err: &abycore::Error) -> bool {
-    matches!(
-        err.kind,
-        ErrorKind::BudgetExceeded
-            | ErrorKind::Timeout
-            | ErrorKind::Transport
-            | ErrorKind::StreamClosed
-            | ErrorKind::Server
-            | ErrorKind::RateLimit
-            | ErrorKind::EmptyResponse
-    )
-}
-
-/// Pacing before a transient continuation: the provider's `Retry-After` when it
-/// sent one, else one second, capped like abycore's own retry backoff. Budget
-/// stops retry immediately. Timeouts wait one second and remain interruptible.
-fn continuation_delay(err: &abycore::Error) -> Option<Duration> {
-    match err.kind {
-        ErrorKind::Timeout => Some(Duration::from_secs(1)),
-        ErrorKind::RateLimit | ErrorKind::Server => Some(
-            err.retry_after
-                .unwrap_or(Duration::from_secs(1))
-                .min(Duration::from_secs(15)),
-        ),
-        _ => None,
-    }
-}
-
-/// One transcript notice per automatic continuation.
-fn continuation_notice(err: &abycore::Error, round: usize, rounds: usize) -> String {
-    if err.kind == ErrorKind::BudgetExceeded {
-        return format!(
-            "turn budget reached — continuing the unfinished turn ({round}/{rounds}) / 达到回合预算，自动续跑（{round}/{rounds}）"
-        );
-    }
-    if err.kind == ErrorKind::Timeout {
-        return format!(
-            "timed out — continuing the unfinished turn ({round}/{rounds}) / 超时，自动续跑（{round}/{rounds}）"
-        );
-    }
-    if err.kind == ErrorKind::EmptyResponse {
-        return format!(
-            "empty response — retrying the unfinished step ({round}/{rounds}) / 空响应，正在同一回合内重试（{round}/{rounds}）"
-        );
-    }
-    let (en, zh) = match err.kind {
-        ErrorKind::Transport | ErrorKind::StreamClosed => ("connection lost", "连接中断"),
-        ErrorKind::RateLimit => ("rate limited", "限流"),
-        ErrorKind::Server => ("server error", "服务端错误"),
-        _ => ("request failed", "请求失败"),
-    };
-    format!(
-        "{en} — retrying the unfinished step ({round}/{rounds}) / {zh}，正在同一回合内重试（{round}/{rounds}）"
-    )
-}
-
-/// A limit for the error text: `usize::MAX` reads as "unlimited", not a number
-/// no human wants to parse.
-fn limit_label(value: usize) -> String {
-    if value == TurnLimits::UNLIMITED {
-        "unlimited".into()
-    } else {
-        value.to_string()
-    }
-}
-
-fn stop_kind(reason: &StopReason) -> &'static str {
-    match reason {
-        StopReason::Completed => "completed",
-        StopReason::Incomplete => "incomplete",
-        StopReason::Failed => "failed",
-        StopReason::Error(kind) if kind == &ErrorKind::Cancelled => "interrupted",
-        StopReason::Error(_) => "error",
-    }
 }
 
 /// AgentEvent → transcript-ready UiEvents.
@@ -3258,7 +2603,7 @@ mod tests {
             permission_mode: mode,
             persist: None,
             guard: RepeatGuard::default(),
-            steers: None,
+            inbox: None,
             compaction: None,
             context: None,
         }
@@ -3749,13 +3094,16 @@ mod tests {
                 home: None,
             },
             skills: Arc::new(catalog),
-            steers: Arc::default(),
+            inbox: HostInbox::new(
+                &steer_test_config(&workspace, "http://127.0.0.1:1"),
+                Arc::new(|_| {}),
+            )
+            .unwrap(),
         };
         assert!(skill_tool(&host).is_some(), "a session with skills has it");
         let without = scratch_dir("skills-none");
         let empty = HostPolicy {
             skills: Arc::new(abycore::SkillCatalog::discover(&without)),
-            steers: Arc::default(),
             instructions: crate::instructions::InstructionSource {
                 workspace: without.clone(),
                 home: None,
@@ -3925,8 +3273,16 @@ mod tests {
             _ => None,
         });
         let rows = rows.expect("SessionList arrives");
-        assert_eq!(rows.len(), 1, "the persisted session is listed: {rows:?}");
-        assert_eq!(rows[0].id, "resume-list-test");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both committed sessions are listed: {rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.id == "resume-list-test"));
+        assert!(
+            rows.iter().any(|row| row.id == "list-test"),
+            "the new empty checkpoint is resumable too"
+        );
         assert_eq!(
             rows[0].updated_at.as_deref().map(str::len),
             Some("YYYY-MM-DD HH:MM".len()),
@@ -4589,10 +3945,11 @@ mod tests {
         );
         // The old session's item is still parked on disk for its own next start.
         assert_eq!(
-            crate::queue_store::load(&steer_test_config(&workspace, &provider.url), "steer-test"),
-            vec![crate::queue_store::QueuedRecord::text(
-                "old session's follow-up"
-            )]
+            crate::queue_store::load(&steer_test_config(&workspace, &provider.url), "steer-test")
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old session's follow-up"]
         );
         drop(events);
         std::fs::remove_dir_all(&workspace).expect("remove test workspace");
@@ -4702,18 +4059,6 @@ mod tests {
         assert_eq!(admitted, vec![vec![31]], "one boundary, one report");
         drop(events);
         std::fs::remove_dir_all(&workspace).expect("remove test workspace");
-    }
-
-    /// A steer nobody admitted yet stays outstanding: no report is invented,
-    /// and the id survives until the boundary that spends it.
-    #[test]
-    fn outstanding_steers_is_a_fifo_of_unspent_ids() {
-        let steers = OutstandingSteers::default();
-        assert!(steers.take().is_empty(), "nothing outstanding yet");
-        steers.push(1);
-        steers.push(2);
-        assert_eq!(steers.take(), vec![1, 2], "FIFO order");
-        assert!(steers.take().is_empty(), "the report spends them");
     }
 
     /// A steered `/<name>` line crosses the same skill seam a typed prompt
@@ -4942,18 +4287,27 @@ mod tests {
         std::fs::remove_dir_all(&workspace).expect("remove test workspace");
     }
 
-    /// The idle wait prefers commands, and turns a steer into the prompt that
-    /// the turn loop already knows how to run.
+    async fn memory_inbox(sink: Arc<dyn Fn(Event) + Send + Sync>) -> HostInbox {
+        let mut cfg = steer_test_config(std::path::Path::new("/tmp"), "http://127.0.0.1:1");
+        cfg.home = None;
+        let inbox = HostInbox::new(&cfg, sink).unwrap();
+        inbox
+            .bind(
+                "s",
+                Some(abycore::SessionSnapshot::new("test", Default::default())),
+            )
+            .await
+            .unwrap();
+        inbox
+    }
+
     #[tokio::test]
     async fn the_idle_wait_turns_a_steer_into_the_next_turn() {
         let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let mut cmd_rx = Commands::new(cmd_rx);
+        let mut commands = Commands::new(cmd_rx);
         let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
-        let mut queue = VecDeque::new();
-        let taken = OutstandingSteers::default();
-        let cfg = steer_test_config(std::path::Path::new("/tmp"), "http://127.0.0.1:1");
-        let ctl = |_event: CtlEvent| {};
+        let inbox = memory_inbox(Arc::new(|_| {})).await;
         steer_tx
             .send(SteerRequest {
                 session_id: "s".into(),
@@ -4961,131 +4315,94 @@ mod tests {
                 text: "hello".into(),
                 parts: None,
             })
-            .expect("queue steer");
-        match next_command(
-            &mut cmd_rx,
-            &mut goal_rx,
-            &mut steer_rx,
-            &mut queue,
-            &taken,
-            &cfg,
-            "s",
-            &ctl,
-        )
-        .await
-        {
-            Some(Cmd::SteerForSession {
-                message_id, text, ..
-            }) => {
-                assert_eq!(message_id, 3);
-                assert_eq!(text, "hello");
-            }
-            other => panic!("expected an admitted steer, got {other:?}"),
-        }
-        cmd_tx.send(Cmd::Shutdown).expect("queue command");
+            .unwrap();
+        assert!(
+            matches!(next_command(&mut commands, &mut goal_rx, &mut steer_rx, &inbox, &|_| {}).await,
+            Some(Cmd::SteerForSession { message_id: 3, text, .. }) if text == "hello")
+        );
+        cmd_tx.send(Cmd::Shutdown).unwrap();
         assert!(matches!(
-            next_command(
-                &mut cmd_rx,
-                &mut goal_rx,
-                &mut steer_rx,
-                &mut queue,
-                &taken,
-                &cfg,
-                "s",
-                &ctl
-            )
-            .await,
+            next_command(&mut commands, &mut goal_rx, &mut steer_rx, &inbox, &|_| {}).await,
             Some(Cmd::Shutdown)
         ));
     }
 
-    /// The idle wait drains the FIFO, in order, and a command that is already
-    /// waiting is applied first — the item it changes cannot ship ahead of it.
     #[tokio::test]
-    async fn the_idle_wait_drains_the_queue_after_pending_commands() {
+    async fn pending_edits_precede_delivery_and_claim_waits_for_a_receipt() {
         let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let mut cmd_rx = Commands::new(cmd_rx);
+        let mut commands = Commands::new(cmd_rx);
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
-        let mut queue = VecDeque::new();
-        let taken = OutstandingSteers::default();
-        let cfg = steer_test_config(std::path::Path::new("/tmp"), "http://127.0.0.1:1");
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = Arc::clone(&events);
-        let ctl = move |event: CtlEvent| captured.lock().expect("event lock").push(event);
-        let push = |item_id: u64, text: &str| QueuedItem {
-            item_id,
-            text: text.into(),
-            parts: None,
-            placement: QueuePlacement::Queued,
-            held: false,
-        };
-        queue.push_back(push(1, "first"));
-        queue.push_back(push(2, "second"));
-
-        // A removal is waiting: it is read before anything ships.
+        let captured = events.clone();
+        let inbox = memory_inbox(Arc::new(move |event| captured.lock().unwrap().push(event))).await;
+        for (item_id, text) in [(1, "first"), (2, "second")] {
+            inbox
+                .apply(Cmd::QueueForSession {
+                    session_id: "s".into(),
+                    item_id,
+                    text: text.into(),
+                })
+                .await
+                .unwrap();
+        }
         cmd_tx
             .send(Cmd::UpdateQueue {
                 session_id: "s".into(),
                 item_id: 1,
                 action: QueueAction::Remove,
             })
-            .expect("queue removal");
-        match next_command(
-            &mut cmd_rx,
-            &mut goal_rx,
-            &mut steer_rx,
-            &mut queue,
-            &taken,
-            &cfg,
-            "s",
-            &ctl,
-        )
-        .await
-        {
-            Some(Cmd::UpdateQueue { .. }) => {}
-            other => panic!("the command goes first, got {other:?}"),
+            .unwrap();
+        let command = next_command(&mut commands, &mut goal_rx, &mut steer_rx, &inbox, &|_| {})
+            .await
+            .unwrap();
+        assert!(matches!(command, Cmd::UpdateQueue { .. }));
+        inbox.apply(command).await.unwrap();
+        assert!(
+            matches!(next_command(&mut commands, &mut goal_rx, &mut steer_rx, &inbox, &|_| {}).await,
+            Some(Cmd::DeliverQueued { item_id: 2, text, .. }) if text == "second")
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, Event::Ctl(CtlEvent::QueueClaimed { .. })))
+        );
+        let input = inbox
+            .prepare("s", Some(2), "second".into(), None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut snapshot = abycore::SessionSnapshot::new("test", Default::default());
+        let mut item = abycore::Item::user("second");
+        if let abycore::Item::Message { id, .. } = &mut item {
+            *id = Some(input.id);
         }
-        // The loop applies it (the arm body is in `drive`); do it here.
-        queue.retain(|item| item.item_id != 1);
-        match next_command(
-            &mut cmd_rx,
-            &mut goal_rx,
-            &mut steer_rx,
-            &mut queue,
-            &taken,
-            &cfg,
-            "s",
-            &ctl,
-        )
-        .await
-        {
-            Some(Cmd::Prompt { text }) => assert_eq!(text, "second"),
-            other => panic!("the survivor ships, got {other:?}"),
-        }
-        assert!(queue.is_empty(), "a claimed item left the FIFO");
-        let claimed: Vec<u64> = events
-            .lock()
-            .expect("event lock")
-            .iter()
-            .filter_map(|event| match event {
-                CtlEvent::QueueClaimed { item_id } => Some(*item_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(claimed, vec![2]);
+        snapshot.items.push(item);
+        snapshot.needs_response = true;
+        snapshot.validate().unwrap();
+        inbox
+            .committed("s", HostInbox::receipts(&snapshot))
+            .await
+            .unwrap();
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, Event::Ctl(CtlEvent::QueueClaimed { item_id: 2 })))
+        );
+        assert!(inbox.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn a_pending_goal_start_precedes_its_followup_pause() {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let mut cmd_rx = Commands::new(cmd_rx);
+        let mut commands = Commands::new(cmd_rx);
         let (goal_tx, mut goal_rx) = mpsc::unbounded_channel();
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
-        let mut queue = VecDeque::new();
-        let taken = OutstandingSteers::default();
-        let cfg = steer_test_config(std::path::Path::new("/tmp"), "http://127.0.0.1:1");
-        let ctl = |_event: CtlEvent| {};
+        let inbox = memory_inbox(Arc::new(|_| {})).await;
         cmd_tx
             .send(Cmd::Goal {
                 arg: "new objective".into(),
@@ -5093,44 +4410,32 @@ mod tests {
             .unwrap();
         goal_tx.send(GoalControl::Pause).unwrap();
         for expected in ["new objective", "pause"] {
-            let next = next_command(
-                &mut cmd_rx,
-                &mut goal_rx,
-                &mut steer_rx,
-                &mut queue,
-                &taken,
-                &cfg,
-                "s",
-                &ctl,
-            )
-            .await;
-            assert!(matches!(next, Some(Cmd::Goal { arg }) if arg == expected));
+            assert!(
+                matches!(next_command(&mut commands, &mut goal_rx, &mut steer_rx, &inbox, &|_| {}).await,
+                Some(Cmd::Goal { arg }) if arg == expected)
+            );
         }
     }
 
-    /// Acceptance means "the agent holds it": the text sits in the inbox until
-    /// the next step boundary, and the composer is told so without any cancel.
-    #[test]
-    fn acceptance_puts_the_text_in_the_inbox_and_settles_the_echo() {
+    #[tokio::test]
+    async fn steering_acknowledges_handoff_without_claiming_durable_admission() {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = Arc::clone(&events);
-        let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
-            captured.lock().expect("event lock").push(event);
-        });
+        let captured = events.clone();
+        let sink: Arc<dyn Fn(Event) + Send + Sync> =
+            Arc::new(move |event| captured.lock().unwrap().push(event));
+        let inbox = memory_inbox(sink.clone()).await;
         let mut config = ClientConfig::new("test-key");
         config.base_url = "http://127.0.0.1:1".into();
         let agent = Agent::new(
-            DeepSeekClient::new(config).expect("fixture client"),
+            DeepSeekClient::new(config).unwrap(),
             "persona",
             ModelOptions::default(),
         )
-        .expect("fixture agent");
+        .unwrap();
         let steer = agent.steer_handle();
         let skills = Arc::new(abycore::SkillCatalog::discover(std::path::Path::new(
             "/nonexistent-workspace",
         )));
-        let admitted: Arc<OutstandingSteers> = Arc::default();
-        let taken: Arc<OutstandingSteers> = Arc::default();
         let (_interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
         let (_steer_tx, mut steer_rx) = mpsc::unbounded_channel();
         let (_goal_tx, mut goal_rx) = mpsc::unbounded_channel();
@@ -5143,12 +4448,10 @@ mod tests {
             steer_rx: &mut steer_rx,
             steer: steer.clone(),
             skills: &skills,
-            admitted: &admitted,
-            taken: &taken,
+            inbox: &inbox,
             limits: TurnLimits::default(),
             compaction: None,
         };
-
         settle_steer(
             SteerRequest {
                 session_id: "s".into(),
@@ -5157,22 +4460,20 @@ mod tests {
                 parts: None,
             },
             &mut ctx,
-        );
-        assert!(!steer.is_empty(), "the message waits for the next boundary");
-        assert!(matches!(
-            events.lock().expect("event lock").as_slice(),
-            [
-                Event::Ctl(CtlEvent::SteerSettled {
-                    message_id: 5,
-                    deferred: false
-                }),
-                Event::Ctl(CtlEvent::QueueClaimed { item_id: 5 })
-            ]
-        ));
-
-        // Rejection is honest: the inbox stays empty and the client keeps the
-        // item queued.
-        events.lock().expect("event lock").clear();
+        )
+        .await;
+        assert!(!steer.is_empty());
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            Event::Ctl(CtlEvent::SteerSettled {
+                message_id: 5,
+                deferred: false
+            })
+        )));
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            Event::Ctl(CtlEvent::QueueClaimed { .. } | CtlEvent::SteerAdmitted { .. })
+        )));
         settle_steer(
             SteerRequest {
                 session_id: "s".into(),
@@ -5181,20 +4482,123 @@ mod tests {
                 parts: None,
             },
             &mut ctx,
-        );
-        let seen: Vec<String> = {
-            let events = events.lock().expect("event lock");
-            events
-                .iter()
-                .map(|event| match event {
-                    Event::Ctl(CtlEvent::TuiOpFailed(_)) => "failed".to_string(),
-                    Event::Ctl(CtlEvent::SteerSettled { deferred, .. }) => {
-                        if *deferred { "deferred" } else { "accepted" }.to_string()
-                    }
-                    _ => "other".to_string(),
-                })
-                .collect()
+        )
+        .await;
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            Event::Ctl(CtlEvent::SteerSettled {
+                message_id: 6,
+                deferred: true
+            })
+        )));
+    }
+    #[tokio::test]
+    async fn restore_reconciles_a_committed_image_without_redelivery() {
+        let workspace = scratch_dir("receipt-recovery");
+        let cfg = steer_test_config(&workspace, "http://127.0.0.1:9");
+        let parts = vec![abycore::ContentPart::InputImage {
+            media_type: "image/png".into(),
+            data: "AA==".into(),
+        }];
+        let input = abycore::UserInput::new(parts.clone());
+        let record = crate::queue_store::QueuedRecord {
+            input_id: input.id.clone(),
+            text: String::new(),
+            parts: Some(parts.clone()),
         };
-        assert_eq!(seen, vec!["failed".to_string(), "deferred".to_string()]);
+        crate::queue_store::save(cfg.home.as_deref().unwrap(), &cfg.workspace, "s", &[record])
+            .unwrap();
+        let mut snapshot = abycore::SessionSnapshot::new("test", Default::default());
+        let mut item = abycore::Item::user_parts(parts);
+        if let abycore::Item::Message { id, .. } = &mut item {
+            *id = Some(input.id);
+        }
+        snapshot.items.push(item);
+        snapshot.needs_response = true;
+        snapshot.validate().unwrap();
+        let inbox = HostInbox::new(&cfg, Arc::new(|_| {})).unwrap();
+        inbox.bind("s", Some(snapshot)).await.unwrap();
+        assert!(inbox.next().await.unwrap().is_none());
+        assert!(
+            crate::queue_store::load_checked(&cfg, "s")
+                .unwrap()
+                .is_empty()
+        );
+        inbox.barrier().await.unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unowned_session_cannot_migrate_or_accept_a_queue() {
+        let workspace = scratch_dir("receipt-unowned");
+        let cfg = steer_test_config(&workspace, "http://127.0.0.1:9");
+        let path = crate::queue_store::path(cfg.home.as_deref().unwrap(), &cfg.workspace, "s");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = r#"{"version":1,"items":["keep me"]}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let inbox = HostInbox::new(&cfg, Arc::new(|_| {})).unwrap();
+        inbox.bind("s", None).await.unwrap();
+        assert!(
+            inbox
+                .prepare("s", Some(1), "new".into(), None, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), legacy);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+    #[tokio::test]
+    async fn an_unadmitted_steer_becomes_editable_only_after_withdrawal() {
+        let inbox = memory_inbox(Arc::new(|_| {})).await;
+        let client = DeepSeekClient::new(ClientConfig::new("fixture-key")).unwrap();
+        let agent = Agent::new(client, "test", ModelOptions::default()).unwrap();
+        let steer = agent.steer_handle();
+        let input = inbox
+            .prepare("s", Some(42), "old".into(), None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        steer.send_input(input.clone()).unwrap();
+        inbox.finish_turn(steer.clone(), vec![]).await.unwrap();
+        assert!(steer.is_empty(), "no stale content may remain in the SDK");
+        inbox
+            .apply(Cmd::UpdateQueue {
+                session_id: "s".into(),
+                item_id: 42,
+                action: QueueAction::Edit("edited".into()),
+            })
+            .await
+            .unwrap();
+        let edited = inbox
+            .prepare("s", Some(42), "ignored retry".into(), None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edited.id, input.id);
+        assert_eq!(
+            edited.parts,
+            vec![abycore::ContentPart::InputText {
+                text: "edited".into()
+            }]
+        );
+        inbox.finish_turn(steer, vec![input.id]).await.unwrap();
+        inbox
+            .apply(Cmd::UpdateQueue {
+                session_id: "s".into(),
+                item_id: 42,
+                action: QueueAction::Edit("too late".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            inbox
+                .prepare("s", Some(42), "ignored".into(), None, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .parts,
+            edited.parts,
+            "an uncommitted input already in the live transcript stays immutable"
+        );
     }
 }

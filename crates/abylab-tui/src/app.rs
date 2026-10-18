@@ -7,7 +7,8 @@
 //! empty presses to quit; `/` opens the slash menu; Up recalls history on an
 //! empty prompt.
 
-use std::collections::{HashMap, VecDeque};
+use crate::queue_view::{PendingSteer, QueueEditState, QueuedPrompt};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -349,70 +350,7 @@ pub fn permission_desc(locale: Locale, id: &str) -> Option<&'static str> {
         .map(|(_, desc)| *desc)
 }
 
-/// Map a file extension to the attachment media type the host accepts.
-fn media_type_for(path: &str) -> Option<&'static str> {
-    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        "gif" => Some("image/gif"),
-        _ => None,
-    }
-}
-
-/// Read the raster image currently on the system clipboard as (bytes, media
-/// type). Terminals don't deliver image paste over stdin, so this shells out
-/// to the platform clipboard tool instead.
-#[cfg(target_os = "macos")]
-fn read_clipboard_image() -> Option<(Vec<u8>, &'static str)> {
-    let tmp = std::env::temp_dir().join(format!("dsh-clip-{}.png", std::process::id()));
-    let tmp_s = tmp.to_str()?.to_string();
-    let script = format!(
-        "set out to \"{tmp_s}\"\n\
-         set d to (the clipboard as «class PNGf»)\n\
-         set h to open for access (POSIX file out) with write permission\n\
-         write d to h as «class PNGf»\n\
-         close access h\n\
-         return out"
-    );
-    let out = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        return None;
-    }
-    let bytes = std::fs::read(&tmp).ok()?;
-    let _ = std::fs::remove_file(&tmp);
-    Some((bytes, "image/png"))
-}
-
-#[cfg(target_os = "linux")]
-fn read_clipboard_image() -> Option<(Vec<u8>, &'static str)> {
-    let attempts: &[(&str, &[&str])] = &[
-        ("wl-paste", &["--type", "image/png"]),
-        (
-            "xclip",
-            &["-selection", "clipboard", "-t", "image/png", "-o"],
-        ),
-    ];
-    for (cmd, args) in attempts {
-        if let Ok(out) = std::process::Command::new(cmd).args(*args).output() {
-            if out.status.success() && !out.stdout.is_empty() {
-                return Some((out.stdout, "image/png"));
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn read_clipboard_image() -> Option<(Vec<u8>, &'static str)> {
-    None
-}
+use crate::attachment_loader::media_type_for;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
@@ -738,6 +676,7 @@ pub struct App {
     /// Images staged in the composer as inline `[image N]` chips living in
     /// the draft text; editing a token away un-stages its image.
     pub pending_images: crate::attachments::Staged,
+    attachment_loader: Option<crate::attachment_loader::Loader>,
     /// Screen rects of the inline chips this frame (hover/cursor preview
     /// hit-testing; recorded by `ui::draw_input`).
     pub att_chips: Vec<(ratatui::layout::Rect, usize)>,
@@ -841,15 +780,7 @@ pub struct App {
     session_switch: Option<SessionSwitch>,
     pub quit: bool,
     pub queued: usize,
-    /// Transcript cells grouped by the client FIFO prompt that owns them.
-    /// Client-owned FIFO of prompts waiting for the active turn to end; `queued`
-    /// mirrors its length, and the queue is what `⌥↑` edits.
-    prompt_queue: VecDeque<QueuedPrompt>,
-    /// The queued prompt loaded back into the composer for editing (`⌥↑`).
-    queue_edit: Option<QueueEditState>,
-    /// Send Now bubbles awaiting the driver's settlement.
-    pending_steer_cells: HashMap<u64, PendingSteer>,
-    next_prompt_id: u64,
+    queue: crate::queue_view::QueueView,
     /// A first prompt was handed to the controller but has not reached the
     /// ACP request task yet. Runtime startup alone does not make a turn busy.
     prompt_pending: bool,
@@ -866,35 +797,11 @@ enum SessionSwitch {
 }
 
 fn ui_session(event: &crate::events::UiEvent) -> Option<&str> {
-    use crate::events::UiEvent;
-    match event {
-        UiEvent::SessionStatus { session, .. }
-        | UiEvent::TurnStart { session, .. }
-        | UiEvent::TurnEnd { session, .. }
-        | UiEvent::TextDelta { session, .. }
-        | UiEvent::ReasoningDelta { session, .. }
-        | UiEvent::AssistantFinal { session, .. }
-        | UiEvent::ToolCall { session, .. }
-        | UiEvent::ToolCallDelta { session, .. }
-        | UiEvent::ToolStarted { session, .. }
-        | UiEvent::ToolResult { session, .. }
-        | UiEvent::Usage { session, .. }
-        | UiEvent::UserInjected { session, .. }
-        | UiEvent::UserMessage { session, .. }
-        | UiEvent::SessionTitle { session, .. }
-        | UiEvent::Plan { session, .. }
-        | UiEvent::PlanMode { session, .. }
-        | UiEvent::SandboxMode { session, .. }
-        | UiEvent::ApprovalPolicy { session, .. }
-        | UiEvent::PermissionPreset { session, .. }
-        | UiEvent::ApprovalAsked { session, .. }
-        | UiEvent::ApprovalDecided { session, .. } => Some(session),
-        UiEvent::SubagentStarted { .. } | UiEvent::SubagentFinished { .. } => None,
-    }
+    event.session()
 }
 
 /// Draft pieces after stripping `[image n]` chips, still in reading order.
-enum StagedBlock {
+pub(crate) enum StagedBlock {
     Text(String),
     Image(crate::attachments::Attachment),
 }
@@ -964,35 +871,6 @@ fn queued_blocks(row: &crate::bus::QueueRow) -> Vec<StagedBlock> {
             _ => None,
         })
         .collect()
-}
-
-/// One client-owned queued prompt: the blocks (text and/or staged images)
-/// waiting for the active turn to end, plus the transcript cells echoing them
-/// (marked queued until the prompt is actually sent).
-///
-/// The queue lives here rather than in the driver's command channel so a
-/// queued prompt stays addressable: `⌥↑` lists it, Enter loads it back into
-/// the composer for editing, and an empty-draft Enter promotes the head into
-/// the active turn (Martty's client-owned FIFO).
-pub(crate) struct QueuedPrompt {
-    id: u64,
-    blocks: Vec<StagedBlock>,
-    cells: Vec<usize>,
-}
-
-/// A Send Now bubble awaiting settlement: the echo cells to re-tint (or to
-/// hand back to the queue) plus the blocks themselves, so a deferred steer
-/// requeues as the very prompt the user sent — images included.
-struct PendingSteer {
-    cells: Vec<usize>,
-    blocks: Vec<StagedBlock>,
-}
-
-/// The queued prompt currently loaded into the composer for editing.
-pub(crate) struct QueueEditState {
-    prompt_id: u64,
-    /// `ctrl+d` arms before it deletes: the first press asks, the second does.
-    delete_confirm: bool,
 }
 
 fn token_spans_in(
@@ -1276,6 +1154,7 @@ impl App {
             confirm: None,
             view_overlay: None,
             pending_images: crate::attachments::Staged::default(),
+            attachment_loader: None,
             att_chips: Vec::new(),
             att_thumbs: Vec::new(),
             hover_att: None,
@@ -1313,10 +1192,7 @@ impl App {
             pending_permission: None,
             quit: false,
             queued: 0,
-            prompt_queue: VecDeque::new(),
-            queue_edit: None,
-            pending_steer_cells: HashMap::new(),
-            next_prompt_id: 1,
+            queue: Default::default(),
             prompt_pending: false,
             server_info: None,
             needs_redraw: true,
@@ -1362,6 +1238,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.poll_attachments();
         if self
             .permission_ask
             .as_ref()
@@ -1826,6 +1703,9 @@ impl App {
         let modes_before = self.modes.clone();
         let model_before = self.cfg.model.clone();
         self.handle_inner(ev, ctl);
+        if let Some(loader) = &mut self.attachment_loader {
+            loader.sync(&self.session_id, self.input.revision());
+        }
         // A previewed palette never sticks: after every event, one that is no
         // longer under a highlight reverts the painter to the committed theme.
         self.reconcile_theme_preview();
@@ -1877,12 +1757,12 @@ impl App {
                 // `withdraw_prompt_echo` remaps the cells of the items still
                 // queued behind it, which a single flattened pass cannot do
                 // (their echoes are not one contiguous run).
-                while let Some(prompt) = self.prompt_queue.pop_front() {
+                while let Some(prompt) = self.queue.rows.pop_front() {
                     self.withdraw_prompt_echo(&prompt.cells);
                 }
                 self.queued = 0;
-                self.queue_edit = None;
-                self.pending_steer_cells.clear();
+                self.queue.edit = None;
+                self.queue.steering.clear();
                 if self.state != RunState::Idle {
                     self.state = RunState::Idle;
                     self.run_started = None;
@@ -1933,34 +1813,31 @@ impl App {
                         message_id,
                         deferred,
                     } => {
-                        if let Some(pending) = self.pending_steer_cells.remove(&message_id) {
-                            if deferred {
-                                self.transcript.mark_prompt_queued(&pending.cells);
-                                let blocks = pending.blocks;
-                                let text = staged_text(&blocks);
-                                let wire = prompt_blocks_from_staged(&blocks);
-                                self.enqueue_prompt(message_id, blocks, pending.cells);
-                                self.send_queued_wire(message_id, text, wire, ctl);
-                                self.show_tip(self.locale.tr(
-                                    "agent deferred Send Now — queued after the active turn",
-                                    "Agent 推迟了立即发送 —— 已排到本轮之后",
-                                ));
-                            } else {
-                                // The steer was accepted (a promoted queue head
-                                // reuses its queued echo): it is delivered now,
-                                // so the queued tint goes.
-                                self.transcript.mark_prompt_delivered(&pending.cells);
-                            }
+                        if let Some(pending) = self.queue.rejected(message_id, deferred) {
+                            self.transcript.mark_prompt_queued(&pending.cells);
+                            let blocks = pending.blocks;
+                            let text = staged_text(&blocks);
+                            let wire = prompt_blocks_from_staged(&blocks);
+                            self.enqueue_prompt(message_id, blocks, pending.cells);
+                            self.send_queued_wire(message_id, text, wire, ctl);
+                            self.show_tip(self.locale.tr(
+                                "agent deferred Send Now — queued after the active turn",
+                                "Agent 推迟了立即发送 —— 已排到本轮之后",
+                            ));
                         }
                     }
-                    CtlEvent::Queue { items } => self.fold_queue(items),
+                    CtlEvent::Queue { session_id, items } => {
+                        if session_id == self.session_id {
+                            self.fold_queue(items);
+                        }
+                    }
                     CtlEvent::QueueClaimed { item_id } => self.claim_queue_row(item_id),
                     CtlEvent::QueueRemoved { item_id } => self.remove_queue_row(item_id),
                     CtlEvent::SteerAdmitted { message_ids } => {
                         // The agent drained its inbox: those messages are in the
                         // transcript now, so their rows stop being pending.
                         for message_id in message_ids {
-                            if let Some(pending) = self.pending_steer_cells.remove(&message_id) {
+                            if let Some(pending) = self.queue.steering.remove(&message_id) {
                                 self.transcript.mark_prompt_delivered(&pending.cells);
                             }
                         }
@@ -3433,7 +3310,7 @@ impl App {
 
         // The queue editor owns ctrl+d while an item is loaded (the keymap
         // would read it as delete-forward): first press arms, second deletes.
-        if self.queue_edit.is_some()
+        if self.queue.edit.is_some()
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('d')
         {
@@ -3610,14 +3487,14 @@ impl App {
             Action::Enter => {
                 // The queue editor owns enter: it saves the edited item
                 // instead of sending it.
-                if self.queue_edit.is_some() {
+                if self.queue.edit.is_some() {
                     self.save_queue_edit(ctl);
                     return;
                 }
                 // An empty draft promotes the FIFO head into the active turn.
                 if self.input.is_empty()
                     && self.pending_images.is_empty()
-                    && !self.prompt_queue.is_empty()
+                    && !self.queue.rows.is_empty()
                 {
                     self.send_queue_head_now(ctl);
                     return;
@@ -3652,10 +3529,10 @@ impl App {
                 // cell indices now name nothing, and once new cells land they
                 // would name a stranger's cell. Drop them; the queue items
                 // themselves stay queued.
-                for prompt in &mut self.prompt_queue {
+                for prompt in &mut self.queue.rows {
                     prompt.cells.clear();
                 }
-                for steer in self.pending_steer_cells.values_mut() {
+                for steer in self.queue.steering.values_mut() {
                     steer.cells.clear();
                 }
                 self.prompt_jump_cell = None;
@@ -3701,7 +3578,7 @@ impl App {
                 // against the busy-Enter preference.
                 if self.input.is_empty()
                     && self.pending_images.is_empty()
-                    && !self.prompt_queue.is_empty()
+                    && !self.queue.rows.is_empty()
                 {
                     self.steer_all_queued(ctl);
                 } else {
@@ -4100,7 +3977,7 @@ impl App {
                     .items
                     .get(picker.sel)
                     .and_then(|item| item.id.parse::<u64>().ok())
-                    .and_then(|id| self.prompt_queue.iter().position(|prompt| prompt.id == id));
+                    .and_then(|id| self.queue.rows.iter().position(|prompt| prompt.id == id));
                 if let Some(index) = index {
                     self.steer_queued(index, ctl);
                     // The steered row left the FIFO: rebuild the list on the row
@@ -4276,7 +4153,7 @@ impl App {
     /// deletes rows (`ctrl+d`), so it is also the place to drop a queued prompt
     /// you no longer mean to send.
     fn open_queue_selector(&mut self) {
-        if self.prompt_queue.is_empty() {
+        if self.queue.rows.is_empty() {
             self.show_tip(
                 self.locale
                     .tr("no queued prompt to edit", "没有可编辑的排队命令"),
@@ -4300,12 +4177,13 @@ impl App {
     /// item being edited, else the head — while `Some` keeps a highlight that
     /// already exists (a delete rebuilds the list under it).
     fn queue_picker(&self, sel: Option<usize>) -> Option<Picker> {
-        if self.prompt_queue.is_empty() {
+        if self.queue.rows.is_empty() {
             return None;
         }
-        let editing = self.queue_edit.as_ref().map(|edit| edit.prompt_id);
+        let editing = self.queue.edit.as_ref().map(|edit| edit.prompt_id);
         let items: Vec<PickerItem> = self
-            .prompt_queue
+            .queue
+            .rows
             .iter()
             .enumerate()
             .map(|(index, prompt)| {
@@ -4378,7 +4256,8 @@ impl App {
             Image(String, String, String, Vec<u8>),
         }
         let Some((prompt_id, pieces)) = self
-            .prompt_queue
+            .queue
+            .rows
             .iter()
             .find(|prompt| prompt.id.to_string() == id)
             .map(|prompt| {
@@ -4416,7 +4295,7 @@ impl App {
                 }
             }
         }
-        self.queue_edit = Some(QueueEditState {
+        self.queue.edit = Some(QueueEditState {
             prompt_id,
             delete_confirm: false,
         });
@@ -4429,7 +4308,7 @@ impl App {
 
     /// Enter while editing: replace the queued item with the edited draft.
     fn save_queue_edit(&mut self, ctl: &Controller) {
-        let Some(edit) = self.queue_edit.as_ref() else {
+        let Some(edit) = self.queue.edit.as_ref() else {
             return;
         };
         let prompt_id = edit.prompt_id;
@@ -4451,7 +4330,8 @@ impl App {
             self.take_staged_blocks()
         };
         let Some(index) = self
-            .prompt_queue
+            .queue
+            .rows
             .iter()
             .position(|prompt| prompt.id == prompt_id)
         else {
@@ -4462,25 +4342,25 @@ impl App {
             );
             return;
         };
-        let had_images = self.prompt_queue[index]
+        let had_images = self.queue.rows[index]
             .blocks
             .iter()
             .any(|block| matches!(block, StagedBlock::Image(_)));
-        self.prompt_queue[index].blocks = blocks;
-        let text = staged_text(&self.prompt_queue[index].blocks);
-        let images = self.prompt_queue[index]
+        self.queue.rows[index].blocks = blocks;
+        let text = staged_text(&self.queue.rows[index].blocks);
+        let images = self.queue.rows[index]
             .blocks
             .iter()
             .any(|block| matches!(block, StagedBlock::Image(_)));
         let action = if images || had_images {
             crate::bus::QueueAction::EditParts {
                 text,
-                blocks: prompt_blocks_from_staged(&self.prompt_queue[index].blocks),
+                blocks: prompt_blocks_from_staged(&self.queue.rows[index].blocks),
             }
         } else {
             crate::bus::QueueAction::Edit(text)
         };
-        let item_id = self.prompt_queue[index].id;
+        let item_id = self.queue.rows[index].id;
         self.repaint_prompt_echo(index);
         self.update_queue_row(item_id, action, ctl);
         self.finish_queue_edit();
@@ -4493,7 +4373,7 @@ impl App {
 
     /// `ctrl+d` while editing: the first press arms, the second deletes.
     fn delete_queue_edit(&mut self, ctl: &Controller) {
-        let Some(edit) = self.queue_edit.as_mut() else {
+        let Some(edit) = self.queue.edit.as_mut() else {
             return;
         };
         if !edit.delete_confirm {
@@ -4506,7 +4386,8 @@ impl App {
         }
         let prompt_id = edit.prompt_id;
         let Some(index) = self
-            .prompt_queue
+            .queue
+            .rows
             .iter()
             .position(|prompt| prompt.id == prompt_id)
         else {
@@ -4523,11 +4404,11 @@ impl App {
     /// (the message was never sent), the counter follows, and an idle client
     /// sends the next in line. The editor's `ctrl+d` and the picker's land here.
     fn drop_queued_prompt(&mut self, index: usize, ctl: &Controller) {
-        let Some(prompt) = self.prompt_queue.remove(index) else {
+        let Some(prompt) = self.queue.rows.remove(index) else {
             return;
         };
         self.withdraw_prompt_echo(&prompt.cells);
-        self.queued = self.prompt_queue.len();
+        self.queued = self.queue.rows.len();
         self.update_queue_row(prompt.id, crate::bus::QueueAction::Remove, ctl);
         self.show_tip(
             self.locale
@@ -4549,7 +4430,8 @@ impl App {
         // A row whose item already left (a session switch, another client's
         // delete) is simply gone: the rebuild below shows the queue as it is.
         if let Some(index) = self
-            .prompt_queue
+            .queue
+            .rows
             .iter()
             .position(|prompt| prompt.id.to_string() == id)
         {
@@ -4605,8 +4487,8 @@ impl App {
     /// blocks may well have changed shape (a text and an image swapped), so the
     /// run is replaced rather than rewritten cell by cell.
     fn repaint_prompt_echo(&mut self, index: usize) {
-        let blocks = std::mem::take(&mut self.prompt_queue[index].blocks);
-        let run = std::mem::take(&mut self.prompt_queue[index].cells);
+        let blocks = std::mem::take(&mut self.queue.rows[index].blocks);
+        let run = std::mem::take(&mut self.queue.rows[index].cells);
         let echo = match blocks[..] {
             [] => Vec::new(),
             _ => {
@@ -4627,8 +4509,8 @@ impl App {
         };
         let (shift, painted) = self.transcript.replace_cells(&run, echo);
         self.remap_cell_indices(shift, Some(index));
-        self.prompt_queue[index].cells = painted;
-        self.prompt_queue[index].blocks = blocks;
+        self.queue.rows[index].cells = painted;
+        self.queue.rows[index].blocks = blocks;
         self.needs_redraw = true;
     }
 
@@ -4638,23 +4520,7 @@ impl App {
     /// caller, not from the shift. The flash is dropped: its anchor may be
     /// stale.
     fn remap_cell_indices(&mut self, shift: crate::transcript::CellShift, skip: Option<usize>) {
-        let remap = |cells: &mut Vec<usize>| {
-            cells.retain_mut(|index| match shift.map(*index) {
-                Some(at) => {
-                    *index = at;
-                    true
-                }
-                None => false,
-            });
-        };
-        for (index, prompt) in self.prompt_queue.iter_mut().enumerate() {
-            if Some(index) != skip {
-                remap(&mut prompt.cells);
-            }
-        }
-        for steer in self.pending_steer_cells.values_mut() {
-            remap(&mut steer.cells);
-        }
+        self.queue.remap(&shift, skip);
         self.prompt_jump_cell = self.prompt_jump_cell.and_then(|index| shift.map(index));
         self.prompt_flash = None;
         self.prompt_flash_lines = None;
@@ -4664,7 +4530,7 @@ impl App {
     /// Leave edit mode: the draft (and the tray it resolved into) is dropped;
     /// the queued item keeps whatever it already had.
     fn finish_queue_edit(&mut self) {
-        self.queue_edit = None;
+        self.queue.edit = None;
         self.input.clear();
         self.pending_images.clear();
         self.reconcile_attachments();
@@ -4681,7 +4547,7 @@ impl App {
     /// is invented: the head goes out as an ordinary prompt and the rest stay
     /// queued for the idle dispatcher (the harness reports this case silently).
     fn steer_all_queued(&mut self, ctl: &Controller) {
-        if self.queue_edit.is_some() || self.prompt_queue.is_empty() {
+        if self.queue.edit.is_some() || self.queue.rows.is_empty() {
             return;
         }
         let running = matches!(self.state, RunState::Running) || self.prompt_pending;
@@ -4691,7 +4557,7 @@ impl App {
         }
         // Always index 0: each steer takes the head, so the FIFO order the
         // rows were shown in is the order the agent sees.
-        let count = self.prompt_queue.len();
+        let count = self.queue.rows.len();
         for _ in 0..count {
             self.steer_queued(0, ctl);
         }
@@ -4706,7 +4572,7 @@ impl App {
     }
 
     fn send_queue_head_now(&mut self, ctl: &Controller) {
-        if self.queue_edit.is_some() {
+        if self.queue.edit.is_some() {
             return;
         }
         // `turn_busy` counts this non-empty queue itself, so it cannot say
@@ -4720,15 +4586,15 @@ impl App {
             self.steer_queued(0, ctl);
             return;
         }
-        let Some(prompt) = self.prompt_queue.remove(0) else {
+        let Some(prompt) = self.queue.rows.remove(0) else {
             return;
         };
-        self.queued = self.prompt_queue.len();
+        self.queued = self.queue.rows.len();
         self.scroll_up = 0;
         let message_id = prompt.id;
         let wire = prompt_blocks_from_staged(&prompt.blocks);
         self.transcript.mark_prompt_steering(&prompt.cells);
-        self.pending_steer_cells.insert(
+        self.queue.steering.insert(
             message_id,
             PendingSteer {
                 cells: prompt.cells,
@@ -4853,9 +4719,7 @@ impl App {
         self.selected_model = None;
         self.session_title = None;
         self.queued = 0;
-        self.prompt_queue.clear();
-        self.queue_edit = None;
-        self.pending_steer_cells.clear();
+        self.queue.reset();
         self.prompt_pending = false;
         // A different session reports its own preset; nothing of the old one's
         // request is in flight behind it.
@@ -5146,6 +5010,9 @@ impl App {
     }
 
     fn handle_esc(&mut self, ctl: &Controller) {
+        if let Some(loader) = &mut self.attachment_loader {
+            loader.cancel();
+        }
         if self.permission_ask.is_some() {
             self.finish_permission_ask(PermissionAskReply::Cancelled);
             return;
@@ -5163,7 +5030,7 @@ impl App {
         // A queued prompt loaded for editing leaves the item untouched. The
         // idle status that could ship the FIFO was already spent holding the
         // queue back, so cancelling the edit has to hand the head over now.
-        if self.queue_edit.is_some() {
+        if self.queue.edit.is_some() {
             self.finish_queue_edit();
             self.show_tip(
                 self.locale
@@ -5229,6 +5096,9 @@ impl App {
     }
 
     fn handle_ctrl_c(&mut self, _ctl: &Controller) {
+        if let Some(loader) = &mut self.attachment_loader {
+            loader.cancel();
+        }
         if !self.input.is_empty() {
             // Clearing the draft never counts as the first press of the
             // double-Ctrl+C quit chord.
@@ -5982,16 +5852,15 @@ impl App {
     fn turn_busy(&self) -> bool {
         matches!(self.state, RunState::Running)
             || self.prompt_pending
-            || !self.prompt_queue.is_empty()
+            || !self.queue.rows.is_empty()
     }
 
     /// Queue one prompt behind the active turn and mark its echo cells.
     /// Show a row we just asked the host to queue. The driver's snapshot is the
     /// truth; this only closes the round trip for the picker and the counters.
     fn enqueue_prompt(&mut self, id: u64, blocks: Vec<StagedBlock>, cells: Vec<usize>) {
-        self.prompt_queue
-            .push_back(QueuedPrompt { id, blocks, cells });
-        self.queued = self.prompt_queue.len();
+        self.queue.enqueue(id, blocks, cells);
+        self.queued = self.queue.rows.len();
     }
 
     /// Fold the driver's queue into the view.
@@ -6006,17 +5875,19 @@ impl App {
         for row in items {
             // A queue acknowledgement can arrive after the user promoted its
             // optimistic row to a steer. Its pending echo already exists.
-            if self.pending_steer_cells.contains_key(&row.item_id) {
+            if self.queue.steering.contains_key(&row.item_id) {
                 continue;
             }
             let existing = self
-                .prompt_queue
+                .queue
+                .rows
                 .iter()
                 .position(|prompt| prompt.id == row.item_id);
             match existing {
                 Some(index) => {
                     let mut prompt = self
-                        .prompt_queue
+                        .queue
+                        .rows
                         .remove(index)
                         .expect("index came from a position search");
                     if !staged_matches_queue(&prompt.blocks, &row) {
@@ -6046,12 +5917,12 @@ impl App {
             }
         }
         // Whatever the host no longer lists is gone: its echo goes with it.
-        let kept = self.prompt_queue.drain(..).collect::<Vec<_>>();
+        let kept = self.queue.rows.drain(..).collect::<Vec<_>>();
         for prompt in kept {
             self.withdraw_prompt_echo(&prompt.cells);
         }
-        self.prompt_queue = next;
-        self.queued = self.prompt_queue.len();
+        self.queue.rows = next;
+        self.queued = self.queue.rows.len();
     }
 
     /// The driver delivered one row: its echo is an ordinary user row now.
@@ -6059,7 +5930,7 @@ impl App {
         if let Some(prompt) = self.take_queue_row(item_id) {
             self.transcript.mark_prompt_delivered(&prompt.cells);
         }
-        if let Some(pending) = self.pending_steer_cells.remove(&item_id) {
+        if let Some(pending) = self.queue.steering.remove(&item_id) {
             self.transcript.mark_prompt_delivered(&pending.cells);
         }
     }
@@ -6075,12 +5946,8 @@ impl App {
 
     /// Take one row out of the local mirror, if it is still there.
     fn take_queue_row(&mut self, item_id: u64) -> Option<QueuedPrompt> {
-        let index = self
-            .prompt_queue
-            .iter()
-            .position(|prompt| prompt.id == item_id)?;
-        let prompt = self.prompt_queue.remove(index)?;
-        self.queued = self.prompt_queue.len();
+        let prompt = self.queue.take(item_id)?;
+        self.queued = self.queue.rows.len();
         Some(prompt)
     }
 
@@ -6100,15 +5967,15 @@ impl App {
     /// bubble turns into a pending-steering row, and the driver settles it when
     /// the agent takes it (or puts it back when it cannot).
     fn steer_queued(&mut self, index: usize, ctl: &Controller) -> bool {
-        let Some(prompt) = self.prompt_queue.remove(index) else {
+        let Some(prompt) = self.queue.rows.remove(index) else {
             return false;
         };
-        self.queued = self.prompt_queue.len();
+        self.queued = self.queue.rows.len();
         self.scroll_up = 0;
         let message_id = prompt.id;
         let wire = prompt_blocks_from_staged(&prompt.blocks);
         self.transcript.mark_prompt_steering(&prompt.cells);
-        self.pending_steer_cells.insert(
+        self.queue.steering.insert(
             message_id,
             PendingSteer {
                 cells: prompt.cells,
@@ -6207,39 +6074,60 @@ impl App {
             ));
             return;
         };
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(err) => {
-                self.show_tip(format!(
-                    "{} {path}: {err}",
-                    self.locale.tr("cannot read", "无法读取")
-                ));
-                return;
-            }
-        };
-        let name = path.rsplit('/').next().unwrap_or(path).to_string();
-        let stored_path = std::fs::canonicalize(path)
-            .or_else(|_| std::path::absolute(path))
-            .unwrap_or_else(|_| std::path::PathBuf::from(path))
-            .to_string_lossy()
-            .into_owned();
-        self.stage_image(name, stored_path, media_type.to_string(), bytes, caption);
+        let _ = media_type;
+        self.load_attachment(crate::attachment_loader::Source::File(path.into()), caption);
     }
 
-    /// `/clip [caption]` — stage the clipboard image in the composer.
     fn clip_image(&mut self, caption: &str, _ctl: &Controller) {
-        match read_clipboard_image() {
-            Some((bytes, media_type)) => self.stage_image(
-                "clipboard.png".into(),
-                "clipboard".into(),
-                media_type.to_string(),
-                bytes,
-                caption.to_string(),
+        self.load_attachment(crate::attachment_loader::Source::Clipboard, caption.into());
+    }
+
+    fn load_attachment(&mut self, source: crate::attachment_loader::Source, caption: String) {
+        if self.attachment_loader.is_none() {
+            match crate::attachment_loader::Loader::new() {
+                Ok(loader) => self.attachment_loader = Some(loader),
+                Err(error) => {
+                    self.show_tip(format!("image loader: {error}"));
+                    return;
+                }
+            }
+        }
+        let loader = self.attachment_loader.as_mut().unwrap();
+        loader.sync(&self.session_id, self.input.revision());
+        match loader.submit(source, caption) {
+            Ok(()) => self.show_tip(
+                self.locale
+                    .tr("loading image… · esc cancels", "正在加载图片… · esc 取消"),
             ),
-            None => self.show_tip(self.locale.tr(
-                "clipboard has no image, or this platform isn't supported",
-                "剪贴板里没有图片，或当前平台不支持",
-            )),
+            Err(error) => self.show_tip(error),
+        }
+    }
+
+    fn poll_attachments(&mut self) {
+        loop {
+            let Some(loader) = &mut self.attachment_loader else {
+                return;
+            };
+            loader.sync(&self.session_id, self.input.revision());
+            let Some(result) = loader.poll() else {
+                return;
+            };
+            match result {
+                Ok(image) => self.stage_image(
+                    image.name,
+                    image.path,
+                    image.media_type,
+                    image.data,
+                    image.caption,
+                ),
+                Err(error) => self.show_tip(error),
+            }
+            // Insertions by this loader belong to the same draft; keyboard
+            // edits/replacements instead invalidate outstanding completions.
+            self.attachment_loader
+                .as_mut()
+                .unwrap()
+                .rebase(self.input.revision());
         }
     }
 
@@ -6312,9 +6200,7 @@ impl App {
     }
 
     fn next_prompt_id(&mut self) -> u64 {
-        let id = self.next_prompt_id;
-        self.next_prompt_id = self.next_prompt_id.wrapping_add(1).max(1);
-        id
+        self.queue.allocate_id()
     }
 
     /// Echo staged blocks in the transcript (text and image thumbnails in
@@ -6364,7 +6250,7 @@ impl App {
         // record for a deferred requeue.
         let wire = prompt_blocks_from_staged(&staged);
         if let Some(message_id) = steer_message_id {
-            self.pending_steer_cells.insert(
+            self.queue.steering.insert(
                 message_id,
                 PendingSteer {
                     cells,
@@ -6503,7 +6389,7 @@ impl App {
             self.scroll_up = 0;
             let message_id = if running {
                 let message_id = self.next_prompt_id();
-                self.pending_steer_cells.insert(
+                self.queue.steering.insert(
                     message_id,
                     PendingSteer {
                         cells: vec![cell],
@@ -8701,7 +8587,8 @@ mod mode_tests {
 
         app.send_now(&ctl);
         let message_id = *app
-            .pending_steer_cells
+            .queue
+            .steering
             .keys()
             .next()
             .expect("tracked steer command");
@@ -8724,17 +8611,15 @@ mod mode_tests {
         ));
     }
 
-    /// A queue head promoted by an empty enter is delivered when the steer
-    /// settles: its echo loses the queued tint (the item already left the
-    /// queue, so leaving it tinted contradicts the counter).
+    /// The handoff ack preserves the pending tint until a committed receipt.
     #[test]
-    fn a_settled_queue_head_steer_clears_the_queued_tint() {
+    fn a_committed_queue_head_steer_clears_the_pending_tint() {
         let (mut app, ctl, _rx) = test_app();
         app.state = RunState::Running;
         app.send_agent_text("head".into(), &ctl);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
         let (message_id, cells) = {
-            let (id, pending) = app.pending_steer_cells.iter().next().expect("steer");
+            let (id, pending) = app.queue.steering.iter().next().expect("steer");
             (*id, pending.cells.clone())
         };
         app.handle(
@@ -8744,7 +8629,21 @@ mod mode_tests {
             }),
             &ctl,
         );
-        assert!(app.pending_steer_cells.is_empty());
+        assert!(app.queue.steering.contains_key(&message_id));
+        assert!(matches!(
+            app.transcript.cells[cells[0]].kind,
+            crate::transcript::CellKind::User {
+                delivery: crate::transcript::Delivery::Steering,
+                ..
+            }
+        ));
+        app.handle(
+            AppEvent::Ctl(CtlEvent::SteerAdmitted {
+                message_ids: vec![message_id],
+            }),
+            &ctl,
+        );
+        assert!(app.queue.steering.is_empty());
         for cell in cells {
             assert!(matches!(
                 &app.transcript.cells[cell].kind,
@@ -8843,10 +8742,10 @@ mod mode_tests {
         app.input.set("later".into());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctl);
         assert_eq!(app.queued, 1);
-        assert_eq!(app.prompt_queue.len(), 1);
+        assert_eq!(app.queue.rows.len(), 1);
         assert!(
             matches!(commands.try_recv(), Ok(Cmd::Queue { item_id, text, .. })
-                if text == "later" && item_id == app.prompt_queue[0].id),
+                if text == "later" && item_id == app.queue.rows[0].id),
             "queueing is the host's job now: the row rides Cmd::Queue"
         );
 
@@ -8887,7 +8786,7 @@ mod mode_tests {
         assert_eq!(steered, ["first", "second"], "FIFO, all of them");
         assert_eq!(app.queued, 0, "the queue emptied into the turn");
         assert_eq!(
-            app.pending_steer_cells.len(),
+            app.queue.steering.len(),
             2,
             "both echoes await their settlement"
         );
@@ -8902,11 +8801,7 @@ mod mode_tests {
         app.state = RunState::Running;
         app.input.set("change course".into());
         app.send_now(&ctl);
-        let message_id = *app
-            .pending_steer_cells
-            .keys()
-            .next()
-            .expect("tracked steer");
+        let message_id = *app.queue.steering.keys().next().expect("tracked steer");
         let cell = app.transcript.cells.len() - 1;
         assert!(matches!(
             &app.transcript.cells[cell].kind,
@@ -8923,7 +8818,7 @@ mod mode_tests {
             &ctl,
         );
 
-        assert!(app.pending_steer_cells.is_empty(), "nothing left pending");
+        assert!(app.queue.steering.is_empty(), "nothing left pending");
         assert!(matches!(
             &app.transcript.cells[cell].kind,
             crate::transcript::CellKind::User {
@@ -8934,7 +8829,7 @@ mod mode_tests {
         // An unrelated id in the same report changes nothing.
         app.input.set("later".into());
         app.send_now(&ctl);
-        let other = *app.pending_steer_cells.keys().next().expect("second steer");
+        let other = *app.queue.steering.keys().next().expect("second steer");
         app.handle(
             AppEvent::Ctl(CtlEvent::SteerAdmitted {
                 message_ids: vec![message_id, 999],
@@ -8942,7 +8837,7 @@ mod mode_tests {
             &ctl,
         );
         assert!(
-            app.pending_steer_cells.contains_key(&other),
+            app.queue.steering.contains_key(&other),
             "a stale settlement must not clear a live steer"
         );
     }
@@ -8959,7 +8854,7 @@ mod mode_tests {
         app.input.set("second".into());
         app.send_now(&ctl);
         let (first, second) = {
-            let mut ids: Vec<u64> = app.pending_steer_cells.keys().copied().collect();
+            let mut ids: Vec<u64> = app.queue.steering.keys().copied().collect();
             ids.sort_unstable();
             (ids[0], ids[1])
         };
@@ -8979,10 +8874,11 @@ mod mode_tests {
             &ctl,
         );
 
-        assert!(app.pending_steer_cells.is_empty());
+        assert!(app.queue.steering.is_empty());
         assert_eq!(app.queued, 2);
         let texts: Vec<String> = app
-            .prompt_queue
+            .queue
+            .rows
             .iter()
             .map(|prompt| match prompt.blocks.first() {
                 Some(StagedBlock::Text(text)) => text.clone(),
@@ -9032,7 +8928,8 @@ mod mode_tests {
         assert_eq!(steered, ["second"], "only the highlighted row went");
         assert_eq!(app.queued, 2, "the other two keep their FIFO slots");
         let remaining: Vec<String> = app
-            .prompt_queue
+            .queue
+            .rows
             .iter()
             .map(|prompt| match prompt.blocks.first() {
                 Some(StagedBlock::Text(text)) => text.clone(),
@@ -9091,11 +8988,7 @@ mod mode_tests {
             matches!(commands.try_recv(), Ok(Cmd::Steer { text, .. }) if text == "second"),
             "the host decides what a steer means when nothing is running"
         );
-        assert_eq!(
-            app.pending_steer_cells.len(),
-            1,
-            "and it awaits the verdict"
-        );
+        assert_eq!(app.queue.steering.len(), 1, "and it awaits the verdict");
     }
 
     /// `/enter` is gone as a builtin: its menu row with it, and a hand-typed
@@ -9417,7 +9310,8 @@ mod mode_tests {
         app.input.set("old steer".into());
         app.send_now(&ctl);
         let message_id = *app
-            .pending_steer_cells
+            .queue
+            .steering
             .keys()
             .next()
             .expect("steer is awaiting settlement");
@@ -9431,9 +9325,9 @@ mod mode_tests {
             &ctl,
         );
 
-        assert!(app.pending_steer_cells.is_empty());
+        assert!(app.queue.steering.is_empty());
         assert_eq!(app.queued, 0, "late settlement cannot taint a new session");
-        assert!(app.prompt_queue.is_empty());
+        assert!(app.queue.rows.is_empty());
     }
 
     #[test]
@@ -9444,13 +9338,13 @@ mod mode_tests {
         app.input.set("unsettled steer".into());
         app.send_now(&ctl);
         assert_eq!(app.queued, 1);
-        assert_eq!(app.pending_steer_cells.len(), 1);
+        assert_eq!(app.queue.steering.len(), 1);
 
         app.handle(AppEvent::RuntimeExited(Some(1)), &ctl);
 
         assert_eq!(app.queued, 0);
-        assert!(app.prompt_queue.is_empty());
-        assert!(app.pending_steer_cells.is_empty());
+        assert!(app.queue.rows.is_empty());
+        assert!(app.queue.steering.is_empty());
         assert!(
             app.transcript.cells.iter().all(|cell| !matches!(
                 &cell.kind,
@@ -9494,7 +9388,10 @@ mod mode_tests {
         app.handle(
             AppEvent::Ui(crate::events::UiEvent::TurnEnd {
                 session: app.session_id.clone(),
-                kind: "interrupted".into(),
+                turn: 1,
+                error: None,
+                usage: Default::default(),
+                kind: abylab_backend::TurnStatus::Interrupted,
             }),
             &ctl,
         );
@@ -9534,7 +9431,7 @@ mod mode_tests {
         );
 
         assert_eq!(app.queued, 2);
-        assert_eq!(app.prompt_queue.len(), 2);
+        assert_eq!(app.queue.rows.len(), 2);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::Image {
@@ -9555,7 +9452,7 @@ mod mode_tests {
         app.send_now(&ctl);
 
         assert_eq!(app.queued, 1);
-        assert_eq!(app.pending_steer_cells.len(), 1);
+        assert_eq!(app.queue.steering.len(), 1);
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::User {
@@ -9574,7 +9471,7 @@ mod mode_tests {
         app.state = RunState::Running;
         app.send_agent_text("first followup".into(), &ctl);
         app.send_agent_text("second followup".into(), &ctl);
-        let kept_id = app.prompt_queue[1].id;
+        let kept_id = app.queue.rows[1].id;
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &ctl);
         let picker = app.picker.as_ref().expect("queue picker");
@@ -9592,18 +9489,18 @@ mod mode_tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
         assert!(app.picker.is_none(), "the picker closed on enter");
         assert_eq!(app.input.buf(), "second followup");
-        assert!(app.queue_edit.is_some());
-        assert_eq!(app.prompt_queue.len(), 2, "the item keeps its slot");
+        assert!(app.queue.edit.is_some());
+        assert_eq!(app.queue.rows.len(), 2, "the item keeps its slot");
 
         // Enter saves: the item is replaced in place and nothing was sent.
         app.input.set("second followup, revised".into());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
-        assert!(app.queue_edit.is_none());
+        assert!(app.queue.edit.is_none());
         assert!(app.input.is_empty());
         assert_eq!(app.queued, 2);
-        assert_eq!(app.prompt_queue[1].id, kept_id, "the slot is unchanged");
+        assert_eq!(app.queue.rows[1].id, kept_id, "the slot is unchanged");
         assert!(
-            matches!(&app.prompt_queue[1].blocks[..], [StagedBlock::Text(text)] if text == "second followup, revised"),
+            matches!(&app.queue.rows[1].blocks[..], [StagedBlock::Text(text)] if text == "second followup, revised"),
             "the edit replaced the blocks"
         );
         let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
@@ -9645,12 +9542,12 @@ mod mode_tests {
         app.send_agent_text("third".into(), &ctl);
         assert_eq!(echo_texts(&app), ["first", "typo here", "third"]);
 
-        let id = app.prompt_queue[1].id;
+        let id = app.queue.rows[1].id;
         app.begin_queue_edit(&id.to_string(), &ctl);
         app.input.set("fixed".into());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
 
-        assert!(app.queue_edit.is_none());
+        assert!(app.queue.edit.is_none());
         assert_eq!(app.queued, 3, "an edit is not a send and not a delete");
         assert_eq!(
             echo_texts(&app),
@@ -9658,11 +9555,11 @@ mod mode_tests {
             "the edited bubble shows the new text, in its own place"
         );
         assert_eq!(
-            app.prompt_queue[1].cells.len(),
+            app.queue.rows[1].cells.len(),
             1,
             "the run matches the item's blocks"
         );
-        for cell in app.prompt_queue[1].cells.clone() {
+        for cell in app.queue.rows[1].cells.clone() {
             assert!(
                 matches!(
                     &app.transcript.cells[cell].kind,
@@ -9692,15 +9589,15 @@ mod mode_tests {
         let (ctl, commands) = crate::controller::test_controller();
         app.state = RunState::Running;
         app.send_agent_text("keep me".into(), &ctl);
-        let id = app.prompt_queue[0].id;
+        let id = app.queue.rows[0].id;
         app.begin_queue_edit(&id.to_string(), &ctl);
         app.input.set("changed my mind".into());
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctl);
-        assert!(app.queue_edit.is_none(), "esc cancelled the edit");
+        assert!(app.queue.edit.is_none(), "esc cancelled the edit");
         assert!(app.input.is_empty(), "the draft is dropped");
         assert!(
-            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "keep me"),
+            matches!(&app.queue.rows[0].blocks[..], [StagedBlock::Text(text)] if text == "keep me"),
             "the queued item is untouched"
         );
         assert_eq!(app.queued, 1);
@@ -9711,14 +9608,14 @@ mod mode_tests {
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
             &ctl,
         );
-        assert!(app.queue_edit.is_some(), "the first press only arms");
-        assert_eq!(app.prompt_queue.len(), 1);
+        assert!(app.queue.edit.is_some(), "the first press only arms");
+        assert_eq!(app.queue.rows.len(), 1);
         app.handle_key(
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
             &ctl,
         );
-        assert!(app.queue_edit.is_none());
-        assert!(app.prompt_queue.is_empty(), "the second press deleted it");
+        assert!(app.queue.edit.is_none());
+        assert!(app.queue.rows.is_empty(), "the second press deleted it");
         assert_eq!(app.queued, 0);
         let sent: Vec<Cmd> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
         assert!(
@@ -9766,7 +9663,7 @@ mod mode_tests {
         app.send_agent_text("keep me".into(), &ctl);
         assert_eq!(queued_echoes(&app), ["delete me", "keep me"]);
 
-        let id = app.prompt_queue[0].id;
+        let id = app.queue.rows[0].id;
         app.begin_queue_edit(&id.to_string(), &ctl);
         for _ in 0..2 {
             app.handle_key(
@@ -9776,14 +9673,14 @@ mod mode_tests {
         }
 
         assert_eq!(app.queued, 1, "one item left in the queue");
-        assert_eq!(app.prompt_queue.len(), 1);
+        assert_eq!(app.queue.rows.len(), 1);
         assert_eq!(
             queued_echoes(&app),
             ["keep me"],
             "the deleted echo left the timeline, the survivor stayed"
         );
         assert_eq!(app.transcript.cells.len(), 1, "only its own bubble is left");
-        for cell in app.prompt_queue[0].cells.clone() {
+        for cell in app.queue.rows[0].cells.clone() {
             assert!(
                 matches!(
                     &app.transcript.cells[cell].kind,
@@ -9848,7 +9745,7 @@ mod mode_tests {
                 .contains("ctrl+d"),
             "the armed row says what the next press does"
         );
-        assert_eq!(app.prompt_queue.len(), 3, "the first press only asks");
+        assert_eq!(app.queue.rows.len(), 3, "the first press only asks");
 
         // ↓ walks off the row and takes the arming with it: `ctrl+d` names the
         // row under the highlight, never the one the user left behind.
@@ -9858,7 +9755,7 @@ mod mode_tests {
             "moving the highlight disarms"
         );
         app.handle_key(ctrl_d(), &ctl);
-        assert_eq!(app.prompt_queue.len(), 3, "arming again deletes nothing");
+        assert_eq!(app.queue.rows.len(), 3, "arming again deletes nothing");
 
         // Second press: the row goes, its echo leaves the timeline with it, and
         // the dialog stays open on the row that moved up into its place.
@@ -9875,7 +9772,7 @@ mod mode_tests {
             app.handle_key(ctrl_d(), &ctl);
             app.handle_key(ctrl_d(), &ctl);
         }
-        assert!(app.prompt_queue.is_empty());
+        assert!(app.queue.rows.is_empty());
         assert_eq!(app.queued, 0);
         assert!(queued_echoes(&app).is_empty(), "no echo outlives its item");
         assert!(app.picker.is_none(), "an empty list is not a dialog");
@@ -9912,7 +9809,7 @@ mod mode_tests {
         app.state = RunState::Running;
         app.send_agent_text("head".into(), &ctl);
         app.send_agent_text("tail".into(), &ctl);
-        let head = app.prompt_queue[0].id;
+        let head = app.queue.rows[0].id;
         app.begin_queue_edit(&head.to_string(), &ctl);
 
         app.handle(
@@ -9941,7 +9838,7 @@ mod mode_tests {
         // resurrected row.
         app.input.set("head, revised".into());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctl);
-        assert!(app.queue_edit.is_none(), "the editor closed");
+        assert!(app.queue.edit.is_none(), "the editor closed");
         assert_eq!(app.queued, 1, "the delivered row stayed delivered");
         assert!(
             app.tip
@@ -10342,11 +10239,11 @@ mod mode_tests {
         let (ctl, _commands) = crate::controller::test_controller();
         app.state = RunState::Running;
         app.send_agent_text("queued".into(), &ctl);
-        assert_eq!(app.prompt_queue[0].cells.len(), 1);
+        assert_eq!(app.queue.rows[0].cells.len(), 1);
 
         app.dispatch(Action::ClearScrollback, &ctl);
         assert!(
-            app.prompt_queue[0].cells.is_empty(),
+            app.queue.rows[0].cells.is_empty(),
             "the cleared timeline's index is dropped"
         );
 
@@ -10356,7 +10253,7 @@ mod mode_tests {
             .push_user("unrelated".into(), crate::transcript::Delivery::Delivered);
         let unrelated = app.transcript.cells.len() - 1;
         app.drop_queued_prompt(0, &ctl);
-        assert_eq!(app.prompt_queue.len(), 0);
+        assert_eq!(app.queue.rows.len(), 0);
         assert_eq!(app.transcript.cells.len(), 2, "the notice and the bubble");
         assert!(matches!(
             &app.transcript.cells[unrelated].kind,
@@ -10582,7 +10479,7 @@ mod mode_tests {
         app.state = RunState::Running;
         app.run_started = Some(Instant::now());
         app.state_note = "working".into();
-        app.prompt_queue.push_back(QueuedPrompt {
+        app.queue.rows.push_back(QueuedPrompt {
             id: 1,
             blocks: vec![StagedBlock::Text("followup".into())],
             cells: vec![],
@@ -10716,15 +10613,11 @@ mod mode_tests {
             Ok(Cmd::Steer { text, .. }) if text == "head"
         ));
         assert_eq!(app.queued, 1, "the tail stays queued");
-        assert_eq!(app.prompt_queue.len(), 1);
+        assert_eq!(app.queue.rows.len(), 1);
         assert!(
-            matches!(&app.prompt_queue[0].blocks[..], [StagedBlock::Text(text)] if text == "tail")
+            matches!(&app.queue.rows[0].blocks[..], [StagedBlock::Text(text)] if text == "tail")
         );
-        assert_eq!(
-            app.pending_steer_cells.len(),
-            1,
-            "the steer awaits settlement"
-        );
+        assert_eq!(app.queue.steering.len(), 1, "the steer awaits settlement");
     }
     #[test]
     fn initial_default_plan_mode_does_not_add_an_off_notice() {
@@ -11088,10 +10981,10 @@ mod mode_tests {
         );
 
         // The claim is what settles the echo and the row.
-        let item_id = app.prompt_queue[0].id;
+        let item_id = app.queue.rows[0].id;
         app.handle(AppEvent::Ctl(CtlEvent::QueueClaimed { item_id }), &ctl);
         assert_eq!(app.queued, 0);
-        assert!(app.prompt_queue.is_empty(), "the row left the mirror");
+        assert!(app.queue.rows.is_empty(), "the row left the mirror");
         assert!(matches!(
             app.transcript.cells.last().map(|cell| &cell.kind),
             Some(crate::transcript::CellKind::User {
@@ -11109,11 +11002,12 @@ mod mode_tests {
         let (ctl, _commands) = crate::controller::test_controller();
         app.state = RunState::Running;
         app.send_agent_text("mine".into(), &ctl);
-        let mine = app.prompt_queue[0].id;
+        let mine = app.queue.rows[0].id;
 
         // Another client queued a row we have never seen.
         app.handle(
             AppEvent::Ctl(CtlEvent::Queue {
+                session_id: app.session_id.clone(),
                 items: vec![
                     crate::bus::QueueRow {
                         item_id: 77,
@@ -11134,10 +11028,7 @@ mod mode_tests {
 
         assert_eq!(app.queued, 2);
         assert_eq!(
-            app.prompt_queue
-                .iter()
-                .map(|row| row.id)
-                .collect::<Vec<_>>(),
+            app.queue.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             [77, mine],
             "the host's order wins"
         );
@@ -11163,6 +11054,7 @@ mod mode_tests {
         // snapshot withdraws the echo it owned.
         app.handle(
             AppEvent::Ctl(CtlEvent::Queue {
+                session_id: app.session_id.clone(),
                 items: vec![crate::bus::QueueRow {
                     item_id: mine,
                     text: "mine".into(),
@@ -11198,10 +11090,11 @@ mod mode_tests {
         let (ctl, _commands) = crate::controller::test_controller();
         app.state = RunState::Running;
         app.send_agent_text("follow-up".into(), &ctl);
-        let item_id = app.prompt_queue[0].id;
+        let item_id = app.queue.rows[0].id;
         assert!(app.steer_queued(0, &ctl));
         app.handle(
             AppEvent::Ctl(CtlEvent::Queue {
+                session_id: app.session_id.clone(),
                 items: vec![crate::bus::QueueRow {
                     item_id,
                     text: "follow-up".into(),
@@ -11220,7 +11113,13 @@ mod mode_tests {
             &ctl,
         );
         app.handle(AppEvent::Ctl(CtlEvent::QueueClaimed { item_id }), &ctl);
-        app.handle(AppEvent::Ctl(CtlEvent::Queue { items: vec![] }), &ctl);
+        app.handle(
+            AppEvent::Ctl(CtlEvent::Queue {
+                session_id: app.session_id.clone(),
+                items: vec![],
+            }),
+            &ctl,
+        );
         let echoes: Vec<_> = app
             .transcript
             .cells
@@ -11253,7 +11152,7 @@ mod mode_tests {
 
         app.handle(AppEvent::RuntimeExited(Some(1)), &ctl);
 
-        assert!(app.prompt_queue.is_empty());
+        assert!(app.queue.rows.is_empty());
         assert!(
             app.transcript.cells.iter().any(|cell| matches!(
                 &cell.kind,
@@ -11496,7 +11395,7 @@ mod mode_tests {
             matches!(&blocks[0], crate::bus::PromptBlock::Image(image) if image.media_type == "image/png" && !image.data.is_empty())
         );
         assert!(commands.try_recv().is_err(), "image prompt sent only once");
-        assert!(app.prompt_queue.is_empty(), "idle prompt has no queue echo");
+        assert!(app.queue.rows.is_empty(), "idle prompt has no queue echo");
         assert_eq!(
             app.transcript
                 .cells
@@ -11526,7 +11425,7 @@ mod mode_tests {
             commands.try_recv().unwrap(),
             Cmd::QueueParts { .. }
         ));
-        let id = app.prompt_queue[0].id;
+        let id = app.queue.rows[0].id;
         app.begin_queue_edit(&id.to_string(), &ctl);
         app.pending_images.clear();
         app.input.set("text only".into());

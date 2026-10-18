@@ -98,3 +98,11 @@ DEEPSEEK_API_KEY=sk-… cargo run --example basic
 
 Rust 1.90+（edition 2024）。abycore 不发布到 crates.io，请以 workspace 内
 路径依赖的方式使用。
+
+
+持久化宿主可用 `UserInput::new(parts)` / `UserInput::text(text)` 和 `Agent::run_input`、
+`SteerHandle::send_input` 保留输入身份；在 checkpoint 成功后用
+`SessionSnapshot::contains_input` 对照提交凭据，恢复时不重复追加。
+`SteerHandle::withdraw_input` 只撤回尚未入历史的输入。
+`Subagents::close` / `close_agent` 释放已结束叶子的会话及工具，保留进程内的 16 KiB 结果摘要；
+`Subagents::close_session(root_id)` 从叶子向上回收已结束的旧会话树，跳过运行中及未决任务。

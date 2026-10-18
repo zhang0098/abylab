@@ -57,6 +57,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "tempfile",
  "tokio",
  "tui-markdown",
  "unicode-segmentation",

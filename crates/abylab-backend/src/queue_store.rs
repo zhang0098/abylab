@@ -17,6 +17,9 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedRecord {
+    /// Stable across process restarts; also stored as the user message id.
+    #[serde(default)]
+    pub input_id: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parts: Option<Vec<abycore::ContentPart>>,
@@ -25,6 +28,7 @@ pub struct QueuedRecord {
 impl QueuedRecord {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
+            input_id: abycore::UserInput::text("").id,
             text: text.into(),
             parts: None,
         }
@@ -106,28 +110,43 @@ pub fn load_checked(
         }
         Err(error) => return Err(format!("queue load failed ({}): {error}", file.display())),
     };
-    parse_store(&text, &file)
+    let mut records = parse_store(&text, &file)?;
+    let version = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value["version"].as_u64());
+    if version != Some(3) {
+        for record in &mut records {
+            if record.input_id.is_empty() {
+                record.input_id = abycore::UserInput::text("").id;
+            }
+        }
+        // Migration must commit identities before any record can be delivered.
+        save(home, &cfg.workspace, session, &records)
+            .map_err(|error| format!("queue migration failed: {error}"))?;
+    }
+    Ok(records)
 }
 
 fn parse_store(text: &str, file: &Path) -> Result<Vec<QueuedRecord>, String> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| format!("queue file is invalid ({}): {error}", file.display()))?;
     let version = value.get("version").and_then(serde_json::Value::as_u64);
-    if !matches!(version, Some(1 | 2)) {
+    if !matches!(version, Some(1..=3)) {
         return Err(format!("unsupported queue version ({})", file.display()));
     }
     let rows = value
         .get("items")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| format!("queue file has no items array ({})", file.display()))?;
-    rows.iter()
+    let records: Vec<QueuedRecord> = rows
+        .iter()
         .enumerate()
         .map(|(index, row)| match version {
             Some(1) => row
                 .as_str()
                 .map(QueuedRecord::text)
                 .ok_or_else(|| format!("queue item {index} is invalid ({})", file.display())),
-            Some(2) => serde_json::from_value::<QueuedRecord>(row.clone()).map_err(|error| {
+            Some(2 | 3) => serde_json::from_value::<QueuedRecord>(row.clone()).map_err(|error| {
                 format!(
                     "queue item {index} is invalid ({}): {error}",
                     file.display()
@@ -135,7 +154,21 @@ fn parse_store(text: &str, file: &Path) -> Result<Vec<QueuedRecord>, String> {
             }),
             _ => unreachable!("version checked above"),
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if version == Some(3) {
+        let mut ids = std::collections::HashSet::new();
+        if records.iter().any(|record| {
+            record.input_id.is_empty()
+                || record.input_id.len() > 128
+                || !ids.insert(&record.input_id)
+        }) {
+            return Err(format!(
+                "queue has invalid or duplicate input ids ({})",
+                file.display()
+            ));
+        }
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -148,8 +181,9 @@ pub fn load(cfg: &crate::contract::DriverConfig, session: &str) -> Vec<QueuedRec
 /// session it belongs to is being deleted, and refusing would leave the file
 /// behind forever.
 pub fn remove(home: &str, workspace: &str, session: &str) -> std::io::Result<()> {
-    match std::fs::remove_file(path(home, workspace, session)) {
-        Ok(()) => Ok(()),
+    let file = path(home, workspace, session);
+    match std::fs::remove_file(&file) {
+        Ok(()) => sync_dir(file.parent().expect("queue parent")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
@@ -175,21 +209,42 @@ pub fn save(
         Err(error) => return Err(error),
     }
     if items.is_empty() {
-        return match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        };
+        return remove(home, workspace, session);
     }
     // Versioned so a future shape can migrate instead of reinterpreting.
-    let store = serde_json::json!({ "version": 2, "items": items });
+    let store = serde_json::json!({ "version": 3, "items": items });
     let text = serde_json::to_vec_pretty(&store)?;
+    parse_store(std::str::from_utf8(&text).expect("JSON is UTF-8"), &path)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let dir = path.parent().expect("queue path has a parent");
-    std::fs::create_dir_all(dir)?;
+    create_dir_synced(dir)?;
     let mut stage = tempfile::NamedTempFile::new_in(dir)?;
     stage.write_all(&text)?;
     stage.as_file().sync_all()?;
-    stage.persist(path).map_err(|error| error.error)?;
+    stage.persist(&path).map_err(|error| error.error)?;
+    sync_dir(dir)
+}
+
+fn sync_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn create_dir_synced(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        create_dir_synced(parent)?;
+        match std::fs::create_dir(path) {
+            Ok(()) => sync_dir(parent)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(())
 }
 
@@ -291,10 +346,10 @@ mod tests {
         assert_ne!(path(&home, "/one", "a/b"), path(&home, "/two", "a/b"));
         let mut config = cfg(&home);
         config.workspace = "/one".into();
-        assert_eq!(load(&config, "a/b"), vec![QueuedRecord::text("one")]);
-        assert_eq!(load(&config, "a_b"), vec![QueuedRecord::text("two")]);
+        assert_eq!(load(&config, "a/b")[0].text, "one");
+        assert_eq!(load(&config, "a_b")[0].text, "two");
         config.workspace = "/two".into();
-        assert_eq!(load(&config, "a/b"), vec![QueuedRecord::text("three")]);
+        assert_eq!(load(&config, "a/b")[0].text, "three");
     }
 
     #[test]
@@ -326,6 +381,7 @@ mod tests {
         std::fs::write(&file, r#"{"version":1,"items":["first","second"]}"#).unwrap();
         assert_eq!(read(&home, "aby-1"), vec!["first", "second"]);
         let record = QueuedRecord {
+            input_id: "image-input".into(),
             text: "look".into(),
             parts: Some(vec![
                 abycore::ContentPart::InputText {
@@ -357,5 +413,43 @@ mod tests {
         let mut config = cfg("/tmp/never-used");
         config.home = None;
         assert!(load(&config, "aby-1").is_empty());
+    }
+    #[test]
+    fn migration_commits_stable_ids_and_rejects_duplicate_receipts() {
+        let home = home("receipt-migration");
+        let cfg = cfg(&home);
+        for (session, old) in [
+            ("v1", serde_json::json!({"version":1,"items":["text"]})),
+            (
+                "v2",
+                serde_json::json!({"version":2,"items":[{"text":"image","parts":[{"type":"input_image","media_type":"image/png","data":"AA=="}]}]}),
+            ),
+        ] {
+            let file = path(&home, &cfg.workspace, session);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, old.to_string()).unwrap();
+            let first = load_checked(&cfg, session).unwrap();
+            assert!(!first[0].input_id.is_empty());
+            assert_eq!(first, load_checked(&cfg, session).unwrap());
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap())
+                    .unwrap()["version"],
+                3
+            );
+            assert!(
+                save(
+                    &home,
+                    &cfg.workspace,
+                    session,
+                    &[first[0].clone(), first[0].clone()]
+                )
+                .is_err()
+            );
+            assert_eq!(
+                first,
+                load_checked(&cfg, session).unwrap(),
+                "invalid write did not replace the accepted queue"
+            );
+        }
     }
 }
