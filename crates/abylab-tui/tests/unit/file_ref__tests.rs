@@ -180,6 +180,56 @@ fn unrepresentable_paths_are_none() {
     assert_eq!(format_file_mention("", false, false), None);
 }
 
+// --- slash command path arguments -----------------------------------------
+
+fn pair(path: &str, caption: &str) -> (String, String) {
+    (path.into(), caption.into())
+}
+
+#[test]
+fn bare_path_arguments_split_at_the_first_space() {
+    assert_eq!(split_path_caption(""), pair("", ""));
+    assert_eq!(split_path_caption("./pic.png"), pair("./pic.png", ""));
+    assert_eq!(
+        split_path_caption("./pic.png  a caption"),
+        pair("./pic.png", "a caption")
+    );
+    assert_eq!(split_path_caption("/abs/x.jpg"), pair("/abs/x.jpg", ""));
+}
+
+/// What the `@` browser inserts is the same path: the marker is grammar.
+#[test]
+fn mention_paths_lose_the_marker() {
+    assert_eq!(
+        split_path_caption("@../qimiao/content/post/crossingchina_2024/L1000003.jpg"),
+        pair("../qimiao/content/post/crossingchina_2024/L1000003.jpg", "")
+    );
+    assert_eq!(
+        split_path_caption("@../pics/a.jpg sunset over the harbour"),
+        pair("../pics/a.jpg", "sunset over the harbour")
+    );
+    assert_eq!(split_path_caption("@"), pair("", ""));
+}
+
+#[test]
+fn quoted_mentions_keep_their_spaces_and_take_a_caption() {
+    assert_eq!(
+        split_path_caption("@\"my pics/a.jpg\""),
+        pair("my pics/a.jpg", "")
+    );
+    assert_eq!(
+        split_path_caption("@\"my pics/a.jpg\" a caption"),
+        pair("my pics/a.jpg", "a caption")
+    );
+    // An unterminated quote (the token still open in the draft) runs to the
+    // end: no caption can follow an unclosed path.
+    assert_eq!(
+        split_path_caption("@\"my pics/a.jpg"),
+        pair("my pics/a.jpg", "")
+    );
+    assert_eq!(split_path_caption("\"\""), pair("", ""));
+}
+
 // --- relative paths -------------------------------------------------------
 
 #[test]

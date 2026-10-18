@@ -10,6 +10,10 @@
 
 ## [Unreleased]
 
+- `/image` 接受文件浏览器插入的 `@路径`：`/image @../pics/a.jpg`（名字带空格时是
+  `@"my pics/a.jpg"`）和 `/image ../pics/a.jpg` 指的是同一个文件，`@` 和引号按语法去掉；
+  相对路径按 workspace 解析，和浏览器列出的根、Agent 工具看到的根一致。
+
 ## [0.1.21] - 2026-10-18
 
 - README 顶部和 abylab.ai 首页现在都标出当前版本：README 是最新版本徽章，首页是标题上方

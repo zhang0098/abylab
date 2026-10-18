@@ -213,7 +213,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "image",
-        usage: "/image <path> [text]",
+        usage: "/image <path|@path> [text]",
         desc: "send a local image (png/jpeg/webp/gif)",
     },
     SlashCommand {
@@ -5398,7 +5398,7 @@ The key lands in `~/.abylab/.credentials.yaml` (0600, owner-only)
 - /vim · 切换 vim 模态编辑（/vim on|off，默认关闭）
 - /resume · 恢复之前的会话
 - /delete · 永久删除当前会话及其存档（快照 + 排队命令文件），随后自动新开一个会话
-- /image · 暂存本地图片：/image ./pic.png [说明]
+- /image · 暂存本地图片：/image ./pic.png [说明] · 也接受文件浏览器的 @路径（@../pics/a.jpg）
 - /clip · 暂存剪贴板图片并弹出预览（⌫ 删除图片）· ctrl+v 同样可用
 - !cmd · 在会话级本地 shell 中运行命令，不经过 Agent；初始目录为 workspace，cd/环境变量跨命令保留
 - /<skill> · 手打的技能行由 Agent 注入技能正文（技能不进 / 菜单）
@@ -5428,7 +5428,7 @@ token 用量（含缓存命中）以及轮次结束原因。"
 - /logout · remove the stored API key (a --api-key override keeps running)
 - /resume · pick up a durable session — transcript replays, log continues
 - /delete · permanently delete this session and its saved files (snapshot + queued prompts), then open a fresh one
-- /image · stage a local image — /image ./pic.png [caption]
+- /image · stage a local image — /image ./pic.png [caption] · the browser's @path works too
 - /clip · stage the clipboard image — its preview pops up (⌫ drops the chip) · /clip [caption] · ctrl+v also works
 - !cmd · run in the session's local shell (not the agent); starts in the workspace, keeps cd/env across commands
 - /<skill> · a hand-typed skill line — the agent injects the skill's body (skills never list under /)
@@ -6055,11 +6055,14 @@ impl App {
 
     /// `/image <path> [caption]` — stage a local raster in the composer; it is
     /// sent on the next Enter (caption becomes the prompt text).
+    ///
+    /// The path may be spelled the way the `@` browser inserts it
+    /// (`@../pics/a.jpg`, `@"my pics/a.jpg"`): the mention marker and the
+    /// quotes are composer grammar, not file name. A relative path resolves
+    /// against the workspace — the root the browser listed and the agent's
+    /// tools share (`Path::join` leaves absolute paths absolute).
     fn send_image(&mut self, arg: &str, _ctl: &Controller) {
-        let (path, caption) = match arg.split_once(char::is_whitespace) {
-            Some((p, rest)) => (p, rest.trim().to_string()),
-            None => (arg, String::new()),
-        };
+        let (path, caption) = crate::file_ref::split_path_caption(arg);
         if path.is_empty() {
             self.show_tip(self.locale.tr(
                 "/image needs a path — /image ./pic.png [caption]",
@@ -6067,7 +6070,7 @@ impl App {
             ));
             return;
         }
-        let Some(media_type) = media_type_for(path) else {
+        let Some(media_type) = media_type_for(&path) else {
             self.show_tip(self.locale.tr(
                 "unsupported image — use .png .jpg .jpeg .webp .gif",
                 "不支持的图片格式 —— 请用 .png .jpg .jpeg .webp .gif",
@@ -6075,7 +6078,8 @@ impl App {
             return;
         };
         let _ = media_type;
-        self.load_attachment(crate::attachment_loader::Source::File(path.into()), caption);
+        let file = std::path::Path::new(&self.cfg.workspace).join(&path);
+        self.load_attachment(crate::attachment_loader::Source::File(file), caption);
     }
 
     fn clip_image(&mut self, caption: &str, _ctl: &Controller) {
@@ -8461,6 +8465,35 @@ mod mode_tests {
         png[16..20].copy_from_slice(&w.to_be_bytes());
         png[20..24].copy_from_slice(&h.to_be_bytes());
         png
+    }
+
+    /// `/image @pics/a.png` is the path the `@` browser hands over: the
+    /// marker is grammar, and the rest resolves against the workspace (the
+    /// root the browser listed) instead of the process cwd.
+    #[test]
+    fn slash_image_takes_the_mention_path_the_browser_inserts() {
+        let workspace = fresh_root();
+        std::fs::create_dir_all(format!("{workspace}/pics")).unwrap();
+        std::fs::write(format!("{workspace}/pics/a.png"), png_header(8, 8)).unwrap();
+        let (mut app, ctl, _rx) = test_app();
+        app.cfg.workspace = workspace.clone();
+
+        app.run_slash("image", "@pics/a.png a caption", &ctl);
+        // The loader reads off-thread; poll the way the event loop does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.pending_images.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.poll_attachments();
+        }
+        assert_eq!(app.pending_images.len(), 1, "the mention path stages");
+        let image = app.pending_images.get(0).unwrap();
+        assert_eq!(image.name, "a.png");
+        assert!(
+            image.path.ends_with("/pics/a.png"),
+            "stored as the resolved file: {}",
+            image.path
+        );
+        assert_eq!(app.input.buf().trim(), "a caption [image 1]");
     }
 
     #[test]

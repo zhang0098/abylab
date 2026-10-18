@@ -11,6 +11,11 @@ uninstall) live in
 
 ## [Unreleased]
 
+- `/image` accepts the `@path` the file browser inserts: `/image @../pics/a.jpg` (or
+  `@"my pics/a.jpg"` when the name has spaces) names the same file as `/image ../pics/a.jpg` —
+  the marker and the quotes are grammar and are dropped. Relative paths resolve against the
+  workspace, the root the browser listed and the agent's tools share.
+
 ## [0.1.21] - 2026-10-18
 
 - The READMEs and the abylab.ai homepage now name the current release: a latest-release badge on
