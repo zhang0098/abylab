@@ -104,7 +104,11 @@ impl Live {
             assert!(
                 !matches!(
                     &event,
-                    Event::Ctl(CtlEvent::Error(_) | CtlEvent::TuiOpFailed(_))
+                    Event::Ctl(
+                        CtlEvent::Error(_)
+                            | CtlEvent::TuiOpFailed(_)
+                            | CtlEvent::SessionSwitchFailed(_)
+                    )
                 ),
                 "unexpected failure: {event:?}"
             );
@@ -115,7 +119,7 @@ impl Live {
     }
     fn prompt(&self, text: &str) {
         self.send(Cmd::Prompt { text: text.into() });
-        self.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind }) if session == "session" && kind == "completed"));
+        self.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind, .. }) if session == "session" && kind.as_str() == "completed"));
     }
     fn snapshot(&self) -> SessionSnapshot {
         SessionStore::new(&self.workspace)
@@ -155,7 +159,7 @@ fn child_with_its_own_host_policy_inherits_workspace_instructions() {
     let parent_done = std::cell::Cell::new(false);
     let child_done = std::cell::Cell::new(false);
     live.wait(|event| {
-        if matches!(event, Event::Ui(UiEvent::TurnEnd { session, kind }) if session == "session" && kind == "completed") {
+        if matches!(event, Event::Ui(UiEvent::TurnEnd { session, kind, .. }) if session == "session" && kind.as_str() == "completed") {
             parent_done.set(true);
         }
         if matches!(event, Event::Ui(UiEvent::SubagentFinished { .. })) {
@@ -199,11 +203,14 @@ fn workspace_instructions_survive_compaction_and_reload_on_resume_without_pollut
     live.done("compacted");
     live.prompt("after compaction");
 
+    let switch_sequence = std::cell::Cell::new(0);
     let resume = || {
+        switch_sequence.set(switch_sequence.get() + 1);
+        let other = format!("other-{}", switch_sequence.get());
         live.send(Cmd::NewSession {
-            session_id: "other".into(),
+            session_id: other.clone(),
         });
-        live.wait(|e| matches!(e, Event::Ctl(CtlEvent::SessionBound { session_id, .. }) if session_id == "other"));
+        live.wait(|e| matches!(e, Event::Ctl(CtlEvent::SessionBound { session_id, .. }) if session_id == &other));
         live.send(Cmd::Resume {
             session_id: "session".into(),
         });
@@ -283,7 +290,7 @@ fn settings_changes_preserve_the_writer_and_child_control_identity() {
         parent, "session",
         "route the event to the durable UI session"
     );
-    live.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind }) if session == "session" && kind == "completed"));
+    live.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind, .. }) if session == "session" && kind.as_str() == "completed"));
     live.send(Cmd::SetPermission {
         preset: "read-only".into(),
     });
@@ -324,7 +331,7 @@ fn compact_and_goal_commands_are_durable_before_the_success_event() {
         Reply::sse(text_body("goal", "one round")),
     ]);
     let live = Live::start(&server);
-    live.prompt(&"original history ".repeat(1000));
+    live.prompt(&"original history ".repeat(900));
     live.send(Cmd::Compact);
     live.done("compacted");
     assert_eq!(live.snapshot().compactions.len(), 1);
@@ -373,7 +380,7 @@ fn manual_and_overflow_summaries_are_interruptible_and_keep_history() {
         replies.push(Reply::sse(text_body("summary", "summary")).delayed(Duration::from_secs(2)));
         let server = MockServer::start(replies);
         let live = Live::start(&server);
-        live.prompt(&"original history ".repeat(1000));
+        live.prompt(&"original history ".repeat(900));
         if overflow {
             live.send(Cmd::Prompt {
                 text: "next prompt".into(),
@@ -391,7 +398,7 @@ fn manual_and_overflow_summaries_are_interruptible_and_keep_history() {
         let now = Instant::now();
         live.handle.as_ref().unwrap().interrupt();
         if overflow {
-            live.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind }) if session == "session" && kind == "interrupted"));
+            live.wait(|e| matches!(e, Event::Ui(UiEvent::TurnEnd { session, kind, .. }) if session == "session" && kind.as_str() == "interrupted"));
         } else {
             live.wait(
                 |e| matches!(e, Event::Ctl(CtlEvent::TuiOpFailed(s)) if s.contains("cancelled")),
@@ -484,7 +491,7 @@ fn interrupting_a_stalled_segment_saves_the_turn_without_retrying() {
     let started = Instant::now();
     live.handle.as_ref().unwrap().interrupt();
     live.wait(
-        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "interrupted"),
+        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind.as_str() == "interrupted"),
     );
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(server.bodies().len(), 1, "Esc prevents the next request");
@@ -534,7 +541,7 @@ fn session_listing_answers_while_a_turn_is_running() {
 
     // Leave the run clean: the turn still finishes and persists normally.
     live.wait(
-        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "completed"),
+        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind.as_str() == "completed"),
     );
     assert!(
         live.snapshot()
@@ -595,7 +602,7 @@ fn model_catalog_answers_while_a_turn_is_running() {
     );
 
     live.wait(
-        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind == "completed"),
+        |event| matches!(event, Event::Ui(UiEvent::TurnEnd { kind, .. }) if kind.as_str() == "completed"),
     );
 }
 
@@ -655,11 +662,15 @@ fn delete_removes_the_session_files_and_binds_a_fresh_session() {
     live.send(Cmd::Prompt {
         text: "again".into(),
     });
-    live.wait(|event| matches!(event, Event::Ui(UiEvent::TurnEnd { session, kind }) if *session == next && kind == "completed"));
+    live.wait(|event| matches!(event, Event::Ui(UiEvent::TurnEnd { session, kind, .. }) if *session == next && kind.as_str() == "completed"));
     let fresh = store.load(&next).unwrap().1;
+    let mut expected = abycore::Item::user("again");
+    if let abycore::Item::Message { id, .. } = &mut expected {
+        *id = fresh.items[0].id().map(str::to_string);
+    }
+    assert!(expected.id().is_some());
     assert_eq!(
-        fresh.items[0],
-        abycore::Item::user("again"),
+        fresh.items[0], expected,
         "the fresh session starts with its own history"
     );
     assert!(

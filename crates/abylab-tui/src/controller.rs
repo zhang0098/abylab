@@ -271,7 +271,7 @@ fn parts_from_blocks(blocks: Vec<crate::bus::PromptBlock>) -> Vec<abylab_backend
 /// Backend events → TUI `AppEvent`s (the seam between the two contracts).
 fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
     match event {
-        abylab_backend::Event::Ui(ui) => vec![AppEvent::Ui(translate_ui(ui))],
+        abylab_backend::Event::Ui(ui) => vec![AppEvent::Ui(ui)],
         abylab_backend::Event::Ctl(ctl) => {
             if let abylab_backend::CtlEvent::Ready { server } = ctl {
                 return vec![
@@ -297,20 +297,18 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
                 abylab_backend::CtlEvent::SteerAdmitted { message_ids } => {
                     CtlEvent::SteerAdmitted { message_ids }
                 }
-                abylab_backend::CtlEvent::Queue { session_id, items } => {
-                    let _ = session_id;
-                    CtlEvent::Queue {
-                        items: items
-                            .into_iter()
-                            .map(|row| crate::bus::QueueRow {
-                                item_id: row.item_id,
-                                text: row.text,
-                                parts: row.parts,
-                                steering: row.placement == abylab_backend::QueuePlacement::Steering,
-                            })
-                            .collect(),
-                    }
-                }
+                abylab_backend::CtlEvent::Queue { session_id, items } => CtlEvent::Queue {
+                    session_id,
+                    items: items
+                        .into_iter()
+                        .map(|row| crate::bus::QueueRow {
+                            item_id: row.item_id,
+                            text: row.text,
+                            parts: row.parts,
+                            steering: row.placement == abylab_backend::QueuePlacement::Steering,
+                        })
+                        .collect(),
+                },
                 abylab_backend::CtlEvent::QueueClaimed { item_id } => {
                     CtlEvent::QueueClaimed { item_id }
                 }
@@ -392,144 +390,6 @@ fn translate_backend(event: abylab_backend::Event) -> Vec<AppEvent> {
         }],
         abylab_backend::Event::UserQuestion { question, reply } => {
             vec![AppEvent::UserQuestion { question, reply }]
-        }
-    }
-}
-
-fn translate_ui(ui: abylab_backend::UiEvent) -> crate::events::UiEvent {
-    use crate::events::UiEvent;
-    match ui {
-        abylab_backend::UiEvent::SessionStatus { session, running } => {
-            UiEvent::SessionStatus { session, running }
-        }
-        abylab_backend::UiEvent::TurnStart { session, turn } => {
-            UiEvent::TurnStart { session, turn }
-        }
-        abylab_backend::UiEvent::TurnEnd { session, kind } => UiEvent::TurnEnd { session, kind },
-        abylab_backend::UiEvent::TextDelta { session, text } => {
-            UiEvent::TextDelta { session, text }
-        }
-        abylab_backend::UiEvent::ReasoningDelta { session, text } => {
-            UiEvent::ReasoningDelta { session, text }
-        }
-        abylab_backend::UiEvent::AssistantFinal {
-            session,
-            text,
-            model,
-        } => UiEvent::AssistantFinal {
-            session,
-            text,
-            model,
-        },
-        abylab_backend::UiEvent::ToolCall {
-            session,
-            call_id,
-            name,
-            arguments,
-        } => UiEvent::ToolCall {
-            session,
-            call_id,
-            name,
-            arguments,
-        },
-        abylab_backend::UiEvent::ToolCallDelta {
-            session,
-            call_id,
-            name,
-            delta,
-        } => UiEvent::ToolCallDelta {
-            session,
-            call_id,
-            name,
-            delta,
-        },
-        abylab_backend::UiEvent::ToolStarted {
-            session,
-            call_id,
-            name,
-        } => UiEvent::ToolStarted {
-            session,
-            call_id,
-            name,
-        },
-        abylab_backend::UiEvent::ToolResult {
-            session,
-            call_id,
-            is_error,
-            text,
-            error,
-        } => UiEvent::ToolResult {
-            session,
-            call_id,
-            is_error,
-            text,
-            error,
-        },
-        abylab_backend::UiEvent::Plan {
-            session,
-            summary,
-            todos,
-            active,
-            active_extra,
-            completed,
-            total,
-        } => UiEvent::Plan {
-            session,
-            summary,
-            todos: todos
-                .into_iter()
-                .map(|todo| crate::events::PlanItem {
-                    content: todo.content,
-                    status: match todo.status {
-                        abylab_backend::PlanStatus::Pending => crate::events::PlanStatus::Pending,
-                        abylab_backend::PlanStatus::InProgress => {
-                            crate::events::PlanStatus::InProgress
-                        }
-                        abylab_backend::PlanStatus::Completed => {
-                            crate::events::PlanStatus::Completed
-                        }
-                    },
-                })
-                .collect(),
-            active,
-            active_extra,
-            completed,
-            total,
-        },
-        abylab_backend::UiEvent::SubagentStarted {
-            parent,
-            child,
-            label,
-        } => UiEvent::SubagentStarted {
-            parent,
-            child,
-            label,
-        },
-        abylab_backend::UiEvent::SubagentFinished { child } => UiEvent::SubagentFinished { child },
-        abylab_backend::UiEvent::Usage {
-            session,
-            input,
-            output,
-            cached,
-            reasoning,
-        } => UiEvent::Usage {
-            session,
-            input,
-            output,
-            cached,
-            reasoning,
-        },
-        abylab_backend::UiEvent::UserMessage { session, text } => {
-            UiEvent::UserMessage { session, text }
-        }
-        abylab_backend::UiEvent::SandboxMode { session, mode } => {
-            UiEvent::SandboxMode { session, mode }
-        }
-        abylab_backend::UiEvent::PermissionPreset { session, preset } => {
-            UiEvent::PermissionPreset { session, preset }
-        }
-        abylab_backend::UiEvent::ApprovalPolicy { session, policy } => {
-            UiEvent::ApprovalPolicy { session, policy }
         }
     }
 }

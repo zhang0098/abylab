@@ -8,9 +8,6 @@ use tokio::sync::oneshot;
 pub use abycore::ContentPart as PromptPart;
 use abycore::SessionStore;
 
-/// One semantic UI fact, mirroring the subset of the TUI's `UiEvent` the
-/// transcript renderer consumes. `session` names the owning session so the
-/// app can route events across tabs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEvent {
     SessionStatus {
@@ -23,7 +20,11 @@ pub enum UiEvent {
     },
     TurnEnd {
         session: String,
-        kind: String,
+        turn: u64,
+        kind: TurnStatus,
+        error: Option<String>,
+        /// Total usage of every request in this host turn, including retries.
+        usage: TurnUsage,
     },
     TextDelta {
         session: String,
@@ -44,16 +45,16 @@ pub enum UiEvent {
         name: String,
         arguments: String,
     },
-    /// Incremental tool-call arguments: the call's card can render its title
-    /// while the model is still writing it.
+    /// Incremental tool-call arguments: the call's card renders its title while
+    /// the model is still writing it.
     ToolCallDelta {
         session: String,
         call_id: String,
         name: String,
         delta: String,
     },
-    /// Execution begins for a tool call whose card the streamed call created.
-    /// The tool timer starts here, not at the first argument delta.
+    /// Execution begins for a call whose card the streamed call created; the
+    /// tool timer starts here, not at the first argument delta.
     ToolStarted {
         session: String,
         call_id: String,
@@ -66,14 +67,49 @@ pub enum UiEvent {
         text: String,
         error: Option<String>,
     },
-    /// Todo-plan snapshot: `summary` is the transcript plan cell's digest,
-    /// while the structured fields let the TUI paint its own live todo line
-    /// and the clickable progress dialog. An empty `summary` (no list this
-    /// turn, or an explicit clear) hides every plan surface.
+    Usage {
+        session: String,
+        input: u64,
+        output: u64,
+        cached: u64,
+        reasoning: u64,
+    },
+    #[allow(dead_code)] // host-injected user context; awaiting a direct driver producer
+    UserInjected {
+        session: String,
+        source: String,
+        preview: String,
+    },
+    /// abycore subagent lifecycle (driver broadcast forwarder).
+    SubagentStarted {
+        parent: String,
+        child: String,
+        /// Spawn description — the child view's human label.
+        label: Option<String>,
+    },
+    /// abycore subagent lifecycle (driver broadcast forwarder).
+    SubagentFinished {
+        child: String,
+    },
+    /// ACP `user_message_chunk` (session/load replay needs user lines).
+    UserMessage {
+        session: String,
+        text: String,
+    },
+    /// ACP `session_info_update` title.
+    #[allow(dead_code)] // dsh `session_info_update` title; awaiting a direct driver producer
+    SessionTitle {
+        session: String,
+        title: String,
+    },
+    /// ACP `plan` / `plan_update` snapshot (todo entries, not `plan/mode`).
+    /// `summary` feeds the transcript's plan cell; the structured fields feed
+    /// the composer's live todo line and its clickable progress dialog, so the
+    /// TUI owns their wording. An empty `summary` hides every surface.
     Plan {
         session: String,
         summary: String,
-        /// The whole checklist, in list order — the dialog shows every row.
+        /// The whole checklist, in list order — the dialog lists every row.
         todos: Vec<PlanItem>,
         /// First in-progress task, in list order.
         active: Option<String>,
@@ -82,57 +118,162 @@ pub enum UiEvent {
         completed: usize,
         total: usize,
     },
-    /// Subagent lifecycle under the parent's session id.
-    SubagentStarted {
-        parent: String,
-        child: String,
-        label: Option<String>,
-    },
-    SubagentFinished {
-        child: String,
-    },
-    Usage {
+    /// `plan/mode` — dsh-plan-mode collaboration state (last one wins);
+    /// awaiting a direct driver producer (plan mode facts currently ride
+    /// the permission facts emission).
+    #[allow(dead_code)]
+    PlanMode {
         session: String,
-        input: u64,
-        output: u64,
-        cached: u64,
-        reasoning: u64,
+        active: bool,
     },
-    /// Replayed user line from a resumed session.
-    UserMessage {
-        session: String,
-        text: String,
-    },
-    /// Effective filesystem/process sandbox for this session.
+    /// `sandbox/mode` — file policy: read-only | workspace-write | danger-full-access.
     SandboxMode {
         session: String,
         mode: String,
     },
-    /// User-facing permission preset selected for this session.
-    PermissionPreset {
-        session: String,
-        preset: String,
-    },
-    /// Whether individual tool calls require host approval.
+    /// `approval/policy` — ask | never.
     ApprovalPolicy {
         session: String,
         policy: String,
     },
+    /// `permission/preset` — bundled permission preset name.
+    PermissionPreset {
+        session: String,
+        preset: String,
+    },
+    /// `approval/asked` — one pending approval request; awaiting a direct
+    /// driver producer (the driver's permission ask uses the overlay).
+    #[allow(dead_code)]
+    ApprovalAsked {
+        session: String,
+        tool: String,
+        reason: Option<String>,
+    },
+    /// `approval/decided` — its outcome; awaiting a direct driver producer.
+    #[allow(dead_code)]
+    ApprovalDecided {
+        session: String,
+        outcome: String,
+    },
+}
+
+impl UiEvent {
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            UiEvent::SessionStatus { session, .. }
+            | UiEvent::TurnStart { session, .. }
+            | UiEvent::TurnEnd { session, .. }
+            | UiEvent::TextDelta { session, .. }
+            | UiEvent::ReasoningDelta { session, .. }
+            | UiEvent::AssistantFinal { session, .. }
+            | UiEvent::ToolCall { session, .. }
+            | UiEvent::ToolCallDelta { session, .. }
+            | UiEvent::ToolStarted { session, .. }
+            | UiEvent::ToolResult { session, .. }
+            | UiEvent::Usage { session, .. }
+            | UiEvent::UserInjected { session, .. }
+            | UiEvent::UserMessage { session, .. }
+            | UiEvent::SessionTitle { session, .. }
+            | UiEvent::Plan { session, .. }
+            | UiEvent::PlanMode { session, .. }
+            | UiEvent::SandboxMode { session, .. }
+            | UiEvent::ApprovalPolicy { session, .. }
+            | UiEvent::PermissionPreset { session, .. }
+            | UiEvent::ApprovalAsked { session, .. }
+            | UiEvent::ApprovalDecided { session, .. } => Some(session),
+            UiEvent::SubagentStarted { .. } | UiEvent::SubagentFinished { .. } => None,
+        }
+    }
+
+    /// Live todo progress behind the composer's todo line and its clickable
+    /// progress dialog, or `None` when a plan event carries no checklist
+    /// (`UiEvent::Plan` with an empty summary). The transcript keeps the full
+    /// digest; the cap row shows only the task in progress plus completed/total,
+    /// worded by the active locale.
+    pub fn plan_progress(&self) -> Option<PlanProgress> {
+        match self {
+            UiEvent::Plan {
+                summary,
+                todos,
+                active,
+                active_extra,
+                completed,
+                total,
+                ..
+            } if !summary.is_empty() && *total > 0 => Some(PlanProgress {
+                todos: todos.clone(),
+                active: active.clone(),
+                active_extra: *active_extra,
+                completed: *completed,
+                total: *total,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The checklist facts the composer's todo line and progress dialog render
+/// (see [`UiEvent::plan_progress`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanProgress {
+    /// The whole checklist, in list order.
+    pub todos: Vec<PlanItem>,
+    /// First in-progress task, in list order.
+    pub active: Option<String>,
+    /// Additional concurrently in-progress tasks.
+    pub active_extra: usize,
+    pub completed: usize,
+    pub total: usize,
 }
 
 /// One checklist row, in the order the agent wrote it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanItem {
     pub content: String,
     pub status: PlanStatus,
 }
 
 /// Lifecycle of one [`PlanItem`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanStatus {
     Pending,
     InProgress,
     Completed,
+}
+
+/// Exhaustive terminal states shared by graphical and headless clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStatus {
+    Completed,
+    Incomplete,
+    Interrupted,
+    Failed,
+    Error,
+}
+impl TurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+            Self::Error => "error",
+        }
+    }
+}
+impl std::fmt::Display for TurnStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnUsage {
+    /// Requests with missing or inconsistent usage; totals contain known counters only.
+    pub unknown_requests: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+    pub reasoning: u64,
 }
 
 /// Driver lifecycle facts, mirroring the TUI's `CtlEvent` subset.
@@ -538,6 +679,15 @@ pub struct SteerRequest {
 /// while a turn is running queues behind it.
 #[derive(Debug, Clone)]
 pub enum Cmd {
+    /// Internal dispatch from the durable inbox. The row stays on disk until
+    /// the user message and its stable identity are committed to the session.
+    #[doc(hidden)]
+    DeliverQueued {
+        session_id: String,
+        item_id: u64,
+        text: String,
+        parts: Option<Vec<PromptPart>>,
+    },
     Prompt {
         text: String,
     },

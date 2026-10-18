@@ -14,6 +14,7 @@ mod error;
 mod event;
 mod goal;
 mod hooks;
+mod input;
 mod local_tools;
 mod persist;
 mod session;
@@ -43,6 +44,7 @@ pub use error::{Error, ErrorKind, Result};
 pub use event::{AgentEvent, RunOutcome, StopReason, StreamEvent};
 pub use goal::{CreateGoalTool, GetGoalTool, Goal, GoalStatus, UpdateGoalTool};
 pub use hooks::{AgentHooks, CheckpointKind, ToolDecision};
+pub use input::UserInput;
 pub use local_tools::{
     BashJob, BashJobOutput, BashJobStatus, BashOutputCursor, BashResult, BashStreamOutput,
     BashTool, EditTool, LocalToolConfig, LocalTools, PermissionMode, ReadTool, WriteTool,

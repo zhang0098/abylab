@@ -207,6 +207,7 @@ impl LayoutMap {
 /// hand-rolled `Input` exposed where app code used it.
 pub struct ComposerEditor {
     textarea: TextArea<'static>,
+    revision: u64,
     pub history: Vec<String>,
     pub hist_pos: Option<usize>,
     pub stash: String,
@@ -229,12 +230,17 @@ impl ComposerEditor {
         );
         ComposerEditor {
             textarea,
+            revision: 0,
             history: Vec::new(),
             hist_pos: None,
             stash: String::new(),
             layout: None,
             scroll_top: 0,
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn textarea_mut(&mut self) -> &mut TextArea<'static> {
@@ -296,16 +302,19 @@ impl ComposerEditor {
     // --- editing --------------------------------------------------------
 
     pub fn insert_char(&mut self, ch: char) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().insert_char(ch);
         self.hist_pos = None;
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().insert_str(s);
         self.hist_pos = None;
     }
 
     pub fn insert_newline(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().insert_newline();
         self.hist_pos = None;
     }
@@ -314,16 +323,19 @@ impl ComposerEditor {
     // widget's native behavior); cancelling it here would reduce the edit to
     // a single char.
     pub fn backspace(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().delete_char();
         self.hist_pos = None;
     }
 
     pub fn delete_forward(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().delete_next_char();
         self.hist_pos = None;
     }
 
     pub fn delete_word_back(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().delete_word();
         self.hist_pos = None;
     }
@@ -333,6 +345,7 @@ impl ComposerEditor {
     /// selection is cancelled first: the widget's `delete_str` would
     /// otherwise delete the selection instead of the requested range.
     pub fn delete_char_range(&mut self, start: usize, end: usize) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().cancel_selection();
         let (row, col) = self.char_to_rowcol(start);
         self.move_cursor(CursorMove::Jump(row as u16, col as u16));
@@ -347,6 +360,7 @@ impl ComposerEditor {
     /// cursor lifts onto it, so repeated presses keep deleting upward.
     /// A single empty line is a no-op.
     pub fn kill_line(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         let DataCursor(row, _) = self.textarea.cursor();
         let lines = self.lines();
         if row >= lines.len() {
@@ -383,6 +397,7 @@ impl ComposerEditor {
     /// Undo the last draft edit (the widget keeps a 50-step history).
     /// Returns whether the buffer changed.
     pub fn undo(&mut self) -> bool {
+        self.revision = self.revision.wrapping_add(1);
         let done = self.textarea_mut().undo();
         if done {
             self.hist_pos = None;
@@ -392,6 +407,7 @@ impl ComposerEditor {
 
     /// Redo the last undone draft edit. Returns whether the buffer changed.
     pub fn redo(&mut self) -> bool {
+        self.revision = self.revision.wrapping_add(1);
         let done = self.textarea_mut().redo();
         if done {
             self.hist_pos = None;
@@ -402,6 +418,7 @@ impl ComposerEditor {
     /// Paste the widget's yank buffer (the last kill/delete_str) at the
     /// cursor. Returns whether anything was pasted.
     pub fn paste_yank(&mut self) -> bool {
+        self.revision = self.revision.wrapping_add(1);
         let done = self.textarea_mut().paste();
         if done {
             self.hist_pos = None;
@@ -410,6 +427,7 @@ impl ComposerEditor {
     }
 
     pub fn clear(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().clear();
         self.hist_pos = None;
         self.layout = None;
@@ -419,6 +437,7 @@ impl ComposerEditor {
     /// editor's `set`, this does not touch `hist_pos` — history navigation
     /// relies on it surviving buffer replacement.
     pub fn set(&mut self, s: String) {
+        self.revision = self.revision.wrapping_add(1);
         let mut lines: Vec<String> = s.split('\n').map(str::to_string).collect();
         if lines.is_empty() {
             lines.push(String::new());
@@ -582,6 +601,7 @@ impl ComposerEditor {
 
     /// Cut the selection (delete it and keep it in the yank buffer).
     pub fn cut_selection_to_yank(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.textarea_mut().cut();
         self.hist_pos = None;
     }
@@ -665,6 +685,7 @@ impl ComposerEditor {
     /// Cancels an active selection first so the requested range dies
     /// (the widget's `delete_str` prefers the selection).
     pub fn kill_to_end(&mut self, wrap_width: usize) {
+        self.revision = self.revision.wrapping_add(1);
         let end = self
             .cursor_screen_row(wrap_width)
             .and_then(|row| self.layout(wrap_width).rows.get(row).map(|r| r.end_char));
@@ -681,6 +702,7 @@ impl ComposerEditor {
     /// Cancels an active selection first so the requested range dies
     /// (the widget's `delete_str` prefers the selection).
     pub fn kill_to_start(&mut self, wrap_width: usize) {
+        self.revision = self.revision.wrapping_add(1);
         let start = self
             .cursor_screen_row(wrap_width)
             .and_then(|row| self.layout(wrap_width).rows.get(row).map(|r| r.start_char));

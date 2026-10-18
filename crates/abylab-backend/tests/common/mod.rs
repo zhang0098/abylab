@@ -386,7 +386,21 @@ fn captured_sink(events: Captured) -> impl Fn(Event) + Send + Sync + 'static {
         let summary = match &event {
             Event::Ui(ui) => match ui {
                 UiEvent::TurnStart { turn, .. } => format!("turn-start:{turn}"),
-                UiEvent::TurnEnd { kind, .. } => format!("turn-end:{kind}"),
+                UiEvent::TurnEnd {
+                    kind, error, turn, ..
+                } => {
+                    events
+                        .lock()
+                        .expect("event lock")
+                        .push(format!("turn-result:{turn}"));
+                    if let Some(error) = error {
+                        events
+                            .lock()
+                            .expect("event lock")
+                            .push(format!("terminal-error:{error}"));
+                    }
+                    format!("turn-end:{kind}")
+                }
                 UiEvent::SessionStatus { running, .. } => format!("status:{running}"),
                 UiEvent::PermissionPreset { preset, .. } => format!("permission:{preset}"),
                 // The live tool line: streamed arguments, then the completed
@@ -470,7 +484,10 @@ impl Run {
 
     /// No error surfaced and no permission overlay was needed.
     pub fn is_clean(&self) -> bool {
-        !self.events.iter().any(|event| event.starts_with("error:"))
+        !self
+            .events
+            .iter()
+            .any(|event| event.starts_with("error:") || event.starts_with("terminal-error:"))
             && !self
                 .events
                 .iter()
@@ -706,6 +723,28 @@ pub fn drive(scenario: Scenario) -> Run {
         events: events.lock().expect("event lock").clone(),
         requests: server.bodies(),
     };
+    let starts: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|event| event.strip_prefix("turn-start:"))
+        .collect();
+    let results: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|event| event.strip_prefix("turn-result:"))
+        .collect();
+    assert_eq!(
+        starts, results,
+        "each started turn has exactly one correlated terminal result"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        results.len(),
+        "turn identities do not repeat"
+    );
     let _ = std::fs::remove_dir_all(&workspace);
     run
 }

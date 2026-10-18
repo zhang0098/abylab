@@ -97,6 +97,8 @@ pub enum SubagentStatus {
     NeedsResolution,
     /// The executor was dropped or panicked; inspect the retained snapshot.
     Unavailable,
+    /// Closed to further messages; only its compact result remains available.
+    Archived,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,6 +149,13 @@ impl Inbox {
     }
 
     fn enqueue(&self, parts: Vec<crate::ContentPart>, source: crate::MessageSource) -> Result<()> {
+        self.enqueue_item(crate::Item::user_parts(parts), source)
+    }
+
+    fn enqueue_item(&self, mut input: crate::Item, source: crate::MessageSource) -> Result<()> {
+        let crate::Item::Message { content: parts, .. } = &input else {
+            unreachable!("user input")
+        };
         if parts.is_empty()
             || !parts.iter().any(|part| match part {
                 crate::ContentPart::InputText { text } => !text.trim().is_empty(),
@@ -156,13 +165,21 @@ impl Inbox {
         {
             return Err(invalid("message must contain text or an image"));
         }
-        let mut input = crate::Item::user_parts(parts);
         input.validate()?;
         let crate::Item::Message { source: origin, .. } = &mut input else {
             unreachable!("user_parts makes a message")
         };
         *origin = Some(source);
         let mut queue = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = input.id()
+            && let Some(existing) = queue.iter().find(|item| item.id() == Some(id))
+        {
+            return if existing == &input {
+                Ok(())
+            } else {
+                Err(invalid("input id was reused with different content"))
+            };
+        }
         if queue.len() >= 32 {
             return Err(Error::new(ErrorKind::BudgetExceeded, "agent inbox is full"));
         }
@@ -209,6 +226,25 @@ impl SteerHandle {
 
     pub fn send_parts(&self, parts: Vec<crate::ContentPart>) -> Result<()> {
         self.0.enqueue(parts, crate::MessageSource::User)
+    }
+
+    /// Inject a previously persisted envelope. Its transcript id lets the host
+    /// reconcile a crash between admission and removal from its durable inbox.
+    pub fn send_input(&self, input: crate::UserInput) -> Result<()> {
+        self.0
+            .enqueue_item(input.into_item()?, crate::MessageSource::User)
+    }
+
+    /// Withdraw an identified input that has not yet crossed an admission
+    /// boundary. Hosts can return it to a durable editable queue after a turn
+    /// ends. Returns false if the input was already drained or is absent.
+    pub fn withdraw_input(&self, id: &str) -> bool {
+        let mut queue = self.0.0.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(index) = queue.iter().position(|item| item.id() == Some(id)) else {
+            return false;
+        };
+        queue.remove(index);
+        true
     }
 
     /// Whether a message is waiting for the next step boundary.
@@ -271,7 +307,68 @@ impl Entry {
 #[derive(Default)]
 struct Store {
     entries: BTreeMap<String, Arc<Entry>>,
+    archived: BTreeMap<String, SubagentInfo>,
     closed: bool,
+}
+
+enum WaitTarget {
+    Live(Arc<Entry>),
+    Archived(SubagentInfo),
+}
+impl WaitTarget {
+    async fn wait(self) -> SubagentInfo {
+        match self {
+            Self::Live(entry) => entry.wait().await,
+            Self::Archived(info) => info,
+        }
+    }
+}
+
+fn close_entry(store: &mut Store, id: &str) -> Result<SubagentInfo> {
+    if let Some(info) = store.archived.get(id) {
+        return Ok(info.clone());
+    }
+    let entry = store
+        .entries
+        .get(id)
+        .ok_or_else(|| invalid("unknown subagent"))?;
+    let mut info = entry.info();
+    if info.status != SubagentStatus::Idle
+        || !entry
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending
+            .is_empty()
+    {
+        return Err(invalid(
+            "close requires a settled agent with no unresolved tools; interrupt and wait or resolve tools first",
+        ));
+    }
+    if store
+        .entries
+        .values()
+        .any(|entry| entry.info().parent_id == id)
+    {
+        return Err(invalid("close descendants before their parent"));
+    }
+    info.status = SubagentStatus::Archived;
+    if let Some(result) = &mut info.result {
+        const LIMIT: usize = 16 * 1024;
+        if result.output.len() > LIMIT {
+            let mut end = LIMIT;
+            while !result.output.is_char_boundary(end) {
+                end -= 1;
+            }
+            result.output.truncate(end);
+            result
+                .output
+                .push_str("\n[archived result truncated to 16 KiB]");
+        }
+    }
+    store.entries.remove(id);
+    store.archived.insert(id.into(), info.clone());
+    Ok(info)
 }
 
 struct Manager {
@@ -317,7 +414,7 @@ impl Subagents {
         })))
     }
 
-    /// Register spawn/fork and all four control tools atomically. Keep this owner alive.
+    /// Register spawn/fork and the lifecycle tools atomically. Keep this owner alive.
     pub fn register(&self, agent: &mut Agent) -> Result<()> {
         agent.register_tools(tools::definitions(Arc::downgrade(&self.0)))?;
         agent.subagent_manager = Some(self.0.id);
@@ -352,12 +449,18 @@ impl Subagents {
     }
 
     pub fn get(&self, id: &str) -> Result<SubagentInfo> {
-        Ok(self.0.entry(id)?.info())
+        let store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        store
+            .entries
+            .get(id)
+            .map(|entry| entry.info())
+            .or_else(|| store.archived.get(id).cloned())
+            .ok_or_else(|| invalid("unknown subagent"))
     }
 
     /// Wait for the current turn to settle. Dropping this wait does not cancel the child.
     pub async fn wait(&self, id: &str) -> Result<SubagentInfo> {
-        Ok(self.0.entry(id)?.wait().await)
+        Ok(self.0.wait_target(id, None)?.wait().await)
     }
 
     /// Queue steering at the next complete tool-batch boundary, or start an idle child.
@@ -416,7 +519,16 @@ impl Subagents {
             .entries
             .get(id)
             .ok_or_else(|| invalid("unknown subagent"))?;
-        if entry.info().status == SubagentStatus::Running {
+        if matches!(
+            entry.info().status,
+            SubagentStatus::Running | SubagentStatus::NeedsResolution
+        ) || !entry
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending
+            .is_empty()
+        {
             return Err(invalid(
                 "interrupt and wait for the subagent before forgetting it",
             ));
@@ -430,6 +542,41 @@ impl Subagents {
         }
         store.entries.remove(id);
         Ok(())
+    }
+
+    /// Close a settled leaf, releasing its transcript/tools while retaining a
+    /// result summary (up to 16 KiB) for repeated `get`/`wait` calls. Idempotent.
+    /// Running agents, unresolved tools and resident descendants are protected.
+    pub fn close(&self, id: &str) -> Result<SubagentInfo> {
+        self.0.close(id, None)
+    }
+
+    /// Retire a root's settled descendants from leaves upward. Running or
+    /// unresolved subtrees remain intact and may be retried when they settle.
+    pub fn close_session(&self, root_id: &str) -> Vec<SubagentInfo> {
+        let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut candidates: Vec<_> = store
+            .entries
+            .values()
+            .map(|entry| entry.info())
+            .filter(|info| {
+                let mut parent = info.parent_id.clone();
+                loop {
+                    if parent == root_id {
+                        return true;
+                    }
+                    let Some(entry) = store.entries.get(&parent) else {
+                        return false;
+                    };
+                    parent = entry.info().parent_id;
+                }
+            })
+            .collect();
+        candidates.sort_by_key(|info| std::cmp::Reverse(info.depth));
+        candidates
+            .into_iter()
+            .filter_map(|info| close_entry(&mut store, &info.id).ok())
+            .collect()
     }
 
     /// Reject new starts/follow-ups, cancel all running children, and await settlement.
@@ -455,6 +602,43 @@ impl Subagents {
 }
 
 impl Manager {
+    fn wait_target(&self, id: &str, parent: Option<&str>) -> Result<WaitTarget> {
+        let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let target = if let Some(entry) = store.entries.get(id) {
+            WaitTarget::Live(entry.clone())
+        } else if let Some(info) = store.archived.get(id) {
+            WaitTarget::Archived(info.clone())
+        } else {
+            return Err(invalid("unknown subagent"));
+        };
+        let info = match &target {
+            WaitTarget::Live(entry) => entry.info(),
+            WaitTarget::Archived(info) => info.clone(),
+        };
+        if parent.is_some_and(|parent| info.parent_id != parent) {
+            return Err(invalid(
+                "target is outside the caller's permitted subagent lineage",
+            ));
+        }
+        Ok(target)
+    }
+
+    fn close(&self, id: &str, parent: Option<&str>) -> Result<SubagentInfo> {
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let info = store
+            .entries
+            .get(id)
+            .map(|entry| entry.info())
+            .or_else(|| store.archived.get(id).cloned())
+            .ok_or_else(|| invalid("unknown subagent"))?;
+        if parent.is_some_and(|parent| info.parent_id != parent) {
+            return Err(invalid(
+                "target is outside the caller's permitted subagent lineage",
+            ));
+        }
+        close_entry(&mut store, id)
+    }
+
     fn entry(&self, id: &str) -> Result<Arc<Entry>> {
         self.store
             .lock()
@@ -580,7 +764,7 @@ impl Manager {
         if store.entries.len() >= self.config.max_agents {
             return Err(Error::new(
                 ErrorKind::BudgetExceeded,
-                "subagent retention limit reached; forget completed agents",
+                "subagent retention limit reached; call close_agent on settled leaves, then retry",
             ));
         }
         store.entries.insert(info.id.clone(), entry.clone());

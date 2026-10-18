@@ -90,8 +90,11 @@ fn which_tools_the_model_reaches_for() {
                     .expect("call lock")
                     .push(Call { name, arguments }),
                 Event::Ui(UiEvent::TurnEnd { kind, .. }) => {
-                    if kind != "completed" {
-                        failures.lock().expect("failure lock").push(kind);
+                    if kind.as_str() != "completed" {
+                        failures
+                            .lock()
+                            .expect("failure lock")
+                            .push(kind.to_string());
                     }
                     turn_end.fetch_add(1, Ordering::SeqCst);
                 }

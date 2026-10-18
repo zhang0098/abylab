@@ -657,10 +657,16 @@ impl Transcript {
                     self.ttft_pending = true;
                 }
             }
-            UiEvent::TurnEnd { session, kind } => {
+            UiEvent::TurnEnd {
+                session,
+                kind,
+                error,
+                ..
+            } => {
+                let kind = kind.as_str();
                 self.close_open(&session);
                 if session == self.root_session {
-                    self.last_finish = Some(kind.clone());
+                    self.last_finish = Some(kind.to_string());
                     if let Some(t0) = self.turn_started.take() {
                         self.stats.turn_millis += t0.elapsed().as_millis() as u64;
                     }
@@ -672,7 +678,9 @@ impl Transcript {
                         };
                         self.push_notice(
                             level,
-                            format!("{} · {kind}", self.locale.tr("turn ended", "回合结束")),
+                            error.unwrap_or_else(|| {
+                                format!("{} · {kind}", self.locale.tr("turn ended", "回合结束"))
+                            }),
                         );
                     }
                 }
@@ -2313,7 +2321,10 @@ mod tests {
         });
         tr.apply(UiEvent::TurnEnd {
             session: "s".into(),
-            kind: "error".into(),
+            turn: 1,
+            error: None,
+            usage: Default::default(),
+            kind: abylab_backend::TurnStatus::Error,
         });
         tr.apply(UiEvent::ToolCall {
             session: "s".into(),
@@ -3512,7 +3523,10 @@ mod tests {
         });
         tr.apply(UiEvent::TurnEnd {
             session: "s".into(),
-            kind: "completed".into(),
+            turn: 1,
+            error: None,
+            usage: Default::default(),
+            kind: abylab_backend::TurnStatus::Completed,
         });
 
         assert_eq!(tr.stats.turns, 1);

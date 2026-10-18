@@ -2,11 +2,13 @@
 
 mod app;
 mod ask;
+mod attachment_loader;
 mod attachments;
 mod bus;
 mod clipboard;
 mod controller;
 mod credentials;
+mod queue_view;
 
 mod data;
 mod events;

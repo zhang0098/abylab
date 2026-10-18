@@ -58,7 +58,7 @@ fn model_asks_and_continues_after_a_real_answer() {
                 text.lock().unwrap().push_str(&delta)
             }
             Event::Ui(UiEvent::TurnEnd { kind, .. }) => {
-                let _ = done_tx.send(kind);
+                let _ = done_tx.send(kind.to_string());
             }
             Event::Ctl(CtlEvent::Error(error)) => {
                 let _ = done_tx.send(format!("error: {error}"));

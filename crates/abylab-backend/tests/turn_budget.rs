@@ -350,7 +350,11 @@ fn repeated_run_deadlines_exhaust_the_continuation_limit() {
     assert!(run.ended("error"), "{}", run.explain());
     assert_eq!(run.continuations().len(), 1, "{}", run.explain());
     assert_eq!(run.count(), 2, "{}", run.explain());
-    let error = run.events.iter().find(|e| e.starts_with("error:")).unwrap();
+    let error = run
+        .events
+        .iter()
+        .find(|e| e.starts_with("terminal-error:"))
+        .unwrap();
     assert!(
         error.contains("the run stalled with no progress for its 1s window"),
         "the host's own window is named: {error}"
@@ -382,7 +386,7 @@ fn the_run_deadline_ends_a_hung_segment() {
     let error = run
         .events
         .iter()
-        .find(|event| event.starts_with("error:"))
+        .find(|event| event.starts_with("terminal-error:"))
         .expect("a timeout is reported");
     assert!(
         error.contains("timed out") && error.contains("继续输入"),
@@ -416,7 +420,7 @@ fn an_exhausted_budget_ends_the_turn_with_an_actionable_error() {
     let error = run
         .events
         .iter()
-        .find(|event| event.starts_with("error:"))
+        .find(|event| event.starts_with("terminal-error:"))
         .expect("the budget error is reported");
     assert!(error.contains("--max-requests"), "{error}");
     assert!(error.contains("--max-tool-calls"), "{error}");

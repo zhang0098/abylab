@@ -3,13 +3,14 @@ use crate::{CallBudget, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture
 use serde_json::{Value, json};
 use std::sync::Weak;
 
-const NAMES: [&str; 6] = [
+const NAMES: [&str; 7] = [
     "subagent",
     "subagent_fork",
     "list_agents",
     "send_message",
     "interrupt_agent",
     "wait_agent",
+    "close_agent",
 ];
 
 pub(super) fn definitions(manager: Weak<Manager>) -> Vec<Arc<dyn Tool>> {
@@ -100,6 +101,11 @@ impl Tool for DelegationTool {
             ),
             "interrupt_agent" => (
                 "Request cancellation of a child's or descendant's current turn. Descendants continue independently. The child stays available unless an interrupted tool requires host resolution. Already idle children are unaffected.",
+                json!({"agent_id":{"type":"string","minLength":1}}),
+                json!(["agent_id"]),
+            ),
+            "close_agent" => (
+                "Close your settled direct child after collecting its result. Releases its conversation and tools; later messages are rejected. A compact result remains readable with wait_agent. Close descendants first; running children and unresolved tools cannot be closed.",
                 json!({"agent_id":{"type":"string","minLength":1}}),
                 json!(["agent_id"]),
             ),
@@ -233,13 +239,20 @@ impl Tool for DelegationTool {
                         args.agent_id
                     )))
                 }
+                "close_agent" => {
+                    let args: TargetArgs = parse(arguments)?;
+                    let info = manager
+                        .close(&args.agent_id, Some(&parent.id))
+                        .map_err(failed)?;
+                    Ok(render_info(&info, true))
+                }
                 _ => {
                     let args: TargetArgs = parse(arguments)?;
-                    let entry = manager
-                        .authorize(parent, &args.agent_id, false)
+                    let target = manager
+                        .wait_target(&args.agent_id, Some(&parent.id))
                         .map_err(failed)?;
                     drop(manager);
-                    Ok(render_info(&entry.wait().await, true))
+                    Ok(render_info(&target.wait().await, true))
                 }
             }
         })

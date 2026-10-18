@@ -238,14 +238,33 @@ impl Agent {
         request_view(items, &compactions, self.state.prune.as_ref())
     }
 
-    fn receive_messages(&mut self) -> bool {
+    fn receive_messages(&mut self) -> Result<bool> {
         let messages = self.inbox.drain();
-        let received = !messages.is_empty();
-        self.state.items.extend(messages);
+        let mut received = false;
+        let mut conflict = false;
+        for message in messages {
+            if let Some(id) = message.id()
+                && let Some(existing) = self.state.items.iter().find(|item| item.id() == Some(id))
+            {
+                if existing != &message {
+                    conflict = true;
+                    continue;
+                }
+                continue;
+            }
+            self.state.items.push(message);
+            received = true;
+        }
         if received {
             self.state.needs_response = true;
         }
-        received
+        if conflict {
+            return Err(Error::new(
+                ErrorKind::Session,
+                "input id was reused with different content",
+            ));
+        }
+        Ok(received)
     }
 
     /// Install optional persistence/authorization barriers. Not included in snapshots.
@@ -884,6 +903,53 @@ impl Agent {
         &mut self,
         parts: Vec<ContentPart>,
         options: RunOptions,
+        on_event: F,
+    ) -> Result<RunOutcome>
+    where
+        F: FnMut(AgentEvent) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.start_run(Item::user_parts(parts), options, on_event)
+            .await
+    }
+
+    /// Admit an identified user input to a new or unfinished turn. Its id is
+    /// committed together with its content at RunStarted, before any request.
+    /// Already admitted ids are rejected; recovery should inspect the stored
+    /// snapshot and resume the unfinished turn without appending them again.
+    pub async fn run_input<F, Fut>(
+        &mut self,
+        input: crate::UserInput,
+        options: RunOptions,
+        on_event: F,
+    ) -> Result<RunOutcome>
+    where
+        F: FnMut(AgentEvent) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        if self
+            .state
+            .items
+            .iter()
+            .any(|item| item.id() == Some(input.id.as_str()))
+        {
+            return Err(Error::new(
+                ErrorKind::Session,
+                "input was already admitted; resume without repeating it",
+            ));
+        }
+        let item = input.into_item()?;
+        if self.state.needs_response {
+            self.resume_run(Some(item), options, on_event).await
+        } else {
+            self.start_run(item, options, on_event).await
+        }
+    }
+
+    async fn start_run<F, Fut>(
+        &mut self,
+        input: Item,
+        options: RunOptions,
         mut on_event: F,
     ) -> Result<RunOutcome>
     where
@@ -906,7 +972,6 @@ impl Agent {
         )?;
         context.check()?;
         let start = self.state.items.len();
-        let input = Item::user_parts(parts);
         input.validate()?;
         self.state.items.push(input);
         self.state.needs_response = true;
@@ -958,12 +1023,13 @@ impl Agent {
         F: FnMut(AgentEvent) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        self.resume_run(Some(parts), options, on_event).await
+        self.resume_run(Some(Item::user_parts(parts)), options, on_event)
+            .await
     }
 
     async fn resume_run<F, Fut>(
         &mut self,
-        input: Option<Vec<ContentPart>>,
+        input: Option<Item>,
         options: RunOptions,
         mut on_event: F,
     ) -> Result<RunOutcome>
@@ -988,7 +1054,6 @@ impl Agent {
         context.check()?;
         let start = self.state.items.len();
         if let Some(input) = input {
-            let input = Item::user_parts(input);
             input.validate()?;
             self.state.items.push(input);
         }
@@ -1098,7 +1163,7 @@ impl Agent {
             .then(|| Arc::new(self.subagent_parent()));
         loop {
             context.check()?;
-            if self.receive_messages() {
+            if self.receive_messages()? {
                 self.checkpoint(CheckpointKind::MessagesReceived, context)
                     .await?;
             }
@@ -1173,7 +1238,7 @@ impl Agent {
                 return Ok(response);
             }
             if self.state.pending.is_empty() {
-                if self.receive_messages() {
+                if self.receive_messages()? {
                     self.checkpoint(CheckpointKind::MessagesReceived, context)
                         .await?;
                     continue;

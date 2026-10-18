@@ -89,7 +89,10 @@ pub enum CtlEvent {
     SteerSettled { message_id: u64, deferred: bool },
     /// The session's queue, after every change and once when a session binds.
     /// The rows are the driver's; the client renders them.
-    Queue { items: Vec<QueueRow> },
+    Queue {
+        session_id: String,
+        items: Vec<QueueRow>,
+    },
     /// One row left the queue because the driver delivered it.
     QueueClaimed { item_id: u64 },
     /// One row left the queue without being delivered.
