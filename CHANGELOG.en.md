@@ -11,6 +11,9 @@ uninstall) live in
 
 ## [Unreleased]
 
+- Full Bash output logs now spill to the system temporary directory instead of
+  `workspace/.abycore/*.log`; files keep the `abylab-bash-` prefix and stay private to the user.
+
 ## [0.1.22] - 2026-10-19
 
 - `/image` accepts the `@path` the file browser inserts: `/image @../pics/a.jpg` (or

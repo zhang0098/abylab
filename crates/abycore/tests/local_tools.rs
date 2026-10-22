@@ -83,7 +83,8 @@ async fn four_tools_execute_in_order_and_results_survive_restore() {
     );
     let requests = server.captured();
     assert_eq!(requests[1].body["messages"], requests[2].body["messages"]);
-    assert_eq!(std::fs::read_to_string(log).unwrap(), "beta\n".repeat(200));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "beta\n".repeat(200));
+    std::fs::remove_file(log).unwrap();
 }
 
 #[tokio::test]

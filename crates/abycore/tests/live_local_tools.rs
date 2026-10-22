@@ -21,7 +21,7 @@ async fn four_local_tools_live() {
         ..Default::default()
     };
     let mut agent = Agent::new(DeepSeekClient::new(config).unwrap(),
-        "Follow the exact requested sequence. Only access abycore_local_probe.txt and the .abycore log returned by Bash. The only allowed Bash commands are: for ((i=0;i<200;i++)); do cat abycore_local_probe.txt; done AND printf background-ok. Do not inspect environment variables or any other files. The host manages background jobs, so after starting the requested background job simply report its id.",model).unwrap();
+        "Follow the exact requested sequence. Only access abycore_local_probe.txt and the full-output log whose path Bash returns. The only allowed Bash commands are: for ((i=0;i<200;i++)); do cat abycore_local_probe.txt; done AND printf background-ok. Do not inspect environment variables or any other files. The host manages background jobs, so after starting the requested background job simply report its id.",model).unwrap();
     let tools = LocalTools::new(workspace.path()).unwrap();
     tools.register(&mut agent).unwrap();
     let details = Arc::new(Mutex::new(vec![]));

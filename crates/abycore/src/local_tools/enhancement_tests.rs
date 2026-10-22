@@ -7,6 +7,9 @@ use std::time::Duration;
 fn bundle(root: &std::path::Path) -> LocalTools {
     let mut config = LocalToolConfig::new(root);
     config.bash_grace = Duration::from_millis(40);
+    // Keep spill logs inside the test workspace so runs leave the shared
+    // temporary directory untouched.
+    config.bash_log_dir = Some(root.join(".logs"));
     LocalTools::with_config(config).unwrap()
 }
 async fn bash(tools: &LocalTools, command: &str, ctx: ToolContext) -> ToolOutput {
@@ -159,6 +162,14 @@ async fn separate_full_stream_logs_are_private_and_readable() {
     let out_path = output.stdout.spill_path.unwrap();
     let err_path = output.stderr.spill_path.unwrap();
     assert_ne!(out_path, err_path);
+    assert_eq!(out_path.parent(), Some(std::env::temp_dir().as_path()));
+    assert!(
+        out_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("abylab-bash-")
+    );
     assert_eq!(
         std::fs::read_to_string(&out_path).unwrap(),
         "out\n".repeat(200)
@@ -171,26 +182,49 @@ async fn separate_full_stream_logs_are_private_and_readable() {
         std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o077,
         0
     );
-    assert_eq!(
-        std::fs::metadata(dir.path().join(".abycore"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o077,
-        0
-    );
+    assert!(!dir.path().join(".abycore").exists());
     let read = tools
         .read()
         .execute(json!({"file_path":out_path,"limit":2}), context(512))
         .await
         .unwrap();
     assert!(read.content.contains("1: out\n2: out"));
+    std::fs::remove_file(out_path).unwrap();
+    std::fs::remove_file(err_path).unwrap();
+}
+
+#[tokio::test]
+async fn bash_logs_follow_the_configured_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let logs = dir.path().join("logs");
+    let mut config = LocalToolConfig::new(dir.path());
+    config.bash_log_dir = Some(logs.clone());
+    let tools = LocalTools::with_config(config).unwrap();
+    let output = result(
+        bash(
+            &tools,
+            "for ((i=0;i<200;i++)); do printf 'out\\n'; done",
+            context(512),
+        )
+        .await,
+    );
+    let path = output.stdout.spill_path.unwrap();
+    assert_eq!(path.parent(), Some(logs.as_path()));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "out\n".repeat(200));
+    assert_eq!(
+        std::fs::metadata(&logs).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert!(!dir.path().join(".abycore").exists());
 }
 
 #[tokio::test]
 async fn overflowing_spill_cap_discards_log_and_keeps_tail() {
     let dir = tempfile::tempdir().unwrap();
+    let logs = dir.path().join("logs");
     let mut config = LocalToolConfig::new(dir.path());
+    config.bash_log_dir = Some(logs.clone());
     config.max_bash_log_bytes = 128;
     config.bash_output_bytes = 32;
     let tools = LocalTools::with_config(config).unwrap();
@@ -205,13 +239,8 @@ async fn overflowing_spill_cap_discards_log_and_keeps_tail() {
     assert!(output.stdout.truncated);
     assert!(output.stdout.text.ends_with("FINAL"));
     assert!(output.stdout.spill_path.is_none());
-    if dir.path().join(".abycore").exists() {
-        assert_eq!(
-            std::fs::read_dir(dir.path().join(".abycore"))
-                .unwrap()
-                .count(),
-            0
-        );
+    if logs.exists() {
+        assert_eq!(std::fs::read_dir(logs).unwrap().count(), 0);
     }
 }
 
@@ -232,26 +261,36 @@ async fn minimum_output_budget_preserves_exit_information() {
 
 #[tokio::test]
 async fn logging_can_be_disabled_or_fail_without_failing_the_command() {
-    for disabled in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = LocalToolConfig::new(dir.path());
-        config.save_bash_output = !disabled;
-        if !disabled {
-            std::fs::write(dir.path().join(".abycore"), "occupied").unwrap();
-        }
-        let tools = LocalTools::with_config(config).unwrap();
-        let output = bash(
-            &tools,
-            "for ((i=0;i<100;i++)); do printf value; done",
-            context(64),
-        )
-        .await;
-        assert!(!output.is_error);
-        assert!(result(output).stdout.spill_path.is_none());
-        if disabled {
-            assert!(!dir.path().join(".abycore").exists());
-        }
-    }
+    let disabled = tempfile::tempdir().unwrap();
+    let mut config = LocalToolConfig::new(disabled.path());
+    config.save_bash_output = false;
+    config.bash_log_dir = Some(disabled.path().join("logs"));
+    let tools = LocalTools::with_config(config).unwrap();
+    let output = bash(
+        &tools,
+        "for ((i=0;i<100;i++)); do printf value; done",
+        context(64),
+    )
+    .await;
+    assert!(!output.is_error);
+    assert!(result(output).stdout.spill_path.is_none());
+    assert!(!disabled.path().join("logs").exists());
+
+    // A log directory that cannot be created must not fail the command.
+    let failed = tempfile::tempdir().unwrap();
+    let logs = failed.path().join("logs");
+    std::fs::write(&logs, "occupied").unwrap();
+    let mut config = LocalToolConfig::new(failed.path());
+    config.bash_log_dir = Some(logs);
+    let tools = LocalTools::with_config(config).unwrap();
+    let output = bash(
+        &tools,
+        "for ((i=0;i<100;i++)); do printf value; done",
+        context(64),
+    )
+    .await;
+    assert!(!output.is_error);
+    assert!(result(output).stdout.spill_path.is_none());
 }
 
 #[tokio::test]
@@ -292,6 +331,7 @@ async fn background_query_reports_eviction_and_rejects_invalid_cursors() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = LocalToolConfig::new(dir.path());
     config.bash_output_bytes = 16;
+    config.bash_log_dir = Some(dir.path().join("logs"));
     let tools = LocalTools::with_config(config).unwrap();
     let id = background(
         &tools,

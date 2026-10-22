@@ -80,8 +80,11 @@ pub struct LocalToolConfig {
     /// Maximum retained background jobs, including completed jobs; forget completed jobs to free slots.
     pub max_background_jobs: usize,
     pub max_command_bytes: usize,
-    /// Save overflowing Bash output under root/.abycore (default true).
+    /// Save overflowing Bash output (default true).
     pub save_bash_output: bool,
+    /// Directory for Bash stream logs; `None` uses the system temporary directory.
+    /// Created with mode 0700 when missing.
+    pub bash_log_dir: Option<PathBuf>,
     /// Maximum bytes per stream log; overflowing logs are discarded.
     pub max_bash_log_bytes: usize,
     /// Inherit the parent environment after credential-name filtering (default true).
@@ -109,6 +112,7 @@ impl LocalToolConfig {
             max_background_jobs: 64,
             max_command_bytes: 64 * 1024,
             save_bash_output: true,
+            bash_log_dir: None,
             max_bash_log_bytes: 64 * 1024 * 1024,
             inherit_env: true,
             env: BTreeMap::new(),
@@ -135,6 +139,7 @@ impl fmt::Debug for LocalToolConfig {
             .field("max_background_jobs", &self.max_background_jobs)
             .field("max_command_bytes", &self.max_command_bytes)
             .field("save_bash_output", &self.save_bash_output)
+            .field("bash_log_dir", &self.bash_log_dir)
             .field("max_bash_log_bytes", &self.max_bash_log_bytes)
             .field("inherit_env", &self.inherit_env)
             .field("env", &"[REDACTED]")
@@ -163,6 +168,10 @@ impl LocalTools {
             || config.max_output_bytes < 64
             || config.max_command_bytes == 0
             || config.max_bash_log_bytes == 0
+            || config
+                .bash_log_dir
+                .as_ref()
+                .is_some_and(|dir| dir.as_os_str().is_empty())
             || config.bash_path.as_os_str().is_empty()
             || config.bash_timeout.is_zero()
             || config.bash_max_timeout.is_zero()

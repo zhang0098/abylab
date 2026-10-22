@@ -4,8 +4,7 @@ use super::{
     workspace::Workspace,
 };
 use crate::ToolOutput;
-use cap_std::fs::{Dir, DirBuilder, DirBuilderExt, OpenOptions, OpenOptionsExt};
-use std::{io, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 use tokio::io::AsyncWriteExt;
 
 pub(super) struct Capture {
@@ -69,8 +68,7 @@ impl Capture {
                     self.buffer
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .spill_path =
-                        Some(self.workspace.config.root.join(".abycore").join(&log.name));
+                        .spill_path = Some(log.path.clone());
                 }
             }
         }
@@ -106,38 +104,59 @@ impl Drop for Capture {
 }
 
 struct Log {
-    directory: Dir,
-    name: String,
+    path: PathBuf,
     file: Option<tokio::fs::File>,
     keep: bool,
 }
 impl Log {
     async fn create(workspace: Arc<Workspace>) -> io::Result<Self> {
         tokio::task::spawn_blocking(move || {
-            let mut builder = DirBuilder::new();
-            builder.mode(0o700);
-            let log_path = workspace.workspace_child(".abycore");
-            match workspace.directory.create_dir_with(&log_path, &builder) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-            if !workspace.directory.symlink_metadata(&log_path)?.is_dir() {
-                return Err(io::Error::other(
-                    "Bash log directory must be a real directory",
-                ));
-            }
-            let directory = workspace.directory.open_dir(&log_path)?;
+            let directory = match workspace.config.bash_log_dir.clone() {
+                Some(directory) => {
+                    let directory = if directory.is_absolute() {
+                        directory
+                    } else {
+                        workspace.workspace_child(directory)
+                    };
+                    let mut builder = std::fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        builder.mode(0o700);
+                    }
+                    match builder.create(&directory) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error),
+                    }
+                    if !std::fs::symlink_metadata(&directory)?.is_dir() {
+                        return Err(io::Error::other(
+                            "Bash log directory must be a real directory",
+                        ));
+                    }
+                    directory
+                }
+                None => std::env::temp_dir(),
+            };
             for _ in 0..8 {
-                let name = format!("{:012x}.log", rand::random::<u64>() & 0xffff_ffff_ffff);
-                let mut options = OpenOptions::new();
-                options.write(true).create_new(true).mode(0o600);
-                match directory.open_with(&name, &options) {
+                let name = format!(
+                    "abylab-bash-{}-{:012x}.log",
+                    std::process::id(),
+                    rand::random::<u64>() & 0xffff_ffff_ffff
+                );
+                let path = directory.join(name);
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                match options.open(&path) {
                     Ok(file) => {
                         return Ok(Self {
-                            directory,
-                            name,
-                            file: Some(tokio::fs::File::from_std(file.into_std())),
+                            path,
+                            file: Some(tokio::fs::File::from_std(file)),
                             keep: false,
                         });
                     }
@@ -163,7 +182,7 @@ impl Drop for Log {
     fn drop(&mut self) {
         self.file.take();
         if !self.keep {
-            let _ = self.directory.remove_file(&self.name);
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
