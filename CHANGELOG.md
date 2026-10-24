@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-10-24
+
 - Bash 输出溢出时的完整日志改写到系统临时目录，不再在工作区生成 `.abycore/*.log`；
   日志文件名带 `abylab-bash-` 前缀，仍只有当前用户可读。
 
@@ -532,7 +534,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/zhang0098/abylab/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20

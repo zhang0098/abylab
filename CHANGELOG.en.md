@@ -11,6 +11,8 @@ uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-10-24
+
 - Full Bash output logs now spill to the system temporary directory instead of
   `workspace/.abycore/*.log`; files keep the `abylab-bash-` prefix and stay private to the user.
 
@@ -706,7 +708,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/zhang0098/abylab/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/zhang0098/abylab/compare/v0.1.19...v0.1.20
