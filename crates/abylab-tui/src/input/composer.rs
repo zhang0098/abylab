@@ -433,6 +433,15 @@ impl ComposerEditor {
         self.layout = None;
     }
 
+    /// Forget the previous session's recall ring without touching the draft.
+    /// A successful session switch keeps an unsent draft, but `↑` must only
+    /// walk prompts belonging to the newly bound session.
+    pub fn clear_prompt_history(&mut self) {
+        self.history.clear();
+        self.hist_pos = None;
+        self.stash.clear();
+    }
+
     /// Replace the whole draft; the cursor lands at the end. Like the old
     /// editor's `set`, this does not touch `hist_pos` — history navigation
     /// relies on it surviving buffer replacement.

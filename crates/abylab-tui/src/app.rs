@@ -2076,6 +2076,14 @@ impl App {
 
         let mut apply_to_transcript = true;
         match &ui {
+            // `UserMessage` is emitted by session/load replay. Mirror each
+            // restored prompt into the composer's session-scoped recall ring
+            // as well as painting it in the transcript. Empty text represents
+            // an image-only prompt, which cannot be usefully recalled without
+            // its attachment.
+            E::UserMessage { session, text } if *session == self.session_id && !text.is_empty() => {
+                self.input.history.push(text.clone());
+            }
             E::PlanMode { session, active } if *session == self.session_id => {
                 if self.modes.plan == *active {
                     apply_to_transcript = false;
@@ -4707,6 +4715,7 @@ impl App {
         self.confirm = None;
         self.vim.reset_pending();
         self.reset_subagent_views();
+        self.input.clear_prompt_history();
         self.transcript.clear();
         self.plan = None;
         self.todo_dialog = None;
@@ -12797,12 +12806,31 @@ mod resume_replay_tests {
     #[test]
     fn session_bound_then_user_message_renders_replay() {
         let (mut app, ctl, _rx) = test_app();
+        app.input.history.push("old session prompt".into());
+        app.input.set("unsent draft".into());
+        app.session_switch = Some(SessionSwitch::Resume("persist-demo".into()));
         app.handle(
             AppEvent::Ctl(CtlEvent::SessionBound {
                 session_id: "persist-demo".into(),
                 notice: Some("resumed · 1 turns".into()),
                 model: None,
                 effort: None,
+            }),
+            &ctl,
+        );
+        assert!(
+            app.input.history.is_empty(),
+            "binding the resumed session drops the previous session's recall ring"
+        );
+        assert_eq!(
+            app.input.buf(),
+            "unsent draft",
+            "switching sessions still preserves an unsent draft"
+        );
+        app.handle(
+            AppEvent::Ui(crate::events::UiEvent::UserMessage {
+                session: "persist-demo".into(),
+                text: "first persisted prompt".into(),
             }),
             &ctl,
         );
@@ -12826,6 +12854,20 @@ mod resume_replay_tests {
             users.iter().any(|t| t.contains("hello persistence")),
             "replayed user line lands in the transcript: {users:?}"
         );
+        assert_eq!(
+            app.input.history,
+            ["first persisted prompt", "hello persistence"],
+            "replayed prompts rebuild the composer's recall ring in order"
+        );
+
+        app.history_prev_from_draft();
+        assert_eq!(app.input.buf(), "hello persistence");
+        app.history_prev();
+        assert_eq!(app.input.buf(), "first persisted prompt");
+        app.history_next();
+        assert_eq!(app.input.buf(), "hello persistence");
+        app.history_next();
+        assert_eq!(app.input.buf(), "unsent draft");
     }
 }
 
