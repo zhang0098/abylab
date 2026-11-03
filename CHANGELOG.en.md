@@ -11,6 +11,10 @@ uninstall) live in
 
 ## [Unreleased]
 
+- Resuming a session restores its previously sent text prompts for up/down arrow
+  recall. Switching sessions clears the previous session's history while preserving
+  any unsent draft.
+
 ## [0.1.23] - 2026-10-24
 
 - Full Bash output logs now spill to the system temporary directory instead of
