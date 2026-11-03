@@ -11,6 +11,8 @@ uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-03
+
 - Resuming a session restores its previously sent text prompts for up/down arrow
   recall. Switching sessions clears the previous session's history while preserving
   any unsent draft.
@@ -712,7 +714,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.23...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.24...HEAD
+[0.1.24]: https://github.com/zhang0098/abylab/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/zhang0098/abylab/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21

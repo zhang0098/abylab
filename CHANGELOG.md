@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-03
+
 - 恢复会话后，输入框的上下键可以再次按顺序查阅该会话以前发送的文字；切换会话时会清除
   上一个会话的输入历史，同时保留尚未发送的草稿。
 
@@ -537,7 +539,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.23...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.24...HEAD
+[0.1.24]: https://github.com/zhang0098/abylab/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/zhang0098/abylab/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/zhang0098/abylab/compare/v0.1.20...v0.1.21
