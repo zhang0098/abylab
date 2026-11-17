@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-17
+
 - 网页搜索统一直连 DeepSeek Search API，移除辅助 Messages 搜索模式及
   `--search-provider`、`--search-base-url` 参数。旧设置中的模式字段在加载时忽略；
   搜索和抓取端点继续通过 `--web-api-base-url` 或 `web.api_base_url` 配置。
@@ -545,7 +547,8 @@
 卡片、markdown、主题包、`@` 文件提及、图片缩略图），一条命令的安装脚本和
 release 流水线。
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/zhang0098/abylab/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/zhang0098/abylab/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/zhang0098/abylab/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22

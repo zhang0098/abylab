@@ -11,6 +11,8 @@ uninstall) live in
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-17
+
 - Web search now always calls the DeepSeek Search API directly. Removed auxiliary
   Messages search and the `--search-provider` / `--search-base-url` flags. Retired
   mode settings are ignored on load; configure Search/Fetch endpoints with
@@ -722,7 +724,8 @@ First release: the abycore agent SDK, the abylab-backend driver and the
 abylab-tui canvas (composer card, markdown, palettes, `@` file mentions, image
 thumbnails), plus the one-line installer and the release pipeline.
 
-[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/zhang0098/abylab/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/zhang0098/abylab/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/zhang0098/abylab/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/zhang0098/abylab/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/zhang0098/abylab/compare/v0.1.21...v0.1.22
