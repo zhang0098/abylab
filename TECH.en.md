@@ -50,25 +50,17 @@ an isolated temporary directory that is removed on completion.
 ## DeepSeek network protocols
 
 Conversation traffic stays on native Messages (`/anthropic/v1/messages`,
-`x-api-key`, SSE). Like Harness `0.2.1-rc.2`, search defaults to an auxiliary
-Messages request with server-side search, retaining the direct Search API as
-an explicit alternative. `web_fetch` always uses the independent Fetch API;
-changing search mode does not change fetch or introduce local HTTP scraping.
+`x-api-key`, SSE). `web_search` calls the DeepSeek Search API directly, and
+`web_fetch` calls the Fetch API. Both use an API prefix independent of chat.
+Auxiliary Messages search is no longer available.
 
 Merge these non-secret settings into `settings.json`, preserving other preferences:
 
 ```json
 {
   "web": {
-    "search_provider": "messages",
-    "messages_search": {
-      "base_url": "https://api.deepseek.com/anthropic/v1",
-      "model": "deepseek-v4-flash",
-      "max_tokens": 4096,
-      "max_uses": 5,
-      "max_retries": 0
-    },
     "api_base_url": "https://api.deepseek.com/v1/tools",
+    "summary_max_chars": 800,
     "search_timeout_secs": 60,
     "fetch_timeout_secs": 30,
     "max_retries": 2,
@@ -84,22 +76,15 @@ Merge these non-secret settings into `settings.json`, preserving other preferenc
 
 Invalid network settings stop startup instead of silently selecting an official
 endpoint. CLI overrides are not saved. `--base-url` only controls chat;
-`--search-base-url` overrides the complete Messages search prefix (only `/messages`
-is appended); `--web-api-base-url` overrides the full Search / Fetch prefix.
-All three are independent. `--search-provider messages|api` overrides
-`web.search_provider` for this run. Existing settings without that field select
-Messages search; set it to `api` to retain direct search. New sessions, resume,
-`ask`, and children use this configuration.
+`--web-api-base-url` overrides the full Search / Fetch prefix, appending only
+`/search` or `/fetch`. The two endpoint settings are independent.
+The retired `--search-provider` and `--search-base-url` flags report migration guidance.
+The host ignores saved `web.search_provider` and `web.messages_search` fields;
+all remaining network settings stay strictly validated. Saving preferences writes only
+current fields. The SDK's `WebConfig` no longer exposes those two fields.
+New sessions, resume, `ask`, and children use this configuration.
 Key rotation replaces both web tools; running children keep their credential snapshot.
 
-- Messages search sends an auxiliary `/anthropic/v1/messages` request with
-  `deepseek-v4-flash`, 4096 output tokens, `web_search_20250305`, at most five
-  server-tool uses, and thinking disabled. Headers are `x-api-key`, Bearer and
-  `anthropic-version: 2023-06-01`. Only native `web_search_tool_result` blocks
-  and citation snippets become sources; prose alone is never a search result.
-  Retries default to zero and use `web.messages_search.max_retries`. Auxiliary
-  model usage is recorded even when structured search output is invalid.
-  Failure never switches to the direct API.
 - `web_search` retains `queries` (1–4 strings): exact deduplication, concurrent
   queries, round-robin merging in input order, URL deduplication, eight sources
   by default. Failure cancels and drains siblings. Direct payloads are
@@ -107,6 +92,11 @@ Key rotation replaces both web tools; running children keep their credential sna
   characters; the latest user prompt is whitespace-normalized and capped at
   128 characters. Host context and tool reminders never replace it. Sending
   the original question can be disabled.
+  Model output prefers each source's `summary`, falling back to `snippet` when the
+  summary is absent or blank. Whitespace is collapsed, and `web.summary_max_chars`
+  caps each summary at 800 Unicode characters by default, including a truncation
+  ellipsis (`…`). Tool metadata retains the bounded summary and original snippet
+  for session replay.
 - `web_fetch` sends `{url}` and returns a title and Markdown. URLs must be
   HTTP(S) without userinfo; no final redirect URL is invented. Both tools label
   external content as untrusted and request citations; output defaults to 64 KiB.
@@ -127,7 +117,7 @@ Key rotation replaces both web tools; running children keep their credential sna
   account quotas and may still receive 429. Each attempt is recorded and
   checkpointed before dispatch; retries and uploads consume the request budget.
   Direct web requests carry no token usage, not fabricated zero usage. Billing
-  follows the account's service rules for either mode; no free usage is promised
+  follows the account's service rules for search and fetch; no free usage is promised
   based on the client name.
 
 Images default to Files uploads with `files-api-2025-04-14`. Image-hash caches

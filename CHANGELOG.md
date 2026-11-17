@@ -10,6 +10,12 @@
 
 ## [Unreleased]
 
+- 网页搜索统一直连 DeepSeek Search API，移除辅助 Messages 搜索模式及
+  `--search-provider`、`--search-base-url` 参数。旧设置中的模式字段在加载时忽略；
+  搜索和抓取端点继续通过 `--web-api-base-url` 或 `web.api_base_url` 配置。
+- 搜索结果优先向模型提供 `summary`，缺失或空白时使用 `snippet`；摘要合并空白并默认
+  限制为 800 个字符，可通过 `web.summary_max_chars` 调整。
+
 ## [0.1.24] - 2026-11-03
 
 - 恢复会话后，输入框的上下键可以再次按顺序查阅该会话以前发送的文字；切换会话时会清除

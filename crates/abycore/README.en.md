@@ -91,10 +91,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The default `web-search` feature provides
 `WebConfig::tools(key, WebRateLimiter::default())`; pass the result to
-`agent.register_tools(...)` for `web_search` and direct `web_fetch`. Search defaults
-to the Messages server tool; set `WebConfig.search_provider = SearchProvider::Api`
-for direct search, without automatic fallback. `DeepSeekMessagesSearch` exposes
-standalone Messages search; `DeepSeekWebApi` exposes standalone direct `search` / `fetch`.
+`agent.register_tools(...)` for `web_search` and `web_fetch`. Both call the DeepSeek
+Search/Fetch APIs directly, using the independent `WebConfig.api_base_url` endpoint.
+`DeepSeekWebApi` exposes standalone `search` / `fetch` calls.
+Search sources retain both `summary` and `snippet`. The tool prefers summaries,
+falls back to snippets for absent or blank summaries, and caps each summary with
+`WebConfig.summary_max_chars` (800 characters by default).
 `ClientConfig.files` controls uploads, expiry and inline fallback
 (enabled by default); stream idle timeout defaults to 300 seconds.
 `model_capabilities` exposes the catalog. Configuration updates and auxiliary
@@ -104,7 +106,7 @@ returning from `AgentHooks::checkpoint`. See [TECH.en.md](../../TECH.en.md).
 `examples/` ships runnable snippets: `basic.rs` (one completion), `todo.rs`
 (plan-driven turn), `tools.rs` (tool bundle), `local_tools.rs` (sandboxed
 filesystem tools), `session.rs` (snapshot store), `cancel.rs` (cancellation),
-`subagent.rs` (delegation), `web_search.rs` (auxiliary search), and `cli.rs`
+`subagent.rs` (delegation), `web_search.rs` (web search), and `cli.rs`
 (a small interactive terminal agent).
 
 Run one with your key in the environment:

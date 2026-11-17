@@ -1,7 +1,7 @@
 [package]
 name = "abycore"
 version = "0.1.24"
-edition = "2024"
+edition.workspace = true
 description = "An embeddable Rust agent SDK for DeepSeek Messages"
 license.workspace = true
 readme = "README.md"

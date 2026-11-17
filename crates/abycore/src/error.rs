@@ -24,7 +24,6 @@ pub enum ErrorKind {
     Session,
     NeedsResolution,
     EventHandler,
-    SearchUnavailable,
     /// A web target was rejected by the provider's security policy.
     AccessDenied,
     /// A web target did not yield retrievable content.

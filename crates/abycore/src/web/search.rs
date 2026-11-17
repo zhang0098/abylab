@@ -1,4 +1,4 @@
-//! Search results shared by Messages search, the direct API and the model-facing tool.
+//! Search results shared by the DeepSeek Search API and the model-facing tool.
 use crate::Usage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -10,6 +10,9 @@ pub struct SearchSource {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// API summary; the web_search tool normalizes and bounds it before model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Provider-supplied date text, not a parsed publication date.
     #[serde(
         default,
@@ -32,7 +35,11 @@ pub(crate) struct SearchOutput {
     pub truncated: bool,
 }
 
-pub(crate) fn merge_results(results: &[SearchResult], max_results: usize) -> SearchOutput {
+pub(crate) fn merge_results(
+    results: &[SearchResult],
+    max_results: usize,
+    summary_max_chars: usize,
+) -> SearchOutput {
     let mut seen = HashSet::new();
     let mut output = SearchOutput {
         sources: vec![],
@@ -45,7 +52,12 @@ pub(crate) fn merge_results(results: &[SearchResult], max_results: usize) -> Sea
                 && seen.insert(&source.url)
             {
                 if output.sources.len() < max_results {
-                    output.sources.push(source.clone());
+                    let mut source = source.clone();
+                    source.summary = source
+                        .summary
+                        .as_deref()
+                        .and_then(|text| bounded_summary(text, summary_max_chars));
+                    output.sources.push(source);
                 } else {
                     output.truncated = true;
                 }
@@ -53,6 +65,19 @@ pub(crate) fn merge_results(results: &[SearchResult], max_results: usize) -> Sea
         }
     }
     output
+}
+
+/// Collapse whitespace and cap the summary without splitting a Unicode character.
+fn bounded_summary(text: &str, max_chars: usize) -> Option<String> {
+    let mut summary = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.is_empty() {
+        return None;
+    }
+    if summary.chars().count() > max_chars {
+        summary = summary.chars().take(max_chars.saturating_sub(1)).collect();
+        summary.push('…');
+    }
+    Some(summary)
 }
 
 pub(crate) fn format_search(result: &SearchOutput) -> String {
@@ -71,8 +96,8 @@ pub(crate) fn format_search(result: &SearchOutput) -> String {
                     .unwrap_or_else(|| source.url.clone())
             });
             let mut meta = vec![];
-            if let Some(snippet) = &source.snippet {
-                meta.push(snippet.clone());
+            if let Some(excerpt) = source.summary.as_ref().or(source.snippet.as_ref()) {
+                meta.push(excerpt.clone());
             }
             if let Some(date) = &source.published_at {
                 meta.push(format!("({date})"));

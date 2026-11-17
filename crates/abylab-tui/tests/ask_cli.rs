@@ -443,8 +443,6 @@ fn ask_uses_independent_web_endpoint_and_restores_results_without_repeating_tool
     let run = sandbox.ask(
         &[
             "original question",
-            "--search-provider",
-            "api",
             "--web-api-base-url",
             &endpoint,
             "--session-id",
@@ -470,8 +468,6 @@ fn ask_uses_independent_web_endpoint_and_restores_results_without_repeating_tool
     let run = sandbox.ask(
         &[
             "recall",
-            "--search-provider",
-            "api",
             "--web-api-base-url",
             &endpoint,
             "--session-id",
@@ -491,13 +487,9 @@ fn ask_uses_independent_web_endpoint_and_restores_results_without_repeating_tool
 }
 
 #[test]
-fn ask_defaults_to_messages_search_and_can_override_a_saved_api_selection() {
-    for override_api in [false, true] {
-        let sandbox = Sandbox::new(if override_api {
-            "native-search-override"
-        } else {
-            "native-search-default"
-        });
+fn ask_uses_direct_search_with_default_or_retired_search_settings() {
+    for legacy_mode in [None, Some("messages"), Some("api")] {
+        let sandbox = Sandbox::new("direct-search-settings");
         let tool = block_start(
             0,
             r#"{"type":"tool_use","id":"s","name":"web_search","input":{"queries":["official docs"]}}"#,
@@ -511,52 +503,53 @@ fn ask_defaults_to_messages_search_and_can_override_a_saved_api_selection() {
             )),
             Reply::sse(sse("resume", &[text_block(0, "remembered")], "end_turn")),
         ]);
-        let native = Provider::start(vec![Reply {
+        let direct = Provider::start(vec![Reply {
             status: 200,
             content_type: "application/json",
             body: serde_json::json!({
-                "id":"aux", "stop_reason":"end_turn",
-                "content":[{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"https://example.org/docs","title":"Native source"}]}],
-                "usage":{"input_tokens":7,"output_tokens":3}
+                "results":[{"url":"https://example.org/docs","title":"API source","snippet":"Excerpt","summary":"  Model\nsummary  ","date":null}]
             }).to_string(),
         }]);
-        let direct = Provider::start(vec![]);
-        let endpoint = format!("{}/anthropic/v1", native.base_url);
-        let direct_endpoint = format!("{}/v1/tools", direct.base_url);
-        let settings = if override_api {
-            r#"{"web":{"search_provider":"api"}}"#
-        } else {
-            r#"{"web":{}}"#
-        };
-        std::fs::write(sandbox.home.join("settings.json"), settings).unwrap();
-        let mut args = vec![
-            "find docs",
-            "--search-base-url",
-            &endpoint,
-            "--web-api-base-url",
-            &direct_endpoint,
-            "--session-id",
-            "native-session",
-        ];
-        if override_api {
-            args.extend(["--search-provider", "messages"]);
+        let retired = Provider::start(vec![]);
+        let mut settings = serde_json::json!({
+            "model":"saved-chat-model",
+            "language":"en",
+            "web":{"api_base_url":format!("{}/v1/tools", direct.base_url)}
+        });
+        if let Some(mode) = legacy_mode {
+            settings["web"]["search_provider"] = serde_json::json!(mode);
+            settings["web"]["messages_search"] = serde_json::json!({
+                "base_url":format!("{}/anthropic/v1", retired.base_url),
+                "model":"retired-search-model"
+            });
         }
+        let settings = settings.to_string();
+        std::fs::write(sandbox.home.join("settings.json"), &settings).unwrap();
+        let mut args = vec!["find docs", "--session-id", "search-session"];
         let run = sandbox.ask(&args, &provider.base_url, Some("fixture-key"));
         assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
         assert_eq!(run.stdout, "[Docs](https://example.org/docs)\n");
-        assert_eq!(native.bodies().len(), 1);
-        assert!(direct.bodies().is_empty());
-        let request: serde_json::Value = serde_json::from_str(&native.bodies()[0]).unwrap();
-        assert_eq!(request["tools"][0]["type"], "web_search_20250305");
-        assert_eq!(request["model"], "deepseek-v4-flash");
-        assert_eq!(request["thinking"]["type"], "disabled");
-        assert!(provider.bodies()[1].contains("Native source"));
+        assert_eq!(direct.bodies().len(), 1);
+        assert!(retired.bodies().is_empty());
+        let request: serde_json::Value = serde_json::from_str(&direct.bodies()[0]).unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "query":"official docs", "count":8, "need_content":false, "ori_question":"find docs"
+            })
+        );
+        let chat: serde_json::Value = serde_json::from_str(&provider.bodies()[0]).unwrap();
+        assert_eq!(chat["model"], "saved-chat-model");
+        assert!(provider.bodies()[1].contains("API source"));
+        assert!(provider.bodies()[1].contains("Model summary"));
+        assert!(!provider.bodies()[1].contains("Excerpt"));
         args[0] = "recall";
         let run = sandbox.ask(&args, &provider.base_url, Some("rotated-fixture-key"));
         assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
         assert_eq!(run.stdout, "remembered\n");
-        assert_eq!(native.bodies().len(), 1);
-        assert!(provider.bodies()[2].contains("Native source"));
+        assert_eq!(direct.bodies().len(), 1);
+        assert!(provider.bodies()[2].contains("API source"));
+        assert!(provider.bodies()[2].contains("Model summary"));
         assert_eq!(
             std::fs::read_to_string(sandbox.home.join("settings.json")).unwrap(),
             settings
@@ -565,19 +558,23 @@ fn ask_defaults_to_messages_search_and_can_override_a_saved_api_selection() {
 }
 
 #[test]
-fn invalid_search_provider_flag_fails_without_network_requests() {
-    let sandbox = Sandbox::new("bad-search-provider");
+fn retired_search_flags_fail_without_network_requests() {
+    let sandbox = Sandbox::new("retired-search-flags");
     let provider = Provider::start(vec![]);
-    let run = sandbox.ask(
-        &["question", "--search-provider", "fallback"],
-        &provider.base_url,
-        Some("fixture-key"),
-    );
-    assert_ne!(run.status.code(), Some(0));
-    assert!(run
-        .stderr
-        .contains("--search-provider must be messages or api"));
-    assert!(provider.bodies().is_empty());
+    for (flag, value) in [
+        ("--search-provider", "messages"),
+        ("--search-provider", "api"),
+        ("--search-base-url", "https://example.org/anthropic/v1"),
+    ] {
+        let run = sandbox.ask(
+            &["question", flag, value],
+            &provider.base_url,
+            Some("fixture-key"),
+        );
+        assert_ne!(run.status.code(), Some(0));
+        assert!(run.stderr.contains(&format!("{flag} was removed")));
+        assert!(provider.bodies().is_empty());
+    }
 }
 
 #[test]
@@ -587,9 +584,9 @@ fn malformed_network_settings_fail_before_any_model_request() {
     for settings in [
         r#"{"web":{"unknown_option":true}}"#,
         r#"{"web":{"api_base_url":"file:///tmp/tools"}}"#,
-        r#"{"web":{"search_provider":"unknown"}}"#,
-        r#"{"web":{"messages_search":{"base_url":"https://user:password@example.org"}}}"#,
-        r#"{"web":{"messages_search":{"max_uses":0}}}"#,
+        r#"{"web":{"search_provider":"messages","api_base_url":"https://user:password@example.org"}}"#,
+        r#"{"web":{"messages_search":{},"count":0}}"#,
+        r#"{"web":{"summary_max_chars":0}}"#,
         r#"{"messages":{"stream_idle_timeout_secs":0}}"#,
     ] {
         std::fs::write(sandbox.home.join("settings.json"), settings).unwrap();
