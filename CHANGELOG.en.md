@@ -11,6 +11,14 @@ uninstall) live in
 
 ## [Unreleased]
 
+- Web search now always calls the DeepSeek Search API directly. Removed auxiliary
+  Messages search and the `--search-provider` / `--search-base-url` flags. Retired
+  mode settings are ignored on load; configure Search/Fetch endpoints with
+  `--web-api-base-url` or `web.api_base_url`.
+- Search output now prefers `summary`, falling back to `snippet` when absent or
+  blank. Summaries collapse whitespace and default to an 800-character cap,
+  configurable through `web.summary_max_chars`.
+
 ## [0.1.24] - 2026-11-03
 
 - Resuming a session restores its previously sent text prompts for up/down arrow

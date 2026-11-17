@@ -159,6 +159,14 @@ impl DeepSeekWebApi {
                     .map_err(|_| Error::protocol("invalid search source URL"))?;
                 let title = required("title")?;
                 let snippet = required("snippet")?;
+                let summary = result
+                    .get("summary")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or_else(|| Error::protocol("invalid search summary"))
+                    })
+                    .transpose()?;
                 let date = result
                     .get("date")
                     .ok_or_else(|| Error::protocol("search result has no date"))?;
@@ -169,6 +177,7 @@ impl DeepSeekWebApi {
                     url: url.into(),
                     title: (!title.is_empty()).then(|| title.into()),
                     snippet: (!snippet.is_empty()).then(|| snippet.into()),
+                    summary: summary.filter(|v| !v.is_empty()).map(str::to_owned),
                     published_at: date.as_str().filter(|v| !v.is_empty()).map(str::to_owned),
                 });
             }

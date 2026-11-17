@@ -13,350 +13,30 @@ fn results(url: &str) -> Value {
 }
 fn config(server: &Server) -> WebConfig {
     WebConfig {
-        search_provider: SearchProvider::Api,
         api_base_url: format!("{}/gateway/v1/tools/", server.url),
         max_retries: 0,
         ..Default::default()
     }
 }
 
-fn native_result(urls: &[&str]) -> Value {
-    json!({
-        "id":"native-search", "type":"message", "role":"assistant", "stop_reason":"end_turn",
-        "content":[
-            {"type":"server_tool_use","id":"server-search","name":"web_search","input":{"query":"q"}},
-            {"type":"web_search_tool_result","tool_use_id":"server-search","content":urls.iter().map(|url| json!({"type":"web_search_result","url":url,"title":"Native title","page_age":"today"})).collect::<Vec<_>>()},
-            {"type":"text","text":"Generated answer is not a search result","citations":urls.iter().map(|url| json!({"url":url,"cited_text":"Cited excerpt"})).collect::<Vec<_>>()}
-        ],
-        "usage":{"input_tokens":10,"cache_read_input_tokens":2,"output_tokens":3}
-    })
-}
-
-fn native_config(server: &Server) -> WebConfig {
-    WebConfig {
-        messages_search: MessagesSearchConfig {
-            base_url: format!("{}/native/v1/", server.url),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
 #[test]
-fn messages_is_the_default_and_old_settings_pick_it_without_migration() {
+fn web_settings_round_trip_and_reject_unknown_fields() {
     for value in [
         json!({}),
         json!({"api_base_url":"https://example.org/tools"}),
     ] {
         let config: WebConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(config.search_provider, SearchProvider::Messages);
-        assert_eq!(config.messages_search, MessagesSearchConfig::default());
         config.validate().unwrap();
         let saved = serde_json::to_value(&config).unwrap();
-        assert_eq!(saved["search_provider"], "messages");
         assert_eq!(serde_json::from_value::<WebConfig>(saved).unwrap(), config);
     }
-    let config: WebConfig = serde_json::from_value(json!({"search_provider":"api"})).unwrap();
-    assert_eq!(config.search_provider, SearchProvider::Api);
     for value in [
-        json!({"search_provider":"fallback"}),
-        json!({"messages_search":{"unknown":true}}),
+        json!({"search_provider":"messages"}),
+        json!({"messages_search":{}}),
+        json!({"unknown":true}),
     ] {
         assert!(serde_json::from_value::<WebConfig>(value).is_err());
     }
-    for value in [
-        json!({"messages_search":{"base_url":"https://user:secret@example.org"}}),
-        json!({"messages_search":{"base_url":"file:///tmp/search"}}),
-        json!({"messages_search":{"model":" "}}),
-        json!({"messages_search":{"max_tokens":0}}),
-        json!({"messages_search":{"max_uses":0}}),
-        json!({"messages_search":{"max_retries":11}}),
-    ] {
-        assert!(
-            serde_json::from_value::<WebConfig>(value)
-                .unwrap()
-                .validate()
-                .is_err()
-        );
-    }
-}
-
-#[tokio::test]
-async fn native_search_uses_messages_headers_server_tools_and_structured_sources() {
-    let native = Server::start(vec![Reply::json(native_result(&[
-        "https://example.org/a",
-        "https://example.org/a",
-        "https://example.org/b",
-    ]))])
-    .await;
-    let mut cfg = native_config(&native);
-    cfg.max_results = 1;
-    let api = DeepSeekMessagesSearch::new("fixture-secret", cfg).unwrap();
-    let result = api.search("q", RequestOptions::default()).await.unwrap();
-    assert_eq!(result.sources.len(), 1);
-    assert_eq!(result.sources[0].url, "https://example.org/a");
-    assert_eq!(result.sources[0].snippet.as_deref(), Some("Cited excerpt"));
-    assert_eq!(result.sources[0].published_at.as_deref(), Some("today"));
-    assert!(result.truncated);
-    assert_eq!(result.usage.as_ref().unwrap().input_tokens, Some(12));
-    let request = &native.captured()[0];
-    assert_eq!(request.path, "/native/v1/messages");
-    assert!(request.headers.contains("x-api-key: fixture-secret"));
-    assert!(
-        request
-            .headers
-            .contains("authorization: Bearer fixture-secret")
-    );
-    assert!(request.headers.contains("anthropic-version: 2023-06-01"));
-    assert!(request.headers.contains("accept: application/json"));
-    assert_eq!(request.body["model"], "deepseek-v4-flash");
-    assert_eq!(request.body["max_tokens"], 4096);
-    assert_eq!(
-        request.body["tools"],
-        json!([{"type":"web_search_20250305","name":"web_search","max_uses":5}])
-    );
-    assert_eq!(request.body["thinking"], json!({"type":"disabled"}));
-    assert_eq!(
-        request.body["messages"][0]["content"][0]["text"],
-        "Perform a web search for the query: q"
-    );
-    assert!(request.body.get("ori_question").is_none());
-}
-
-#[tokio::test]
-async fn default_tool_uses_native_search_but_fetch_still_uses_direct_api() {
-    let snapshots = Arc::new(Mutex::new(Vec::new()));
-    let saved = snapshots.clone();
-    let native = Server::start_with_handler(move |request| {
-        assert!(
-            saved
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|s: &SessionSnapshot| s.requests.iter().any(|r| {
-                    r.web.as_ref().is_some_and(|w| {
-                        w.provider == "deepseek-messages-search" && w.body == request.body
-                    })
-                }))
-        );
-        Reply::json(native_result(&["https://example.org/a"]))
-    })
-    .await;
-    let direct = Server::start(vec![Reply::json(
-        json!({"title":"Page","content":"# Page body"}),
-    )])
-    .await;
-    let chat = Server::start(vec![
-        Reply::sse(response(
-            "s",
-            vec![call("s", "web_search", r#"{"queries":["q","q"]}"#)],
-        )),
-        Reply::sse(response(
-            "f",
-            vec![call("f", "web_fetch", r#"{"url":"https://example.org/a"}"#)],
-        )),
-        Reply::sse(response("done", vec![message("m", "done")])),
-    ])
-    .await;
-    let mut cfg = native_config(&native);
-    cfg.api_base_url = format!("{}/tools", direct.url);
-    let mut agent = Agent::new(chat.client(), "system", ModelOptions::default()).unwrap();
-    agent.set_hooks(Arc::new(Save {
-        snapshots,
-        reject_web: false,
-    }));
-    agent
-        .register_tools(
-            cfg.tools("fixture-secret", WebRateLimiter::default())
-                .unwrap(),
-        )
-        .unwrap();
-    let result = agent
-        .run("user question", RunOptions::default(), |_| async { Ok(()) })
-        .await
-        .unwrap();
-    assert_eq!(result.requests.len(), 5);
-    assert_eq!(native.captured().len(), 1);
-    assert_eq!(direct.captured()[0].path, "/tools/fetch");
-    assert_eq!(direct.captured().len(), 1);
-    assert_eq!(result.requests[1].purpose, RequestPurpose::WebSearch);
-    assert_eq!(
-        result.requests[1].usage.as_ref().unwrap().output_tokens,
-        Some(3)
-    );
-    assert!(result.requests[3].usage.is_none());
-    assert!(
-        chat.captured()[1]
-            .body
-            .to_string()
-            .contains("Cited excerpt")
-    );
-    let snapshot = agent.snapshot();
-    let saved = snapshot.to_json().unwrap();
-    assert!(!saved.contains("fixture-secret"));
-    assert_eq!(SessionSnapshot::from_json(&saved).unwrap(), snapshot);
-}
-
-#[tokio::test]
-async fn selected_search_backend_never_falls_back_and_native_has_no_default_retry() {
-    let native =
-        Server::start_with_handler(|_| Reply::raw(503, "text/plain", "fixture-secret")).await;
-    let direct =
-        Server::start_with_handler(|_| Reply::raw(503, "text/plain", "fixture-secret")).await;
-    let mut cfg = native_config(&native);
-    cfg.api_base_url = format!("{}/tools", direct.url);
-    cfg.max_retries = 0;
-    let (result, snapshot) = run_tool(
-        cfg.clone(),
-        "web_search",
-        json!({"queries":["q"]}),
-        RunOptions::default(),
-    )
-    .await;
-    result.unwrap();
-    assert_eq!(native.captured().len(), 1);
-    assert!(direct.captured().is_empty());
-    assert!(
-        snapshot
-            .items
-            .iter()
-            .any(|item| matches!(item, Item::FunctionCallOutput { is_error: true, .. }))
-    );
-    assert!(!snapshot.to_json().unwrap().contains("fixture-secret"));
-    cfg.search_provider = SearchProvider::Api;
-    let (result, _) = run_tool(
-        cfg,
-        "web_search",
-        json!({"queries":["q"]}),
-        RunOptions::default(),
-    )
-    .await;
-    result.unwrap();
-    assert_eq!(native.captured().len(), 1);
-    assert_eq!(direct.captured().len(), 1);
-}
-
-#[tokio::test]
-async fn native_search_rejects_prose_and_bad_blocks_but_preserves_usage() {
-    for content in [
-        json!([{"type":"text","text":"I found https://example.org"}]),
-        json!([{"type":"web_search_tool_result","content":{"type":"web_search_tool_result_error","error_code":"fixture-secret"}}]),
-        json!([{"type":"web_search_tool_result","content":[{"type":"web_search_tool_result_error"}]}]),
-        json!([{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"file:///etc/passwd"}]}]),
-    ] {
-        let mut response = native_result(&[]);
-        response["content"] = content;
-        let native = Server::start(vec![Reply::json(response)]).await;
-        let (result, snapshot) = run_tool(
-            native_config(&native),
-            "web_search",
-            json!({"queries":["q"]}),
-            RunOptions::default(),
-        )
-        .await;
-        result.unwrap();
-        assert!(
-            snapshot
-                .items
-                .iter()
-                .any(|item| matches!(item, Item::FunctionCallOutput { is_error: true, .. }))
-        );
-        let record = &snapshot.requests[1];
-        assert_eq!(record.status.as_deref(), Some("invalid_response"));
-        assert_eq!(record.usage.as_ref().unwrap().input_tokens, Some(12));
-        assert!(!snapshot.to_json().unwrap().contains("fixture-secret"));
-    }
-    let native = Server::start(vec![Reply::json(native_result(&[]))]).await;
-    assert!(
-        DeepSeekMessagesSearch::new("fixture-secret", native_config(&native))
-            .unwrap()
-            .search("q", RequestOptions::default())
-            .await
-            .unwrap()
-            .sources
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn native_search_rejects_redirects_and_honors_cancellation() {
-    let target = Server::start(vec![]).await;
-    let mut redirect = Reply::raw(302, "text/plain", "");
-    redirect
-        .headers
-        .push(("location".into(), target.url.clone()));
-    let native = Server::start(vec![redirect]).await;
-    let client = DeepSeekMessagesSearch::new("fixture-secret", native_config(&native)).unwrap();
-    assert!(client.search("q", RequestOptions::default()).await.is_err());
-    assert!(target.captured().is_empty());
-    let native = Server::start_with_handler(|_| {
-        let mut reply = Reply::json(native_result(&[]));
-        reply.chunks[0].0 = Duration::from_secs(10);
-        reply
-    })
-    .await;
-    let client = DeepSeekMessagesSearch::new("fixture-secret", native_config(&native)).unwrap();
-    let cancellation = CancellationToken::new();
-    let search = client.search(
-        "q",
-        RequestOptions {
-            cancellation: cancellation.clone(),
-            timeout: None,
-        },
-    );
-    let cancel = async {
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        cancellation.cancel();
-    };
-    let (result, _) = tokio::join!(search, cancel);
-    assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
-}
-
-#[tokio::test]
-async fn native_search_dispatch_requires_persistence_and_budget_and_accepts_long_queries() {
-    let native = Server::start(vec![]).await;
-    let cfg = native_config(&native);
-    let tools = cfg
-        .tools("fixture-secret", WebRateLimiter::default())
-        .unwrap();
-    assert!(
-        tools[0]
-            .validate(&json!({"queries":["q".repeat(129)]}))
-            .is_ok()
-    );
-    assert!(tools[0].validate(&json!({"queries":[" "]})).is_err());
-    let chat = Server::start(vec![
-        Reply::sse(response(
-            "s",
-            vec![call("s", "web_search", r#"{"queries":["q"]}"#)],
-        )),
-        Reply::sse(response("done", vec![message("m", "failed")])),
-    ])
-    .await;
-    let mut agent = Agent::new(chat.client(), "", ModelOptions::default()).unwrap();
-    agent.set_hooks(Arc::new(Save {
-        snapshots: Arc::default(),
-        reject_web: true,
-    }));
-    agent.register_tools(tools).unwrap();
-    let result = agent
-        .run("q", RunOptions::default(), |_| async { Ok(()) })
-        .await
-        .unwrap();
-    assert_eq!(result.requests[1].status.as_deref(), Some("not_dispatched"));
-    assert!(native.captured().is_empty());
-    let (_, snapshot) = run_tool(
-        cfg,
-        "web_search",
-        json!({"queries":["q"]}),
-        RunOptions {
-            max_requests: 1,
-            ..Default::default()
-        },
-    )
-    .await;
-    assert_eq!(snapshot.requests.len(), 1);
-    assert!(native.captured().is_empty());
 }
 
 #[tokio::test]
@@ -377,6 +57,8 @@ async fn direct_json_routes_and_headers_match_the_official_api() {
         .await
         .unwrap();
     assert_eq!(search.sources.len(), 1);
+    assert_eq!(search.sources[0].summary.as_deref(), Some("Long summary"));
+    assert_eq!(search.sources[0].snippet.as_deref(), Some("Excerpt"));
     assert_eq!(search.usage, None);
     let page = api
         .fetch("https://example.org/a", RequestOptions::default())
@@ -845,6 +527,92 @@ async fn run_tool(
         .run("original question", options, |_| async { Ok(()) })
         .await;
     (result, agent.snapshot())
+}
+
+#[tokio::test]
+async fn search_prefers_bounded_summaries_and_keeps_snippets_in_metadata() {
+    for (summary, limit, expected) in [
+        (None, None, None),
+        (Some(String::new()), None, None),
+        (Some(" \n\t ".into()), None, None),
+        (
+            Some("  First\n  second\t第三  ".into()),
+            None,
+            Some("First second 第三".into()),
+        ),
+        (Some("🙂".repeat(800)), None, Some("🙂".repeat(800))),
+        (
+            Some("🙂".repeat(801)),
+            None,
+            Some(format!("{}…", "🙂".repeat(799))),
+        ),
+        (Some("四🙂五".into()), Some(2), Some("四…".into())),
+        (Some("两字".into()), Some(1), Some("…".into())),
+    ] {
+        let mut response = results("https://example.org/a");
+        let source = response["results"][0].as_object_mut().unwrap();
+        if let Some(summary) = summary {
+            source.insert("summary".into(), json!(summary));
+        } else {
+            source.remove("summary");
+        }
+        let server = Server::start(vec![Reply::json(response)]).await;
+        let mut cfg = config(&server);
+        if let Some(limit) = limit {
+            cfg.summary_max_chars = limit;
+        }
+        let (result, snapshot) = run_tool(
+            cfg,
+            "web_search",
+            json!({"queries":["q"]}),
+            RunOptions::default(),
+        )
+        .await;
+        assert_eq!(result.unwrap().stop_reason, StopReason::Completed);
+        let (output, meta) = snapshot
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::FunctionCallOutput {
+                    output,
+                    meta: Some(meta),
+                    is_error: false,
+                    ..
+                } => Some((output, meta)),
+                _ => None,
+            })
+            .unwrap();
+        let excerpt = expected.as_deref().unwrap_or("Excerpt");
+        assert!(output.contains(&format!("- [Title](https://example.org/a) — {excerpt}\n")));
+        assert_eq!(meta["sources"][0]["snippet"], "Excerpt");
+        if let Some(summary) = expected {
+            assert_eq!(meta["sources"][0]["summary"], summary);
+            assert!(!output.contains("Excerpt"));
+        } else {
+            assert!(meta["sources"][0].get("summary").is_none());
+        }
+        assert_eq!(
+            SessionSnapshot::from_json(&snapshot.to_json().unwrap()).unwrap(),
+            snapshot
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_rejects_non_string_summaries() {
+    for summary in [Value::Null, json!(42), json!([]), json!({})] {
+        let mut response = results("https://example.org/a");
+        response["results"][0]["summary"] = summary;
+        let server = Server::start(vec![Reply::json(response)]).await;
+        let api = DeepSeekWebApi::new("fixture-secret", config(&server)).unwrap();
+        assert_eq!(
+            api.search("q", None, RequestOptions::default())
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Protocol
+        );
+    }
 }
 
 #[tokio::test]

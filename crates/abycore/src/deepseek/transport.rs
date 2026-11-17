@@ -18,8 +18,6 @@ pub(crate) struct Transport {
 #[derive(Clone)]
 enum Protocol {
     Messages,
-    #[cfg(feature = "web-search")]
-    MessagesSearch,
     Web,
 }
 
@@ -37,11 +35,6 @@ impl Transport {
     #[cfg(feature = "web-search")]
     pub fn new_web(config: ClientConfig) -> Result<Self> {
         Self::build(config, Protocol::Web)
-    }
-
-    #[cfg(feature = "web-search")]
-    pub fn new_search(config: ClientConfig) -> Result<Self> {
-        Self::build(config, Protocol::MessagesSearch)
     }
 
     fn build(config: ClientConfig, protocol: Protocol) -> Result<Self> {
@@ -274,12 +267,6 @@ impl Transport {
                     ),
                 Protocol::Web => request
                     .bearer_auth(&self.config.api_key)
-                    .header("accept", "application/json"),
-                #[cfg(feature = "web-search")]
-                Protocol::MessagesSearch => request
-                    .header("x-api-key", &self.config.api_key)
-                    .bearer_auth(&self.config.api_key)
-                    .header("anthropic-version", "2023-06-01")
                     .header("accept", "application/json"),
             };
             if matches!(self.protocol, Protocol::Messages) {

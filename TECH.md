@@ -42,24 +42,16 @@ Linux 使用 wl-paste/xclip，macOS 使用隔离临时目录中的 osascript 输
 ## DeepSeek 网络协议
 
 主对话保持原生 Messages：`/anthropic/v1/messages`，`x-api-key`，流式 SSE。
-搜索与 Harness `0.2.1-rc.2` 一样默认使用辅助 Messages 请求中的服务端搜索工具，
-保留直连 Search API 作为显式可选项。`web_fetch` 始终使用独立 Fetch API，
-不随搜索模式切换；没有引入 Harness 的本地 HTTP 抓取实现。
+`web_search` 直接调用 DeepSeek Search API，`web_fetch` 直接调用 Fetch API。
+两者共用独立于主对话的 API 前缀，不再提供辅助 Messages 搜索模式。
 
 `settings.json` 可增量加入以下配置（其余偏好无需删除；不要把 key 放进去）：
 
 ```json
 {
   "web": {
-    "search_provider": "messages",
-    "messages_search": {
-      "base_url": "https://api.deepseek.com/anthropic/v1",
-      "model": "deepseek-v4-flash",
-      "max_tokens": 4096,
-      "max_uses": 5,
-      "max_retries": 0
-    },
     "api_base_url": "https://api.deepseek.com/v1/tools",
+    "summary_max_chars": 800,
     "search_timeout_secs": 60,
     "fetch_timeout_secs": 30,
     "max_retries": 2,
@@ -74,26 +66,24 @@ Linux 使用 wl-paste/xclip，macOS 使用隔离临时目录中的 osascript 输
 ```
 
 网络配置无效会拒绝启动，不静默回退到官方地址。命令行覆盖不回写偏好。
-`--base-url` 只控制主对话；`--search-base-url` 覆盖 Messages 搜索的完整前缀，只追加
-`/messages`；`--web-api-base-url` 覆盖完整 Search / Fetch 前缀。三者互相独立。
-`--search-provider messages|api` 临时选择搜索实现，也可在配置中设置 `web.search_provider`。
-未设置该字段的旧配置默认使用 Messages 搜索；保留直连需显式设为 `api`。
+`--base-url` 只控制主对话；`--web-api-base-url` 覆盖完整 Search / Fetch 前缀，
+只追加 `/search` 或 `/fetch`。两个端点配置互相独立。
+旧的 `--search-provider`、`--search-base-url` 参数已移除，使用时会报告迁移提示。
+宿主读取已有设置时忽略 `web.search_provider` 和 `web.messages_search`，其余网络字段仍严格校验；
+保存偏好时只写入现有字段。SDK 的 `WebConfig` 已移除这两个字段。
 新建、恢复、`ask`、子代理共享这套配置；换 key 后新调用
 更换两个联网工具，已经运行的子代理保留自己的凭据快照。
 
-- Messages 搜索向独立 `/anthropic/v1/messages` 发送一轮辅助模型请求，默认
-  `deepseek-v4-flash`、4096 输出 token、`web_search_20250305`、最多 5 次服务端搜索，
-  关闭 thinking。使用 `x-api-key`、Bearer 和 `anthropic-version: 2023-06-01`。
-  只解析 `web_search_tool_result` 结构化来源及 citation 片段，不把模型正文当搜索结果。
-  默认不重试；`web.messages_search.max_retries` 可单独调整。辅助模型 token 用量计入账本，
-  即使返回无效搜索结果也保留已收到的 usage。失败不切换直连 API。
 - `web_search` 保持 `queries`（1–4 条）的工具接口：完全相同的查询去重，查询并发执行，
   按查询顺序轮流合并、按 URL 去重，默认最多 8 个来源。一条失败会取消并收齐其它请求。
-  直连模式请求为 `{query,count,need_content:false,ori_question?}`；该模式 query 最多 128 个 Unicode
+  请求为 `{query,count,need_content:false,ori_question?}`；query 最多 128 个 Unicode
   字符，原始用户问题压平空白后取前 128 字符，不用系统提示、工具提醒替代。可以关闭发送原问题。
+  模型优先读取来源的 `summary`，缺失或仅含空白时回退到 `snippet`。摘要压平空白，按
+  `web.summary_max_chars` 限制为默认 800 个 Unicode 字符（包含截断标记 `…`）；
+  工具结果元数据保存处理后的摘要及原始 snippet，便于会话回放。
 - `web_fetch` 发送 `{url}`，返回标题与 Markdown；只接受不含用户凭据的 HTTP(S) URL，
   不伪造重定向最终地址。两种工具都标明外部内容不可信、要求引用来源；输出默认上限 64 KiB。
-- 直连工具 API 只使用 Bearer 认证，和 Messages 的头分离；两种搜索都不跟随 HTTP 重定向，避免泄漏 key。
+- 工具 API 只使用 Bearer 认证，和主对话 Messages 的头分离；搜索和抓取都不跟随 HTTP 重定向，避免泄漏 key。
   408、429、5xx 和连接失败有限重试，尊重 `Retry-After`；402 是额度不足，Fetch 的 403 是
   抓取策略拒绝，404 是无可用内容，其它 4xx 不重试。空搜索结果是成功。没有自动跨提供商回退。
   Fetch 的 404 可能来自目标网页不可用、站点禁止抓取、不支持的内容类型或无法提取正文，
@@ -103,7 +93,7 @@ Linux 使用 wl-paste/xclip，macOS 使用隔离临时目录中的 osascript 输
 - 直连 Search / Fetch 各自限速，默认每秒 5 次；同一宿主及子代理共用限速器，重试也经过限速。
   跨进程不能协调账号配额，仍可能收到 429。每次辅助 HTTP 尝试先记账、经过持久化屏障，
   才发出去；重试和上传都消耗本轮请求预算。直连工具没有 token 用量，不把它伪装成零 token。
-  两种模式的费用均取决于账号与服务端规则，不根据客户端名称承诺免费。
+  搜索和抓取的费用取决于账号与服务端规则，不根据客户端名称承诺免费。
 
 图片默认先通过 Files API 上传，使用 `files-api-2025-04-14`。缓存按客户端凭据和端点隔离，
 同一图片哈希复用 file id；默认寿命 7 天，提前 1 小时刷新。恢复进程或换 key 会重新上传。

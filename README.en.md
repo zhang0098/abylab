@@ -104,11 +104,11 @@ Your preferences live in `$ABYLAB_HOME/settings.json`: interface language
 (Chinese by default), model, reasoning effort, permission preset, and
 appearance (mode + palette). Flags override them for that run only.
 
-Search defaults to Messages server-side search. `--search-provider api` selects
-the direct Search API; `--search-provider messages` explicitly selects the default.
-`--search-base-url` sets the independent Messages search prefix. `web_fetch` always
-uses the Fetch API; `--web-api-base-url` sets the Search/Fetch prefix (default
-`https://api.deepseek.com/v1/tools`). Neither search backend falls back to the other.
+`web_search` calls the DeepSeek Search API directly; `web_fetch` calls the Fetch API.
+`--web-api-base-url` sets the Search/Fetch prefix (default
+`https://api.deepseek.com/v1/tools`), independently of the conversation's `--base-url`.
+The old Messages search mode and its CLI flags have been removed. Existing
+`web.search_provider` and `web.messages_search` settings are ignored when loaded.
 Search and fetch may incur separate charges. See [TECH.en.md](TECH.en.md) for settings.
 
 </details>

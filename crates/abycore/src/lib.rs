@@ -68,7 +68,4 @@ pub use types::{
     RequestRecord, Response, ResponseStatus, ThinkingSignature, Usage, WebRequestRecord,
 };
 #[cfg(feature = "web-search")]
-pub use web::{
-    DeepSeekMessagesSearch, DeepSeekWebApi, FetchResult, MessagesSearchConfig, SearchProvider,
-    SearchResult, SearchSource, WebConfig, WebRateLimiter,
-};
+pub use web::{DeepSeekWebApi, FetchResult, SearchResult, SearchSource, WebConfig, WebRateLimiter};

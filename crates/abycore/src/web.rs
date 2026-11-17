@@ -1,4 +1,4 @@
-//! Stable web tools and provider-independent deployment settings.
+//! DeepSeek Search/Fetch tools and deployment settings.
 use crate::context::RequestContext;
 use crate::{
     CallBudget, Error, ErrorKind, RequestOptions, Result, Tool, ToolContext, ToolDefinition,
@@ -11,32 +11,21 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 mod deepseek_api;
-mod messages_search;
 mod search;
 pub use deepseek_api::{DeepSeekWebApi, FetchResult, WebRateLimiter};
-pub use messages_search::{DeepSeekMessagesSearch, MessagesSearchConfig};
 pub use search::{SearchResult, SearchSource};
-
-/// Select exactly one search backend; fetch always uses the independent Fetch API.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchProvider {
-    #[default]
-    Messages,
-    Api,
-}
 
 /// No credentials: safe to persist in the host's settings document.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
-    pub search_provider: SearchProvider,
-    pub messages_search: MessagesSearchConfig,
     /// Full prefix; only `/search` or `/fetch` is appended.
     pub api_base_url: String,
     pub count: usize,
     pub max_results: usize,
     pub max_queries: usize,
+    /// Maximum Unicode characters per model-facing summary, including a truncation ellipsis.
+    pub summary_max_chars: usize,
     pub search_timeout_secs: u64,
     pub fetch_timeout_secs: u64,
     pub max_output_bytes: usize,
@@ -49,12 +38,11 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            search_provider: SearchProvider::Messages,
-            messages_search: MessagesSearchConfig::default(),
             api_base_url: "https://api.deepseek.com/v1/tools".into(),
             count: 10,
             max_results: 8,
             max_queries: 4,
+            summary_max_chars: 800,
             search_timeout_secs: 60,
             fetch_timeout_secs: 30,
             max_output_bytes: 64 * 1024,
@@ -67,7 +55,6 @@ impl Default for WebConfig {
 
 impl WebConfig {
     pub fn validate(&self) -> Result<()> {
-        self.messages_search.validate()?;
         let parsed = reqwest::Url::parse(&self.api_base_url)
             .map_err(|_| Error::new(ErrorKind::Configuration, "invalid web API base URL"))?;
         if !matches!(parsed.scheme(), "https" | "http")
@@ -85,6 +72,7 @@ impl WebConfig {
         if !(1..=50).contains(&self.count)
             || self.max_results == 0
             || !(1..=4).contains(&self.max_queries)
+            || self.summary_max_chars == 0
             || self.max_output_bytes < 256
             || !(1..=5).contains(&self.requests_per_second)
             || self.max_retries > 10
@@ -93,7 +81,7 @@ impl WebConfig {
         {
             return Err(Error::new(
                 ErrorKind::Configuration,
-                "invalid web settings: count 1..50, queries 1..4, QPS 1..5, retries 0..10, timeouts 1..3600s, output at least 256 bytes",
+                "invalid web settings: count 1..50, queries 1..4, positive summary_max_chars, QPS 1..5, retries 0..10, timeouts 1..3600s, output at least 256 bytes",
             ));
         }
         Ok(())
@@ -103,15 +91,9 @@ impl WebConfig {
     pub fn tools(&self, key: &str, limiter: WebRateLimiter) -> Result<Vec<Arc<dyn Tool>>> {
         self.validate()?;
         let api = DeepSeekWebApi::with_limiter(key, self.clone(), limiter)?;
-        let search = match self.search_provider {
-            SearchProvider::Messages => {
-                SearchBackend::Messages(DeepSeekMessagesSearch::new(key, self.clone())?)
-            }
-            SearchProvider::Api => SearchBackend::Api(api.clone()),
-        };
         Ok(vec![
             Arc::new(WebSearchTool {
-                search,
+                api: api.clone(),
                 config: self.clone(),
             }),
             Arc::new(WebFetchTool {
@@ -122,27 +104,8 @@ impl WebConfig {
     }
 }
 
-enum SearchBackend {
-    Messages(DeepSeekMessagesSearch),
-    Api(DeepSeekWebApi),
-}
-
-impl SearchBackend {
-    async fn search(
-        &self,
-        query: &str,
-        question: Option<&str>,
-        context: RequestContext,
-    ) -> Result<SearchResult> {
-        match self {
-            Self::Messages(client) => client.search_with_context(query, context).await,
-            Self::Api(client) => client.search_with_context(query, question, context).await,
-        }
-    }
-}
-
 struct WebSearchTool {
-    search: SearchBackend,
+    api: DeepSeekWebApi,
     config: WebConfig,
 }
 
@@ -171,7 +134,7 @@ impl WebSearchTool {
                 .as_str()
                 .filter(|q| !q.trim().is_empty())
                 .ok_or_else(invalid)?;
-            if self.config.search_provider == SearchProvider::Api && query.chars().count() > 128 {
+            if query.chars().count() > 128 {
                 return Err(ToolError::Failed(
                     "each search query must have at most 128 Unicode characters".into(),
                 ));
@@ -195,8 +158,12 @@ impl WebSearchTool {
         let mut pending = FuturesUnordered::new();
         for (index, query) in queries.iter().enumerate() {
             let context = batch.clone();
-            pending
-                .push(async move { (index, self.search.search(query, question, context).await) });
+            pending.push(async move {
+                (
+                    index,
+                    self.api.search_with_context(query, question, context).await,
+                )
+            });
         }
         let mut results = vec![None; queries.len()];
         let mut failure = None;
@@ -217,6 +184,7 @@ impl WebSearchTool {
         Ok(merge_results(
             &results.into_iter().flatten().collect::<Vec<_>>(),
             self.config.max_results,
+            self.config.summary_max_chars,
         ))
     }
 }

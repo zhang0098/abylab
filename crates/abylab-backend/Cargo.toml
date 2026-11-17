@@ -1,12 +1,12 @@
 [package]
 name = "abylab-backend"
 version = "0.1.24"
-edition = "2024"
+edition.workspace = true
 description = "abycore-driven agent backend for the abylab TUI"
 license.workspace = true
 
 [dependencies]
-abycore = { path = "../abycore" }
+abycore.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "fs", "time", "sync"] }
 futures-util = "0.3.34"
 serde = { version = "1", features = ["derive"] }

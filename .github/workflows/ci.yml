@@ -101,7 +101,7 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
   # Cross-platform release builds for the four supported targets.
-  # macos-14 runners are Apple Silicon; macos-15-intel is the Intel image.
+  # macos-15 runners are Apple Silicon; macos-15-intel is the Intel image.
   #
   # The Linux assets: one static binary per architecture, linked against musl
   # inside Alpine, whose own libc that is. The image is the whole toolchain,
@@ -194,7 +194,7 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
     steps:

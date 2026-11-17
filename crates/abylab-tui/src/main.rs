@@ -77,8 +77,6 @@ OPTIONS:
                             (default: $ABYLAB_HOME/sessions)
       --model <id>          model id (default: $ABY_MODEL or deepseek-flash)
       --base-url <url>      Messages API base URL for this run
-      --search-provider <messages|api>  search backend (default: messages)
-      --search-base-url <url>  Messages search prefix (default: https://api.deepseek.com/anthropic/v1)
       --web-api-base-url <url>  Search/Fetch API prefix (default: https://api.deepseek.com/v1/tools)
       --api-key <key>       override the agent API key for this run
                             (/login persists one instead)
@@ -100,8 +98,6 @@ OPTIONS:
 ";
 
 struct Args {
-    search_provider: Option<abylab_backend::SearchProvider>,
-    search_base_url: Option<String>,
     web_api_base_url: Option<String>,
     workspace: Option<String>,
     sessions_root: Option<String>,
@@ -128,8 +124,6 @@ fn parse_args() -> Result<Args> {
 
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut args_out = Args {
-        search_provider: None,
-        search_base_url: None,
         web_api_base_url: None,
         workspace: None,
         sessions_root: None,
@@ -162,13 +156,13 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--model" => args_out.model = Some(take("--model")?),
             "--base-url" => args_out.base_url = Some(take("--base-url")?),
             "--search-provider" => {
-                args_out.search_provider = Some(match take("--search-provider")?.as_str() {
-                    "messages" => abylab_backend::SearchProvider::Messages,
-                    "api" => abylab_backend::SearchProvider::Api,
-                    _ => anyhow::bail!("--search-provider must be messages or api"),
-                });
+                bail!(
+                    "--search-provider was removed; web search always uses the DeepSeek Search API"
+                );
             }
-            "--search-base-url" => args_out.search_base_url = Some(take("--search-base-url")?),
+            "--search-base-url" => {
+                bail!("--search-base-url was removed; configure the Search/Fetch API prefix with --web-api-base-url");
+            }
             "--web-api-base-url" => args_out.web_api_base_url = Some(take("--web-api-base-url")?),
             "--api-key" => args_out.api_key = Some(take("--api-key")?),
             "--theme" => args_out.theme = Some(take("--theme")?),
@@ -240,12 +234,6 @@ fn build_config(args: &Args) -> Result<RuntimeConfig> {
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     if let Some(url) = &args.web_api_base_url {
         web.api_base_url = url.clone();
-    }
-    if let Some(provider) = args.search_provider {
-        web.search_provider = provider;
-    }
-    if let Some(url) = &args.search_base_url {
-        web.messages_search.base_url = url.clone();
     }
     web.validate().map_err(|error| anyhow::anyhow!("{error}"))?;
 

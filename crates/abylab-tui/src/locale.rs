@@ -73,6 +73,7 @@ impl Locale {
 pub struct UiSettings {
     pub messages: abylab_backend::MessagesConfig,
     /// Shared Search/Fetch settings, without credentials.
+    #[serde(deserialize_with = "deserialize_web_settings")]
     pub web: abylab_backend::WebConfig,
     pub language: Locale,
     /// Last selected model id (`/model`, `--model` overrides it per run).
@@ -148,6 +149,18 @@ impl EnterBehavior {
     }
 }
 
+/// Old search-mode settings are retired; the remaining web settings stay strictly validated.
+fn deserialize_web_settings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<abylab_backend::WebConfig, D::Error> {
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(web) = value.as_object_mut() {
+        web.remove("search_provider");
+        web.remove("messages_search");
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
 impl UiSettings {
     /// Endpoints must not silently fall back after malformed settings.
     pub fn load_network(
@@ -167,7 +180,7 @@ impl UiSettings {
         }
         let web = value
             .get("web")
-            .map(|value| serde_json::from_value(value.clone()))
+            .map(|value| deserialize_web_settings(value.clone()))
             .transpose()
             .map_err(|_| "invalid web settings in settings.json".to_owned())?
             .unwrap_or_default();
